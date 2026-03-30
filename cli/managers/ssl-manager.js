@@ -319,8 +319,21 @@ async function installCertbot() {
     // Enable all TLS versions (1.0, 1.1, 1.2, 1.3) for maximum compatibility
     const tlsSetup = `[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13`;
 
+    // Helper to safely run a command and catch EPERM errors
+    const safeRun = async (cmd, opts) => {
+      try {
+        return await run(cmd, opts);
+      } catch (err) {
+        // Re-throw EPERM so caller can handle Windows Defender blocks
+        if (err.code === 'EPERM' || err.message?.includes('EPERM')) {
+          throw err;
+        }
+        return { success: false, stdout: '', stderr: err.message, exitCode: null };
+      }
+    };
+
     // Method 1: Invoke-WebRequest with all TLS versions
-    let r = await run(
+    let r = await safeRun(
       `${tlsSetup}; $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '${safeUrl}' -OutFile '${safeDest}' -UseBasicParsing -TimeoutSec 120`,
       { timeout: 130000 },
     );
@@ -328,7 +341,7 @@ async function installCertbot() {
     if (showErrors && r.stderr) lastDownloadError = `Invoke-WebRequest: ${r.stderr}`;
 
     // Method 2: WebClient with TLS
-    r = await run(
+    r = await safeRun(
       `${tlsSetup}; (New-Object System.Net.WebClient).DownloadFile('${safeUrl}','${safeDest}')`,
       { timeout: 130000 },
     );
@@ -336,7 +349,7 @@ async function installCertbot() {
     if (showErrors && r.stderr && !lastDownloadError) lastDownloadError = `WebClient: ${r.stderr}`;
 
     // Method 3: BITS Transfer
-    r = await run(
+    r = await safeRun(
       `Import-Module BitsTransfer -ErrorAction SilentlyContinue; Start-BitsTransfer -Source '${safeUrl}' -Destination '${safeDest}' -ErrorAction Stop`,
       { timeout: 130000 },
     );
@@ -345,7 +358,7 @@ async function installCertbot() {
 
     // Method 4: curl.exe (works on Windows 10+)
     if (hasCurl) {
-      r = await run(
+      r = await safeRun(
         `curl.exe -L --ssl-no-revoke --max-time 120 -o '${safeDest}' '${safeUrl}'`,
         { timeout: 130000 },
       );
@@ -354,7 +367,7 @@ async function installCertbot() {
     }
 
     // Method 5: HttpClient with custom handler
-    r = await run(
+    r = await safeRun(
       `${tlsSetup}; $handler=[System.Net.Http.HttpClientHandler]::new(); $handler.ServerCertificateCustomValidationCallback={$true}; $handler.AllowAutoRedirect=$true; $hc=[System.Net.Http.HttpClient]::new($handler); $hc.DefaultRequestHeaders.Add('User-Agent','Mozilla/5.0 (Windows NT 10.0; Win64; x64)'); $hc.Timeout=[TimeSpan]::FromSeconds(120); $bytes=$hc.GetByteArrayAsync('${safeUrl}').GetAwaiter().GetResult(); [System.IO.File]::WriteAllBytes('${safeDest}',$bytes)`,
       { timeout: 130000 },
     );
@@ -362,7 +375,7 @@ async function installCertbot() {
     if (showErrors && r.stderr && !lastDownloadError) lastDownloadError = `HttpClient: ${r.stderr}`;
 
     // Method 6: Certutil (built-in Windows tool)
-    r = await run(
+    r = await safeRun(
       `certutil.exe -urlcache -split -f "${safeUrl}" "${safeDest}"`,
       { timeout: 130000 },
     );
@@ -370,7 +383,7 @@ async function installCertbot() {
     if (showErrors && r.stderr && !lastDownloadError) lastDownloadError = `certutil: ${r.stderr}`;
 
     // Method 7: PowerShell with DisableKeepAlive
-    r = await run(
+    r = await safeRun(
       `${tlsSetup}; $req=[System.Net.WebRequest]::Create('${safeUrl}'); $req.Method='GET'; $req.KeepAlive=$false; $req.UserAgent='Mozilla/5.0'; $resp=$req.GetResponse(); $stream=$resp.GetResponseStream(); $reader=[System.IO.BinaryReader]::new($stream); $bytes=$reader.ReadBytes($resp.ContentLength); $reader.Close(); [System.IO.File]::WriteAllBytes('${safeDest}',$bytes)`,
       { timeout: 130000 },
     );
@@ -479,7 +492,7 @@ async function installCertbot() {
         const appInstallerDest = '$env:TEMP\\AppInstaller.msixbundle';
 
         console.log(chalk.gray('\n Downloading App Installer...'));
-        const downloaded = await downloadFile(appInstallerUrl, appInstallerDest);
+        let downloaded = false; try { downloaded = await downloadFile(appInstallerUrl, appInstallerDest); } catch (err) { if (err.code === 'EPERM' || err.message?.includes('EPERM')) { console.log(chalk.red('\n ? Windows Defender blocked the download.')); console.log(chalk.gray(' Add an exclusion in Windows Defender or download manually.')); console.log(chalk.gray(' Download URL: https://aka.ms/getwinget\n')); } else { console.log(chalk.yellow('\n Download failed: ' + err.message + '\n')); } }
 
         if (downloaded) {
           console.log(chalk.gray(' Running App Installer...'));
@@ -573,7 +586,7 @@ async function installCertbot() {
   const WINACME_DEST = 'C:\\Program Files\\win-acme';
 
   // Test network before attempting downloads
-  await testNetworkConnectivity();
+  try { await testNetworkConnectivity(); } catch (err) { console.log(chalk.yellow('Network test failed: ' + err.message)); }
 
   step('Downloading win-acme from GitHub ...');
   const winAcmeUrls = [
@@ -587,7 +600,7 @@ async function installCertbot() {
 
     const zipDest = `$env:TEMP\\win-acme.zip`;
     lastDownloadError = '';
-    if (await downloadFile(url, zipDest, true)) {
+    let dlOk = false; try { dlOk = await downloadFile(url, zipDest, true); } catch (err) { if (err.code === 'EPERM' || err.message?.includes('EPERM')) { console.log(chalk.red('Windows Defender blocked this download.')); console.log(chalk.gray('Use the manual installer option or add a Windows Defender exclusion.')); } } if (dlOk) {
       console.log(chalk.gray(' Extracting win-acme ...\n'));
       await run(`New-Item -ItemType Directory -Force -Path '${WINACME_DEST}'`);
       await run(`Expand-Archive -Path '${zipDest}' -DestinationPath '${WINACME_DEST}' -Force`);
@@ -619,7 +632,7 @@ async function installCertbot() {
     step(`Downloading certbot installer from ${hostname} ...`);
 
     lastDownloadError = '';
-    if (await downloadFile(url, INSTALLER_DEST, true)) {
+    let dlOk = false; try { dlOk = await downloadFile(url, INSTALLER_DEST, true); } catch (err) { if (err.code === 'EPERM' || err.message?.includes('EPERM')) { console.log(chalk.red('Windows Defender blocked this download.')); console.log(chalk.gray('Use the manual installer option or add a Windows Defender exclusion.')); } } if (dlOk) {
       console.log(chalk.gray(' Running installer silently ...\n'));
       const ok = await runNsisInstaller(INSTALLER_DEST);
       await run(`Remove-Item -Force '${INSTALLER_DEST}' -ErrorAction SilentlyContinue`);
