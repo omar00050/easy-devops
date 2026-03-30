@@ -247,7 +247,7 @@ async function installNginx() {
   if (hasWinget) {
     spinner.text = 'Installing nginx via winget…';
     const result = await run(
-      'winget install -e --id Nginx.Nginx --accept-package-agreements --accept-source-agreements',
+      'winget install -e --id nginxinc.nginx --accept-package-agreements --accept-source-agreements',
       { timeout: 120000 },
     );
     if (result.success) {
