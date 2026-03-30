@@ -11,6 +11,7 @@ import sslMenu from './menus/ssl.js';
 import domainsMenu from './menus/domains.js';
 import dashboardMenu from './menus/dashboard.js';
 import settingsMenu from './menus/settings.js';
+import updateMenu from './menus/update.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
@@ -44,6 +45,7 @@ async function showMainMenu() {
       '🔗 Domain Manager',
       '🎛️ Open Dashboard',
       '⚙️ Settings',
+      '🔄 Check for Updates',
       '✖ Exit',
     ],
   }]);
@@ -58,6 +60,7 @@ async function dispatch(choice) {
     case '🔗 Domain Manager': await domainsMenu(); break;
     case '🎛️ Open Dashboard': await dashboardMenu(); break;
     case '⚙️ Settings': await settingsMenu(); break;
+    case '🔄 Check for Updates': await updateMenu(); break;
     case '✖ Exit': process.exit(0);
   }
 }

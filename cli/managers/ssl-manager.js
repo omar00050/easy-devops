@@ -276,18 +276,34 @@ async function installCertbot() {
     console.log(chalk.yellow('  Chocolatey failed, trying direct download...\n'));
   }
 
-  // 3. Direct download — official EFF installer (NSIS, supports /S silent flag)
-  const installerUrl = 'https://dl.eff.org/certbot-beta-installer-win_amd64_signed.exe';
+  // 3. Direct download — try multiple sources in order
+  const INSTALLER_FILENAME = 'certbot-beta-installer-win_amd64_signed.exe';
+  const downloadSources = [
+    `https://github.com/certbot/certbot/releases/latest/download/${INSTALLER_FILENAME}`,
+    `https://dl.eff.org/${INSTALLER_FILENAME}`,
+  ];
 
-  console.log(chalk.gray('\n  Downloading certbot installer from dl.eff.org ...\n'));
+  let downloaded = false;
+  for (const url of downloadSources) {
+    const label = new URL(url).hostname;
+    console.log(chalk.gray(`\n  Downloading certbot installer from ${label} ...\n`));
 
-  const downloadResult = await run(
-    `$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '${installerUrl}' -OutFile "$env:TEMP\\certbot-installer.exe" -UseBasicParsing -TimeoutSec 120`,
-    { timeout: 130000 },
-  );
+    const downloadResult = await run(
+      `$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '${url}' -OutFile "$env:TEMP\\certbot-installer.exe" -UseBasicParsing -TimeoutSec 120`,
+      { timeout: 130000 },
+    );
 
-  if (!downloadResult.success) {
-    console.log(chalk.red('  Download failed: ' + (downloadResult.stderr || downloadResult.stdout)));
+    if (downloadResult.success) {
+      downloaded = true;
+      break;
+    }
+
+    console.log(chalk.yellow(`  Failed from ${label}: ${(downloadResult.stderr || downloadResult.stdout).split('\n')[0].trim()}`));
+  }
+
+  if (!downloaded) {
+    console.log(chalk.red('\n  Download failed from all sources.'));
+    console.log(chalk.gray('  Install manually: https://certbot.eff.org/instructions?ws=other&os=windows\n'));
     return { success: false };
   }
 

@@ -69,7 +69,7 @@ function isPidAlive(pid) {
 
 // ─── Status ───────────────────────────────────────────────────────────────────
 
-async function getDashboardStatus() {
+export async function getDashboardStatus() {
   const { dashboardPort } = loadConfig();
   const storedPid  = dbGet('dashboard-pid');
   const storedPort = dbGet('dashboard-port') ?? dashboardPort;
@@ -91,7 +91,7 @@ async function getDashboardStatus() {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-async function startDashboard(port) {
+export async function startDashboard(port) {
   await fs.mkdir(path.dirname(LOG_PATH), { recursive: true });
 
   // openSync gives a real fd immediately — required by spawn's stdio option
@@ -118,7 +118,7 @@ async function startDashboard(port) {
 
 // ─── Stop ─────────────────────────────────────────────────────────────────────
 
-async function stopDashboard(pid) {
+export async function stopDashboard(pid) {
   if (!pid) return { success: false };
   try {
     if (isWindows) {
