@@ -21,7 +21,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import { run } from '../../core/shell.js';
-import { dbGet, dbSet, closeDb } from '../../core/db.js';
+import { dbGet, dbSet, closeDb, initDb } from '../../core/db.js';
 import { loadConfig } from '../../core/config.js';
 import { getDashboardStatus, startDashboard, stopDashboard } from './dashboard.js';
 
@@ -107,6 +107,9 @@ async function performUpdate(latestVersion) {
   }
 
   sp.succeed(`Updated to v${latestVersion}`);
+
+  // Re-initialize the database connection after npm replaced the module
+  initDb();
 
   // Step 5 — restart dashboard if it was running before
   const saved = dbGet('update-pre-dashboard');

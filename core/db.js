@@ -16,8 +16,13 @@ try {
 }
 
 let db;
+
+function createDbConnection() {
+  return new GoodDB(new SQLiteDriver({ path: DB_PATH }));
+}
+
 try {
-  db = new GoodDB(new SQLiteDriver({ path: DB_PATH }));
+  db = createDbConnection();
 } catch (err) {
   process.stderr.write(`[ERROR] Failed to initialize database at: ${DB_PATH}\n`);
   process.stderr.write(`Hint: Check that the current user has write access to: ${DATA_DIR}\n`);
@@ -38,4 +43,18 @@ export function closeDb() {
   try {
     db.driver?.db?.close?.();
   } catch { /* ignore */ }
+}
+
+/**
+ * Reinitializes the database connection after it was closed.
+ * Call this after closeDb() when you need to use the database again.
+ */
+export function initDb() {
+  try {
+    // Check if connection is still open
+    db.driver?.db?.prepare('SELECT 1');
+  } catch {
+    // Connection is closed, create a new one
+    db = createDbConnection();
+  }
 }
