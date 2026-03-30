@@ -1,0 +1,53 @@
+<!-- SSL Page -->
+<div v-show="page === 'ssl'" class="max-w-6xl mx-auto">
+  <div class="flex items-center justify-between mb-2">
+    <h2 class="text-2xl font-bold">SSL Certificates</h2>
+    <button @click="renewAll" :disabled="ssl.renewingDomain !== null" class="btn btn-primary btn-sm">
+      {{ ssl.renewingDomain === 'all' ? 'Renewing...' : 'Renew Expiring' }}
+    </button>
+  </div>
+  <p class="text-slate-400 mb-8">Let's Encrypt certificates managed by certbot</p>
+
+  <div v-if="ssl.error" class="card p-4 mb-6 bg-red-500/10 border-red-500/20 text-red-400">
+    {{ ssl.error }}
+  </div>
+
+  <div v-if="ssl.loading" class="text-slate-500">Loading certificates...</div>
+
+  <div v-else-if="ssl.certs.length === 0" class="card p-12 text-center">
+    <p class="text-slate-500">No certificates found. Use the CLI to issue certificates.</p>
+  </div>
+
+  <div v-else class="card overflow-hidden">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Domain</th>
+          <th>Expires</th>
+          <th>Days Left</th>
+          <th>Status</th>
+          <th class="text-right">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="cert in ssl.certs" :key="cert.domain">
+          <td class="font-mono text-sm">{{ cert.domain }}</td>
+          <td class="text-slate-400">{{ cert.expiry ? new Date(cert.expiry).toLocaleDateString() : '—' }}</td>
+          <td>
+            <span :class="certDaysColor(cert)" class="font-mono font-semibold">
+              {{ cert.daysLeft !== null ? cert.daysLeft + 'd' : '—' }}
+            </span>
+          </td>
+          <td>
+            <span :class="'badge badge-' + certBadgeType(cert)">{{ certStatus(cert) }}</span>
+          </td>
+          <td class="text-right">
+            <button @click="renewCert(cert.domain)" :disabled="ssl.renewingDomain !== null" class="btn btn-secondary btn-sm" :class="{ 'opacity-50': ssl.renewingDomain !== null }">
+              {{ ssl.renewingDomain === cert.domain ? 'Renewing...' : 'Renew' }}
+            </button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>

@@ -1,0 +1,329 @@
+/**
+ * cli/managers/nginx-manager.js
+ *
+ * Nginx Manager — full control over nginx from the CLI.
+ *
+ * Exported functions:
+ *   - showNginxManager() — interactive menu for managing nginx
+ *
+ * All shell calls go through core/shell.js (run / runLive).
+ * Platform differences (Windows/Linux) are handled via isWindows guards.
+ */
+
+import chalk from 'chalk';
+import inquirer from 'inquirer';
+import ora from 'ora';
+import { run, runLive } from '../../core/shell.js';
+import { loadConfig } from '../../core/config.js';
+
+const isWindows = process.platform === 'win32';
+
+// ─── getNginxStatus ───────────────────────────────────────────────────────────
+
+async function getNginxStatus(nginxDir) {
+  const nginxExe = isWindows ? `${nginxDir}\\nginx.exe` : 'nginx';
+  const logPath = isWindows
+    ? `${nginxDir}\\logs\\error.log`
+    : '/var/log/nginx/error.log';
+
+  let running = false;
+  let version = null;
+
+  if (isWindows) {
+    const taskResult = await run('tasklist /FI "IMAGENAME eq nginx.exe" /NH');
+    running = taskResult.success && taskResult.stdout.toLowerCase().includes('nginx.exe');
+
+    const versionResult = await run(`& "${nginxExe}" -v`);
+    const versionMatch = (versionResult.stderr + versionResult.stdout).match(/nginx\/(\S+)/);
+    if (versionMatch) version = versionMatch[1];
+  } else {
+    const pgrepResult = await run('pgrep -x nginx');
+    running = pgrepResult.exitCode === 0;
+
+    const versionResult = await run('nginx -v');
+    const versionMatch = (versionResult.stderr + versionResult.stdout).match(/nginx\/(\S+)/);
+    if (versionMatch) version = versionMatch[1];
+  }
+
+  return { running, version, nginxDir, nginxExe, logPath };
+}
+
+// ─── testConfig ───────────────────────────────────────────────────────────────
+
+async function testConfig(nginxExe, nginxDir) {
+  const cmd = isWindows ? `& "${nginxExe}" -t` : 'nginx -t';
+  const result = await run(cmd, { cwd: nginxDir });
+  return {
+    success: result.success,
+    output: (result.stdout + '\n' + result.stderr).trim(),
+  };
+}
+
+// ─── reloadNginx ──────────────────────────────────────────────────────────────
+
+async function reloadNginx(nginxExe, nginxDir) {
+  const spinner = ora('Testing config…').start();
+  const configTest = await testConfig(nginxExe, nginxDir);
+
+  if (!configTest.success) {
+    spinner.fail('Config test failed');
+    console.log(chalk.red('\n' + configTest.output));
+    return { success: false, message: 'Config test failed', output: configTest.output };
+  }
+
+  spinner.text = 'Reloading nginx…';
+  const cmd = isWindows ? `& "${nginxExe}" -s reload` : 'systemctl reload nginx';
+  const result = await run(cmd, { cwd: nginxDir });
+
+  if (result.success) {
+    spinner.succeed('nginx reloaded successfully');
+  } else {
+    spinner.fail('Reload failed');
+  }
+
+  return {
+    success: result.success,
+    message: result.success ? 'nginx reloaded successfully' : 'Reload failed',
+    output: (result.stdout + '\n' + result.stderr).trim(),
+  };
+}
+
+// ─── restartNginx ─────────────────────────────────────────────────────────────
+
+async function restartNginx(nginxExe, nginxDir) {
+  const spinner = ora('Testing config…').start();
+  const configTest = await testConfig(nginxExe, nginxDir);
+
+  if (!configTest.success) {
+    spinner.fail('Config test failed');
+    console.log(chalk.red('\n' + configTest.output));
+    return { success: false, message: 'Config test failed', output: configTest.output };
+  }
+
+  spinner.text = 'Restarting nginx…';
+  let result;
+  if (isWindows) {
+    await run('taskkill /f /IM nginx.exe', { cwd: nginxDir });
+    result = await run(`& "${nginxExe}"`, { cwd: nginxDir });
+  } else {
+    result = await run('systemctl restart nginx');
+  }
+
+  if (result.success) {
+    spinner.succeed('nginx restarted successfully');
+  } else {
+    spinner.fail('Restart failed');
+  }
+
+  return {
+    success: result.success,
+    message: result.success ? 'nginx restarted successfully' : 'Restart failed',
+    output: (result.stdout + '\n' + result.stderr).trim(),
+  };
+}
+
+// ─── viewErrorLog ─────────────────────────────────────────────────────────────
+
+async function viewErrorLog(logPath) {
+  const cmd = isWindows
+    ? `Get-Content -Tail 50 "${logPath}"`
+    : `tail -n 50 "${logPath}"`;
+
+  const result = await run(cmd);
+
+  if (result.success && result.stdout) {
+    console.log('\n' + result.stdout);
+  } else {
+    console.log(chalk.yellow('\n  No errors logged yet (log file not found or empty)\n'));
+  }
+}
+
+// ─── startNginx ───────────────────────────────────────────────────────────────
+
+async function startNginx(nginxExe, nginxDir) {
+  // Step 1: config check before attempting to start
+  const spinner = ora('Checking config…').start();
+  const configTest = await testConfig(nginxExe, nginxDir);
+  if (!configTest.success) {
+    spinner.fail('Config test failed — fix the errors below before starting');
+    console.log(chalk.red('\n' + configTest.output));
+    return { success: false };
+  }
+
+  // Step 2: launch nginx
+  spinner.text = 'Starting nginx…';
+
+  if (isWindows) {
+    // nginx.exe runs in the foreground on Windows and never exits, so we must
+    // use Start-Process to launch it as a detached background process.
+    const startCmd = `Start-Process -FilePath "${nginxExe}" -WorkingDirectory "${nginxDir}" -WindowStyle Hidden`;
+    await run(startCmd, { timeout: 10000 });
+  } else {
+    const result = await run('systemctl start nginx', { timeout: 15000 });
+    if (!result.success) {
+      spinner.fail('Start failed');
+      console.log(chalk.red('\n' + (result.stderr || result.stdout)));
+      return { success: false };
+    }
+  }
+
+  // Step 3: wait briefly then verify nginx is actually running
+  await new Promise(r => setTimeout(r, 1500));
+
+  let running = false;
+  if (isWindows) {
+    const check = await run('tasklist /FI "IMAGENAME eq nginx.exe" /NH');
+    running = check.success && check.stdout.toLowerCase().includes('nginx.exe');
+  } else {
+    const check = await run('pgrep -x nginx');
+    running = check.exitCode === 0;
+  }
+
+  if (running) {
+    spinner.succeed('nginx started successfully');
+    return { success: true };
+  }
+
+  // Step 4: nginx didn't come up — read the error log to surface the reason
+  spinner.fail('nginx did not start');
+  const logPath = isWindows
+    ? `${nginxDir}\\logs\\error.log`
+    : '/var/log/nginx/error.log';
+  const logCmd = isWindows
+    ? `Get-Content -Tail 20 "${logPath}" -ErrorAction SilentlyContinue`
+    : `tail -n 20 "${logPath}" 2>/dev/null`;
+  const logResult = await run(logCmd);
+
+  console.log(chalk.yellow('\n  Recent error log:'));
+  if (logResult.success && logResult.stdout) {
+    console.log(chalk.red(logResult.stdout));
+  } else {
+    console.log(chalk.gray('  (error log not found or empty)'));
+  }
+
+  return { success: false };
+}
+
+// ─── stopNginx ────────────────────────────────────────────────────────────────
+
+async function stopNginx(nginxDir) {
+  const spinner = ora('Stopping nginx…').start();
+  const cmd = isWindows ? 'taskkill /f /IM nginx.exe' : 'systemctl stop nginx';
+  const result = await run(cmd, { cwd: nginxDir });
+  if (result.success) {
+    spinner.succeed('nginx stopped');
+  } else {
+    spinner.fail('Stop failed');
+    console.log(chalk.red('\n' + (result.stderr || result.stdout)));
+  }
+  return { success: result.success, output: (result.stdout + '\n' + result.stderr).trim() };
+}
+
+// ─── installNginx ─────────────────────────────────────────────────────────────
+
+async function installNginx() {
+  const spinner = ora('Installing nginx…').start();
+
+  const cmd = isWindows
+    ? 'winget install -e --id Nginx.Nginx --accept-package-agreements --accept-source-agreements'
+    : 'sudo apt-get install -y nginx';
+
+  const result = await run(cmd, { timeout: 120000 });
+
+  if (result.success) {
+    spinner.succeed('nginx installed successfully');
+    return { success: true, message: 'nginx installed successfully', output: result.stdout };
+  } else {
+    spinner.fail('Installation failed');
+    console.log(chalk.red(result.stderr || result.stdout));
+    console.log(chalk.gray('\n  Manual instructions: https://nginx.org/en/docs/install.html\n'));
+    return { success: false, message: 'Installation failed', output: result.stderr || result.stdout };
+  }
+}
+
+// ─── showNginxManager ─────────────────────────────────────────────────────────
+
+export async function showNginxManager() {
+  while (true) {
+    const { nginxDir } = loadConfig();
+    const status = await getNginxStatus(nginxDir);
+
+    console.log(chalk.bold('\n  Nginx Manager'));
+    console.log(chalk.gray('  ' + '─'.repeat(40)));
+
+    if (status.version) {
+      const statusIcon = status.running ? chalk.green('✅ Running') : chalk.red('❌ Stopped');
+      console.log(`  ${statusIcon}  |  v${status.version}  |  ${status.nginxDir}`);
+    } else {
+      console.log(`  ${chalk.yellow('⚠ Not installed')}`);
+    }
+    console.log();
+
+    const choices = [];
+
+    if (status.running) {
+      // nginx is running — offer reload, restart, stop
+      choices.push('Reload nginx', 'Restart nginx', 'Stop nginx', new inquirer.Separator());
+      choices.push('Test config', 'View error log', new inquirer.Separator());
+    } else if (status.version) {
+      // nginx is installed but stopped — offer start
+      choices.push('Start nginx', new inquirer.Separator());
+      choices.push('Test config', 'View error log', new inquirer.Separator());
+    } else {
+      // nginx not found — offer install
+      choices.push('Install nginx', new inquirer.Separator());
+    }
+
+    choices.push('← Back');
+
+    let choice;
+    try {
+      ({ choice } = await inquirer.prompt([{
+        type: 'list',
+        name: 'choice',
+        message: 'Select an option:',
+        choices,
+      }]));
+    } catch (err) {
+      if (err.name === 'ExitPromptError') return;
+      throw err;
+    }
+
+    switch (choice) {
+      case 'Reload nginx':
+        await reloadNginx(status.nginxExe, status.nginxDir);
+        break;
+      case 'Restart nginx':
+        await restartNginx(status.nginxExe, status.nginxDir);
+        break;
+      case 'Start nginx':
+        await startNginx(status.nginxExe, status.nginxDir);
+        break;
+      case 'Stop nginx':
+        await stopNginx(status.nginxDir);
+        break;
+      case 'Test config': {
+        const result = await testConfig(status.nginxExe, status.nginxDir);
+        console.log(
+          '\n  Config test: ' +
+          (result.success ? chalk.green('✓ OK') : chalk.red('✗ Failed')) +
+          '\n',
+        );
+        console.log(chalk.gray(result.output) + '\n');
+        break;
+      }
+      case 'View error log':
+        await viewErrorLog(status.logPath);
+        break;
+      case 'Install nginx':
+        await installNginx();
+        break;
+      case '← Back':
+        return;
+    }
+
+    if (choice !== '← Back') {
+      await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
+    }
+  }
+}

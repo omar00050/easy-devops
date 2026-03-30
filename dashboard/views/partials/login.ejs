@@ -1,0 +1,50 @@
+<!-- Login Page -->
+<div v-if="!authenticated" class="min-h-screen flex items-center justify-center p-4">
+  <div class="w-full max-w-md">
+    <div class="text-center mb-10">
+      <div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-brand-400 to-brand-600 mb-4">
+        <svg class="w-8 h-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+        </svg>
+      </div>
+      <h1 class="text-2xl font-bold text-white">Easy DevOps</h1>
+      <p class="text-slate-400 mt-2">Sign in to access your dashboard</p>
+    </div>
+
+    <div class="card p-8">
+      <div class="space-y-5">
+        <div class="input-group">
+          <input v-model="login.password" type="password" placeholder=" " @keyup.enter="doLogin" />
+          <label>Password</label>
+        </div>
+
+        <p v-if="login.error" class="text-red-400 text-sm flex items-center gap-2">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+          {{ login.error }}
+        </p>
+
+        <button @click="doLogin" :disabled="login.loading" class="btn btn-primary w-full">
+          <svg v-if="login.loading" class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+          </svg>
+          {{ login.loading ? 'Signing in...' : 'Sign In' }}
+        </button>
+      </div>
+
+      <p class="text-center text-xs text-slate-500 mt-6">No password set? Leave blank and press Sign In.</p>
+    </div>
+
+    <button @click="toggleTheme" class="mx-auto mt-6 flex items-center gap-2 text-sm text-slate-500 hover:text-slate-300 transition">
+      <svg v-if="isDark" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+      </svg>
+      <svg v-else class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+      </svg>
+      {{ isDark ? 'Light mode' : 'Dark mode' }}
+    </button>
+  </div>
+</div>

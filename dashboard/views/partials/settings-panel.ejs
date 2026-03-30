@@ -1,0 +1,37 @@
+<!-- Settings Page -->
+<div v-show="page === 'settings'" class="max-w-2xl mx-auto">
+  <h2 class="text-2xl font-bold mb-2">Settings</h2>
+  <p class="text-slate-400 mb-8">Dashboard configuration and service paths</p>
+
+  <div class="card p-6 space-y-6">
+    <div class="input-group">
+      <input v-model.number="settings.dashboardPort" type="number" placeholder=" " />
+      <label>Dashboard Port</label>
+      <p class="text-xs text-slate-500 mt-1 ml-1">Restart dashboard after changing</p>
+    </div>
+
+    <div class="input-group">
+      <input v-model="settings.nginxDir" placeholder=" " />
+      <label>Nginx Directory</label>
+    </div>
+
+    <div class="input-group">
+      <input v-model="settings.certbotDir" placeholder=" " />
+      <label>Certbot Directory</label>
+    </div>
+
+    <div class="input-group">
+      <input v-model="settings.password" type="password" placeholder=" " />
+      <label>New Password</label>
+      <p class="text-xs text-slate-500 mt-1 ml-1">Leave blank to keep current</p>
+    </div>
+
+    <div class="flex items-center gap-4 pt-2">
+      <button @click="saveSettings" :disabled="settings.loading" class="btn btn-primary">
+        {{ settings.loading ? 'Saving...' : 'Save Settings' }}
+      </button>
+      <span v-if="settings.msg" class="text-brand-400 text-sm">{{ settings.msg }}</span>
+      <span v-if="settings.error" class="text-red-400 text-sm">{{ settings.error }}</span>
+    </div>
+  </div>
+</div>

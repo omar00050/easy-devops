@@ -1,0 +1,66 @@
+{
+  "name": "easy-devops",
+  "version": "0.1.0",
+  "description": "A unified DevOps management tool with CLI and web dashboard for managing Nginx, SSL certificates, and Node.js on Linux and Windows servers.",
+  "keywords": [
+    "devops",
+    "nginx",
+    "ssl",
+    "certbot",
+    "letsencrypt",
+    "nodejs",
+    "dashboard",
+    "cli",
+    "server-management",
+    "reverse-proxy",
+    "certificate-management",
+    "sysadmin"
+  ],
+  "author": {
+    "name": "Omar Farghaly",
+    "url": "https://github.com/omar00050"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/omar00050/Easy-DevOps.git"
+  },
+  "bugs": {
+    "url": "https://github.com/omar00050/Easy-DevOps/issues"
+  },
+  "homepage": "https://github.com/omar00050/Easy-DevOps#readme",
+  "type": "module",
+  "main": "cli/index.js",
+  "bin": {
+    "easy-devops": "cli/index.js"
+  },
+  "files": [
+    "cli/",
+    "core/",
+    "dashboard/",
+    "lib/",
+    "data/.gitkeep",
+    "install.bat",
+    "install.ps1",
+    "install.sh"
+  ],
+  "scripts": {
+    "start": "node cli/index.js",
+    "dashboard": "node dashboard/server.js",
+    "system-info": "node cli/index.js system-info"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "cli-table3": "^0.6.5",
+    "ejs": "^5.0.1",
+    "express": "^5.2.1",
+    "express-session": "^1.17.3",
+    "good.db": "^2.4.6",
+    "inquirer": "^9.2.12",
+    "ora": "^7.0.1",
+    "socket.io": "^4.8.3"
+  }
+}

@@ -1,0 +1,229 @@
+<!-- Domain Form -->
+<div v-if="domains.showForm" class="card mb-6">
+  <div class="flex items-center justify-between p-4 border-b border-slate-800">
+    <h3 class="font-semibold">{{ domains.editingName ? 'Edit: ' + domains.editingName : 'New Domain' }}</h3>
+    <div class="flex gap-2">
+      <button @click="resetDomainForm()" class="btn btn-secondary btn-sm">Cancel</button>
+      <button @click="saveDomain()" :disabled="domains.saving" class="btn btn-primary btn-sm">
+        {{ domains.saving ? 'Saving...' : 'Save' }}
+      </button>
+    </div>
+  </div>
+
+  <p v-if="domains.error" class="mx-4 mt-4 p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
+    {{ domains.error }}
+  </p>
+
+  <!-- Basic Section -->
+  <div class="border-b border-slate-800">
+    <div @click="toggleSection('basic')" class="section-header">
+      <span class="font-medium">Basic Configuration</span>
+      <svg class="w-5 h-5 text-slate-500 transition-transform" :class="{ 'rotate-180': sections.basic }" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+      </svg>
+    </div>
+    <div v-show="sections.basic" class="p-4 grid grid-cols-2 gap-4">
+      <div class="input-group">
+        <input v-model="domains.form.name" :disabled="!!domains.editingName" placeholder=" " />
+        <label>Domain Name</label>
+        <p class="text-xs text-slate-500 mt-1 ml-1">e.g., api.example.com or *.example.com</p>
+      </div>
+      <div class="input-group">
+        <input v-model.number="domains.form.port" type="number" placeholder=" " />
+        <label>Backend Port</label>
+        <p class="text-xs text-slate-500 mt-1 ml-1">Port your app listens on</p>
+      </div>
+      <div class="input-group">
+        <input v-model="domains.form.backendHost" placeholder=" " />
+        <label>Backend Host</label>
+      </div>
+      <div class="input-group">
+        <select v-model="domains.form.upstreamType">
+          <option value="http">HTTP</option>
+          <option value="https">HTTPS</option>
+          <option value="ws">WebSocket</option>
+        </select>
+        <label>Upstream Type</label>
+      </div>
+      <div class="col-span-2 flex items-center gap-3 py-2">
+        <label class="switch">
+          <input type="checkbox" v-model="domains.form.www" />
+          <span class="slider"></span>
+        </label>
+        <span class="text-sm">Include www subdomain</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- SSL Section -->
+  <div class="border-b border-slate-800">
+    <div @click="toggleSection('ssl')" class="section-header">
+      <span class="font-medium">SSL Configuration</span>
+      <svg class="w-5 h-5 text-slate-500 transition-transform" :class="{ 'rotate-180': sections.ssl }" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+      </svg>
+    </div>
+    <div v-show="sections.ssl" class="p-4 space-y-4">
+      <div class="flex items-center gap-3">
+        <label class="switch">
+          <input type="checkbox" v-model="domains.form.ssl.enabled" />
+          <span class="slider"></span>
+        </label>
+        <span class="text-sm">Enable SSL / HTTPS</span>
+      </div>
+
+      <div v-if="domains.form.ssl.enabled" class="grid grid-cols-2 gap-4 pl-14">
+        <div class="input-group">
+          <input v-model="domains.form.ssl.certPath" placeholder=" " class="font-mono text-xs" />
+          <label>Certificate Path</label>
+        </div>
+        <div class="input-group">
+          <input v-model="domains.form.ssl.keyPath" placeholder=" " class="font-mono text-xs" />
+          <label>Private Key Path</label>
+        </div>
+        <div class="col-span-2 flex items-center gap-3">
+          <label class="switch">
+            <input type="checkbox" v-model="domains.form.ssl.redirect" />
+            <span class="slider"></span>
+          </label>
+          <span class="text-sm">Redirect HTTP to HTTPS</span>
+        </div>
+        <div class="flex items-center gap-3">
+          <label class="switch">
+            <input type="checkbox" v-model="domains.form.ssl.hsts" />
+            <span class="slider"></span>
+          </label>
+          <span class="text-sm">Enable HSTS</span>
+        </div>
+        <div v-if="domains.form.ssl.hsts" class="input-group">
+          <input v-model.number="domains.form.ssl.hstsMaxAge" type="number" placeholder=" " />
+          <label>HSTS Max-Age (seconds)</label>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Performance Section -->
+  <div class="border-b border-slate-800">
+    <div @click="toggleSection('performance')" class="section-header">
+      <span class="font-medium">Performance</span>
+      <svg class="w-5 h-5 text-slate-500 transition-transform" :class="{ 'rotate-180': sections.performance }" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+      </svg>
+    </div>
+    <div v-show="sections.performance" class="p-4 grid grid-cols-2 gap-4">
+      <div class="input-group">
+        <input v-model="domains.form.performance.maxBodySize" placeholder=" " />
+        <label>Max Body Size</label>
+        <p class="text-xs text-slate-500 mt-1 ml-1">e.g., 10m, 1g</p>
+      </div>
+      <div class="input-group">
+        <input v-model.number="domains.form.performance.readTimeout" type="number" placeholder=" " />
+        <label>Read Timeout (s)</label>
+      </div>
+      <div class="input-group">
+        <input v-model.number="domains.form.performance.connectTimeout" type="number" placeholder=" " />
+        <label>Connect Timeout (s)</label>
+      </div>
+      <div class="flex items-center gap-3">
+        <label class="switch">
+          <input type="checkbox" v-model="domains.form.performance.proxyBuffers" />
+          <span class="slider"></span>
+        </label>
+        <span class="text-sm">Proxy Buffering</span>
+      </div>
+      <div class="flex items-center gap-3">
+        <label class="switch">
+          <input type="checkbox" v-model="domains.form.performance.gzip" />
+          <span class="slider"></span>
+        </label>
+        <span class="text-sm">Gzip Compression</span>
+      </div>
+      <div v-if="domains.form.performance.gzip" class="input-group">
+        <input v-model="domains.form.performance.gzipTypes" placeholder=" " class="text-xs" />
+        <label>Gzip MIME Types</label>
+      </div>
+    </div>
+  </div>
+
+  <!-- Security Section -->
+  <div class="border-b border-slate-800">
+    <div @click="toggleSection('security')" class="section-header">
+      <span class="font-medium">Security</span>
+      <svg class="w-5 h-5 text-slate-500 transition-transform" :class="{ 'rotate-180': sections.security }" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+      </svg>
+    </div>
+    <div v-show="sections.security" class="p-4 space-y-4">
+      <div class="flex items-center gap-3">
+        <label class="switch">
+          <input type="checkbox" v-model="domains.form.security.rateLimit" />
+          <span class="slider"></span>
+        </label>
+        <span class="text-sm">Rate Limiting</span>
+      </div>
+
+      <div v-if="domains.form.security.rateLimit" class="grid grid-cols-2 gap-4 pl-14">
+        <div class="input-group">
+          <input v-model.number="domains.form.security.rateLimitRate" type="number" placeholder=" " />
+          <label>Requests/second</label>
+        </div>
+        <div class="input-group">
+          <input v-model.number="domains.form.security.rateLimitBurst" type="number" placeholder=" " />
+          <label>Burst</label>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-3">
+        <label class="switch">
+          <input type="checkbox" v-model="domains.form.security.securityHeaders" />
+          <span class="slider"></span>
+        </label>
+        <span class="text-sm">Security Headers (X-Frame-Options, etc.)</span>
+      </div>
+
+      <div class="grid grid-cols-2 gap-4">
+        <div class="flex items-center gap-3">
+          <label class="switch">
+            <input type="checkbox" v-model="domains.form.security.custom404" />
+            <span class="slider"></span>
+          </label>
+          <span class="text-sm">Custom 404 Page</span>
+        </div>
+        <div class="flex items-center gap-3">
+          <label class="switch">
+            <input type="checkbox" v-model="domains.form.security.custom50x" />
+            <span class="slider"></span>
+          </label>
+          <span class="text-sm">Custom 50x Page</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Advanced Section -->
+  <div>
+    <div @click="toggleSection('advanced')" class="section-header">
+      <span class="font-medium">Advanced</span>
+      <svg class="w-5 h-5 text-slate-500 transition-transform" :class="{ 'rotate-180': sections.advanced }" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+      </svg>
+    </div>
+    <div v-show="sections.advanced" class="p-4 space-y-4">
+      <div class="flex items-center gap-3">
+        <label class="switch">
+          <input type="checkbox" v-model="domains.form.advanced.accessLog" />
+          <span class="slider"></span>
+        </label>
+        <span class="text-sm">Domain-specific Access Log</span>
+      </div>
+      <div>
+        <label class="block text-sm font-medium text-slate-400 mb-2">Custom Location Blocks</label>
+        <textarea v-model="domains.form.advanced.customLocations" rows="4"
+          class="w-full bg-slate-900 border border-slate-800 rounded-xl p-4 font-mono text-sm text-slate-300 focus:outline-none focus:ring-2 focus:ring-brand-500"
+          placeholder="location /api/v2 { ... }"></textarea>
+        <p class="text-xs text-slate-500 mt-1">Raw nginx location blocks (appended verbatim)</p>
+      </div>
+    </div>
+  </div>
+</div>

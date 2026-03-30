@@ -1,0 +1,23 @@
+# Database — created at runtime, not committed
+data/easy-devops.sqlite
+data/easy-devops.sqlite-shm
+data/easy-devops.sqlite-wal
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+package-lock.json

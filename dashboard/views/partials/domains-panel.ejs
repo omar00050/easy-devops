@@ -1,0 +1,66 @@
+<!-- Domains List Page -->
+<div v-show="page === 'domains'" class="max-w-6xl mx-auto">
+  <div class="flex items-center justify-between mb-2">
+    <h2 class="text-2xl font-bold">Domains</h2>
+    <button @click="toggleDomainForm()" class="btn btn-primary">
+      <svg v-if="!domains.showForm" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+      </svg>
+      {{ domains.showForm ? 'Cancel' : 'Add Domain' }}
+    </button>
+  </div>
+  <p class="text-slate-400 mb-8">Nginx reverse proxy configurations</p>
+
+  <!-- Domain Form (included from domain-form.ejs) -->
+  <%- include('domain-form.ejs') %>
+
+  <!-- Domain List -->
+  <div v-if="domains.loading" class="text-slate-500">Loading...</div>
+  <div v-else-if="domains.list.length === 0" class="card p-12 text-center">
+    <p class="text-slate-500">No domains configured. Click "Add Domain" to get started.</p>
+  </div>
+  <div v-else class="card overflow-hidden">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Domain</th>
+          <th>Port</th>
+          <th>Type</th>
+          <th>SSL</th>
+          <th>Cert</th>
+          <th class="text-right">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="d in domains.list" :key="d.name">
+          <td class="font-mono font-medium">{{ d.name }}</td>
+          <td class="font-mono text-slate-400">:{{ d.port }}</td>
+          <td><span class="badge badge-neutral">{{ (d.upstreamType || 'http').toUpperCase() }}</span></td>
+          <td>
+            <span :class="d.ssl?.enabled ? 'badge badge-success' : 'badge badge-neutral'">
+              {{ d.ssl?.enabled ? 'HTTPS' : 'HTTP' }}
+            </span>
+          </td>
+          <td class="font-mono text-slate-400">
+            {{ d.daysLeft != null ? d.daysLeft + 'd' : '—' }}
+          </td>
+          <td class="text-right">
+            <div class="flex justify-end gap-2">
+              <button @click="editDomain(d.name)" class="btn btn-secondary btn-sm">Edit</button>
+              <button @click="reloadDomain(d.name)" class="btn btn-secondary btn-sm btn-icon" title="Reload">
+                <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+              </button>
+              <button @click="deleteDomain(d.name)" class="btn btn-danger btn-sm btn-icon" title="Delete">
+                <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+              </button>
+            </div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
