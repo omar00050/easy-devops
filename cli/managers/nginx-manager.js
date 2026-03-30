@@ -268,7 +268,7 @@ async function installNginx() {
   let nginxVersion = FALLBACK_VERSION;
 
   const fetchVersionResult = await run(
-    `try { $p=(Invoke-WebRequest -Uri 'https://nginx.org/en/download.html' -UseBasicParsing -TimeoutSec 15).Content; if($p -match 'nginx-(\\d+\\.\\d+\\.\\d+)\\.zip'){$Matches[1]}else{''} } catch { '' }`,
+    `[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; try { $p=(Invoke-WebRequest -Uri 'https://nginx.org/en/download.html' -UseBasicParsing -TimeoutSec 15).Content; if($p -match 'nginx-(\\d+\\.\\d+\\.\\d+)\\.zip'){$Matches[1]}else{''} } catch { '' }`,
     { timeout: 20000 },
   );
   const fetched = (fetchVersionResult.stdout || '').trim();
@@ -276,15 +276,30 @@ async function installNginx() {
 
   const { nginxDir } = loadConfig();
   const zipUrl = `https://nginx.org/download/nginx-${nginxVersion}.zip`;
+  const zipDest = `$env:TEMP\\nginx-${nginxVersion}.zip`;
 
   spinner.text = `Downloading nginx ${nginxVersion}…`;
 
-  const downloadResult = await run(
-    `$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '${zipUrl}' -OutFile "$env:TEMP\\nginx-${nginxVersion}.zip" -UseBasicParsing -TimeoutSec 120`,
+  // Try Invoke-WebRequest with TLS 1.2 forced, fall back to curl.exe
+  let downloadOk = false;
+  let downloadResult = await run(
+    `[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '${zipUrl}' -OutFile "${zipDest}" -UseBasicParsing -TimeoutSec 120`,
     { timeout: 130000 },
   );
+  if (downloadResult.success) {
+    downloadOk = true;
+  } else {
+    const hasCurl = (await run('where.exe curl.exe 2>$null')).success;
+    if (hasCurl) {
+      downloadResult = await run(
+        `curl.exe -L --silent --show-error --max-time 120 -o "${zipDest}" "${zipUrl}"`,
+        { timeout: 130000 },
+      );
+      if (downloadResult.success) downloadOk = true;
+    }
+  }
 
-  if (!downloadResult.success) {
+  if (!downloadOk) {
     spinner.fail('Download failed');
     console.log(chalk.red(downloadResult.stderr || downloadResult.stdout));
     console.log(chalk.gray(`\n  Download nginx manually from: https://nginx.org/en/download.html\n`));

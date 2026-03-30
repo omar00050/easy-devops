@@ -276,29 +276,41 @@ async function installCertbot() {
     console.log(chalk.yellow('  Chocolatey failed, trying direct download...\n'));
   }
 
-  // 3. Direct download — try multiple sources in order
+  // 3. Direct download — try multiple sources × multiple download methods
+  //    PowerShell 5.1 on Windows Server defaults to TLS 1.0; GitHub requires TLS 1.2+.
+  //    Force TLS 1.2 before every Invoke-WebRequest call.
+  //    Also try curl.exe (built into Windows Server 2019+) as a second method.
   const INSTALLER_FILENAME = 'certbot-beta-installer-win_amd64_signed.exe';
+  const INSTALLER_DEST     = '$env:TEMP\\certbot-installer.exe';
   const downloadSources = [
     `https://github.com/certbot/certbot/releases/latest/download/${INSTALLER_FILENAME}`,
     `https://dl.eff.org/${INSTALLER_FILENAME}`,
   ];
+
+  const hasCurl = (await run('where.exe curl.exe 2>$null')).success;
 
   let downloaded = false;
   for (const url of downloadSources) {
     const label = new URL(url).hostname;
     console.log(chalk.gray(`\n  Downloading certbot installer from ${label} ...\n`));
 
-    const downloadResult = await run(
-      `$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '${url}' -OutFile "$env:TEMP\\certbot-installer.exe" -UseBasicParsing -TimeoutSec 120`,
+    // Method A: Invoke-WebRequest with TLS 1.2 forced
+    const iwr = await run(
+      `[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '${url}' -OutFile "${INSTALLER_DEST}" -UseBasicParsing -TimeoutSec 120`,
       { timeout: 130000 },
     );
+    if (iwr.success) { downloaded = true; break; }
 
-    if (downloadResult.success) {
-      downloaded = true;
-      break;
+    // Method B: curl.exe (handles TLS independently of PowerShell/.NET settings)
+    if (hasCurl) {
+      const curlResult = await run(
+        `curl.exe -L --silent --show-error --max-time 120 -o "${INSTALLER_DEST}" "${url}"`,
+        { timeout: 130000 },
+      );
+      if (curlResult.success) { downloaded = true; break; }
     }
 
-    console.log(chalk.yellow(`  Failed from ${label}: ${(downloadResult.stderr || downloadResult.stdout).split('\n')[0].trim()}`));
+    console.log(chalk.yellow(`  Failed from ${label}`));
   }
 
   if (!downloaded) {
