@@ -4,7 +4,7 @@
  * Nginx Manager — full control over nginx from the CLI.
  *
  * Exported functions:
- * - showNginxManager() — interactive menu for managing nginx
+ *   - showNginxManager() — interactive menu for managing nginx
  *
  * All shell calls go through core/shell.js (run / runLive).
  * Platform differences (Windows/Linux) are handled via isWindows guards.
@@ -14,9 +14,8 @@ import chalk from 'chalk';
 import inquirer from 'inquirer';
 import ora from 'ora';
 import { run, runLive } from '../../core/shell.js';
-import { loadConfig, saveConfig } from '../../core/config.js';
+import { loadConfig } from '../../core/config.js';
 import { ensureNginxInclude } from '../../core/nginx-conf-generator.js';
-import { runDetection } from '../../core/detector.js';
 
 const isWindows = process.platform === 'win32';
 
@@ -137,7 +136,7 @@ async function viewErrorLog(logPath) {
   if (result.success && result.stdout) {
     console.log('\n' + result.stdout);
   } else {
-    console.log(chalk.yellow('\n No errors logged yet (log file not found or empty)\n'));
+    console.log(chalk.yellow('\n  No errors logged yet (log file not found or empty)\n'));
   }
 }
 
@@ -197,11 +196,11 @@ async function startNginx(nginxExe, nginxDir) {
     : `tail -n 20 "${logPath}" 2>/dev/null`;
   const logResult = await run(logCmd);
 
-  console.log(chalk.yellow('\n Recent error log:'));
+  console.log(chalk.yellow('\n  Recent error log:'));
   if (logResult.success && logResult.stdout) {
     console.log(chalk.red(logResult.stdout));
   } else {
-    console.log(chalk.gray(' (error log not found or empty)'));
+    console.log(chalk.gray('  (error log not found or empty)'));
   }
 
   return { success: false };
@@ -234,7 +233,7 @@ async function installNginx() {
     }
     spinner.fail('Installation failed');
     console.log(chalk.red(result.stderr || result.stdout));
-    console.log(chalk.gray('\n Manual instructions: https://nginx.org/en/docs/install.html\n'));
+    console.log(chalk.gray('\n  Manual instructions: https://nginx.org/en/docs/install.html\n'));
     return { success: false, message: 'Installation failed', output: result.stderr || result.stdout };
   }
 
@@ -248,53 +247,16 @@ async function installNginx() {
   if (hasWinget) {
     spinner.text = 'Installing nginx via winget…';
     const result = await run(
-      'winget install -e --id nginxinc.nginx --accept-package-agreements --accept-source-agreements',
+      'winget install -e --id Nginx.Nginx --accept-package-agreements --accept-source-agreements',
       { timeout: 120000 },
     );
-
-    // Check if nginx was installed OR already installed
-    const output = (result.stdout || '') + (result.stderr || '');
-    const alreadyInstalled = output.includes('already installed') || output.includes('No newer package') || output.includes('No available upgrade');
-    const installed = result.success || alreadyInstalled;
-
-    if (installed) {
-      // Try to detect where nginx was installed and update config
-      const commonPaths = [
-        'C:\\nginx',
-        `${process.env.ProgramFiles}\\nginx`,
-        `${process.env.LOCALAPPDATA}\\Programs\\nginx`,
-        `${process.env.ProgramW6432}\\nginx`,
-      ];
-
-      let foundPath = null;
-      for (const p of commonPaths) {
-        if (!p) continue;
-        const check = await run(`Test-Path "${p}\\nginx.exe"`);
-        if (check.stdout.trim().toLowerCase() === 'true') {
-          foundPath = p;
-          break;
-        }
-      }
-
-      if (foundPath) {
-        // Update config if different from current
-        const currentConfig = loadConfig();
-        if (currentConfig.nginxDir !== foundPath) {
-          currentConfig.nginxDir = foundPath;
-          saveConfig(currentConfig);
-        }
-        spinner.succeed(`nginx installed at ${foundPath}`);
-      } else {
-        spinner.succeed('nginx installed successfully');
-      }
-
-      // Re-run detection to update the stored info
-      await runDetection();
+    if (result.success) {
+      spinner.succeed('nginx installed successfully');
       return { success: true, message: 'nginx installed successfully', output: result.stdout };
     }
     spinner.fail('winget install failed');
     console.log(chalk.red(result.stderr || result.stdout));
-    console.log(chalk.gray('\n Manual instructions: https://nginx.org/en/docs/install.html\n'));
+    console.log(chalk.gray('\n  Manual instructions: https://nginx.org/en/docs/install.html\n'));
     return { success: false, message: 'Installation failed', output: result.stderr || result.stdout };
   }
 
@@ -306,41 +268,26 @@ async function installNginx() {
   let nginxVersion = FALLBACK_VERSION;
 
   const fetchVersionResult = await run(
-    `[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; try { $p=(Invoke-WebRequest -Uri 'https://nginx.org/en/download.html' -UseBasicParsing -TimeoutSec 15).Content; if($p -match 'nginx-(\\d+\\.\\d+\\.\\d+)\\.zip'){$Matches[1]}else{''} } catch { '' }`,
+    `try { $p=(Invoke-WebRequest -Uri 'https://nginx.org/en/download.html' -UseBasicParsing -TimeoutSec 15).Content; if($p -match 'nginx-(\\d+\\.\\d+\\.\\d+)\\.zip'){$Matches[1]}else{''} } catch { '' }`,
     { timeout: 20000 },
   );
   const fetched = (fetchVersionResult.stdout || '').trim();
   if (/^\d+\.\d+\.\d+$/.test(fetched)) nginxVersion = fetched;
 
-  let { nginxDir } = loadConfig();
+  const { nginxDir } = loadConfig();
   const zipUrl = `https://nginx.org/download/nginx-${nginxVersion}.zip`;
-  const zipDest = `$env:TEMP\\nginx-${nginxVersion}.zip`;
 
   spinner.text = `Downloading nginx ${nginxVersion}…`;
 
-  // Try Invoke-WebRequest with TLS 1.2 forced, fall back to curl.exe
-  let downloadOk = false;
-  let downloadResult = await run(
-    `[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '${zipUrl}' -OutFile "${zipDest}" -UseBasicParsing -TimeoutSec 120`,
+  const downloadResult = await run(
+    `$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '${zipUrl}' -OutFile "$env:TEMP\\nginx-${nginxVersion}.zip" -UseBasicParsing -TimeoutSec 120`,
     { timeout: 130000 },
   );
-  if (downloadResult.success) {
-    downloadOk = true;
-  } else {
-    const hasCurl = (await run('where.exe curl.exe 2>$null')).success;
-    if (hasCurl) {
-      downloadResult = await run(
-        `curl.exe -L --silent --show-error --max-time 120 -o "${zipDest}" "${zipUrl}"`,
-        { timeout: 130000 },
-      );
-      if (downloadResult.success) downloadOk = true;
-    }
-  }
 
-  if (!downloadOk) {
+  if (!downloadResult.success) {
     spinner.fail('Download failed');
     console.log(chalk.red(downloadResult.stderr || downloadResult.stdout));
-    console.log(chalk.gray(`\n Download nginx manually from: https://nginx.org/en/download.html\n`));
+    console.log(chalk.gray(`\n  Download nginx manually from: https://nginx.org/en/download.html\n`));
     return { success: false, message: 'Download failed', output: downloadResult.stderr || downloadResult.stdout };
   }
 
@@ -364,9 +311,6 @@ async function installNginx() {
     return { success: false, message: 'nginx.exe not found after extraction' };
   }
 
-  // Re-run detection
-  await runDetection();
-
   spinner.succeed(`nginx ${nginxVersion} installed to ${nginxDir}`);
   return { success: true, message: `nginx ${nginxVersion} installed successfully`, output: '' };
 }
@@ -378,14 +322,14 @@ export async function showNginxManager() {
     const { nginxDir } = loadConfig();
     const status = await getNginxStatus(nginxDir);
 
-    console.log(chalk.bold('\n Nginx Manager'));
-    console.log(chalk.gray(' ' + '─'.repeat(40)));
+    console.log(chalk.bold('\n  Nginx Manager'));
+    console.log(chalk.gray('  ' + '─'.repeat(40)));
 
     if (status.version) {
       const statusIcon = status.running ? chalk.green('✅ Running') : chalk.red('❌ Stopped');
-      console.log(` ${statusIcon} | v${status.version} | ${status.nginxDir}`);
+      console.log(`  ${statusIcon}  |  v${status.version}  |  ${status.nginxDir}`);
     } else {
-      console.log(` ${chalk.yellow('⚠ Not installed')}`);
+      console.log(`  ${chalk.yellow('⚠ Not installed')}`);
     }
     console.log();
 
@@ -435,7 +379,7 @@ export async function showNginxManager() {
       case 'Test config': {
         const result = await testConfig(status.nginxExe, status.nginxDir);
         console.log(
-          '\n Config test: ' +
+          '\n  Config test: ' +
           (result.success ? chalk.green('✓ OK') : chalk.red('✗ Failed')) +
           '\n',
         );
