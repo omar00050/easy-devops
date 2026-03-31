@@ -55,6 +55,18 @@ async function testConfig(nginxExe, nginxDir) {
   await ensureNginxInclude(nginxDir);
   const cmd = isWindows ? `& "${nginxExe}" -t` : 'nginx -t';
   const result = await run(cmd, { cwd: nginxDir });
+  const PathDomain = await import('fs/promises').then(fs => fs.exists(`${nginxDir}\\conf\\conf.d`));
+
+  if (!PathDomain) {
+    const createPath = await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\conf\\conf.d`, { recursive: true }));
+    if (!createPath) {
+      return {
+        success: false,
+        output: `Failed to create conf.d directory at ${nginxDir}\\conf\\conf.d`,
+      };
+    }
+  }
+
   return {
     success: result.success,
     output: (result.stdout + '\n' + result.stderr).trim(),
@@ -239,32 +251,33 @@ async function installNginx() {
 
   // ── Windows ──────────────────────────────────────────────────────────────────
   const spinner = ora('Checking for winget…').start();
+  //! Winget is not reliably available on all Windows versions (missing from Windows Server, and some users report it missing on Windows 10 desktop), so we'll skip it for now and go straight to the direct download method. We can revisit this in the future if winget becomes more ubiquitous.
 
   // Try winget first (available on Windows 10/11 desktop; not on Windows Server by default)
-  const wingetCheck = await run('where.exe winget 2>$null');
-  const hasWinget = wingetCheck.success && wingetCheck.stdout.trim().length > 0;
+  // const wingetCheck = await run('where.exe winget 2>$null');
+  // const hasWinget = wingetCheck.success && wingetCheck.stdout.trim().length > 0;
 
-  if (hasWinget) {
-    spinner.text = 'Installing nginx via winget…';
-    const result = await run(
-      'winget install -e --id Nginx.Nginx --accept-package-agreements --accept-source-agreements',
-      { timeout: 120000 },
-    );
-    if (result.success) {
-      spinner.succeed('nginx installed successfully');
-      return { success: true, message: 'nginx installed successfully', output: result.stdout };
-    }
-    spinner.fail('winget install failed');
-    console.log(chalk.red(result.stderr || result.stdout));
-    console.log(chalk.gray('\n  Manual instructions: https://nginx.org/en/docs/install.html\n'));
-    return { success: false, message: 'Installation failed', output: result.stderr || result.stdout };
-  }
+  // if (hasWinget) {
+  //   spinner.text = 'Installing nginx via winget…';
+  //   const result = await run(
+  //     'winget install -e --id Nginx.Nginx --accept-package-agreements --accept-source-agreements',
+  //     { timeout: 120000 },
+  //   );
+  //   if (result.success) {
+  //     spinner.succeed('nginx installed successfully');
+  //     return { success: true, message: 'nginx installed successfully', output: result.stdout };
+  //   }
+  //   spinner.fail('winget install failed');
+  //   console.log(chalk.red(result.stderr || result.stdout));
+  //   console.log(chalk.gray('\n  Manual instructions: https://nginx.org/en/docs/install.html\n'));
+  //   return { success: false, message: 'Installation failed', output: result.stderr || result.stdout };
+  // }
 
   // ── Fallback: direct download from nginx.org ─────────────────────────────────
   spinner.text = 'Fetching latest nginx version…';
 
   // Try to resolve the current stable version; fall back to a known-good release
-  const FALLBACK_VERSION = '1.26.3';
+  const FALLBACK_VERSION = '1.29.6';
   let nginxVersion = FALLBACK_VERSION;
 
   const fetchVersionResult = await run(
@@ -310,6 +323,9 @@ async function installNginx() {
     spinner.fail(`nginx.exe not found in ${nginxDir} after extraction`);
     return { success: false, message: 'nginx.exe not found after extraction' };
   }
+
+  // Create conf/conf.d directory for domain config files
+  await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\conf\\conf.d`, { recursive: true }));
 
   spinner.succeed(`nginx ${nginxVersion} installed to ${nginxDir}`);
   return { success: true, message: `nginx ${nginxVersion} installed successfully`, output: '' };

@@ -2,11 +2,53 @@
 <div v-show="page === 'ssl'" class="max-w-6xl mx-auto">
   <div class="flex items-center justify-between mb-2">
     <h2 class="text-2xl font-bold">SSL Certificates</h2>
-    <button @click="renewAll" :disabled="ssl.renewingDomain !== null" class="btn btn-primary btn-sm">
-      {{ ssl.renewingDomain === 'all' ? 'Renewing...' : 'Renew Expiring' }}
-    </button>
+    <div class="flex gap-2">
+      <button @click="ssl.showCreateForm = !ssl.showCreateForm; ssl.createResult = null; ssl.createError = null" class="btn btn-secondary btn-sm">
+        {{ ssl.showCreateForm ? 'Cancel' : 'New Certificate' }}
+      </button>
+      <button @click="renewAll" :disabled="ssl.renewingDomain !== null" class="btn btn-primary btn-sm">
+        {{ ssl.renewingDomain === 'all' ? 'Renewing...' : 'Renew Expiring' }}
+      </button>
+    </div>
   </div>
-  <p class="text-slate-400 mb-8">Let's Encrypt certificates managed by certbot</p>
+  <p class="text-slate-400 mb-4">Let's Encrypt certificates managed by certbot</p>
+
+  <!-- New Certificate inline form -->
+  <div v-if="ssl.showCreateForm" class="card p-4 mb-6">
+    <h3 class="font-semibold mb-3 text-sm">Create New Certificate</h3>
+    <div class="flex items-end gap-3 flex-wrap">
+      <div class="input-group flex-1 min-w-48">
+        <input v-model="ssl.createDomain" placeholder=" " @keyup.enter="createCert()" />
+        <label>Domain name</label>
+      </div>
+      <div class="flex items-center gap-2 pb-1">
+        <label class="switch">
+          <input type="checkbox" v-model="ssl.createWww" />
+          <span class="slider"></span>
+        </label>
+        <span class="text-sm text-slate-400">Include www</span>
+      </div>
+      <button @click="createCert()" :disabled="ssl.creating || !ssl.createDomain.trim()" class="btn btn-primary btn-sm">
+        {{ ssl.creating ? 'Creating...' : 'Create' }}
+      </button>
+    </div>
+
+    <!-- Success result -->
+    <div v-if="ssl.createResult" class="mt-3 p-3 rounded-lg bg-green-500/10 border border-green-500/20 text-xs">
+      <p class="text-green-400 font-semibold mb-1">Certificate created successfully</p>
+      <p class="text-slate-400 font-mono">Cert: {{ ssl.createResult.certPath }}</p>
+      <p class="text-slate-400 font-mono">Key:  {{ ssl.createResult.keyPath }}</p>
+    </div>
+
+    <!-- Structured error -->
+    <div v-if="ssl.createError" class="mt-3 p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-xs space-y-1">
+      <p class="text-red-400 font-semibold">Certificate creation failed</p>
+      <p class="text-slate-400"><span class="text-slate-300">Step:</span> {{ ssl.createError.step }}</p>
+      <p class="text-slate-400"><span class="text-slate-300">Cause:</span> {{ ssl.createError.cause }}</p>
+      <p class="text-slate-400"><span class="text-slate-300">Consequence:</span> {{ ssl.createError.consequence }}</p>
+      <p class="text-slate-400"><span class="text-slate-300">nginx running:</span> {{ ssl.createError.nginxRunning ? 'yes' : 'no' }}</p>
+    </div>
+  </div>
 
   <div v-if="ssl.error" class="card p-4 mb-6 bg-red-500/10 border-red-500/20 text-red-400">
     {{ ssl.error }}

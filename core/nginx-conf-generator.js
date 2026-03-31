@@ -17,7 +17,7 @@ const isWindows = process.platform === 'win32';
 function getConfDDir(nginxDir) {
   return isWindows
     ? path.join(nginxDir, 'conf', 'conf.d')
-    : path.join(nginxDir, 'conf.d');
+    : path.join(nginxDir, 'conf.d', 'conf.d');
 }
 
 /** Returns the path to nginx.conf. */

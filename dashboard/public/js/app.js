@@ -63,7 +63,12 @@ createApp({
         logs: [], logsLoading: false,
       },
 
-      ssl: { certs: [], loading: false, error: '', renewingDomain: null },
+      ssl: {
+        certs: [], loading: false, error: '', renewingDomain: null,
+        showCreateForm: false,
+        createDomain: '', createWww: false,
+        creating: false, createResult: null, createError: null,
+      },
 
       // T017-T019: Updated domains state
       domains: {
@@ -73,6 +78,9 @@ createApp({
         saving: false,
         dirty: false, // T019: Track unsaved changes
         form: JSON.parse(JSON.stringify(DEFAULT_FORM)), // T025: Nested v2 structure
+        certMissing: null,   // { certPath, keyPath, hint } set when POST /api/domains returns 422
+        certCreating: false, // true while POST /api/ssl/create is in-flight
+        certCreateError: null, // structured error from a failed cert creation
       },
 
       // T018: Collapsible section state
@@ -273,6 +281,30 @@ createApp({
       await this.loadSSL();
     },
 
+    async createCert() {
+      if (!this.ssl.createDomain.trim()) return;
+      this.ssl.creating = true;
+      this.ssl.createResult = null;
+      this.ssl.createError = null;
+      const r = await this.api('POST', '/api/ssl/create', {
+        domain: this.ssl.createDomain.trim(),
+        www: this.ssl.createWww,
+      });
+      this.ssl.creating = false;
+      if (r.ok) {
+        this.ssl.createResult = r.data;
+        this.ssl.createDomain = '';
+        this.ssl.createWww = false;
+        await this.loadSSL();
+      } else if (r.status === 503) {
+        this.ssl.createError = { step: 'ACME client detection', cause: r.data.hint, consequence: 'Install certbot or win-acme first using the SSL Manager CLI.', nginxRunning: true };
+      } else if (r.status === 409) {
+        this.ssl.createError = { step: 'port 80 check', cause: r.data.detail, consequence: r.data.hint, nginxRunning: true };
+      } else {
+        this.ssl.createError = r.data.error || { step: 'certificate issuance', cause: 'Unknown error', consequence: 'No certificate was issued.' };
+      }
+    },
+
     certStatus(cert) {
       if (cert.daysLeft === null || cert.daysLeft === undefined) return 'Unknown';
       if (cert.daysLeft > 30) return 'Healthy';
@@ -323,6 +355,8 @@ createApp({
       this.domains.editingName = null;
       this.domains.dirty = false;
       this.domains.error = '';
+      this.domains.certMissing = null;
+      this.domains.certCreateError = null;
       // Reset sections
       this.sections = {
         basic: true,
@@ -422,9 +456,48 @@ createApp({
         this.domains.editingName = null;
         this.resetDomainForm();
         await this.loadDomains();
+      } else if (r.status === 422 && r.data.error === 'cert_missing') {
+        this.domains.certMissing = r.data;
+        this.domains.certCreateError = null;
       } else {
         this.domains.error = r.data.error || 'Failed to save domain';
       }
+    },
+
+    async createCertAndRetry() {
+      this.domains.certCreating = true;
+      this.domains.certCreateError = null;
+      const domain = this.domains.form.name;
+      const www = this.domains.form.www;
+      const r = await this.api('POST', '/api/ssl/create', { domain, www });
+      this.domains.certCreating = false;
+
+      if (r.ok) {
+        // Update cert paths in the form with what certbot actually wrote
+        this.domains.form.ssl.certPath = r.data.certPath;
+        this.domains.form.ssl.keyPath = r.data.keyPath;
+        this.domains.certMissing = null;
+        // Retry the domain save now that the cert exists
+        await this.saveDomain();
+      } else if (r.status === 503) {
+        this.domains.certCreateError = { step: 'ACME client detection', cause: r.data.hint, consequence: 'Install certbot or win-acme first.', nginxRunning: true };
+      } else if (r.status === 409) {
+        this.domains.certCreateError = { step: 'port 80 check', cause: r.data.detail, consequence: r.data.hint, nginxRunning: true };
+      } else {
+        this.domains.certCreateError = r.data.error || { step: 'certificate issuance', cause: 'Unknown error', consequence: 'No certificate was issued.' };
+      }
+    },
+
+    disableSslAndSave() {
+      this.domains.form.ssl.enabled = false;
+      this.domains.certMissing = null;
+      this.domains.certCreateError = null;
+      this.saveDomain();
+    },
+
+    dismissCertMissing() {
+      this.domains.certMissing = null;
+      this.domains.certCreateError = null;
     },
 
     async deleteDomain(name) {

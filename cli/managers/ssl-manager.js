@@ -680,6 +680,107 @@ async function installCertbot() {
   return { success: false };
 }
 
+// ─── issueCert ────────────────────────────────────────────────────────────────
+
+/**
+ * Issues a new SSL certificate using the installed ACME client.
+ * Stops nginx before the challenge and restarts it afterwards (always).
+ *
+ * @param {string} domainName - The primary domain name
+ * @param {{ www?: boolean }} options
+ * @returns {Promise<{ success: boolean, certPath: string|null, keyPath: string|null, error: object|null }>}
+ */
+export async function issueCert(domainName, { www = false } = {}) {
+  // Guard: ACME client must be installed
+  const certbotExe = await getCertbotExe();
+  if (!certbotExe) {
+    return {
+      success: false,
+      certPath: null,
+      keyPath: null,
+      error: {
+        step: 'ACME client detection',
+        cause: 'No ACME client (certbot or win-acme) is installed on this server.',
+        consequence: 'No certificate was issued. Install certbot or win-acme using the SSL Manager first.',
+        nginxRunning: true,
+        configSaved: false,
+      },
+    };
+  }
+
+  const clientType = await getAcmeClientType();
+
+  // Stop nginx (tolerate failure — nginx may not have been running)
+  await stopNginx();
+
+  try {
+    // Check port 80 is free for the standalone challenge
+    const portCheck = await isPort80Busy();
+    if (portCheck.busy) {
+      await startNginx();
+      return {
+        success: false,
+        certPath: null,
+        keyPath: null,
+        error: {
+          step: 'port 80 check',
+          cause: `Port 80 is still in use: ${portCheck.detail}. Stop that process before creating a certificate.`,
+          consequence: 'The standalone ACME challenge cannot bind to port 80. No certificate was issued. nginx has been restarted.',
+          nginxRunning: true,
+          configSaved: false,
+        },
+      };
+    }
+
+    // Build and run the ACME command
+    const domainArgs = www ? `-d "${domainName}" -d "www.${domainName}"` : `-d "${domainName}"`;
+    const cmd = clientType === 'winacme'
+      ? certbotExe
+      : `${certbotExe} certonly --standalone --non-interactive --agree-tos ${domainArgs}`;
+
+    const exitCode = await runLive(cmd, { timeout: 120000 });
+
+    if (exitCode !== 0) {
+      await startNginx();
+      return {
+        success: false,
+        certPath: null,
+        keyPath: null,
+        error: {
+          step: 'ACME domain validation',
+          cause: 'The ACME challenge failed. Common causes: domain DNS does not point to this server, or port 80 is blocked by a firewall.',
+          consequence: 'No certificate was issued. nginx has been restarted.',
+          nginxRunning: true,
+          configSaved: false,
+        },
+      };
+    }
+
+    // Derive cert paths from the certbot live directory
+    const liveDir = getCertbotDir();
+    const certPath = path.join(liveDir, domainName, 'fullchain.pem');
+    const keyPath = path.join(liveDir, domainName, 'privkey.pem');
+
+    await startNginx();
+
+    return { success: true, certPath, keyPath, error: null };
+  } catch (err) {
+    try { await startNginx(); } catch { /* best effort */ }
+    return {
+      success: false,
+      certPath: null,
+      keyPath: null,
+      error: {
+        step: 'certificate issuance',
+        cause: err.message,
+        consequence: 'An unexpected error occurred during certificate issuance. nginx restart was attempted.',
+        nginxRunning: false,
+        configSaved: false,
+      },
+    };
+  }
+}
+
 // ─── showSslManager ───────────────────────────────────────────────────────────
 
 export async function showSslManager() {
@@ -703,6 +804,7 @@ export async function showSslManager() {
     console.log();
 
     const choices = [
+      'Create new certificate',
       'Renew a certificate',
       'Renew all expiring (< 30 days)',
       'Install certbot',
@@ -724,6 +826,51 @@ export async function showSslManager() {
     }
 
     switch (choice) {
+      case 'Create new certificate': {
+        const installed = await isCertbotInstalled();
+        if (!installed) {
+          console.log(chalk.yellow('\n ⚠ certbot/win-acme not found — select "Install certbot" first\n'));
+          break;
+        }
+
+        let domainInput, wwwInput;
+        try {
+          ({ domainInput } = await inquirer.prompt([{
+            type: 'input',
+            name: 'domainInput',
+            message: 'Domain name:',
+            validate: v => v.trim() ? true : 'Required',
+          }]));
+          ({ wwwInput } = await inquirer.prompt([{
+            type: 'confirm',
+            name: 'wwwInput',
+            message: 'Include www subdomain?',
+            default: false,
+          }]));
+        } catch (err) {
+          if (err.name === 'ExitPromptError') return;
+          throw err;
+        }
+
+        const spinner = ora(`Creating certificate for ${domainInput.trim()}…`).start();
+        const result = await issueCert(domainInput.trim(), { www: wwwInput });
+        spinner.stop();
+
+        if (result.success) {
+          console.log(chalk.green('\n ✓ Certificate created successfully'));
+          console.log(chalk.gray(`   Cert: ${result.certPath}`));
+          console.log(chalk.gray(`   Key:  ${result.keyPath}\n`));
+        } else {
+          const e = result.error;
+          console.log(chalk.red('\n ✗ Certificate creation failed'));
+          console.log(chalk.yellow(`   Step:        ${e.step}`));
+          console.log(chalk.yellow(`   Cause:       ${e.cause}`));
+          console.log(chalk.yellow(`   Consequence: ${e.consequence}`));
+          console.log(chalk.gray(`   nginx running: ${e.nginxRunning ? 'yes' : 'no'}\n`));
+        }
+        break;
+      }
+
       case 'Renew a certificate': {
         const installed = await isCertbotInstalled();
         if (!installed) {

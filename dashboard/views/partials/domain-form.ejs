@@ -14,6 +14,34 @@
     {{ domains.error }}
   </p>
 
+  <!-- cert_missing 422 handler -->
+  <div v-if="domains.certMissing" class="mx-4 mt-4 p-4 rounded-lg bg-yellow-500/10 border border-yellow-500/20">
+    <p class="text-yellow-400 text-sm font-semibold mb-1">SSL certificate not found</p>
+    <p class="text-slate-400 text-xs mb-3 font-mono">{{ domains.certMissing.certPath }}</p>
+    <p class="text-slate-400 text-xs mb-4">{{ domains.certMissing.hint }}</p>
+
+    <!-- Structured error from a failed cert creation attempt -->
+    <div v-if="domains.certCreateError" class="mb-4 p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-xs space-y-1">
+      <p class="text-red-400 font-semibold">Certificate creation failed</p>
+      <p class="text-slate-400"><span class="text-slate-300">Step:</span> {{ domains.certCreateError.step }}</p>
+      <p class="text-slate-400"><span class="text-slate-300">Cause:</span> {{ domains.certCreateError.cause }}</p>
+      <p class="text-slate-400"><span class="text-slate-300">Consequence:</span> {{ domains.certCreateError.consequence }}</p>
+      <p class="text-slate-400"><span class="text-slate-300">nginx running:</span> {{ domains.certCreateError.nginxRunning ? 'yes' : 'no' }}</p>
+    </div>
+
+    <div class="flex gap-2">
+      <button @click="createCertAndRetry()" :disabled="domains.certCreating" class="btn btn-primary btn-sm">
+        {{ domains.certCreating ? 'Creating...' : 'Create Certificate' }}
+      </button>
+      <button @click="disableSslAndSave()" :disabled="domains.certCreating" class="btn btn-secondary btn-sm">
+        Disable SSL
+      </button>
+      <button @click="dismissCertMissing()" :disabled="domains.certCreating" class="btn btn-secondary btn-sm">
+        Cancel
+      </button>
+    </div>
+  </div>
+
   <!-- Basic Section -->
   <div class="border-b border-slate-800">
     <div @click="toggleSection('basic')" class="section-header">

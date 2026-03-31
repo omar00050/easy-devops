@@ -156,6 +156,20 @@ router.post('/', async (req, res) => {
     },
   });
 
+  // Cert existence check (FR-001): prevent saving a config that references non-existent cert files
+  if (domain.ssl.enabled && domain.ssl.certPath) {
+    try {
+      await fs.access(domain.ssl.certPath, fs.constants.F_OK);
+    } catch {
+      return res.status(422).json({
+        error: 'cert_missing',
+        certPath: domain.ssl.certPath,
+        keyPath: domain.ssl.keyPath,
+        hint: 'The SSL certificate files do not exist at the configured paths. Create the certificate first, or disable SSL.',
+      });
+    }
+  }
+
   const { nginxDir } = loadConfig();
 
   try {

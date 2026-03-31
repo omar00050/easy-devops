@@ -13,11 +13,13 @@
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import ora from 'ora';
+import fs from 'fs/promises';
 import Table from 'cli-table3';
 import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../../dashboard/lib/domains-db.js';
 import { generateConf, buildConf } from '../../core/nginx-conf-generator.js';
+import { issueCert } from './ssl-manager.js';
 
 const isWindows = process.platform === 'win32';
 
@@ -137,6 +139,66 @@ async function addDomainAction() {
     }
 
     ssl = { ...ssl, ...sslDetails };
+  }
+
+  // Cert existence check (FR-001, FR-002)
+  if (ssl.enabled) {
+    let certExists = false;
+    try {
+      await fs.access(ssl.certPath, fs.constants.F_OK);
+      certExists = true;
+    } catch {
+      certExists = false;
+    }
+
+    if (!certExists) {
+      console.log(chalk.yellow(`\n ⚠ Certificate not found at: ${ssl.certPath}`));
+
+      let certAction;
+      try {
+        ({ certAction } = await inquirer.prompt([{
+          type: 'list',
+          name: 'certAction',
+          message: 'What would you like to do?',
+          choices: ['Create certificate now', 'Disable SSL', 'Cancel'],
+        }]));
+      } catch (err) {
+        if (err.name === 'ExitPromptError') return;
+        throw err;
+      }
+
+      if (certAction === 'Cancel') {
+        console.log(chalk.gray('\n Cancelled.\n'));
+        return;
+      }
+
+      if (certAction === 'Disable SSL') {
+        ssl.enabled = false;
+        console.log(chalk.gray(' SSL disabled. Domain will be saved as HTTP-only.\n'));
+      }
+
+      if (certAction === 'Create certificate now') {
+        const spinner = ora(`Creating certificate for ${basic.name}…`).start();
+        const result = await issueCert(basic.name, { www: basic.www });
+        spinner.stop();
+
+        if (result.success) {
+          console.log(chalk.green('\n ✓ Certificate created successfully'));
+          console.log(chalk.gray(`   Cert: ${result.certPath}`));
+          console.log(chalk.gray(`   Key:  ${result.keyPath}\n`));
+          ssl.certPath = result.certPath;
+          ssl.keyPath = result.keyPath;
+        } else {
+          const e = result.error;
+          console.log(chalk.red('\n ✗ Certificate creation failed — domain was not saved'));
+          console.log(chalk.yellow(`   Step:        ${e.step}`));
+          console.log(chalk.yellow(`   Cause:       ${e.cause}`));
+          console.log(chalk.yellow(`   Consequence: ${e.consequence}`));
+          console.log(chalk.gray(`   nginx running: ${e.nginxRunning ? 'yes' : 'no'}\n`));
+          return;
+        }
+      }
+    }
   }
 
   // Section 3: Proxy Behavior

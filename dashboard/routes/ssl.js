@@ -1,6 +1,7 @@
 import express from 'express';
 import { run } from '../../core/shell.js';
 import { listAllCerts } from '../lib/cert-reader.js';
+import { issueCert } from '../../cli/managers/ssl-manager.js';
 
 const router = express.Router();
 
@@ -47,6 +48,40 @@ async function renewDomain(domain, certbotCmd) {
   const output = [certResult.stdout, certResult.stderr].filter(Boolean).join('\n').trim();
   return { success: certResult.success, output };
 }
+
+// ─── POST /api/ssl/create ─────────────────────────────────────────────────────
+
+router.post('/create', async (req, res) => {
+  const { domain, www = false } = req.body ?? {};
+
+  if (!domain || typeof domain !== 'string' || !domain.trim()) {
+    return res.status(400).json({ error: 'domain is required' });
+  }
+
+  const result = await issueCert(domain.trim(), { www: !!www });
+
+  if (result.success) {
+    return res.json({ success: true, certPath: result.certPath, keyPath: result.keyPath });
+  }
+
+  const { step } = result.error;
+  if (step === 'ACME client detection') {
+    return res.status(503).json({
+      error: 'no_acme_client',
+      hint: 'Install certbot or win-acme first using the SSL Manager.',
+    });
+  }
+  if (step === 'port 80 check') {
+    return res.status(409).json({
+      error: 'port_busy',
+      detail: result.error.cause,
+      hint: 'Stop the process using port 80 and try again.',
+    });
+  }
+  return res.status(500).json({ success: false, error: result.error });
+});
+
+// ─── GET /api/ssl ─────────────────────────────────────────────────────────────
 
 router.get('/', async (req, res) => {
   const certbotCmd = await getCertbotCmd();
