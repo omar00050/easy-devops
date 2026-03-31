@@ -1,6 +1,6 @@
 {
   "name": "easy-devops",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "A unified DevOps management tool with CLI and web dashboard for managing Nginx, SSL certificates, and Node.js on Linux and Windows servers.",
   "keywords": [
     "devops",
