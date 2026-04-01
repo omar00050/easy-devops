@@ -104,19 +104,22 @@ export async function getStatus() {
 
 export async function reload() {
   const nginxExe = getNginxExe();
+  const nginxDir = getNginxDir();
   const versionResult = await run(`${nginxExe} -v`);
   if (!versionResult.success && !versionResult.stderr.includes('nginx/')) {
     throw new NginxNotFoundError('nginx binary not found');
   }
 
   const result = process.platform === 'win32'
-    ? await run(`${nginxExe} -s reload`)
+    ? await run(`${nginxExe} -s reload`, { cwd: nginxDir, timeout: 15000 })
     : await run('nginx -s reload');
   return { success: result.success, output: combineOutput(result) };
 }
 
+// TODO: We need Fix this
 export async function restart() {
   const nginxExe = getNginxExe();
+  const nginxDir = getNginxDir();
   const versionResult = await run(`${nginxExe} -v`);
   if (!versionResult.success && !versionResult.stderr.includes('nginx/')) {
     throw new NginxNotFoundError('nginx binary not found');
@@ -125,7 +128,11 @@ export async function restart() {
   const stopResult = process.platform === 'win32'
     ? await run('taskkill /f /IM nginx.exe')
     : await run('nginx -s stop');
-  const startResult = await run(nginxExe);
+
+  await new Promise(resolve => setTimeout(resolve, 2000));
+
+  const startResult = await run(nginxExe, { cwd: nginxDir, timeout: 15000 });
+  console.log("startResult ", startResult);
   const output = [combineOutput(stopResult), combineOutput(startResult)]
     .filter(Boolean)
     .join('\n')
@@ -152,7 +159,7 @@ export async function start() {
   const testCmd = process.platform === 'win32'
     ? `${nginxExe} -c "${path.join(nginxDir, 'conf', 'nginx.conf')}" -t`
     : `${nginxExe} -t`;
-  const testResult = await run(testCmd);
+  const testResult = await run(testCmd, { cwd: nginxDir });
   if (!testResult.success) {
     return { success: false, output: combineOutput(testResult) };
   }
@@ -161,7 +168,7 @@ export async function start() {
   if (process.platform === 'win32') {
     const confPath = path.join(nginxDir, 'conf', 'nginx.conf');
     const startCmd = `Start-Process -FilePath "${path.join(nginxDir, 'nginx.exe')}" -ArgumentList '-c','"${confPath}"' -WorkingDirectory "${nginxDir}" -WindowStyle Hidden`;
-    await run(startCmd, { timeout: 10000 });
+    await run(startCmd, { cwd: nginxDir, timeout: 10000 });
   } else {
     const result = await run('nginx', { cwd: nginxDir, timeout: 15000 });
     if (!result.success) {
@@ -229,7 +236,7 @@ export async function test() {
   const testCmd = process.platform === 'win32'
     ? `${nginxExe} -c "${path.join(nginxDir, 'conf', 'nginx.conf')}" -t`
     : `${nginxExe} -t`;
-  const result = await run(testCmd);
+  const result = await run(testCmd, { cwd: nginxDir });
   return { success: result.success, output: combineOutput(result) };
 }
 
@@ -276,7 +283,7 @@ export async function saveConfig(filename, content) {
 
   const nginxExe = getNginxExe();
   await ensureNginxInclude(nginxDir);
-  const result = await run(`${nginxExe} -t`);
+  const result = await run(`${nginxExe} -t`, { cwd: nginxDir });
   if (!result.success) {
     if (hasBackup) {
       await fs.copyFile(backupPath, confPath);

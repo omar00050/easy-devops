@@ -31,7 +31,7 @@
         </button>
         <template v-else>
           <button @click="nginxAction('reload')" class="btn btn-primary btn-sm">Reload</button>
-          <button @click="nginxAction('restart')" class="btn btn-secondary btn-sm">Restart</button>
+          <button @click="nginxAction('restart')" class="btn btn-secondary btn-sm disabled select-none px-3 cursor-not-allowed opacity-60" disabled>Restart</button>
           <button @click="nginxAction('stop')" class="btn btn-danger btn-sm">Stop</button>
         </template>
         <button @click="nginxAction('test')" class="btn btn-secondary btn-sm">Test Config</button>

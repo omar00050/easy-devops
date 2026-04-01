@@ -19,6 +19,18 @@ import { ensureNginxInclude } from '../../core/nginx-conf-generator.js';
 
 const isWindows = process.platform === 'win32';
 
+// ─── Helpers ────────────────────────────────────────────────────────────────
+import { access } from 'fs/promises';
+
+async function pathExists(p) {
+  try {
+    await access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ─── getNginxStatus ───────────────────────────────────────────────────────────
 
 async function getNginxStatus(nginxDir) {
@@ -55,16 +67,18 @@ async function testConfig(nginxExe, nginxDir) {
   await ensureNginxInclude(nginxDir);
   const cmd = isWindows ? `& "${nginxExe}" -t` : 'nginx -t';
   const result = await run(cmd, { cwd: nginxDir });
-  const PathDomain = await import('fs/promises').then(fs => fs.exists(`${nginxDir}\\conf\\conf.d`));
+  const PathDomain = await pathExists(`${nginxDir}\\conf\\conf.d`);
+  const willKnown = await pathExists(`${nginxDir}\\html\\.well-known`);
 
   if (!PathDomain) {
-    const createPath = await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\conf\\conf.d`, { recursive: true }));
-    if (!createPath) {
-      return {
-        success: false,
-        output: `Failed to create conf.d directory at ${nginxDir}\\conf\\conf.d`,
-      };
-    }
+    console.warn(chalk.yellow(`Warning: conf.d directory not found in ${nginxDir} — creating it now...`));
+    await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\conf\\conf.d`, { recursive: true }));
+  }
+
+  if (!willKnown) {
+    console.warn(chalk.yellow(`Warning: .well-known/acme-challenge directory not found in ${nginxDir} — creating it now...`));
+    await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\html\\.well-known\\`, { recursive: true }));
+    await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\html\\.well-known\\acme-challenge`, { recursive: true }));
   }
 
   return {
@@ -118,6 +132,7 @@ async function restartNginx(nginxExe, nginxDir) {
   let result;
   if (isWindows) {
     await run('taskkill /f /IM nginx.exe', { cwd: nginxDir });
+    await new Promise(resolve => setTimeout(resolve, 2000));
     result = await run(`& "${nginxExe}"`, { cwd: nginxDir });
   } else {
     result = await run('systemctl restart nginx');
@@ -326,6 +341,16 @@ async function installNginx() {
 
   // Create conf/conf.d directory for domain config files
   await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\conf\\conf.d`, { recursive: true }));
+
+  await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\html\\.well-known\\`, { recursive: true }));
+  // Create html/.well-known/acme-challenge directory for SSL certificate verification
+  await import('fs/promises').then(fs => fs.writeFile(`${nginxDir}\\html\\.well-known\\acme-challenge`, '', (err) => {
+    if (err) {
+      console.error(chalk.red(`Failed to create acme-challenge directory: ${err.message}`));
+    } else {
+      console.log(chalk.green('Created acme-challenge directory for SSL certificate verification'));
+    }
+  }));
 
   spinner.succeed(`nginx ${nginxVersion} installed to ${nginxDir}`);
   return { success: true, message: `nginx ${nginxVersion} installed successfully`, output: '' };

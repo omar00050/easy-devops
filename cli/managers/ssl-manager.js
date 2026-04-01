@@ -57,37 +57,38 @@ async function parseCertExpiry(certPath) {
 // Supports both certbot and win-acme on Windows
 
 const CERTBOT_WIN_EXE = 'C:\\Program Files\\Certbot\\bin\\certbot.exe';
-const WINACME_EXE = 'C:\\Program Files\\win-acme\\wacs.exe';
+const WINACME_EXE = 'C:\\Program Files\\simple-acme\\wacs.exe';
 
 async function getCertbotExe() {
-  if (!isWindows) {
-    const r = await run('which certbot');
-    return (r.exitCode === 0 && r.stdout.trim()) ? 'certbot' : null;
-  }
+  // if (!isWindows) {
+  //   const r = await run('which certbot');
+  //   return (r.exitCode === 0 && r.stdout.trim()) ? 'certbot' : null;
+  // }
 
-  // 1. certbot on PATH?
-  const pathResult = await run('where.exe certbot');
-  if (pathResult.exitCode === 0 && pathResult.stdout.trim()) {
-    return 'certbot';
-  }
-
-  // 2. certbot well-known location
-  const exeCheck = await run(`Test-Path "${CERTBOT_WIN_EXE}"`);
-  if (exeCheck.stdout.trim().toLowerCase() === 'true') {
-    return `& "${CERTBOT_WIN_EXE}"`;
-  }
-
-  // 3. win-acme on PATH?
+  // 1. win-acme on PATH?
   const wacsPathResult = await run('where.exe wacs');
   if (wacsPathResult.exitCode === 0 && wacsPathResult.stdout.trim()) {
     return 'wacs';
   }
 
-  // 4. win-acme well-known location
+  // 2. win-acme well-known location
   const wacsCheck = await run(`Test-Path "${WINACME_EXE}"`);
   if (wacsCheck.stdout.trim().toLowerCase() === 'true') {
     return `& "${WINACME_EXE}"`;
   }
+
+  // 3. certbot on PATH?
+  const pathResult = await run('where.exe certbot');
+  if (pathResult.exitCode === 0 && pathResult.stdout.trim()) {
+    return 'certbot';
+  }
+
+  // 4. certbot well-known location
+  const exeCheck = await run(`Test-Path "${CERTBOT_WIN_EXE}"`);
+  if (exeCheck.stdout.trim().toLowerCase() === 'true') {
+    return `& "${CERTBOT_WIN_EXE}"`;
+  }
+
 
   return null;
 }
@@ -107,10 +108,10 @@ async function getAcmeClientType() {
 
 async function isPort80Busy() {
   const cmd = isWindows
-    ? 'netstat -ano | findstr ":80"'
-    : "ss -tlnp | grep ':80 '";
+    ? 'netstat -ano | findstr /R "0.0.0.0:80 " | findstr "LISTENING"'
+    : "ss -tlnp | grep ':80'";
   const result = await run(cmd);
-  const busy = result.success && result.stdout.length > 0;
+  const busy = result.success && result.stdout.trim().length > 0;
   return { busy, detail: busy ? result.stdout.split('\n')[0].trim() : null };
 }
 
@@ -300,7 +301,7 @@ async function installCertbot() {
     const paths = [
       WINACME_EXE,
       'C:\\Program Files (x86)\\win-acme\\wacs.exe',
-      'C:\\win-acme\\wacs.exe',
+      'C:\\simple-acme\\wacs.exe',
     ];
     for (const p of paths) {
       const r = await run(`Test-Path '${p}'`);
@@ -478,6 +479,15 @@ async function installCertbot() {
       'winget install -e --id EFF.Certbot --accept-package-agreements --accept-source-agreements',
       { timeout: 180000 },
     );
+
+    step('Trying winget (win-acme) as fallback to support more Windows-friendly client ...');
+    console.log(chalk.gray(' Running: winget install simple-acme.simple-acme\n'));
+    const exitCode_2 = await runLive(
+      'winget install -e --id simple-acme.simple-acme --location "C:\simple-acme" --accept-package-agreements --accept-source-agreements',
+      { timeout: 180000 },
+    );
+    if (exitCode_2 === 0 || await verifyWinAcme()) step('winget simple-acme installed successfully!');
+
     if (exitCode === 0 || await verifyCertbot()) return { success: true };
     console.log(chalk.yellow(' winget certbot failed, trying next...\n'));
   }
@@ -485,13 +495,13 @@ async function installCertbot() {
   // ── Method 2: winget (win-acme) ───────────────────────────────────────────────
   if (wingetAvailable) {
     step('Trying winget (win-acme) ...');
-    console.log(chalk.gray(' Running: winget install win-acme.win-acme\n'));
+    console.log(chalk.gray(' Running: winget install simple-acme.simple-acme\n'));
     const exitCode = await runLive(
-      'winget install -e --id win-acme.win-acme --accept-package-agreements --accept-source-agreements',
+      'winget install -e --id simple-acme.simple-acme --location "C:\simple-acme" --accept-package-agreements --accept-source-agreements',
       { timeout: 180000 },
     );
     if (exitCode === 0 || await verifyWinAcme()) return { success: true, client: 'winacme' };
-    console.log(chalk.yellow(' winget win-acme failed, trying next...\n'));
+    console.log(chalk.yellow(' winget simple-acme failed, trying next...\n'));
   }
 
   // ── Method 3: Chocolatey (win-acme) ───────────────────────────────────────────
@@ -532,12 +542,11 @@ async function installCertbot() {
   }
 
   // ── Method 7: Direct download win-acme (ZIP - smaller, no installer) ──────────
-  const WINACME_DEST = 'C:\\Program Files\\win-acme';
+  const WINACME_DEST = 'C:\\Program Files\\simple-acme';
 
-  step('Downloading win-acme from GitHub ...');
+  step('Downloading simple-acme from GitHub ...');
   const winAcmeUrls = [
-    'https://github.com/win-acme/win-acme/releases/latest/download/win-acme.zip',
-    'https://github.com/win-acme/win-acme/releases/download/v2.2.9.1/win-acme.v2.2.9.1.zip',
+    'https://github.com/win-acme/win-acme/archive/refs/tags/v2.2.9.1701.zip',
   ];
 
   for (const url of winAcmeUrls) {
