@@ -121,7 +121,7 @@ export function run(cmd, options = {}) {
  * @returns {Promise<number|null>}
  */
 export function runLive(cmd, options = {}) {
-  const { timeout = 30000, cwd = process.cwd() } = options;
+  const { timeout = 30000, cwd = process.cwd(), stdin = 'ignore' } = options;
   const { shell, flag } = getShell();
 
   return new Promise((resolve) => {
@@ -131,7 +131,7 @@ export function runLive(cmd, options = {}) {
     const child = spawn(shell, [flag, cmd], {
       cwd,
       signal: ac.signal,
-      stdio: ['ignore', 'inherit', 'inherit'],
+      stdio: [stdin, 'inherit', 'inherit'],
       windowsHide: true,
     });
 

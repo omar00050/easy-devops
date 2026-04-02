@@ -68,6 +68,9 @@ createApp({
         showCreateForm: false,
         createDomain: '', createWww: false,
         creating: false, createResult: null, createError: null,
+        createMethod: 'http',        // 'http' | 'dns'
+        dnsWaiting: null,            // { txtName, txtValue, domain } | null
+        dnsConfirming: false,        // true while confirm call is in-flight
       },
 
       // T017-T019: Updated domains state
@@ -81,6 +84,9 @@ createApp({
         certMissing: null,   // { certPath, keyPath, hint } set when POST /api/domains returns 422
         certCreating: false, // true while POST /api/ssl/create is in-flight
         certCreateError: null, // structured error from a failed cert creation
+        certMethod: 'http',     // 'http' | 'dns' — method selected in cert_missing section
+        certDnsWaiting: null,   // { txtName, txtValue, domain } while DNS two-phase is in progress
+        certDnsConfirming: false, // true while /create-confirm call is in-flight
       },
 
       // T018: Collapsible section state
@@ -289,9 +295,13 @@ createApp({
       const r = await this.api('POST', '/api/ssl/create', {
         domain: this.ssl.createDomain.trim(),
         www: this.ssl.createWww,
+        validationMethod: this.ssl.createMethod,
       });
       this.ssl.creating = false;
-      if (r.ok) {
+      if (r.status === 202 && r.data.status === 'waiting_dns') {
+        this.ssl.dnsWaiting = r.data; // { domain, txtName, txtValue }
+        // Do not hide the form or clear the domain — show DNS waiting state
+      } else if (r.ok) {
         this.ssl.createResult = r.data;
         this.ssl.createDomain = '';
         this.ssl.createWww = false;
@@ -303,6 +313,29 @@ createApp({
       } else {
         this.ssl.createError = r.data.error || { step: 'certificate issuance', cause: 'Unknown error', consequence: 'No certificate was issued.' };
       }
+    },
+
+    async confirmDns() {
+      if (!this.ssl.dnsWaiting) return;
+      this.ssl.dnsConfirming = true;
+      const r = await this.api('POST', '/api/ssl/create-confirm', { domain: this.ssl.dnsWaiting.domain });
+      this.ssl.dnsConfirming = false;
+      if (r.ok) {
+        this.ssl.createResult = r.data;
+        this.ssl.dnsWaiting = null;
+        this.ssl.createDomain = '';
+        this.ssl.createWww = false;
+        await this.loadSSL();
+      } else {
+        this.ssl.createError = r.data.error || { step: 'DNS validation', cause: 'Certificate issuance failed after DNS confirmation.', consequence: 'No certificate was issued.' };
+        this.ssl.dnsWaiting = null;
+      }
+    },
+
+    async cancelDns() {
+      if (!this.ssl.dnsWaiting) return;
+      await this.api('POST', '/api/ssl/create-cancel', { domain: this.ssl.dnsWaiting.domain });
+      this.ssl.dnsWaiting = null;
     },
 
     certStatus(cert) {
@@ -357,6 +390,9 @@ createApp({
       this.domains.error = '';
       this.domains.certMissing = null;
       this.domains.certCreateError = null;
+      this.domains.certMethod = 'http';
+      this.domains.certDnsWaiting = null;
+      this.domains.certDnsConfirming = false;
       // Reset sections
       this.sections = {
         basic: true,
@@ -469,10 +505,13 @@ createApp({
       this.domains.certCreateError = null;
       const domain = this.domains.form.name;
       const www = this.domains.form.www;
-      const r = await this.api('POST', '/api/ssl/create', { domain, www });
+      const r = await this.api('POST', '/api/ssl/create', { domain, www, validationMethod: this.domains.certMethod });
       this.domains.certCreating = false;
 
-      if (r.ok) {
+      if (r.status === 202 && r.data.status === 'waiting_dns') {
+        this.domains.certDnsWaiting = r.data; // { domain, txtName, txtValue }
+        // Stay in cert_missing section — show DNS waiting state
+      } else if (r.ok) {
         // Update cert paths in the form with what certbot actually wrote
         this.domains.form.ssl.certPath = r.data.certPath;
         this.domains.form.ssl.keyPath = r.data.keyPath;
@@ -488,16 +527,41 @@ createApp({
       }
     },
 
+    async confirmCertDns() {
+      if (!this.domains.certDnsWaiting) return;
+      this.domains.certDnsConfirming = true;
+      const r = await this.api('POST', '/api/ssl/create-confirm', { domain: this.domains.certDnsWaiting.domain });
+      this.domains.certDnsConfirming = false;
+      if (r.ok) {
+        this.domains.form.ssl.certPath = r.data.certPath;
+        this.domains.form.ssl.keyPath = r.data.keyPath;
+        this.domains.certDnsWaiting = null;
+        this.domains.certMissing = null;
+        await this.saveDomain();
+      } else {
+        this.domains.certCreateError = r.data.error || { step: 'DNS validation', cause: 'Certificate issuance failed after DNS confirmation.', consequence: 'No certificate was issued.' };
+        this.domains.certDnsWaiting = null;
+      }
+    },
+
+    async cancelCertDns() {
+      if (!this.domains.certDnsWaiting) return;
+      await this.api('POST', '/api/ssl/create-cancel', { domain: this.domains.certDnsWaiting.domain });
+      this.domains.certDnsWaiting = null;
+    },
+
     disableSslAndSave() {
       this.domains.form.ssl.enabled = false;
       this.domains.certMissing = null;
       this.domains.certCreateError = null;
+      this.domains.certDnsWaiting = null;
       this.saveDomain();
     },
 
     dismissCertMissing() {
       this.domains.certMissing = null;
       this.domains.certCreateError = null;
+      this.domains.certDnsWaiting = null;
     },
 
     async deleteDomain(name) {

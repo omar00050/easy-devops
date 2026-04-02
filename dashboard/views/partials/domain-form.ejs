@@ -20,25 +20,55 @@
     <p class="text-slate-400 text-xs mb-3 font-mono">{{ domains.certMissing.certPath }}</p>
     <p class="text-slate-400 text-xs mb-4">{{ domains.certMissing.hint }}</p>
 
-    <!-- Structured error from a failed cert creation attempt -->
-    <div v-if="domains.certCreateError" class="mb-4 p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-xs space-y-1">
-      <p class="text-red-400 font-semibold">Certificate creation failed</p>
-      <p class="text-slate-400"><span class="text-slate-300">Step:</span> {{ domains.certCreateError.step }}</p>
-      <p class="text-slate-400"><span class="text-slate-300">Cause:</span> {{ domains.certCreateError.cause }}</p>
-      <p class="text-slate-400"><span class="text-slate-300">Consequence:</span> {{ domains.certCreateError.consequence }}</p>
-      <p class="text-slate-400"><span class="text-slate-300">nginx running:</span> {{ domains.certCreateError.nginxRunning ? 'yes' : 'no' }}</p>
+    <!-- DNS waiting state — shown after 202 response -->
+    <div v-if="domains.certDnsWaiting" class="mb-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-sm space-y-3">
+      <p class="text-amber-400 font-semibold">Add this DNS TXT record, then click Continue</p>
+      <div class="space-y-1 font-mono text-xs">
+        <p class="text-slate-300">Name:&nbsp; <span class="text-white">{{ domains.certDnsWaiting.txtName }}</span></p>
+        <p class="text-slate-300">Value: <span class="text-white">{{ domains.certDnsWaiting.txtValue }}</span></p>
+      </div>
+      <div class="flex gap-2">
+        <button @click="confirmCertDns()" :disabled="domains.certDnsConfirming" class="btn btn-primary btn-sm">
+          {{ domains.certDnsConfirming ? 'Verifying...' : "I\'ve added the TXT record, continue" }}
+        </button>
+        <button @click="cancelCertDns()" :disabled="domains.certDnsConfirming" class="btn btn-secondary btn-sm">Cancel</button>
+      </div>
     </div>
 
-    <div class="flex gap-2">
-      <button @click="createCertAndRetry()" :disabled="domains.certCreating" class="btn btn-primary btn-sm">
-        {{ domains.certCreating ? 'Creating...' : 'Create Certificate' }}
-      </button>
-      <button @click="disableSslAndSave()" :disabled="domains.certCreating" class="btn btn-secondary btn-sm">
-        Disable SSL
-      </button>
-      <button @click="dismissCertMissing()" :disabled="domains.certCreating" class="btn btn-secondary btn-sm">
-        Cancel
-      </button>
+    <!-- Method selector + action buttons — hidden while DNS waiting -->
+    <div v-if="!domains.certDnsWaiting">
+      <!-- Structured error from a failed cert creation attempt -->
+      <div v-if="domains.certCreateError" class="mb-4 p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-xs space-y-1">
+        <p class="text-red-400 font-semibold">Certificate creation failed</p>
+        <p class="text-slate-400"><span class="text-slate-300">Step:</span> {{ domains.certCreateError.step }}</p>
+        <p class="text-slate-400"><span class="text-slate-300">Cause:</span> {{ domains.certCreateError.cause }}</p>
+        <p class="text-slate-400"><span class="text-slate-300">Consequence:</span> {{ domains.certCreateError.consequence }}</p>
+        <p class="text-slate-400"><span class="text-slate-300">nginx running:</span> {{ domains.certCreateError.nginxRunning ? 'yes' : 'no' }}</p>
+      </div>
+
+      <!-- Validation method selector -->
+      <div class="flex gap-4 mb-3">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="radio" v-model="domains.certMethod" value="http" />
+          <span class="text-sm">HTTP challenge <span class="text-slate-500">(DNS points here)</span></span>
+        </label>
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="radio" v-model="domains.certMethod" value="dns" />
+          <span class="text-sm">DNS challenge <span class="text-slate-500">(add TXT record)</span></span>
+        </label>
+      </div>
+
+      <div class="flex gap-2">
+        <button @click="createCertAndRetry()" :disabled="domains.certCreating" class="btn btn-primary btn-sm">
+          {{ domains.certCreating ? 'Creating...' : 'Create Certificate' }}
+        </button>
+        <button @click="disableSslAndSave()" :disabled="domains.certCreating" class="btn btn-secondary btn-sm">
+          Disable SSL
+        </button>
+        <button @click="dismissCertMissing()" :disabled="domains.certCreating" class="btn btn-secondary btn-sm">
+          Cancel
+        </button>
+      </div>
     </div>
   </div>
 

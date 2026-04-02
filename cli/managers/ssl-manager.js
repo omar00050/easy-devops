@@ -16,7 +16,8 @@ import ora from 'ora';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { run, runLive } from '../../core/shell.js';
+import { spawn } from 'child_process';
+import { run, runLive, getShell } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 
 const isWindows = process.platform === 'win32';
@@ -57,38 +58,44 @@ async function parseCertExpiry(certPath) {
 // Supports both certbot and win-acme on Windows
 
 const CERTBOT_WIN_EXE = 'C:\\Program Files\\Certbot\\bin\\certbot.exe';
-const WINACME_EXE = 'C:\\Program Files\\simple-acme\\wacs.exe';
+const WINACME_EXE = 'C:\\simple-acme\\wacs.exe';
+const WINACME_EXE_FALLBACK = 'C:\\Program Files\\win-acme\\wacs.exe';
 
 async function getCertbotExe() {
-  // if (!isWindows) {
-  //   const r = await run('which certbot');
-  //   return (r.exitCode === 0 && r.stdout.trim()) ? 'certbot' : null;
-  // }
+  if (!isWindows) {
+    const r = await run('which certbot');
+    return (r.exitCode === 0 && r.stdout.trim()) ? 'certbot' : null;
+  }
 
-  // 1. win-acme on PATH?
+  // 1. simple-acme (wacs) on PATH?
   const wacsPathResult = await run('where.exe wacs');
   if (wacsPathResult.exitCode === 0 && wacsPathResult.stdout.trim()) {
     return 'wacs';
   }
 
-  // 2. win-acme well-known location
+  // 2. simple-acme primary location (C:\simple-acme\wacs.exe)
   const wacsCheck = await run(`Test-Path "${WINACME_EXE}"`);
   if (wacsCheck.stdout.trim().toLowerCase() === 'true') {
     return `& "${WINACME_EXE}"`;
   }
 
-  // 3. certbot on PATH?
+  // 3. simple-acme fallback location (C:\Program Files\win-acme\wacs.exe)
+  const wacsFallbackCheck = await run(`Test-Path "${WINACME_EXE_FALLBACK}"`);
+  if (wacsFallbackCheck.stdout.trim().toLowerCase() === 'true') {
+    return `& "${WINACME_EXE_FALLBACK}"`;
+  }
+
+  // 4. certbot on PATH?
   const pathResult = await run('where.exe certbot');
   if (pathResult.exitCode === 0 && pathResult.stdout.trim()) {
     return 'certbot';
   }
 
-  // 4. certbot well-known location
+  // 5. certbot well-known location
   const exeCheck = await run(`Test-Path "${CERTBOT_WIN_EXE}"`);
   if (exeCheck.stdout.trim().toLowerCase() === 'true') {
     return `& "${CERTBOT_WIN_EXE}"`;
   }
-
 
   return null;
 }
@@ -486,7 +493,10 @@ async function installCertbot() {
       'winget install -e --id simple-acme.simple-acme --location "C:\simple-acme" --accept-package-agreements --accept-source-agreements',
       { timeout: 180000 },
     );
+
     if (exitCode_2 === 0 || await verifyWinAcme()) step('winget simple-acme installed successfully!');
+
+    await runLive("wacs --version", { timeout: 5000 }); // Trigger any first-run setup for win-acme
 
     if (exitCode === 0 || await verifyCertbot()) return { success: true };
     console.log(chalk.yellow(' winget certbot failed, trying next...\n'));
@@ -693,13 +703,26 @@ async function installCertbot() {
 
 /**
  * Issues a new SSL certificate using the installed ACME client.
- * Stops nginx before the challenge and restarts it afterwards (always).
+ *
+ * HTTP method: stops nginx before challenge, restarts after (Linux only).
+ *   Windows uses wacs.exe filesystem validation — nginx stays running.
+ * DNS method: does NOT stop nginx. Pauses for user confirmation via onDnsChallenge callback.
  *
  * @param {string} domainName - The primary domain name
- * @param {{ www?: boolean }} options
+ * @param {{
+ *   www?: boolean,
+ *   validationMethod?: 'http' | 'dns',
+ *   email?: string | null,
+ *   onDnsChallenge?: (txtName: string, txtValue: string) => Promise<void>
+ * }} options
  * @returns {Promise<{ success: boolean, certPath: string|null, keyPath: string|null, error: object|null }>}
  */
-export async function issueCert(domainName, { www = false } = {}) {
+export async function issueCert(domainName, {
+  www = false,
+  validationMethod = 'http',
+  email = null,
+  onDnsChallenge = null,
+} = {}) {
   // Guard: ACME client must be installed
   const certbotExe = await getCertbotExe();
   if (!certbotExe) {
@@ -717,13 +740,368 @@ export async function issueCert(domainName, { www = false } = {}) {
     };
   }
 
-  const clientType = await getAcmeClientType();
+  // ── DNS validation path ───────────────────────────────────────────────────────
+  // nginx is never stopped for DNS challenges
+  if (validationMethod === 'dns') {
+    if (isWindows) {
+      // Windows: use piped spawn so we can auto-answer the validation method prompt
+      // and then extract the TXT record details from output.
+      // wacs.exe shows "1: Upload a file / 2: Create a DNS record" even in Unattended
+      // mode when --validation manual is used. We write "2\n" to select DNS-01.
+      const pemPath = `C:\\certbot\\live\\${domainName}`;
+      await run(`New-Item -ItemType Directory -Force -Path "${pemPath}"`, { timeout: 10000 });
+      const wacsCmd = `& "${WINACME_EXE}" --target manual --host "${domainName}" --validation manual --validationmode dns-01 --store pemfiles --pemfilespath "${pemPath}"`;
 
-  // Stop nginx (tolerate failure — nginx may not have been running)
+      const { shell, flag } = getShell();
+      const wacsProc = spawn(shell, [flag, wacsCmd], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+
+      let wacsOutput = '';
+      let wacsMethodAnswered = false;
+      let wacsTxtResolved = false;
+
+      const wacsTxtPromise = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (!wacsTxtResolved) {
+            wacsTxtResolved = true;
+            reject(new Error('Timeout waiting for TXT record from wacs.exe (60s exceeded)'));
+          }
+        }, 60000);
+
+        function checkMethodPrompt() {
+          if (wacsMethodAnswered) return;
+          // wacs asks "How would you like to prove that you own the domain?"
+          if (wacsOutput.includes('Upload a file') || wacsOutput.includes('Create a DNS record')) {
+            wacsMethodAnswered = true;
+            try { wacsProc.stdin.write('2\n'); } catch { /* ignore */ }
+          }
+        }
+
+        function checkTxtRecord() {
+          if (wacsTxtResolved) return;
+          const hostMatch = wacsOutput.match(/Host:\s+(\S+)/);
+          const valueMatch = wacsOutput.match(/Value:\s+(\S+)/);
+          if (hostMatch && valueMatch) {
+            clearTimeout(timer);
+            wacsTxtResolved = true;
+            resolve({ txtName: hostMatch[1], txtValue: valueMatch[1] });
+          }
+        }
+
+        wacsProc.stdout.on('data', (chunk) => {
+          wacsOutput += chunk.toString();
+          checkMethodPrompt();
+          checkTxtRecord();
+        });
+        wacsProc.stderr.on('data', (chunk) => {
+          wacsOutput += chunk.toString();
+          checkMethodPrompt();
+          checkTxtRecord();
+        });
+        wacsProc.on('error', (err) => {
+          clearTimeout(timer);
+          if (!wacsTxtResolved) { wacsTxtResolved = true; reject(err); }
+        });
+        wacsProc.on('close', (code) => {
+          clearTimeout(timer);
+          if (!wacsTxtResolved) {
+            wacsTxtResolved = true;
+            reject(new Error(`wacs.exe exited (code ${code}) before printing TXT record. Output:\n${wacsOutput.slice(-500)}`));
+          }
+        });
+      });
+
+      let wacsTxtDetails;
+      try {
+        wacsTxtDetails = await wacsTxtPromise;
+      } catch (err) {
+        try { wacsProc.kill(); } catch { /* ignore */ }
+        return {
+          success: false,
+          certPath: null,
+          keyPath: null,
+          error: {
+            step: 'TXT record extraction',
+            cause: err.message,
+            consequence: 'No certificate was issued. nginx was not affected.',
+            nginxRunning: true,
+            configSaved: false,
+          },
+        };
+      }
+
+      if (onDnsChallenge) {
+        try {
+          await onDnsChallenge(wacsTxtDetails.txtName, wacsTxtDetails.txtValue);
+        } catch {
+          try { wacsProc.kill(); } catch { /* ignore */ }
+          return {
+            success: false,
+            certPath: null,
+            keyPath: null,
+            error: {
+              step: 'DNS challenge cancelled',
+              cause: 'The DNS challenge was cancelled before confirmation.',
+              consequence: 'No certificate was issued. nginx was not affected.',
+              nginxRunning: true,
+              configSaved: false,
+            },
+          };
+        }
+      }
+
+      // Signal wacs.exe to continue verifying DNS
+      try { wacsProc.stdin.write('\n'); } catch { /* ignore */ }
+
+      const wacsExitCode = await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          try { wacsProc.kill(); } catch { /* ignore */ }
+          resolve(null);
+        }, 300000);
+        wacsProc.on('close', (code) => { clearTimeout(timer); resolve(code); });
+      });
+
+      if (wacsExitCode !== 0) {
+        return {
+          success: false,
+          certPath: null,
+          keyPath: null,
+          error: {
+            step: 'ACME domain validation',
+            cause: 'The DNS challenge failed. The TXT record may not have propagated, or the value was incorrect.',
+            consequence: 'No certificate was issued. nginx was not affected.',
+            nginxRunning: true,
+            configSaved: false,
+          },
+        };
+      }
+
+      const certPath = `C:\\certbot\\live\\${domainName}\\fullchain.pem`;
+      const keyPath = `C:\\certbot\\live\\${domainName}\\privkey.pem`;
+      return { success: true, certPath, keyPath, error: null };
+    }
+
+    // Linux: piped spawn — certbot works with piped stdin for DNS challenge
+    const emailArg = email ? `--email "${email}"` : '--register-unsafely-without-email';
+    const domainArgs = www ? `-d "${domainName}" -d "www.${domainName}"` : `-d "${domainName}"`;
+    const cmd = `certbot certonly --manual --preferred-challenges dns --agree-tos ${emailArg} ${domainArgs}`;
+
+    const { shell, flag } = getShell();
+    const proc = spawn(shell, [flag, cmd], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+
+    // Capture stdout/stderr to extract TXT record
+    let rawOutput = '';
+    let txtResolved = false;
+
+    const txtPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!txtResolved) {
+          txtResolved = true;
+          reject(new Error('Timeout waiting for TXT record prompt (30s exceeded)'));
+        }
+      }, 30000);
+
+      function checkForTxt() {
+        if (txtResolved) return;
+
+        // wacs.exe pattern: "Host: _acme-challenge.example.com" / "Value: abc123"
+        const wacsHostMatch = rawOutput.match(/Host:\s+(\S+)/);
+        const wacsValueMatch = rawOutput.match(/Value:\s+(\S+)/);
+        if (wacsHostMatch && wacsValueMatch) {
+          clearTimeout(timer);
+          txtResolved = true;
+          resolve({ txtName: wacsHostMatch[1], txtValue: wacsValueMatch[1] });
+          return;
+        }
+
+        // certbot pattern: "_acme-challenge.example.com" + "with the following value:"
+        const certbotNameMatch = rawOutput.match(/(_acme-challenge\.\S+)/);
+        const certbotValueIdx = rawOutput.indexOf('with the following value:');
+        if (certbotNameMatch && certbotValueIdx !== -1) {
+          const afterValue = rawOutput.slice(certbotValueIdx + 'with the following value:'.length).trim();
+          const valueMatch = afterValue.match(/^(\S+)/m);
+          if (valueMatch) {
+            clearTimeout(timer);
+            txtResolved = true;
+            resolve({ txtName: certbotNameMatch[1], txtValue: valueMatch[1] });
+            return;
+          }
+        }
+      }
+
+      proc.stdout.on('data', (chunk) => { rawOutput += chunk.toString(); checkForTxt(); });
+      proc.stderr.on('data', (chunk) => { rawOutput += chunk.toString(); checkForTxt(); });
+
+      proc.on('error', (err) => {
+        clearTimeout(timer);
+        if (!txtResolved) {
+          txtResolved = true;
+          reject(err);
+        }
+      });
+
+      proc.on('close', (code) => {
+        clearTimeout(timer);
+        if (!txtResolved) {
+          txtResolved = true;
+          reject(new Error(`ACME process exited (code ${code}) before printing TXT record`));
+        }
+      });
+    });
+
+    let txtDetails;
+    try {
+      txtDetails = await txtPromise;
+    } catch (err) {
+      try { proc.kill(); } catch { }
+      return {
+        success: false,
+        certPath: null,
+        keyPath: null,
+        error: {
+          step: 'TXT record extraction',
+          cause: err.message || 'Failed to extract TXT record from ACME process output.',
+          consequence: 'No certificate was issued. The ACME process has been terminated. nginx was not affected.',
+          nginxRunning: true,
+          configSaved: false,
+        },
+      };
+    }
+
+    // Fallback names if pattern matched but values were empty
+    if (!txtDetails.txtName) txtDetails.txtName = `_acme-challenge.${domainName}`;
+    if (!txtDetails.txtValue) txtDetails.txtValue = '[see terminal output]';
+
+    // Yield TXT record details to the caller — this is the pause mechanism
+    if (onDnsChallenge) {
+      try {
+        await onDnsChallenge(txtDetails.txtName, txtDetails.txtValue);
+      } catch {
+        // Caller cancelled (e.g. dashboard cancel endpoint rejected the deferred)
+        try { proc.kill(); } catch { }
+        return {
+          success: false,
+          certPath: null,
+          keyPath: null,
+          error: {
+            step: 'DNS challenge cancelled',
+            cause: 'The DNS challenge was cancelled or timed out before confirmation.',
+            consequence: 'No certificate was issued. nginx was not affected.',
+            nginxRunning: true,
+            configSaved: false,
+          },
+        };
+      }
+    }
+
+    // Signal the ACME process to continue (user confirmed)
+    try { proc.stdin.write('\n'); } catch { }
+
+    // Wait for the process to exit (up to 300s for DNS propagation + validation)
+    const exitCode = await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        try { proc.kill(); } catch { }
+        resolve(null);
+      }, 300000);
+
+      proc.on('close', (code) => {
+        clearTimeout(timer);
+        resolve(code);
+      });
+    });
+
+    if (exitCode !== 0) {
+      return {
+        success: false,
+        certPath: null,
+        keyPath: null,
+        error: {
+          step: 'ACME domain validation',
+          cause: 'The DNS challenge failed. The TXT record may not have propagated yet, or the value was incorrect.',
+          consequence: 'No certificate was issued. nginx was not affected.',
+          nginxRunning: true,
+          configSaved: false,
+        },
+      };
+    }
+
+    // Derive cert paths
+    let certPath, keyPath;
+    if (isWindows) {
+      certPath = `C:\\certbot\\live\\${domainName}\\fullchain.pem`;
+      keyPath = `C:\\certbot\\live\\${domainName}\\privkey.pem`;
+    } else {
+      const liveDir = getCertbotDir();
+      certPath = path.join(liveDir, domainName, 'fullchain.pem');
+      keyPath = path.join(liveDir, domainName, 'privkey.pem');
+    }
+
+    return { success: true, certPath, keyPath, error: null };
+  }
+
+  // ── HTTP validation path ──────────────────────────────────────────────────────
+
+  if (isWindows) {
+    // Windows: wacs.exe filesystem validation — nginx stays running
+    const pemPath = `C:\\certbot\\live\\${domainName}`;
+    // wacs.exe requires the pemfilespath directory to exist before running
+    await run(`New-Item -ItemType Directory -Force -Path "${pemPath}"`, { timeout: 10000 });
+
+    const hostArgs = www
+      ? `--host "${domainName}" --host "www.${domainName}"`
+      : `--host "${domainName}"`;
+    const cmd = `& "${WINACME_EXE}" --target manual ${hostArgs} --validation filesystem --webroot "C:\\nginx\\html" --store pemfiles --pemfilespath "${pemPath}"`;
+
+    const exitCode = await runLive(cmd, { timeout: 120000 });
+
+    if (exitCode !== 0) {
+      return {
+        success: false,
+        certPath: null,
+        keyPath: null,
+        error: {
+          step: 'ACME domain validation',
+          cause: 'The wacs.exe filesystem challenge failed. Ensure nginx is serving requests from C:\\nginx\\html and the domain DNS points to this server.',
+          consequence: 'No certificate was issued. nginx was not stopped.',
+          nginxRunning: true,
+          configSaved: false,
+        },
+      };
+    }
+
+    const certPath = `C:\\certbot\\live\\${domainName}\\fullchain.pem`;
+    const keyPath = `C:\\certbot\\live\\${domainName}\\privkey.pem`;
+
+    // Verify cert files exist at expected location
+    try {
+      await fs.access(certPath, fs.constants.F_OK);
+    } catch {
+      return {
+        success: false,
+        certPath: null,
+        keyPath: null,
+        error: {
+          step: 'ACME domain validation',
+          cause: `Certificate file not found at ${certPath} after wacs.exe exited successfully. Check the --pemfilespath output directory.`,
+          consequence: 'No certificate was issued. nginx was not stopped.',
+          nginxRunning: true,
+          configSaved: false,
+        },
+      };
+    }
+
+    return { success: true, certPath, keyPath, error: null };
+  }
+
+  // Linux: certbot standalone — stop nginx, check port, run challenge, restart nginx
   await stopNginx();
 
   try {
-    // Check port 80 is free for the standalone challenge
     const portCheck = await isPort80Busy();
     if (portCheck.busy) {
       await startNginx();
@@ -741,11 +1119,9 @@ export async function issueCert(domainName, { www = false } = {}) {
       };
     }
 
-    // Build and run the ACME command
+    const emailArg = email ? `--email "${email}"` : '--register-unsafely-without-email';
     const domainArgs = www ? `-d "${domainName}" -d "www.${domainName}"` : `-d "${domainName}"`;
-    const cmd = clientType === 'winacme'
-      ? certbotExe
-      : `${certbotExe} certonly --standalone --non-interactive --agree-tos ${domainArgs}`;
+    const cmd = `${certbotExe} certonly --standalone --non-interactive --agree-tos ${emailArg} ${domainArgs}`;
 
     const exitCode = await runLive(cmd, { timeout: 120000 });
 
@@ -765,13 +1141,11 @@ export async function issueCert(domainName, { www = false } = {}) {
       };
     }
 
-    // Derive cert paths from the certbot live directory
     const liveDir = getCertbotDir();
     const certPath = path.join(liveDir, domainName, 'fullchain.pem');
     const keyPath = path.join(liveDir, domainName, 'privkey.pem');
 
     await startNginx();
-
     return { success: true, certPath, keyPath, error: null };
   } catch (err) {
     try { await startNginx(); } catch { /* best effort */ }
@@ -842,7 +1216,7 @@ export async function showSslManager() {
           break;
         }
 
-        let domainInput, wwwInput;
+        let domainInput, wwwInput, method;
         try {
           ({ domainInput } = await inquirer.prompt([{
             type: 'input',
@@ -856,14 +1230,43 @@ export async function showSslManager() {
             message: 'Include www subdomain?',
             default: false,
           }]));
+          ({ method } = await inquirer.prompt([{
+            type: 'list',
+            name: 'method',
+            message: 'How should we validate domain ownership?',
+            choices: [
+              { name: 'HTTP challenge (domain DNS points to this server)', value: 'http' },
+              { name: 'DNS challenge (I\'ll add a TXT record manually)', value: 'dns' },
+            ],
+          }]));
         } catch (err) {
           if (err.name === 'ExitPromptError') return;
           throw err;
         }
 
-        const spinner = ora(`Creating certificate for ${domainInput.trim()}…`).start();
-        const result = await issueCert(domainInput.trim(), { www: wwwInput });
-        spinner.stop();
+        let result;
+        if (method === 'dns') {
+          const onDnsChallenge = async (txtName, txtValue) => {
+            console.log(chalk.yellow('\n Add this DNS TXT record:'));
+            console.log(chalk.white(`   Name:  ${txtName}`));
+            console.log(chalk.white(`   Value: ${txtValue}\n`));
+            try {
+              await inquirer.prompt([{
+                type: 'input',
+                name: '_',
+                message: 'Add the TXT record to your DNS, then press Enter to continue...',
+              }]);
+            } catch (err) {
+              if (err.name !== 'ExitPromptError') throw err;
+            }
+          };
+          console.log(chalk.cyan(`\n Starting DNS challenge for ${domainInput.trim()}…\n`));
+          result = await issueCert(domainInput.trim(), { www: wwwInput, validationMethod: 'dns', onDnsChallenge });
+        } else {
+          const spinner = ora(`Creating certificate for ${domainInput.trim()}…`).start();
+          result = await issueCert(domainInput.trim(), { www: wwwInput, validationMethod: 'http' });
+          spinner.stop();
+        }
 
         if (result.success) {
           console.log(chalk.green('\n ✓ Certificate created successfully'));

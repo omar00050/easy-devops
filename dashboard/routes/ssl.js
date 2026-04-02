@@ -5,6 +5,22 @@ import { issueCert } from '../../cli/managers/ssl-manager.js';
 
 const router = express.Router();
 
+// ─── In-memory DNS challenge state ────────────────────────────────────────────
+// Keyed by domain name. Entries are cleaned up when the ACME process exits
+// or when cancelled. Entries older than 10 minutes are forcibly removed.
+
+const pendingDnsChallenges = new Map();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [domain, state] of pendingDnsChallenges) {
+    if (now - state.createdAt > 10 * 60 * 1000) {
+      state.confirmDeferred.reject(new Error('DNS challenge timed out after 10 minutes'));
+      pendingDnsChallenges.delete(domain);
+    }
+  }
+}, 60000);
+
 const CERTBOT_WIN_EXE = 'C:\\Program Files\\Certbot\\bin\\certbot.exe';
 
 // Returns the PS-safe certbot invocation string, or null if not installed.
@@ -52,13 +68,100 @@ async function renewDomain(domain, certbotCmd) {
 // ─── POST /api/ssl/create ─────────────────────────────────────────────────────
 
 router.post('/create', async (req, res) => {
-  const { domain, www = false } = req.body ?? {};
+  const { domain, www = false, validationMethod = 'http', email = null } = req.body ?? {};
 
   if (!domain || typeof domain !== 'string' || !domain.trim()) {
     return res.status(400).json({ error: 'domain is required' });
   }
 
-  const result = await issueCert(domain.trim(), { www: !!www });
+  const domainKey = domain.trim();
+
+  if (validationMethod === 'dns') {
+    // Two-phase flow: spawn ACME process, wait for TXT record, respond 202, pause until confirm.
+    // On Windows, wacs.exe runs interactively (stdin inherited), so onDnsChallenge is never
+    // called — issueCert() completes synchronously and we respond directly below.
+    let confirmResolve, confirmReject;
+    const confirmPromise = new Promise((resolve, reject) => {
+      confirmResolve = resolve;
+      confirmReject = reject;
+    });
+
+    let resultResolve;
+    const resultPromise = new Promise((resolve) => { resultResolve = resolve; });
+
+    // Track whether a response has already been sent (202 from onDnsChallenge, or direct
+    // 200/500 if issueCert() completes without calling onDnsChallenge, e.g. on Windows).
+    let responseSent = false;
+
+    const onDnsChallenge = async (txtName, txtValue) => {
+      responseSent = true;
+      pendingDnsChallenges.set(domainKey, {
+        domain: domainKey,
+        txtName,
+        txtValue,
+        confirmDeferred: { resolve: confirmResolve, reject: confirmReject },
+        resultPromise,
+        createdAt: Date.now(),
+      });
+
+      res.status(202).json({
+        status: 'waiting_dns',
+        domain: domainKey,
+        txtName,
+        txtValue,
+        hint: 'Add a DNS TXT record with the name and value above, then call POST /api/ssl/create-confirm',
+      });
+
+      // Pause until user calls /create-confirm (resolves) or /create-cancel (rejects)
+      await confirmPromise;
+    };
+
+    // Run issueCert in the background — it will call onDnsChallenge which sends 202 and pauses.
+    // If issueCert() completes without calling onDnsChallenge (e.g. Windows interactive mode or
+    // early error), we send the response directly.
+    issueCert(domainKey, { www: !!www, validationMethod: 'dns', email: email || null, onDnsChallenge })
+      .then(result => {
+        resultResolve(result);
+        pendingDnsChallenges.delete(domainKey);
+        if (!responseSent) {
+          responseSent = true;
+          if (result.success) {
+            return res.json({ success: true, certPath: result.certPath, keyPath: result.keyPath });
+          }
+          const { step } = result.error ?? {};
+          if (step === 'ACME client detection') {
+            return res.status(503).json({ error: 'no_acme_client', hint: 'Install certbot or win-acme first using the SSL Manager.' });
+          }
+          return res.status(500).json({ success: false, error: result.error });
+        }
+      })
+      .catch(err => {
+        const errResult = {
+          success: false,
+          certPath: null,
+          keyPath: null,
+          error: {
+            step: 'certificate issuance',
+            cause: err.message,
+            consequence: 'Unexpected error during DNS certificate issuance.',
+            nginxRunning: true,
+            configSaved: false,
+          },
+        };
+        resultResolve(errResult);
+        pendingDnsChallenges.delete(domainKey);
+        if (!responseSent) {
+          responseSent = true;
+          return res.status(500).json({ success: false, error: errResult.error });
+        }
+      });
+
+    // The response is sent either by onDnsChallenge (202) or by the .then()/.catch() above.
+    return;
+  }
+
+  // HTTP validation path (synchronous — responds when complete)
+  const result = await issueCert(domainKey, { www: !!www, validationMethod: 'http', email: email || null });
 
   if (result.success) {
     return res.json({ success: true, certPath: result.certPath, keyPath: result.keyPath });
@@ -79,6 +182,54 @@ router.post('/create', async (req, res) => {
     });
   }
   return res.status(500).json({ success: false, error: result.error });
+});
+
+// ─── POST /api/ssl/create-confirm ────────────────────────────────────────────
+
+router.post('/create-confirm', async (req, res) => {
+  const { domain } = req.body ?? {};
+  const domainKey = domain?.trim();
+  const state = domainKey ? pendingDnsChallenges.get(domainKey) : null;
+
+  if (!state) {
+    return res.status(404).json({
+      error: 'no_pending_challenge',
+      hint: 'No DNS challenge is pending for this domain. Start a new certificate issuance.',
+    });
+  }
+
+  // Signal issueCert() to write '\n' to the ACME process stdin and continue
+  state.confirmDeferred.resolve();
+
+  // Wait for the ACME process to complete
+  const result = await state.resultPromise;
+  pendingDnsChallenges.delete(domainKey);
+
+  if (result.success) {
+    return res.json({ success: true, certPath: result.certPath, keyPath: result.keyPath });
+  }
+  return res.status(500).json({ success: false, error: result.error });
+});
+
+// ─── POST /api/ssl/create-cancel ─────────────────────────────────────────────
+
+router.post('/create-cancel', async (req, res) => {
+  const { domain } = req.body ?? {};
+  const domainKey = domain?.trim();
+  const state = domainKey ? pendingDnsChallenges.get(domainKey) : null;
+
+  if (!state) {
+    return res.status(404).json({
+      error: 'no_pending_challenge',
+      hint: 'No DNS challenge is pending for this domain.',
+    });
+  }
+
+  // Reject the deferred — issueCert() will kill the proc and return a failure result
+  state.confirmDeferred.reject(new Error('cancelled by user'));
+  pendingDnsChallenges.delete(domainKey);
+
+  return res.json({ cancelled: true });
 });
 
 // ─── GET /api/ssl ─────────────────────────────────────────────────────────────

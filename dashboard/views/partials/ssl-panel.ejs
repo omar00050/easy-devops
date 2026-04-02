@@ -16,21 +16,54 @@
   <!-- New Certificate inline form -->
   <div v-if="ssl.showCreateForm" class="card p-4 mb-6">
     <h3 class="font-semibold mb-3 text-sm">Create New Certificate</h3>
-    <div class="flex items-end gap-3 flex-wrap">
-      <div class="input-group flex-1 min-w-48">
-        <input v-model="ssl.createDomain" placeholder=" " @keyup.enter="createCert()" />
-        <label>Domain name</label>
+
+    <!-- DNS waiting state — shown after 202 response -->
+    <div v-if="ssl.dnsWaiting" class="p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-sm space-y-3">
+      <p class="text-amber-400 font-semibold">Add this DNS TXT record, then click Continue</p>
+      <div class="space-y-1 font-mono text-xs">
+        <p class="text-slate-300">Name:&nbsp; <span class="text-white">{{ ssl.dnsWaiting.txtName }}</span></p>
+        <p class="text-slate-300">Value: <span class="text-white">{{ ssl.dnsWaiting.txtValue }}</span></p>
       </div>
-      <div class="flex items-center gap-2 pb-1">
-        <label class="switch">
-          <input type="checkbox" v-model="ssl.createWww" />
-          <span class="slider"></span>
+      <div class="flex gap-2 pt-1">
+        <button @click="confirmDns()" :disabled="ssl.dnsConfirming" class="btn btn-primary btn-sm">
+          {{ ssl.dnsConfirming ? 'Verifying...' : "I\'ve added the TXT record, continue" }}
+        </button>
+        <button @click="cancelDns()" :disabled="ssl.dnsConfirming" class="btn btn-secondary btn-sm">
+          Cancel
+        </button>
+      </div>
+    </div>
+
+    <!-- Input form — hidden while DNS waiting -->
+    <div v-if="!ssl.dnsWaiting">
+      <!-- Validation method selector -->
+      <div class="flex gap-4 mb-3">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="radio" v-model="ssl.createMethod" value="http" />
+          <span class="text-sm">HTTP challenge <span class="text-slate-500">(DNS points here)</span></span>
         </label>
-        <span class="text-sm text-slate-400">Include www</span>
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="radio" v-model="ssl.createMethod" value="dns" />
+          <span class="text-sm">DNS challenge <span class="text-slate-500">(add TXT record)</span></span>
+        </label>
       </div>
-      <button @click="createCert()" :disabled="ssl.creating || !ssl.createDomain.trim()" class="btn btn-primary btn-sm">
-        {{ ssl.creating ? 'Creating...' : 'Create' }}
-      </button>
+
+      <div class="flex items-end gap-3 flex-wrap">
+        <div class="input-group flex-1 min-w-48">
+          <input v-model="ssl.createDomain" placeholder=" " @keyup.enter="createCert()" />
+          <label>Domain name</label>
+        </div>
+        <div class="flex items-center gap-2 pb-1">
+          <label class="switch">
+            <input type="checkbox" v-model="ssl.createWww" />
+            <span class="slider"></span>
+          </label>
+          <span class="text-sm text-slate-400">Include www</span>
+        </div>
+        <button @click="createCert()" :disabled="ssl.creating || !ssl.createDomain.trim()" class="btn btn-primary btn-sm">
+          {{ ssl.creating ? 'Creating...' : 'Create' }}
+        </button>
+      </div>
     </div>
 
     <!-- Success result -->
