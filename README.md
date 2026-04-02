@@ -1,6 +1,6 @@
 # Easy DevOps
 
-[![npm version](https://badge.fury.io/js/easy-devops.svg)](https://badge.fury.io/js/easy-devops)
+[![npm version](https://img.shields.io/badge/npm%20packages-0.2.8-brightgreen.svg)](https://badge.fury.io/js/easy-devops)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
 
