@@ -1,5 +1,6 @@
 import express from 'express';
 import { loadConfig, saveConfig } from '../../core/config.js';
+import { validatePort, validateEmail } from '../../core/validators.js';
 
 const router = express.Router();
 
@@ -30,10 +31,8 @@ router.post('/settings', (req, res) => {
 
     // Validate port if provided
     if (dashboardPort !== undefined) {
-      const port = parseInt(dashboardPort, 10);
-      if (isNaN(port) || port < 1 || port > 65535) {
-        return res.status(400).json({ error: 'Invalid port number' });
-      }
+      const portError = validatePort(parseInt(dashboardPort, 10));
+      if (portError) return res.status(400).json({ error: portError });
     }
 
     // Validate password if provided
@@ -45,14 +44,14 @@ router.post('/settings', (req, res) => {
     if (nginxDir !== undefined && (typeof nginxDir !== 'string' || nginxDir.trim() === '')) {
       return res.status(400).json({ error: 'Nginx directory must be a non-empty string' });
     }
-
     if (sslDir !== undefined && (typeof sslDir !== 'string' || sslDir.trim() === '')) {
       return res.status(400).json({ error: 'SSL directory must be a non-empty string' });
     }
 
     // Validate email if provided
-    if (acmeEmail !== undefined && acmeEmail !== '' && !acmeEmail.includes('@')) {
-      return res.status(400).json({ error: 'Invalid email address' });
+    if (acmeEmail !== undefined) {
+      const emailError = validateEmail(acmeEmail);
+      if (emailError) return res.status(400).json({ error: emailError });
     }
 
     // Load current config and merge updates

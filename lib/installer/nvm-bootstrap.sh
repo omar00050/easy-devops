@@ -17,9 +17,9 @@ bootstrap_nvm() {
   # Step 1: Install nvm if not already present
   # ------------------------------------------------------------------
   if [ -f "$nvm_dir/nvm.sh" ]; then
-    step_done "nvm already installed at $nvm_dir — skipping download"
+    printf '  nvm already installed at %s — skipping download\n' "$nvm_dir"
   else
-    step_running "Downloading and installing nvm…"
+    printf '  Downloading and installing nvm…\n'
 
     local install_ok=false
     if command -v curl >/dev/null 2>&1; then
@@ -34,14 +34,14 @@ bootstrap_nvm() {
     fi
 
     if [ "$install_ok" = "false" ]; then
-      step_failed "nvm download failed"
-      printf '\nManual recovery:\n' >&2
+      printf 'Error: nvm download failed\n' >&2
+      printf 'Manual recovery:\n' >&2
       printf '  curl -o- %s | bash\n' "$nvm_install_url" >&2
       printf '  Then run: source ~/.nvm/nvm.sh\n' >&2
       return 1
     fi
 
-    step_done "nvm installed at $nvm_dir"
+    printf '  nvm installed at %s\n' "$nvm_dir"
   fi
 
   # ------------------------------------------------------------------
@@ -66,12 +66,12 @@ bootstrap_nvm() {
   fi
 
   if ! command -v nvm >/dev/null 2>&1; then
-    step_failed "nvm command not available after install"
-    printf '\nManual recovery:\n' >&2
+    printf 'Error: nvm command not available after install\n' >&2
+    printf 'Manual recovery:\n' >&2
     printf '  source ~/.nvm/nvm.sh\n' >&2
     printf '  Then re-run: bash install.sh\n' >&2
     return 1
   fi
 
-  step_done "nvm is active in this session"
+  printf '  nvm is active in this session\n'
 }

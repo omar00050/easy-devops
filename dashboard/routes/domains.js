@@ -1,87 +1,18 @@
 import express from 'express';
 import fs from 'fs/promises';
+import path from 'path';
 import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../lib/domains-db.js';
 import { generateConf, getDefaultCertPaths } from '../lib/nginx-conf-generator.js';
 import { getCertExpiry } from '../lib/cert-reader.js';
-import path from 'path';
+import { nginxTestCmd, nginxReloadCmd } from '../../core/platform.js';
+import {
+  validateDomainName, validatePort, validateUpstreamType,
+  validateMaxBodySize, validatePositiveInteger,
+} from '../../core/validators.js';
 
 const router = express.Router();
-
-// ─── shared nginx helpers ─────────────────────────────────────────────────────
-
-const isWindows = process.platform === 'win32';
-
-function getNginxExe(nginxDir) {
-  return isWindows ? `${nginxDir}\\nginx.exe` : 'nginx';
-}
-
-function nginxTestCmd(nginxDir) {
-  const exe = getNginxExe(nginxDir);
-  // Use explicit -c flag on Windows to avoid path issues
-  if (isWindows) {
-    const confPath = `${nginxDir}\\conf\\nginx.conf`;
-    return `& "${exe}" -c "${confPath}" -t`;
-  }
-  return 'nginx -t';
-}
-
-function nginxReloadCmd(nginxDir) {
-  const exe = getNginxExe(nginxDir);
-  return isWindows ? `& "${exe}" -s reload` : 'nginx -s reload';
-}
-
-// ─── Validation helpers ───────────────────────────────────────────────────────
-
-function validateDomainName(name) {
-  if (!name || typeof name !== 'string') {
-    return 'name is required';
-  }
-  // Strip *. prefix defensively — the system adds it; users should not type it
-  const bare = name.startsWith('*.') ? name.slice(2) : name;
-  // Each label: starts and ends with alphanumeric, hyphens allowed in middle
-  // Supports any depth of subdomains: a.b.c.example.com
-  const labelPattern = /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$/;
-  const labels = bare.split('.');
-  if (labels.length < 2) {
-    return 'Domain must have at least two labels (e.g. example.com)';
-  }
-  for (const label of labels) {
-    if (!label) return 'Invalid domain name format: empty label';
-    if (!labelPattern.test(label)) return 'Invalid domain name format';
-  }
-  return null;
-}
-
-function validatePort(port) {
-  const portNum = Number(port);
-  if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
-    return 'Invalid port: must be 1-65535';
-  }
-  return null;
-}
-
-function validateUpstreamType(type) {
-  if (type && !['http', 'https', 'ws'].includes(type)) {
-    return 'Invalid upstreamType: must be http, https, or ws';
-  }
-  return null;
-}
-
-function validateMaxBodySize(size) {
-  if (size && !/^\d+[kmgKMG]?$/.test(size)) {
-    return 'Invalid maxBodySize format (e.g., 10m, 1g)';
-  }
-  return null;
-}
-
-function validatePositiveInteger(val, field) {
-  if (val !== undefined && (!Number.isInteger(Number(val)) || Number(val) < 1)) {
-    return `Invalid ${field}: must be a positive integer`;
-  }
-  return null;
-}
 
 // ─── GET /api/domains ─────────────────────────────────────────────────────────
 

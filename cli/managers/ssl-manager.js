@@ -21,8 +21,7 @@ import net from 'net';
 import * as acme from 'acme-client';
 import { run, runLive } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
-
-const isWindows = process.platform === 'win32';
+import { isWindows } from '../../core/platform.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 

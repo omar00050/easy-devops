@@ -16,8 +16,7 @@ import ora from 'ora';
 import { run, runLive } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { ensureNginxInclude } from '../../core/nginx-conf-generator.js';
-
-const isWindows = process.platform === 'win32';
+import { isWindows } from '../../core/platform.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 import { access } from 'fs/promises';

@@ -20,28 +20,7 @@ import { loadConfig } from '../../core/config.js';
 import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../../dashboard/lib/domains-db.js';
 import { generateConf, buildConf } from '../../core/nginx-conf-generator.js';
 import { issueCert } from './ssl-manager.js';
-
-const isWindows = process.platform === 'win32';
-
-// ─── Helper functions ────────────────────────────────────────────────────────
-
-function getNginxExe(nginxDir) {
-  return isWindows ? `${nginxDir}\\nginx.exe` : 'nginx';
-}
-
-function nginxTestCmd(nginxDir) {
-  const exe = getNginxExe(nginxDir);
-  return isWindows ? `& "${exe}" -t` : 'nginx -t';
-}
-
-function nginxReloadCmd(nginxDir) {
-  const exe = getNginxExe(nginxDir);
-  return isWindows ? `& "${exe}" -s reload` : 'nginx -s reload';
-}
-
-function combineOutput(result) {
-  return [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
-}
+import { isWindows, nginxTestCmd, nginxReloadCmd, combineOutput } from '../../core/platform.js';
 
 // ─── List Domains ───────────────────────────────────────────────────────
 

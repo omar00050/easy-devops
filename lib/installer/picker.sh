@@ -60,19 +60,24 @@ _pick_tty() {
   RESET="\033[0m"
   HIGHLIGHT="\033[7m"
 
-  # Hide cursor
-  printf '\033[?25l'
-
-  # Save terminal state and restore on exit
+  # Save terminal state — guard against stty failures (e.g. dumb terminals)
   local old_stty
   old_stty="$(stty -g 2>/dev/null || true)"
 
-  # Cleanup function
+  # Cleanup: restore terminal state and show cursor
   _tty_cleanup() {
-    stty "$old_stty" 2>/dev/null || true
+    [ -n "$old_stty" ] && stty "$old_stty" 2>/dev/null || true
     printf '\033[?25h'   # show cursor
   }
-  trap '_tty_cleanup; return 2' INT TERM
+
+  # Use a flag instead of `return` inside the trap handler.
+  # `return` in a trap does not exit the outer function in bash —
+  # it only returns from the trap handler itself.
+  local _cancelled=false
+  trap '_tty_cleanup; _cancelled=true' INT TERM
+
+  # Hide cursor only if the terminal supports it
+  printf '\033[?25l' 2>/dev/null || true
 
   printf '\nSelect a Node.js version (up/down arrows, Enter to confirm, q to quit):\n\n'
 
@@ -90,12 +95,22 @@ _pick_tty() {
   stty raw -echo 2>/dev/null || true
 
   while true; do
+    # Check cancellation flag (set by INT/TERM trap)
+    if [ "$_cancelled" = "true" ]; then
+      break
+    fi
+
     local ch seq1 seq2
-    IFS= read -r -s -n1 ch 2>/dev/null || true
+    IFS= read -r -n1 ch 2>/dev/null || ch=""
+
+    # Check flag again after read (signal may have arrived during read)
+    if [ "$_cancelled" = "true" ]; then
+      break
+    fi
 
     if [ "$ch" = $'\x1b' ]; then
-      IFS= read -r -s -n1 -t 0.1 seq1 2>/dev/null || seq1=""
-      IFS= read -r -s -n1 -t 0.1 seq2 2>/dev/null || seq2=""
+      IFS= read -r -n1 -t 0.1 seq1 2>/dev/null || seq1=""
+      IFS= read -r -n1 -t 0.1 seq2 2>/dev/null || seq2=""
       if [ "$seq1" = "[" ]; then
         case "$seq2" in
           A) [ "$selected" -gt 0 ] && selected=$(( selected - 1 )) ;;
@@ -105,13 +120,11 @@ _pick_tty() {
     elif [ "$ch" = $'\n' ] || [ "$ch" = $'\r' ] || [ -z "$ch" ]; then
       break
     elif [ "$ch" = "q" ] || [ "$ch" = "Q" ]; then
-      _tty_cleanup
-      trap - INT TERM
-      printf '\n'
-      return 2
+      _cancelled=true
+      break
     fi
 
-    # Redraw: move cursor up count lines
+    # Redraw: move cursor up count lines, clear each line, redraw
     local k
     for (( k=0; k<count; k++ )); do
       printf "${CLEAR_LINE}\033[1A"
@@ -129,6 +142,10 @@ _pick_tty() {
   _tty_cleanup
   trap - INT TERM
   printf '\n'
+
+  if [ "$_cancelled" = "true" ]; then
+    return 2
+  fi
 
   PICKED_VERSION="$(printf '%s' "${NODE_RELEASES[$selected]}" | cut -d'|' -f1)"
 }

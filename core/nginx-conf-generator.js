@@ -10,11 +10,10 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { loadConfig } from './config.js';
-
-const isWindows = process.platform === 'win32';
+import { isWindows } from './platform.js';
 
 /** Returns the conf.d directory for domain config files. */
-function getConfDDir(nginxDir) {
+export function getConfDDir(nginxDir) {
   return isWindows
     ? path.join(nginxDir, 'conf', 'conf.d')
     : path.join(nginxDir, 'conf.d');

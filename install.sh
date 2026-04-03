@@ -236,12 +236,6 @@ STEPS=(
   "Registering global command"
 )
 
-# Print all steps as pending initially
-for _s in "${STEPS[@]}"; do
-  step_pending "$_s"
-done
-printf '\n'
-
 # ---------------------------------------------------------------------------
 # Step 1: Detect system
 # ---------------------------------------------------------------------------
@@ -393,15 +387,20 @@ else
 
   # Step 5: install chosen Node.js version
   step_running "${STEPS[4]}"
-  printf 'Installing Node.js %s via nvm...\n' "$NODE_TARGET"
-  if ! nvm install "$NODE_TARGET" 2>&1; then
+  printf 'Installing Node.js %s via nvm (this may take a minute)...\n' "$NODE_TARGET"
+  _nvm_log="$(mktemp /tmp/nvm-install.XXXXXX 2>/dev/null || mktemp)"
+  if ! nvm install "$NODE_TARGET" > "$_nvm_log" 2>&1; then
+    printf '\n--- nvm install output ---\n' >&2
+    cat "$_nvm_log" >&2
+    rm -f "$_nvm_log"
     die "${STEPS[4]}" "Failed to install Node.js $NODE_TARGET via nvm" \
       "nvm install $NODE_TARGET" \
       "nvm use $NODE_TARGET" \
       "npm install" \
       "npm link"
   fi
-  if ! nvm use "$NODE_TARGET" 2>&1; then
+  rm -f "$_nvm_log"
+  if ! nvm use "$NODE_TARGET" > /dev/null 2>&1; then
     die "${STEPS[4]}" "Failed to activate Node.js $NODE_TARGET" \
       "nvm use $NODE_TARGET" \
       "npm install" \
