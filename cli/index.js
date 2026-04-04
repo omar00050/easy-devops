@@ -25,11 +25,33 @@ if (process.argv[2] === 'system-info') {
 }
 
 function renderBanner() {
-  const title = ` Easy DevOps v${version}`;
-  const paddedTitle = title.padEnd(30);
-  console.log(chalk.cyan('╔══════════════════════════════╗'));
-  console.log(chalk.cyan('║') + chalk.bold(paddedTitle) + chalk.cyan('║'));
-  console.log(chalk.cyan('╚══════════════════════════════╝'));
+  const c = chalk.hex('#d64a29');
+  const dim = chalk.hex('#d64a29').dim;
+
+  // Compact "EZ" logo — 6 lines, ~20 chars wide, fits any 80-col terminal
+  const logo = [
+    '███████╗███████╗',
+    '██╔════╝╚════██╗',
+    '█████╗      ██╔╝',
+    '██╔══╝     ██╔╝ ',
+    '███████╗ ██████╗',
+    '╚══════╝ ╚═════╝',
+  ];
+
+  const gap = '    ';
+  const info = [
+    chalk.bold.white('Easy DevOps') + '  ' + chalk.hex('#d64a29')(`v${version}`),
+    dim('─────────────────────'),
+    chalk.hex('#888888')('CLI & Web Dashboard'),
+    chalk.hex('#888888')('Nginx · SSL · Domains · Node.js'),
+    '',
+    '',
+  ];
+
+  console.log();
+  logo.forEach((line, i) => {
+    console.log('  ' + c(line) + gap + (info[i] ?? ''));
+  });
   console.log();
 }
 

@@ -104,11 +104,14 @@ npx easy-devops
 ### CLI Overview
 
 ```
-╔══════════════════════════════╗
-║      Easy DevOps v1.0.0     ║
-╚══════════════════════════════╝
+  ███████╗███████╗     Easy DevOps  v1.0.0
+  ██╔════╝╚════██╗     ─────────────────────
+  █████╗      ██╔╝     CLI & Web Dashboard
+  ██╔══╝     ██╔╝      Nginx · SSL · Domains · Node.js
+  ███████╗ ██████╗
+  ╚══════╝ ╚═════╝
 
-nginx: ✅ v1.26.2 | node: v22.21.1
+  nginx: ✅ v1.26.2 | ACME: acme-client | node: v22.21.1
 
 ? Select an option:
   📦 Node.js Manager
@@ -117,6 +120,7 @@ nginx: ✅ v1.26.2 | node: v22.21.1
   🔗 Domain Manager
   🎛️ Open Dashboard
   ⚙️ Settings
+  🔄 Check for Updates
   ✖ Exit
 ```
 
