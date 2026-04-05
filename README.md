@@ -104,7 +104,7 @@ npx easy-devops
 ### CLI Overview
 
 ```
-  ███████╗███████╗     Easy DevOps  v1.0.0
+  ███████╗███████╗     Easy DevOps  v1.0.2
   ██╔════╝╚════██╗     ─────────────────────
   █████╗      ██╔╝     CLI & Web Dashboard
   ██╔══╝     ██╔╝      Nginx · SSL · Domains · Node.js
@@ -242,7 +242,9 @@ Default credentials:
 | **Nginx** | Start/stop controls, config editor, error logs |
 | **SSL** | Certificate list, renewal actions, expiry badges |
 | **Domains** | Add/edit form with collapsible sections, table view |
-| **Settings** | Port, password, directory configuration |
+| **Settings** | Port, password, directory configuration, Linux permissions setup |
+
+> **Linux users:** After launching the dashboard for the first time, open **Settings → Linux Permissions** and click **Setup Permissions**. This writes `/etc/sudoers.d/easy-devops` with NOPASSWD rules for `systemctl` so nginx start/stop/reload/restart work from the dashboard without a terminal. Without this step, nginx service control will return "Linux permissions not configured" errors.
 
 ---
 
@@ -267,6 +269,8 @@ The dashboard exposes RESTful API endpoints:
 | `/api/ssl/create-confirm` | POST | Confirm DNS challenge |
 | `/api/ssl/renew/:domain` | POST | Renew certificate |
 | `/api/settings` | GET/POST | Dashboard settings |
+| `/api/settings/permissions` | GET | Linux sudo permissions status |
+| `/api/settings/permissions/setup` | POST | Configure NOPASSWD sudoers (Linux) |
 
 ---
 
