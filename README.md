@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="dashboard/public/img/icon.png" alt="Easy DevOps" width="100" />
+  <img src="src/dashboard/public/img/icon.png" alt="Easy DevOps" width="100" />
 </p>
 
 # Easy DevOps
