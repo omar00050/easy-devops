@@ -16,7 +16,8 @@ import ora from 'ora';
 import { run, runLive, runInteractive } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { ensureNginxInclude } from '../../core/nginx-conf-generator.js';
-import { isWindows } from '../../core/platform.js';
+import { isWindows, isNginxTestOk } from '../../core/platform.js';
+import path from 'path';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 import { access } from 'fs/promises';
@@ -66,23 +67,45 @@ async function testConfig(nginxExe, nginxDir) {
   await ensureNginxInclude(nginxDir);
   const cmd = isWindows ? `& "${nginxExe}" -t` : 'nginx -t';
   const result = await run(cmd, { cwd: nginxDir });
-  const PathDomain = await pathExists(`${nginxDir}\\conf\\conf.d`);
-  const willKnown = await pathExists(`${nginxDir}\\html\\.well-known`);
 
-  if (!PathDomain) {
+  // On Linux: conf.d is directly under nginxDir (/etc/nginx/conf.d)
+  // On Windows: conf.d is under the conf sub-directory (C:\nginx\conf\conf.d)
+  const confDPath = isWindows
+    ? path.join(nginxDir, 'conf', 'conf.d')
+    : path.join(nginxDir, 'conf.d');
+  const wellKnownPath = path.join(nginxDir, 'html', '.well-known');
+  const acmePath = path.join(wellKnownPath, 'acme-challenge');
+
+  const hasConfD = await pathExists(confDPath);
+  const hasWellKnown = await pathExists(wellKnownPath);
+
+  if (!hasConfD) {
     console.warn(chalk.yellow(`Warning: conf.d directory not found in ${nginxDir} — creating it now...`));
-    await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\conf\\conf.d`, { recursive: true }));
+    if (isWindows) {
+      await import('fs/promises').then(fs => fs.mkdir(confDPath, { recursive: true }));
+    } else {
+      const mkResult = await runInteractive(`sudo mkdir -p "${confDPath}"`);
+      if (!mkResult.success) {
+        console.warn(chalk.red(`  Failed to create ${confDPath} — run manually: sudo mkdir -p ${confDPath}`));
+      }
+    }
   }
 
-  if (!willKnown) {
-    console.warn(chalk.yellow(`Warning: .well-known/acme-challenge directory not found in ${nginxDir} — creating it now...`));
-    await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\html\\.well-known\\`, { recursive: true }));
-    await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\html\\.well-known\\acme-challenge`, { recursive: true }));
+  if (!hasWellKnown) {
+    console.warn(chalk.yellow(`Warning: .well-known/acme-challenge directory not found — creating it now...`));
+    if (isWindows) {
+      await import('fs/promises').then(fs => fs.mkdir(acmePath, { recursive: true }));
+    } else {
+      const mkResult = await runInteractive(`sudo mkdir -p "${acmePath}"`);
+      if (!mkResult.success) {
+        console.warn(chalk.red(`  Failed to create ${acmePath} — run manually: sudo mkdir -p ${acmePath}`));
+      }
+    }
   }
 
   return {
-    success: result.success,
-    output: (result.stdout + '\n' + result.stderr).trim(),
+    success: isNginxTestOk(result),
+    output: ((result.stdout || '') + '\n' + (result.stderr || '')).trim(),
   };
 }
 
@@ -99,8 +122,12 @@ async function reloadNginx(nginxExe, nginxDir) {
   }
 
   spinner.text = 'Reloading nginx…';
-  const cmd = isWindows ? `& "${nginxExe}" -s reload` : 'systemctl reload nginx';
-  const result = await run(cmd, { cwd: nginxDir });
+  let result;
+  if (isWindows) {
+    result = await run(`& "${nginxExe}" -s reload`, { cwd: nginxDir });
+  } else {
+    result = await runInteractive('sudo /usr/bin/systemctl reload nginx');
+  }
 
   if (result.success) {
     spinner.succeed('nginx reloaded successfully');
@@ -111,7 +138,7 @@ async function reloadNginx(nginxExe, nginxDir) {
   return {
     success: result.success,
     message: result.success ? 'nginx reloaded successfully' : 'Reload failed',
-    output: (result.stdout + '\n' + result.stderr).trim(),
+    output: ((result.stdout || '') + '\n' + (result.stderr || '')).trim(),
   };
 }
 
@@ -134,7 +161,7 @@ async function restartNginx(nginxExe, nginxDir) {
     await new Promise(resolve => setTimeout(resolve, 2000));
     result = await run(`& "${nginxExe}"`, { cwd: nginxDir });
   } else {
-    result = await run('systemctl restart nginx');
+    result = await runInteractive('sudo /usr/bin/systemctl restart nginx');
   }
 
   if (result.success) {
@@ -146,7 +173,7 @@ async function restartNginx(nginxExe, nginxDir) {
   return {
     success: result.success,
     message: result.success ? 'nginx restarted successfully' : 'Restart failed',
-    output: (result.stdout + '\n' + result.stderr).trim(),
+    output: ((result.stdout || '') + '\n' + (result.stderr || '')).trim(),
   };
 }
 
@@ -187,10 +214,9 @@ async function startNginx(nginxExe, nginxDir) {
     const startCmd = `Start-Process -FilePath "${nginxExe}" -WorkingDirectory "${nginxDir}" -WindowStyle Hidden`;
     await run(startCmd, { timeout: 10000 });
   } else {
-    const result = await run('systemctl start nginx', { timeout: 15000 });
+    const result = await runInteractive('sudo /usr/bin/systemctl start nginx');
     if (!result.success) {
       spinner.fail('Start failed');
-      console.log(chalk.red('\n' + (result.stderr || result.stdout)));
       return { success: false };
     }
   }
@@ -236,40 +262,61 @@ async function startNginx(nginxExe, nginxDir) {
 
 async function stopNginx(nginxDir) {
   const spinner = ora('Stopping nginx…').start();
-  const cmd = isWindows ? 'taskkill /f /IM nginx.exe' : 'systemctl stop nginx';
-  const result = await run(cmd, { cwd: nginxDir });
+  let result;
+  if (isWindows) {
+    result = await run('taskkill /f /IM nginx.exe', { cwd: nginxDir });
+  } else {
+    result = await runInteractive('sudo /usr/bin/systemctl stop nginx');
+  }
+
   if (result.success) {
     spinner.succeed('nginx stopped');
   } else {
     spinner.fail('Stop failed');
-    console.log(chalk.red('\n' + (result.stderr || result.stdout)));
+    if (result.stderr || result.stdout) {
+      console.log(chalk.red('\n' + (result.stderr || result.stdout)));
+    }
   }
-  return { success: result.success, output: (result.stdout + '\n' + result.stderr).trim() };
+  return { success: result.success, output: ((result.stdout || '') + '\n' + (result.stderr || '')).trim() };
 }
 
 // ─── installNginx ─────────────────────────────────────────────────────────────
 
 async function installNginx() {
   if (!isWindows) {
-    console.log(chalk.yellow('\n sudo password required to install nginx.\n'));
-
-    const auth = await runInteractive('sudo -v');
-
-    if (!auth.success) {
-      console.log(chalk.red(' sudo authentication failed.'));
-      return { success: false, message: 'sudo authentication failed', output: auth.stderr };
-    }
-
     const spinner = ora('Installing nginx…').start();
-    const result = await run('sudo apt-get install -y nginx', { timeout: 120000 });
-    if (result.success) {
-      spinner.succeed('nginx installed successfully');
-      return { success: true, message: 'nginx installed successfully', output: result.stdout };
+    const result = await runInteractive('sudo apt-get install -y nginx');
+    if (!result.success) {
+      spinner.fail('Installation failed');
+      console.log(chalk.gray('\n  Manual instructions: https://nginx.org/en/docs/install.html\n'));
+      return { success: false, message: 'Installation failed', output: '' };
     }
-    spinner.fail('Installation failed');
-    console.log(chalk.red(result.stderr || result.stdout));
-    console.log(chalk.gray('\n  Manual instructions: https://nginx.org/en/docs/install.html\n'));
-    return { success: false, message: 'Installation failed', output: result.stderr || result.stdout };
+    spinner.succeed('nginx installed successfully');
+
+    const { nginxDir } = loadConfig();
+    const confDPath = path.join(nginxDir, 'conf.d');
+    const acmePath = path.join(nginxDir, 'html', '.well-known', 'acme-challenge');
+
+    // Create conf.d directory for domain config files
+    const confSpinner = ora(`Creating ${confDPath}…`).start();
+    const confResult = await runInteractive(`sudo mkdir -p "${confDPath}"`);
+    if (confResult.success) {
+      confSpinner.succeed(`Created ${confDPath}`);
+    } else {
+      confSpinner.warn(`Could not create ${confDPath} — run manually: sudo mkdir -p ${confDPath}`);
+    }
+
+    // Create html/.well-known/acme-challenge directory for SSL certificate verification
+    const acmeSpinner = ora(`Creating ${acmePath}…`).start();
+    const acmeResult = await runInteractive(`sudo mkdir -p "${acmePath}"`);
+    if (acmeResult.success) {
+      await runInteractive(`sudo touch "${path.join(acmePath, '.keep')}"`);
+      acmeSpinner.succeed(`Created ${acmePath}`);
+    } else {
+      acmeSpinner.warn(`Could not create ${acmePath} — run manually: sudo mkdir -p ${acmePath}`);
+    }
+
+    return { success: true, message: 'nginx installed successfully', output: '' };
   }
 
   // ── Windows ──────────────────────────────────────────────────────────────────
@@ -348,17 +395,11 @@ async function installNginx() {
   }
 
   // Create conf/conf.d directory for domain config files
-  await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\conf\\conf.d`, { recursive: true }));
+  await import('fs/promises').then(fs => fs.mkdir(path.join(nginxDir, 'conf', 'conf.d'), { recursive: true }));
 
-  await import('fs/promises').then(fs => fs.mkdir(`${nginxDir}\\html\\.well-known\\`, { recursive: true }));
   // Create html/.well-known/acme-challenge directory for SSL certificate verification
-  await import('fs/promises').then(fs => fs.writeFile(`${nginxDir}\\html\\.well-known\\acme-challenge`, '', (err) => {
-    if (err) {
-      console.error(chalk.red(`Failed to create acme-challenge directory: ${err.message}`));
-    } else {
-      console.log(chalk.green('Created acme-challenge directory for SSL certificate verification'));
-    }
-  }));
+  await import('fs/promises').then(fs => fs.mkdir(path.join(nginxDir, 'html', '.well-known', 'acme-challenge'), { recursive: true }));
+  await import('fs/promises').then(fs => fs.writeFile(path.join(nginxDir, 'html', '.well-known', 'acme-challenge', '.keep'), ''));
 
   spinner.succeed(`nginx ${nginxVersion} installed to ${nginxDir}`);
   return { success: true, message: `nginx ${nginxVersion} installed successfully`, output: '' };

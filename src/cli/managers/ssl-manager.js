@@ -19,6 +19,7 @@ import path from 'path';
 import http from 'http';
 import net from 'net';
 import * as acme from 'acme-client';
+import os from 'os';
 import { run, runLive } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { isWindows } from '../../core/platform.js';
@@ -36,7 +37,14 @@ function getSslDir() {
  */
 async function getAccountKey(sslDir) {
   const keyPath = path.join(sslDir, '.account', 'account.key');
-  await fs.mkdir(path.dirname(keyPath), { recursive: true });
+  const accountDir = path.dirname(keyPath);
+  if (!isWindows) {
+    const user = os.userInfo().username;
+    await run(`sudo -n mkdir -p "${accountDir}"`);
+    await run(`sudo -n chown ${user}:${user} "${accountDir}"`);
+  } else {
+    await fs.mkdir(accountDir, { recursive: true });
+  }
   try {
     return await fs.readFile(keyPath);
   } catch {
@@ -223,7 +231,13 @@ export async function issueCert(domainName, {
 
   // Ensure certificate directory exists
   const certDir = path.join(sslDir, domainName);
-  await fs.mkdir(certDir, { recursive: true });
+  if (!isWindows) {
+    const user = os.userInfo().username;
+    await run(`sudo -n mkdir -p "${certDir}"`);
+    await run(`sudo -n chown ${user}:${user} "${certDir}"`);
+  } else {
+    await fs.mkdir(certDir, { recursive: true });
+  }
 
   // Load or create account key
   const accountKey = await getAccountKey(sslDir);

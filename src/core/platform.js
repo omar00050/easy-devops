@@ -59,3 +59,19 @@ export function nginxReloadCmd(nginxDir) {
 export function combineOutput(result) {
   return [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
 }
+
+/**
+ * Returns true if an `nginx -t` result indicates a valid config.
+ *
+ * Without root, nginx exits with code 1 after printing "syntax is ok" because
+ * it cannot write /run/nginx.pid (Permission denied). The config itself is
+ * valid in that case — we check the output text rather than the exit code.
+ *
+ * @param {{ success: boolean, stdout: string, stderr: string }} result
+ * @returns {boolean}
+ */
+export function isNginxTestOk(result) {
+  if (result.success) return true;
+  const output = (result.stdout || '') + (result.stderr || '');
+  return output.includes('syntax is ok');
+}

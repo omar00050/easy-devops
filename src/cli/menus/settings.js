@@ -2,6 +2,7 @@ import chalk from 'chalk';
 import inquirer from 'inquirer';
 import { loadConfig, saveConfig } from '../../core/config.js';
 import { dbGet } from '../../core/db.js';
+import { setupLinuxPermissions, checkPermissionsConfigured } from '../../core/permissions.js';
 
 export default async function settingsMenu() {
   // T021: detect missing/corrupted config before loadConfig() creates defaults
@@ -16,6 +17,9 @@ export default async function settingsMenu() {
     // T013: display current values
     const passwordDisplay = config.dashboardPassword ? '***' : '(not set)';
     const emailDisplay = config.acmeEmail || '(not set)';
+
+    const isLinux = process.platform !== 'win32';
+    const permsOk = isLinux ? await checkPermissionsConfigured() : true;
 
     console.log();
     console.log(chalk.bold('⚙️ Settings'));
@@ -38,11 +42,30 @@ export default async function settingsMenu() {
         { name: `Nginx Directory (${config.nginxDir})`, value: 'nginxDir' },
         { name: `SSL Directory (${config.sslDir})`, value: 'sslDir' },
         { name: `ACME Email (${emailDisplay})`, value: 'acmeEmail' },
+        ...(isLinux ? [{
+          name: permsOk
+            ? '🔓 Linux Permissions  ✅ configured'
+            : '🔓 Setup Linux Permissions  ⚠ required',
+          value: 'permissions',
+        }] : []),
         { name: '← Back', value: 'back' },
       ],
     }]);
 
     if (field === 'back') return;
+
+    if (field === 'permissions') {
+      if (process.platform !== 'win32') {
+        console.log(chalk.yellow('\n  You will be prompted for your sudo password once.\n'));
+        const result = await setupLinuxPermissions();
+        if (result.success) {
+          console.log(chalk.green('\n  ✅ Permissions configured! No more password prompts.\n'));
+        } else {
+          console.log(chalk.red(`\n  ✗ Failed: ${result.reason || 'unknown error'}\n`));
+        }
+      }
+      continue;
+    }
 
     if (field === 'dashboardPort') {
       // T015: port validation with inline error + re-prompt

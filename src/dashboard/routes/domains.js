@@ -6,7 +6,7 @@ import { loadConfig } from '../../core/config.js';
 import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../lib/domains-db.js';
 import { generateConf, getDefaultCertPaths } from '../lib/nginx-conf-generator.js';
 import { getCertExpiry } from '../lib/cert-reader.js';
-import { nginxTestCmd, nginxReloadCmd } from '../../core/platform.js';
+import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk } from '../../core/platform.js';
 import {
   validateDomainName, validatePort, validateUpstreamType,
   validateMaxBodySize, validatePositiveInteger,
@@ -124,10 +124,15 @@ router.post('/', async (req, res) => {
     return res.status(500).json({ error: 'Failed to write nginx conf', details: err.message });
   }
 
-  const testResult = await run(nginxTestCmd(nginxDir), { cwd: nginxDir });
-  if (!testResult.success) {
+  const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
+  const testResult = await run(testCmd, { cwd: nginxDir });
+  if (!isNginxTestOk(testResult)) {
     try { await fs.unlink(domain.configFile); } catch { /* ignore */ }
-    return res.status(500).json({ error: 'nginx config test failed', output: testResult.stderr || testResult.stdout });
+    const output = testResult.stderr || testResult.stdout;
+    const error = !isWindows && output.includes('password is required')
+      ? 'Linux permissions not configured. Open Settings → Setup Linux Permissions.'
+      : 'nginx config test failed';
+    return res.status(500).json({ error, output });
   }
 
   const domains = getDomains();
@@ -200,12 +205,17 @@ router.put('/:name', async (req, res) => {
     return res.status(500).json({ error: 'Failed to write nginx conf', details: err.message });
   }
 
-  const testResult = await run(nginxTestCmd(nginxDir), { cwd: nginxDir });
-  if (!testResult.success) {
+  const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
+  const testResult = await run(testCmd, { cwd: nginxDir });
+  if (!isNginxTestOk(testResult)) {
     if (bakPath) {
       try { await fs.rename(bakPath, existing.configFile); } catch { /* ignore */ }
     }
-    return res.status(500).json({ error: 'nginx config test failed', output: testResult.stderr || testResult.stdout });
+    const output = testResult.stderr || testResult.stdout;
+    const error = !isWindows && output.includes('password is required')
+      ? 'Linux permissions not configured. Open Settings → Setup Linux Permissions.'
+      : 'nginx config test failed';
+    return res.status(500).json({ error, output });
   }
 
   const domains = getDomains();
@@ -288,7 +298,7 @@ router.put('/:name/toggle', async (req, res) => {
     saveDomains(domains);
 
     // Reload so nginx stops serving this domain
-    await run(nginxReloadCmd(nginxDir), { cwd: nginxDir });
+    await run(isWindows ? nginxReloadCmd(nginxDir) : 'sudo -n /usr/bin/systemctl reload nginx', { cwd: nginxDir });
 
     return res.json({ enabled: false });
   } else {
@@ -299,11 +309,16 @@ router.put('/:name/toggle', async (req, res) => {
       return res.status(500).json({ error: 'Failed to rename config file', details: err.message });
     }
 
-    const testResult = await run(nginxTestCmd(nginxDir), { cwd: nginxDir });
-    if (!testResult.success) {
+    const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
+    const testResult = await run(testCmd, { cwd: nginxDir });
+    if (!isNginxTestOk(testResult)) {
       // Roll back rename
       await fs.rename(enabledPath, disabledPath).catch(() => {});
-      return res.status(500).json({ error: 'nginx config test failed', output: testResult.stderr || testResult.stdout });
+      const output = testResult.stderr || testResult.stdout;
+      const error = !isWindows && output.includes('password is required')
+        ? 'Linux permissions not configured. Open Settings → Setup Linux Permissions.'
+        : 'nginx config test failed';
+      return res.status(500).json({ error, output });
     }
 
     const domains = getDomains();
@@ -311,7 +326,7 @@ router.put('/:name/toggle', async (req, res) => {
     domains[idx] = { ...domain, enabled: true, configFile: enabledPath, updatedAt: new Date().toISOString() };
     saveDomains(domains);
 
-    await run(nginxReloadCmd(nginxDir), { cwd: nginxDir });
+    await run(isWindows ? nginxReloadCmd(nginxDir) : 'sudo -n /usr/bin/systemctl reload nginx', { cwd: nginxDir });
 
     return res.json({ enabled: true });
   }
@@ -327,14 +342,24 @@ router.post('/:name/reload', async (req, res) => {
 
   const { nginxDir } = loadConfig();
 
-  const testResult = await run(nginxTestCmd(nginxDir), { cwd: nginxDir });
-  if (!testResult.success) {
-    return res.status(500).json({ error: 'nginx config test failed', output: testResult.stderr || testResult.stdout });
+  const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
+  const testResult = await run(testCmd, { cwd: nginxDir });
+  if (!isNginxTestOk(testResult)) {
+    const output = testResult.stderr || testResult.stdout;
+    const error = !isWindows && output.includes('password is required')
+      ? 'Linux permissions not configured. Open Settings → Setup Linux Permissions.'
+      : 'nginx config test failed';
+    return res.status(500).json({ error, output });
   }
 
-  const reloadResult = await run(nginxReloadCmd(nginxDir), { cwd: nginxDir });
+  const reloadCmd = isWindows ? nginxReloadCmd(nginxDir) : 'sudo -n /usr/bin/systemctl reload nginx';
+  const reloadResult = await run(reloadCmd, { cwd: nginxDir });
   if (!reloadResult.success) {
-    return res.status(500).json({ error: 'nginx reload failed', output: reloadResult.stderr || reloadResult.stdout });
+    const output = reloadResult.stderr || reloadResult.stdout;
+    const error = !isWindows && output.includes('password is required')
+      ? 'Linux permissions not configured. Open Settings → Setup Linux Permissions.'
+      : 'nginx reload failed';
+    return res.status(500).json({ error, output });
   }
 
   res.json({ message: 'nginx reloaded successfully' });

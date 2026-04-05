@@ -3,7 +3,7 @@ import path from 'path';
 import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { ensureNginxInclude, getConfDDir } from '../../core/nginx-conf-generator.js';
-import { isWindows, getNginxExe, nginxTestCmd, combineOutput } from '../../core/platform.js';
+import { isWindows, getNginxExe, nginxTestCmd, combineOutput, isNginxTestOk } from '../../core/platform.js';
 
 // ─── Error Types ──────────────────────────────────────────────────────────────
 
@@ -39,6 +39,25 @@ export function validateFilename(filename) {
   if (!resolved.startsWith(path.resolve(confDir))) {
     throw new InvalidFilenameError('Invalid filename');
   }
+}
+
+const SUDO_PERMISSION_MSG = 'Linux permissions not configured. Open Settings → Setup Linux Permissions.';
+
+function isSudoPermissionError(result) {
+  const output = (result.stderr || result.stdout || '');
+  return (
+    output.includes('password is required') ||
+    output.includes('a terminal is required') ||
+    output.includes('sudo:')
+  );
+}
+
+async function findNginxPath() {
+  const result = await run('which nginx');
+  if (result.success && result.stdout.trim()) {
+    return result.stdout.trim().split('\n')[0].trim();
+  }
+  throw new Error('nginx binary not found');
 }
 
 /** Checks if nginx is installed and throws NginxNotFoundError if not. */
@@ -95,8 +114,11 @@ export async function reload() {
 
   const result = isWindows
     ? await run(`${nginxExe} -s reload`, { cwd: nginxDir, timeout: 15000 })
-    : await run('nginx -s reload');
-  return { success: result.success, output: combineOutput(result) };
+    : await run('sudo -n /usr/bin/systemctl reload nginx');
+  if (!result.success && !isWindows && isSudoPermissionError(result)) {
+    return { success: false, output: SUDO_PERMISSION_MSG };
+  }
+  return { success: result.success, output: combineOutput(result) || '' };
 }
 
 export async function restart() {
@@ -104,18 +126,22 @@ export async function restart() {
   const nginxExe = getNginxExe(nginxDir);
   await assertNginxInstalled(nginxExe);
 
-  const stopResult = isWindows
-    ? await run('taskkill /f /IM nginx.exe')
-    : await run('nginx -s stop');
+  if (isWindows) {
+    const stopResult = await run('taskkill /f /IM nginx.exe');
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    const startResult = await run(nginxExe, { cwd: nginxDir, timeout: 15000 });
+    const output = [combineOutput(stopResult), combineOutput(startResult)]
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    return { success: startResult.success, output };
+  }
 
-  await new Promise(resolve => setTimeout(resolve, 2000));
-
-  const startResult = await run(nginxExe, { cwd: nginxDir, timeout: 15000 });
-  const output = [combineOutput(stopResult), combineOutput(startResult)]
-    .filter(Boolean)
-    .join('\n')
-    .trim();
-  return { success: startResult.success, output };
+  const result = await run('sudo -n /usr/bin/systemctl restart nginx');
+  if (!result.success && isSudoPermissionError(result)) {
+    return { success: false, output: SUDO_PERMISSION_MSG };
+  }
+  return { success: result.success, output: combineOutput(result) || '' };
 }
 
 export async function start() {
@@ -131,9 +157,15 @@ export async function start() {
 
   // Test config before starting
   await ensureNginxInclude(nginxDir);
-  const testResult = await run(nginxTestCmd(nginxDir), { cwd: nginxDir });
-  if (!testResult.success) {
-    return { success: false, output: combineOutput(testResult) };
+  const nginxPath = isWindows ? null : await findNginxPath();
+  const testResult = isWindows
+    ? await run(nginxTestCmd(nginxDir), { cwd: nginxDir })
+    : await run(`${nginxPath} -t`);
+  if (!isNginxTestOk(testResult)) {
+    return {
+      success: false,
+      output: !isWindows && isSudoPermissionError(testResult) ? SUDO_PERMISSION_MSG : combineOutput(testResult),
+    };
   }
 
   // Start nginx
@@ -142,9 +174,9 @@ export async function start() {
     const startCmd = `Start-Process -FilePath "${path.join(nginxDir, 'nginx.exe')}" -ArgumentList '-c','"${confPath}"' -WorkingDirectory "${nginxDir}" -WindowStyle Hidden`;
     await run(startCmd, { cwd: nginxDir, timeout: 10000 });
   } else {
-    const result = await run('nginx', { cwd: nginxDir, timeout: 15000 });
+    const result = await run('sudo -n /usr/bin/systemctl start nginx');
     if (!result.success) {
-      return { success: false, output: combineOutput(result) };
+      return { success: false, output: isSudoPermissionError(result) ? SUDO_PERMISSION_MSG : combineOutput(result) || '' };
     }
   }
 
@@ -156,8 +188,8 @@ export async function start() {
     const check = await run('tasklist /FI "IMAGENAME eq nginx.exe" /NH');
     running = check.success && check.stdout.toLowerCase().includes('nginx.exe');
   } else {
-    const check = await run('pgrep -x nginx');
-    running = check.exitCode === 0;
+    const check = await run('systemctl is-active nginx');
+    running = check.stdout.trim() === 'active';
   }
 
   if (running) {
@@ -186,8 +218,11 @@ export async function stop() {
 
   const result = isWindows
     ? await run('taskkill /f /IM nginx.exe')
-    : await run('nginx -s stop');
+    : await run('sudo -n /usr/bin/systemctl stop nginx');
 
+  if (!result.success && !isWindows && isSudoPermissionError(result)) {
+    return { success: false, output: SUDO_PERMISSION_MSG };
+  }
   return { success: result.success, output: combineOutput(result) || 'nginx stopped' };
 }
 
@@ -199,8 +234,15 @@ export async function test() {
   await assertNginxInstalled(nginxExe);
 
   await ensureNginxInclude(nginxDir);
-  const result = await run(nginxTestCmd(nginxDir), { cwd: nginxDir });
-  return { success: result.success, output: combineOutput(result) };
+  const nginxPath = isWindows ? null : await findNginxPath();
+  const result = isWindows
+    ? await run(nginxTestCmd(nginxDir), { cwd: nginxDir })
+    : await run(`${nginxPath} -t`);
+  if (!result.success && !isWindows && isSudoPermissionError(result)) {
+    return { success: false, output: SUDO_PERMISSION_MSG };
+  }
+  const output = combineOutput(result);
+  return { success: isNginxTestOk(result), output };
 }
 
 // ─── US4: Config File Management ──────────────────────────────────────────────
@@ -246,14 +288,17 @@ export async function saveConfig(filename, content) {
 
   const nginxExe = getNginxExe(nginxDir);
   await ensureNginxInclude(nginxDir);
-  const result = await run(nginxTestCmd(nginxDir), { cwd: nginxDir });
-  if (!result.success) {
+  const nginxPath = isWindows ? null : await findNginxPath();
+  const testCmd = isWindows ? nginxTestCmd(nginxDir) : `${nginxPath} -t`;
+  const result = await run(testCmd, { cwd: nginxDir });
+  if (!isNginxTestOk(result)) {
     if (hasBackup) {
       await fs.copyFile(backupPath, confPath);
     } else {
       try { await fs.unlink(confPath); } catch { /* ignore */ }
     }
-    throw new NginxConfigError(combineOutput(result));
+    const output = !isWindows && isSudoPermissionError(result) ? SUDO_PERMISSION_MSG : combineOutput(result);
+    throw new NginxConfigError(output);
   }
 
   return { success: true, output: combineOutput(result) };

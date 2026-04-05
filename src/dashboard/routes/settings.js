@@ -1,6 +1,28 @@
 import express from 'express';
+import { spawn } from 'child_process';
+import fs from 'fs/promises';
+import path from 'path';
+import os from 'os';
 import { loadConfig, saveConfig } from '../../core/config.js';
 import { validatePort, validateEmail } from '../../core/validators.js';
+import { run } from '../../core/shell.js';
+import { checkPermissionsConfigured } from '../../core/permissions.js';
+
+// Run a bash command with sudo -S (password read from stdin — no terminal needed)
+function runSudoS(bashCmd, password) {
+  return new Promise((resolve) => {
+    const child = spawn('sudo', ['-S', 'bash', '-c', bashCmd], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', d => { stdout += d; });
+    child.stderr.on('data', d => { stderr += d; });
+    child.stdin.write(password + '\n');
+    child.stdin.end();
+    child.on('close', code => resolve({ success: code === 0, stdout: stdout.trim(), stderr: stderr.trim() }));
+    child.on('error', err => resolve({ success: false, stdout: '', stderr: err.message }));
+  });
+}
 
 const router = express.Router();
 
@@ -81,6 +103,92 @@ router.post('/settings', (req, res) => {
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// ─── GET /api/settings/permissions ────────────────────────────────────────────
+
+router.get('/settings/permissions', async (req, res) => {
+  if (process.platform === 'win32') return res.json({ configured: true });
+  try {
+    const configured = await checkPermissionsConfigured();
+    res.json({ configured });
+  } catch {
+    res.json({ configured: false });
+  }
+});
+
+// ─── POST /api/settings/permissions/setup ─────────────────────────────────────
+
+router.post('/settings/permissions/setup', async (req, res) => {
+  if (process.platform === 'win32') {
+    return res.status(400).json({ error: 'Not applicable on Windows' });
+  }
+
+  const { password } = req.body ?? {};
+  if (!password || typeof password !== 'string') {
+    return res.status(400).json({ error: 'Password is required' });
+  }
+
+  // Resolve nginx binary path
+  const whichResult = await run('which nginx');
+  if (!whichResult.success || !whichResult.stdout.trim()) {
+    return res.status(500).json({ error: 'nginx not found. Is nginx installed?' });
+  }
+  const nginxPath = whichResult.stdout.trim().split('\n')[0].trim();
+  const user = os.userInfo().username;
+
+  // Build sudoers rules with the detected nginx path
+  const sudoRules = [
+    '/usr/bin/systemctl start nginx',
+    '/usr/bin/systemctl stop nginx',
+    '/usr/bin/systemctl reload nginx',
+    '/usr/bin/systemctl restart nginx',
+    '/usr/bin/systemctl',
+    nginxPath,
+    `${nginxPath} -t`,
+    `${nginxPath} -s reload`,
+    `${nginxPath} -s stop`,
+    `${nginxPath} -s quit`,
+    '/usr/bin/certbot',
+    '/usr/bin/mkdir',
+    '/usr/bin/cp',
+    '/usr/bin/chmod',
+    '/usr/bin/chown',
+    '/usr/bin/tee',
+  ].join(', ');
+
+  const sudoersContent = `${user} ALL=(ALL) NOPASSWD: ${sudoRules}\n`;
+
+  // Write content to a temp file (no sudo needed for /tmp)
+  const tmpFile = path.join('/tmp', `easy-devops-sudoers-${Date.now()}`);
+  try {
+    await fs.writeFile(tmpFile, sudoersContent, { mode: 0o600 });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to write temp file', output: err.message });
+  }
+
+  // Run all setup steps in a single sudo -S invocation
+  const setupCmd = [
+    `mkdir -p /etc/easy-devops /var/log/easy-devops`,
+    `chown ${user}:${user} /etc/easy-devops /var/log/easy-devops`,
+    `chown -R ${user}:${user} /etc/nginx/conf.d 2>/dev/null || true`,
+    `cp '${tmpFile}' /etc/sudoers.d/easy-devops`,
+    `chmod 440 /etc/sudoers.d/easy-devops`,
+  ].join(' && ');
+
+  const result = await runSudoS(setupCmd, password);
+  await fs.unlink(tmpFile).catch(() => {});
+
+  if (!result.success) {
+    const output = result.stderr || result.stdout;
+    const wrongPassword = output.includes('incorrect password') || output.includes('Sorry, try again') || output.includes('3 incorrect');
+    return res.status(wrongPassword ? 401 : 500).json({
+      error: wrongPassword ? 'Incorrect password' : 'Setup failed',
+      output,
+    });
+  }
+
+  res.json({ success: true });
 });
 
 export default router;

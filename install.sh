@@ -490,7 +490,7 @@ if [ "$_allOK" = "true" ]; then
   printf '  To use immediately in this terminal, run:\n'
   printf '    source ~/.bashrc\n\n'
   printf '  Or open a new terminal, then run:\n'
-  printf '    easy-devops\n'
+  printf '    easy-devops\n or  ezz\n'
 else
   printf '  Some steps need attention -- see warnings above.\n\n'
   printf '  Fallback:\n'

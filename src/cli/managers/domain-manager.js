@@ -20,7 +20,7 @@ import { loadConfig } from '../../core/config.js';
 import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../../dashboard/lib/domains-db.js';
 import { generateConf, buildConf } from '../../core/nginx-conf-generator.js';
 import { issueCert } from './ssl-manager.js';
-import { isWindows, nginxTestCmd, nginxReloadCmd, combineOutput } from '../../core/platform.js';
+import { isWindows, nginxTestCmd, nginxReloadCmd, combineOutput, isNginxTestOk } from '../../core/platform.js';
 
 // ─── List Domains ───────────────────────────────────────────────────────
 
@@ -300,9 +300,10 @@ async function addDomainAction() {
   }
 
   spinner.text = 'Testing config...';
-  const testResult = await run(nginxTestCmd(nginxDir), { cwd: nginxDir });
+  const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
+  const testResult = await run(testCmd, { cwd: nginxDir });
 
-  if (!testResult.success) {
+  if (!isNginxTestOk(testResult)) {
     spinner.fail('Config test failed');
     console.log(chalk.red('\n' + combineOutput(testResult)));
     // Clean up failed config
@@ -376,9 +377,10 @@ async function editDomainAction() {
   }
 
   spinner.text = 'Testing config...';
-  const testResult = await run(nginxTestCmd(nginxDir), { cwd: nginxDir });
+  const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
+  const testResult = await run(testCmd, { cwd: nginxDir });
 
-  if (!testResult.success) {
+  if (!isNginxTestOk(testResult)) {
     spinner.fail('Config test failed');
     console.log(chalk.red('\n' + combineOutput(testResult)));
     return;
@@ -451,8 +453,9 @@ async function reloadNginxAfterChange() {
   const { nginxDir } = loadConfig();
   const spinner = ora('Reloading nginx...').start();
 
-  const testResult = await run(nginxTestCmd(nginxDir), { cwd: nginxDir });
-  if (!testResult.success) {
+  const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
+  const testResult = await run(testCmd, { cwd: nginxDir });
+  if (!isNginxTestOk(testResult)) {
     spinner.fail('Config test failed');
     console.log(chalk.red('\n' + combineOutput(testResult)));
     return false;
@@ -526,8 +529,9 @@ async function toggleDomainAction() {
     } else {
       await fs.rename(disabledPath, enabledPath);
       // Test config before reload
-      const testResult = await run(nginxTestCmd(nginxDir), { cwd: nginxDir });
-      if (!testResult.success) {
+      const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
+  const testResult = await run(testCmd, { cwd: nginxDir });
+      if (!isNginxTestOk(testResult)) {
         await fs.rename(enabledPath, disabledPath).catch(() => {});
         spinner.fail('Config test failed — rolled back');
         console.log(chalk.red('\n' + combineOutput(testResult)));

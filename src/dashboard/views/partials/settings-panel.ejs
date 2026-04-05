@@ -65,4 +65,37 @@
 </div>
 </div>
 </div>
+
+<!-- Linux Permissions card (hidden on Windows) -->
+<div v-if="settings.platform !== 'win32'" class="stat-card overflow-hidden relative mt-6">
+  <div class="absolute top-0 left-0 w-full h-1" :class="permissions.configured ? 'bg-green-500/40' : 'bg-yellow-500/40'"></div>
+  <div class="p-6 border-b border-border/50 bg-black/5 dark:bg-white/5 flex items-center justify-between">
+    <div>
+      <h3 class="form-label !mb-0 font-bold">Linux Permissions</h3>
+      <p class="text-[11px] text-muted mt-1 font-bold tracking-wide uppercase opacity-70">Passwordless sudo for nginx and systemctl</p>
+    </div>
+    <span v-if="permissions.configured" class="text-green-500 text-xs font-bold px-2.5 py-1 rounded-lg bg-green-500/10 border border-green-500/20">✓ Configured</span>
+    <span v-else class="text-yellow-500 text-xs font-bold px-2.5 py-1 rounded-lg bg-yellow-500/10 border border-yellow-500/20">⚠ Required</span>
+  </div>
+  <div class="p-8 bg-background">
+    <p v-if="permissions.configured" class="text-sm text-muted">Passwordless sudo is configured. The dashboard can manage nginx and systemctl without prompting for a password.</p>
+    <div v-else>
+      <p class="text-sm text-muted mb-6">The dashboard needs passwordless sudo to control nginx and systemctl. Enter your sudo password once to configure it.</p>
+      <div class="w-full max-w-md">
+        <label class="form-label">Sudo Password</label>
+        <input v-model="permissions.password" type="password" class="form-input" placeholder="Enter your sudo password" @keyup.enter="setupPermissions" />
+      </div>
+    </div>
+  </div>
+  <div v-if="!permissions.configured" class="p-5 border-t border-border bg-black/5 dark:bg-white/5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+    <button @click="setupPermissions" :disabled="permissions.loading || !permissions.password" class="btn btn-primary min-w-[180px] shadow-sm">
+      <svg v-if="permissions.loading" class="w-4 h-4 animate-spin -ml-1 mr-2 inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
+      {{ permissions.loading ? 'Setting up...' : 'Setup Permissions' }}
+    </button>
+    <div>
+      <span v-if="permissions.msg" class="text-green-500 text-[13px] font-bold px-3 py-1.5 rounded-[10px] bg-green-500/10 border border-green-500/20">{{ permissions.msg }}</span>
+      <span v-if="permissions.error" class="text-red-500 text-[13px] font-bold px-3 py-1.5 rounded-[10px] bg-red-500/10 border border-red-500/20">{{ permissions.error }}</span>
+    </div>
+  </div>
+</div>
 </div>

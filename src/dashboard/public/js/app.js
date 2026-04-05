@@ -108,6 +108,10 @@ createApp({
         password: '', loading: false, msg: '', error: '',
         platform: 'linux', // T022: Platform from settings API
       },
+
+      permissions: {
+        configured: false, loading: false, password: '', msg: '', error: '',
+      },
     };
   },
 
@@ -254,7 +258,7 @@ createApp({
         await Promise.all([this.loadNginxStatus(), this.loadNginxConfigs(), this.loadNginxLogs()]);
       } else if (p === 'ssl') { await this.loadSSL(); }
       else if (p === 'domains') { await this.loadDomains(); }
-      else if (p === 'settings') { await this.loadSettings(); }
+      else if (p === 'settings') { await Promise.all([this.loadSettings(), this.loadPermissionsStatus()]); }
     },
 
     // ── Collapsible Sections ────────────────────────────────────────────
@@ -704,6 +708,25 @@ createApp({
         this.settings.sslDir = r.data.sslDir;
         this.settings.acmeEmail = r.data.acmeEmail || '';
         this.settings.platform = r.data.platform || 'linux'; // T022
+      }
+    },
+
+    async loadPermissionsStatus() {
+      if (this.settings.platform === 'win32') { this.permissions.configured = true; return; }
+      const r = await this.api('GET', '/api/settings/permissions');
+      if (r.ok) this.permissions.configured = r.data.configured;
+    },
+
+    async setupPermissions() {
+      this.permissions.loading = true; this.permissions.msg = ''; this.permissions.error = '';
+      const r = await this.api('POST', '/api/settings/permissions/setup', { password: this.permissions.password });
+      this.permissions.loading = false;
+      if (r.ok) {
+        this.permissions.configured = true;
+        this.permissions.msg = 'Permissions configured ✓';
+        this.permissions.password = '';
+      } else {
+        this.permissions.error = r.data?.error || 'Setup failed';
       }
     },
 
