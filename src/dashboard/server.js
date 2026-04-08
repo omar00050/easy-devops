@@ -1,12 +1,17 @@
 import { createServer } from 'http';
+import { createRequire } from 'module';
 import express from 'express';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import os from 'os';
 import crypto from 'crypto';
 import session from 'express-session';
 import { Server as SocketIO } from 'socket.io';
 import { loadConfig } from '../core/config.js';
 import { dbGet, dbSet } from '../core/db.js';
+
+const require = createRequire(import.meta.url);
+const FileStore = require('session-file-store')(session);
 import authRouter from './routes/auth.js';
 import domainsRouter from './routes/domains.js';
 import sslRouter from './routes/ssl.js';
@@ -31,10 +36,16 @@ if (!sessionSecret) {
   dbSet('session_secret', sessionSecret);
 }
 
+// Sessions stored on disk so they survive restarts
+const SESSION_DIR = process.platform === 'win32'
+  ? path.join(process.env.APPDATA || os.homedir(), 'easy-devops', 'sessions')
+  : path.join(os.homedir(), '.config', 'easy-devops', 'sessions');
+
 app.use(session({
   secret: sessionSecret,
   resave: false,
   saveUninitialized: false,
+  store: new FileStore({ path: SESSION_DIR, retries: 1, logFn() {} }),
   cookie: { httpOnly: true },
 }));
 

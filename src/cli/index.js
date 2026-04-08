@@ -24,6 +24,18 @@ if (process.argv[2] === 'system-info') {
   process.exit(0);
 }
 
+// ─── Detection cache — only re-run if stale (>60s) ───────────────────────────
+const DETECTION_TTL_MS = 60_000;
+let lastDetectionAt = 0;
+
+async function runDetectionIfStale() {
+  const now = Date.now();
+  if (now - lastDetectionAt >= DETECTION_TTL_MS) {
+    await runDetection();
+    lastDetectionAt = now;
+  }
+}
+
 function renderBanner() {
   const c = chalk.hex('#d64a29');
   const dim = chalk.hex('#d64a29').dim;
@@ -90,7 +102,7 @@ async function dispatch(choice) {
 async function main() {
   while (true) {
     const spinner = ora('Checking system…').start();
-    await runDetection();
+    await runDetectionIfStale();
     spinner.stop();
 
     try {

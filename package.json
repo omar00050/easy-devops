@@ -62,6 +62,7 @@
     "good.db": "^2.4.6",
     "inquirer": "^9.2.12",
     "ora": "^7.0.1",
+    "session-file-store": "^1.5.0",
     "socket.io": "^4.8.3"
   }
 }
