@@ -124,7 +124,20 @@ createApp({
         password: '', loading: false, msg: '', error: '',
         platform: 'linux', // T022: Platform from settings API
       },
-      settingsTab: 'general', // 'general' | 'notifications'
+      settingsTab: 'general', // 'general' | 'notifications' | 'hub'
+
+      hub: {
+        loading: false,
+        status: {
+          linked: false, connected: false, status: 'not_linked',
+          hubUrl: null, serverId: null, permissions: {},
+          lastError: null, attempts: 0,
+        },
+        form: { connectionString: '' },
+        msg: '',
+        error: '',
+        pollTimer: null,
+      },
 
       permissions: {
         configured: false, loading: false, password: '', msg: '', error: '',
@@ -325,7 +338,7 @@ createApp({
       } else if (p === 'ssl') { await this.loadSSL(); }
       else if (p === 'domains') { await this.loadDomains(); }
       else if (p === 'logs') { this.subscribeToLogs(this.logs.activeLog); }
-      else if (p === 'settings') { await Promise.all([this.loadSettings(), this.loadPermissionsStatus(), this.loadChannels()]); }
+      else if (p === 'settings') { await Promise.all([this.loadSettings(), this.loadPermissionsStatus(), this.loadChannels(), this.loadHubStatus()]); }
     },
 
     // ── Collapsible Sections ────────────────────────────────────────────
@@ -794,6 +807,103 @@ createApp({
       if (this.settings.platform === 'win32') { this.permissions.configured = true; return; }
       const r = await this.api('GET', '/api/settings/permissions');
       if (r.ok) this.permissions.configured = r.data.configured;
+    },
+
+    // ── Hub ──────────────────────────────────────────────────────────────────────
+    hubStatusLabel() {
+      const map = {
+        not_linked:  'Not linked',
+        connecting:  'Connecting…',
+        connected:   'Online',
+        rejected:    'Rejected by hub',
+        unreachable: 'Hub unreachable',
+      };
+      return map[this.hub.status.status] || 'Unknown';
+    },
+
+    hubStatusDotClass() {
+      const map = {
+        connected:   'bg-green-500',
+        connecting:  'bg-yellow-500',
+        unreachable: 'bg-yellow-500',
+        rejected:    'bg-red-500',
+        not_linked:  'bg-slate-500',
+      };
+      return map[this.hub.status.status] || 'bg-slate-500';
+    },
+
+    async loadHubStatus() {
+      const r = await this.api('GET', '/api/hub/status');
+      if (r.ok) {
+        this.hub.status = {
+          linked: r.data.linked,
+          connected: r.data.connected,
+          status: r.data.status || 'not_linked',
+          hubUrl: r.data.hubUrl,
+          serverId: r.data.serverId,
+          permissions: r.data.permissions || { reloadNginx: false, manageDomains: false, manageSSL: false },
+          lastError: r.data.lastError || null,
+          attempts: r.data.attempts || 0,
+        };
+        // Keep polling only while the outcome is still undecided.
+        if (this.hub.status.status === 'connecting') this.scheduleHubPoll();
+        else this.stopHubPoll();
+      }
+    },
+
+    scheduleHubPoll() {
+      this.stopHubPoll();
+      this.hub.pollTimer = setTimeout(() => this.loadHubStatus(), 2000);
+    },
+
+    stopHubPoll() {
+      if (this.hub.pollTimer) {
+        clearTimeout(this.hub.pollTimer);
+        this.hub.pollTimer = null;
+      }
+    },
+
+    async connectHubAgent() {
+      this.hub.loading = true;
+      this.hub.msg = '';
+      this.hub.error = '';
+      const r = await this.api('POST', '/api/hub/connect', {
+        connectionString: this.hub.form.connectionString,
+      });
+      this.hub.loading = false;
+      if (r.ok) {
+        this.hub.form.connectionString = '';
+        this.hub.msg = 'Connection string saved. Connecting to the hub…';
+        await this.loadHubStatus();
+      } else {
+        this.hub.error = r.data?.error || 'Failed to connect to the hub';
+      }
+    },
+
+    async unlinkHub() {
+      if (!confirm('Unlink this server from the hub? The hub will stop receiving data from this server.')) return;
+      this.hub.loading = true;
+      this.hub.msg = '';
+      this.hub.error = '';
+      const r = await this.api('DELETE', '/api/hub/link');
+      this.hub.loading = false;
+      if (r.ok) {
+        this.stopHubPoll();
+        this.hub.status = {
+          linked: false, connected: false, status: 'not_linked',
+          hubUrl: null, serverId: null, permissions: {},
+          lastError: null, attempts: 0,
+        };
+        this.hub.form.connectionString = '';
+        this.hub.msg = 'Unlinked from hub.';
+      }
+    },
+
+    async saveHubPermissions() {
+      const r = await this.api('PUT', '/api/hub/permissions', this.hub.status.permissions);
+      if (r.ok) {
+        this.hub.status.permissions = r.data.permissions;
+      }
     },
 
     async loadChannels() {

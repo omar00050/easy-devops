@@ -25,6 +25,14 @@
 				: 'text-muted hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5'">
 			🔔 Notifications
 		</button>
+		<button
+			@click="settingsTab = 'hub'"
+			class="flex-1 px-4 py-2.5 text-sm font-semibold rounded-[8px] transition-all"
+			:class="settingsTab === 'hub'
+				? 'bg-primary text-white shadow-sm'
+				: 'text-muted hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5'">
+			🌐 Hub
+		</button>
 	</div>
 
 	<!-- Tab Content: General Settings -->
@@ -201,6 +209,101 @@
 						</div>
 					</div>
 				</div>
+			</div>
+		</div>
+	</div>
+
+	<!-- Tab Content: Hub -->
+	<div v-show="settingsTab === 'hub'" class="space-y-6">
+
+		<!-- Hub Connection card -->
+		<div class="stat-card overflow-hidden relative">
+			<div class="absolute top-0 left-0 w-full h-1" :class="hub.status.status === 'connected' ? 'bg-green-500/40' : (hub.status.status === 'rejected' ? 'bg-red-500/40' : 'bg-yellow-500/40')"></div>
+			<div class="p-6 border-b border-border/50 bg-black/5 dark:bg-white/5">
+				<h3 class="form-label !mb-0 font-bold">Easy DevOps Hub</h3>
+				<p class="text-[11px] text-muted mt-1 font-bold tracking-wide uppercase opacity-70">Monitor and control this server from a central dashboard</p>
+			</div>
+
+			<!-- Not linked state — paste the string the hub issued -->
+			<div v-if="!hub.status.linked" class="p-8 space-y-6 bg-background">
+				<div class="space-y-2">
+					<p class="text-sm text-muted">Add this server in the Hub first, then paste the connection string it gives you.</p>
+					<ol class="text-[13px] text-muted list-decimal list-inside space-y-1">
+						<li>Open your Hub dashboard → <span class="font-semibold text-foreground">Add Server</span></li>
+						<li>Enter a display name and submit</li>
+						<li>Copy the connection string the Hub shows you</li>
+						<li>Paste it below and click Connect</li>
+					</ol>
+				</div>
+				<div class="w-full max-w-md space-y-4">
+					<div>
+						<label class="form-label">Connection String</label>
+						<textarea v-model.trim="hub.form.connectionString" class="form-input font-mono text-xs h-20 resize-none"
+							placeholder="ezops://https://hub.example.com|server-id|secret"></textarea>
+						<p class="text-[11px] text-muted mt-1 font-bold tracking-wide uppercase opacity-70">
+							Shown only once by the Hub. Treat it like a password.
+						</p>
+					</div>
+					<button @click="connectHubAgent" :disabled="hub.loading || !hub.form.connectionString" class="btn btn-primary min-w-[140px]">
+						<svg v-if="hub.loading" class="w-4 h-4 animate-spin -ml-1 mr-2 inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
+						{{ hub.loading ? 'Connecting...' : 'Connect' }}
+					</button>
+				</div>
+			</div>
+
+			<!-- Linked state -->
+			<div v-else class="p-8 space-y-6 bg-background">
+				<div class="flex items-center gap-3 flex-wrap">
+					<span :class="hubStatusDotClass()" class="w-2.5 h-2.5 rounded-full"></span>
+					<span class="text-sm font-semibold">{{ hubStatusLabel() }}</span>
+					<span class="text-xs text-muted">{{ hub.status.hubUrl }}</span>
+				</div>
+
+				<!-- Why we are not connected -->
+				<div v-if="hub.status.lastError" class="px-4 py-3 rounded-[10px] text-[13px] border"
+					:class="hub.status.status === 'rejected'
+						? 'bg-red-500/10 border-red-500/20 text-red-500'
+						: 'bg-yellow-500/10 border-yellow-500/20 text-yellow-600 dark:text-yellow-500'">
+					{{ hub.status.lastError }}
+				</div>
+
+				<!-- Rejected: only a new string can fix this, so offer the input here -->
+				<div v-if="hub.status.status === 'rejected'" class="w-full max-w-md space-y-3 pt-2 border-t border-border/50">
+					<label class="form-label">Paste a new connection string</label>
+					<textarea v-model.trim="hub.form.connectionString" class="form-input font-mono text-xs h-20 resize-none"
+						placeholder="ezops://https://hub.example.com|server-id|secret"></textarea>
+					<button @click="connectHubAgent" :disabled="hub.loading || !hub.form.connectionString" class="btn btn-primary">
+						{{ hub.loading ? 'Connecting...' : 'Reconnect' }}
+					</button>
+				</div>
+
+				<div class="space-y-3">
+					<p class="text-xs font-bold uppercase tracking-wide text-muted">Allow Hub To</p>
+					<label class="flex items-center gap-3 cursor-pointer">
+						<input type="checkbox" v-model="hub.status.permissions.reloadNginx" @change="saveHubPermissions" class="w-4 h-4" />
+						<span class="text-sm">Reload Nginx</span>
+					</label>
+					<label class="flex items-center gap-3 cursor-pointer">
+						<input type="checkbox" v-model="hub.status.permissions.manageDomains" @change="saveHubPermissions" class="w-4 h-4" />
+						<span class="text-sm">Manage Domains</span>
+					</label>
+					<label class="flex items-center gap-3 cursor-pointer">
+						<input type="checkbox" v-model="hub.status.permissions.manageSSL" @change="saveHubPermissions" class="w-4 h-4" />
+						<span class="text-sm">Manage SSL</span>
+					</label>
+				</div>
+
+				<button @click="unlinkHub" :disabled="hub.loading" class="btn btn-secondary text-red-500 border-red-500/30 hover:bg-red-500/10">
+					Unlink from Hub
+				</button>
+			</div>
+
+			<!-- Messages -->
+			<div v-if="hub.msg" class="px-8 pb-6">
+				<span class="text-green-500 text-[13px] font-bold px-3 py-1.5 rounded-[10px] bg-green-500/10 border border-green-500/20">{{ hub.msg }}</span>
+			</div>
+			<div v-if="hub.error" class="px-8 pb-6">
+				<span class="text-red-500 text-[13px] font-bold px-3 py-1.5 rounded-[10px] bg-red-500/10 border border-red-500/20">{{ hub.error }}</span>
 			</div>
 		</div>
 	</div>

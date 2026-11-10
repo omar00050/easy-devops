@@ -94,3 +94,75 @@ export function validatePositiveInteger(val, field) {
   }
   return null;
 }
+
+/**
+ * Validates the hub URL portion of a connection string.
+ * Accepts an http/https URL or a bare host, optionally with a port.
+ * @param {string} hubUrl
+ * @returns {string|null}
+ */
+export function validateHubUrl(hubUrl) {
+  if (!hubUrl || typeof hubUrl !== 'string') {
+    return 'Hub URL is required';
+  }
+  if (hubUrl !== hubUrl.trim()) {
+    return 'Hub URL must not have leading or trailing spaces';
+  }
+
+  // Bare hosts are allowed; the agent defaults them to https.
+  const candidate = /^https?:\/\//i.test(hubUrl) ? hubUrl : `https://${hubUrl}`;
+
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return 'Invalid hub URL';
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return 'Hub URL must use http or https';
+  }
+  if (!parsed.hostname) {
+    return 'Hub URL is missing a host';
+  }
+
+  return null;
+}
+
+/**
+ * Validates an Easy DevOps Hub connection string.
+ * Expected format: ezops://<hubUrl>|<serverId>|<secret>
+ *
+ * Note: this only checks shape. Whether the hub recognises the serverId and
+ * secret is decided by the hub during the agent handshake.
+ *
+ * @param {string} str
+ * @returns {string|null} Error message, or null if valid
+ */
+export function validateConnectionString(str) {
+  if (!str || typeof str !== 'string') {
+    return 'Connection string is required';
+  }
+
+  const trimmed = str.trim();
+  const PREFIX = 'ezops://';
+
+  if (!trimmed.toLowerCase().startsWith(PREFIX)) {
+    return 'Connection string must start with ezops://';
+  }
+
+  const parts = trimmed.slice(PREFIX.length).split('|');
+  if (parts.length !== 3) {
+    return 'Connection string must have the form ezops://hubUrl|serverId|secret';
+  }
+
+  const [hubUrl, serverId, secret] = parts.map((part) => part.trim());
+
+  const hubUrlError = validateHubUrl(hubUrl);
+  if (hubUrlError) return hubUrlError;
+
+  if (!serverId) return 'Connection string is missing the server ID';
+  if (!secret) return 'Connection string is missing the secret';
+
+  return null;
+}

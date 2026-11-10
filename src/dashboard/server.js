@@ -13,7 +13,9 @@ import domainsRouter from './routes/domains.js';
 import sslRouter from './routes/ssl.js';
 import nginxRouter from './routes/nginx.js';
 import settingsRouter from './routes/settings.js';
+import hubRouter from './routes/hub.js';
 import { initSocket } from './socketManager.js';
+import { initHubAgent } from './lib/hubAgent.js';
 
 const require = createRequire(import.meta.url);
 const FileStore = require('session-file-store')(session);
@@ -56,6 +58,7 @@ app.use('/api/domains', domainsRouter);
 app.use('/api/ssl', sslRouter);
 app.use('/api/nginx', nginxRouter);
 app.use('/api', settingsRouter);
+app.use('/api/hub', hubRouter);
 
 // Render EJS template for all other routes
 app.use((req, res) => res.render('index'));
@@ -64,6 +67,9 @@ app.use((req, res) => res.render('index'));
 
 const httpServer = createServer(app);
 initSocket(httpServer);
+
+// Start hub agent if a link is configured
+initHubAgent();
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
