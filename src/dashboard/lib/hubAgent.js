@@ -7,17 +7,30 @@ import os from 'os';
 import { dbGet } from '../../core/db.js';
 import { loadConfig } from '../../core/config.js';
 import { run } from '../../core/shell.js';
-import { getStatus, start as nginxStart, stop as nginxStop, restart as nginxRestart, test as nginxTest, listConfigs, getConfig, getLogs } from './nginx-service.js';
+import { getStatus, start as nginxStart, stop as nginxStop, restart as nginxRestart, test as nginxTest, reload as nginxReload, listConfigs, getConfig, saveConfig, getLogs } from './nginx-service.js';
+import { emitLocalChange } from '../socketManager.js';
+import { isWindows, platformName } from '../../core/platform.js';
 import { listAllCerts } from './cert-reader.js';
+import * as serviceCore from '../../core/service.js';
+import * as runner from '../../core/runner.js';
 import { loadChannels } from '../../core/notifier.js';
 import {
   getHubLink,
   getHubPermissions,
+  getHubRevision,
   resolveHubOrigin,
   isAuthRejection,
   describeRejection,
   HUB_AGENT_STATUS,
 } from '../../core/hubLink.js';
+import {
+  PERMISSION_TREE,
+  COMING_SOON_PERMISSION_IDS,
+  checkCommandAllowed,
+} from '../../core/hubPermissions.js';
+
+/** How often the agent checks the shared revision counter. */
+const REVISION_POLL_MS = 3_000;
 
 // Network retries back off from 1s up to this cap.
 const RECONNECT_DELAY_MIN = 1_000;
@@ -25,6 +38,13 @@ const RECONNECT_DELAY_MAX = 60_000;
 
 let socket = null;
 let intervals = [];
+
+// socket.io-client does NOT auto-reconnect after a server-initiated
+// disconnect ("io server disconnect"), which is exactly what the hub does when
+// the shared secret is rotated. We re-dial manually on our own backoff so the
+// agent learns whether its credentials are still valid instead of sitting idle.
+let rejoinTimer = null;
+let rejoinDelay = 0;
 
 // ─── Connection status ─────────────────────────────────────────────────────────
 // Mirrors the five states in core/hubLink.js. `lastError` is a human-readable
@@ -58,7 +78,6 @@ function getCpuPercent() {
 
 async function getDiskPercent() {
   try {
-    const isWindows = process.platform === 'win32';
     const cmd = isWindows
       ? `(Get-PSDrive C | Select-Object -ExpandProperty Used) / ((Get-PSDrive C | Select-Object -ExpandProperty Used) + (Get-PSDrive C | Select-Object -ExpandProperty Free)) * 100`
       : `df / | awk 'NR==2 {print $5}' | tr -d '%'`;
@@ -117,6 +136,69 @@ async function pushChannelsList() {
   } catch { /* non-fatal */ }
 }
 
+/**
+ * Reports whether the dashboard is running as a background service.
+ *
+ * This is what lets the Hub say "offline means really down": if the dashboard
+ * runs under PM2 with start-on-boot arranged, an agent that stops reporting is
+ * a genuine outage rather than someone having closed a terminal.
+ *
+ * Deliberately cheap and side-effect free — service.status() never starts the
+ * PM2 daemon, so a server that does not use PM2 is not given one just because
+ * it is paired with a Hub.
+ */
+async function pushServiceState() {
+  if (!socket?.connected) return;
+  try {
+    const s = await serviceCore.status();
+    socket.emit('service:state', {
+      installed: s.installed,
+      running: s.running,
+      status: s.status,
+      enabledOnBoot: s.enabledOnBoot,
+      bootMode: s.bootMode,
+      appName: s.appName,
+      dev: s.dev,
+      pm2Installed: s.pm2.installed,
+      pm2Version: s.pm2.version,
+      sameUser: s.sameUser,
+      appUser: s.appUser,
+      restarts: s.app?.restarts ?? 0,
+      uptimeMs: s.app?.uptimeMs ?? null,
+    });
+  } catch { /* non-fatal */ }
+}
+
+/**
+ * Reports the PM2 process list, as read-only telemetry.
+ *
+ * Monitoring is never gated in this project's permission catalog — a paired
+ * server is a monitored server. Acting on a process from the Hub is a separate
+ * matter and is still `comingSoon` in the tree (process.start/stop/restart).
+ *
+ * Skipped entirely when the PM2 daemon is not running, so that reporting never
+ * starts one.
+ */
+async function pushProcesses() {
+  if (!socket?.connected) return;
+  try {
+    if (!runner.isDaemonRunning()) {
+      socket.emit('processes:list', { daemonRunning: false, apps: [] });
+      return;
+    }
+    const pm2 = await runner.detect({ probeVersion: false });
+    if (!pm2.installed) {
+      socket.emit('processes:list', { daemonRunning: false, apps: [] });
+      return;
+    }
+    const listed = await runner.list({ pm2Path: pm2.path ?? 'pm2' });
+    socket.emit('processes:list', {
+      daemonRunning: true,
+      apps: listed.ok ? listed.apps : [],
+    });
+  } catch { /* non-fatal */ }
+}
+
 async function pushCertExpiry() {
   if (!socket?.connected) return;
   try {
@@ -130,37 +212,78 @@ async function pushCertExpiry() {
 }
 
 // ─── Command handlers ──────────────────────────────────────────────────────────
+//
+// Every command goes through runCommand(), which performs the local permission
+// check against core/hubPermissions.js and always replies with command:result.
+// The local check is the real security gate: the Hub's own copy of the
+// permissions is only a UI hint and is never trusted here.
 
 function getPermissions() {
   return getHubPermissions();
 }
 
-async function handleReloadNginx() {
-  if (!getPermissions().reloadNginx) return;
-  const isWindows = process.platform === 'win32';
-  const cmd = isWindows ? 'nginx -s reload' : 'sudo -n systemctl reload nginx';
-  await run(cmd, { timeout: 15000 });
+/** Emits the acknowledgement the Hub and its browser clients wait for. */
+function sendResult(requestId, ok, { error = null, data = null } = {}) {
+  if (!requestId || !socket?.connected) return;
+  socket.emit('command:result', { requestId, ok, error, data });
+}
+
+/**
+ * Runs one hub command: permission check, execution, acknowledgement.
+ *
+ * @param {string} command
+ * @param {Object} payload  May carry a requestId added by the Hub
+ * @param {(payload: Object) => Promise<Object|void>} fn
+ */
+async function runCommand(command, payload, fn) {
+  const requestId = payload?.requestId ?? null;
+
+  const verdict = checkCommandAllowed(command, payload, getPermissions());
+  if (!verdict.allowed) {
+    console.warn('[hubAgent] refused', command, '-', verdict.reason);
+    sendResult(requestId, false, { error: verdict.reason });
+    return;
+  }
+
+  try {
+    const data = await fn(payload ?? {});
+    sendResult(requestId, true, { data: data ?? null });
+  } catch (err) {
+    console.error('[hubAgent]', command, 'failed:', err.message);
+    sendResult(requestId, false, { error: err.message });
+  }
+}
+
+async function handleReloadNginx(payload) {
+  return runCommand('hub:reloadNginx', payload, async () => {
+    // Reuse the dashboard's reload path instead of rebuilding the command
+    // here: it resolves the nginx.exe path on Windows and uses `sudo -n`.
+    const r = await nginxReload();
+    pushNginxStatus();
+    notifyLocalDashboard('nginx');
+    if (!r?.success) throw new Error(r?.output || 'nginx reload failed');
+    return { output: r.output ?? '' };
+  });
 }
 
 async function handleNginxAction(payload) {
-  if (!getPermissions().reloadNginx) return;
-  const { action } = payload ?? {};
-  try {
-    if (action === 'start') await nginxStart();
-    else if (action === 'stop') await nginxStop();
-    else if (action === 'restart') await nginxRestart();
-    else if (action === 'test') await nginxTest();
-    else { console.warn('[hubAgent] unknown nginx action:', action); return; }
-    console.log('[hubAgent] nginx action:', action, 'OK');
-  } catch (err) {
-    console.error('[hubAgent] nginx action failed:', action, err.message);
-  }
-  pushNginxStatus();
+  return runCommand('hub:nginxAction', payload, async ({ action }) => {
+    const actions = {
+      start: nginxStart, stop: nginxStop, restart: nginxRestart, test: nginxTest,
+    };
+    const fn = actions[action];
+    if (!fn) throw new Error(`Unknown nginx action: ${action}`);
+
+    const r = await fn();
+    pushNginxStatus();
+    notifyLocalDashboard('nginx');
+    if (r && r.success === false) throw new Error(r.output || `nginx ${action} failed`);
+    return { action, output: r?.output ?? '' };
+  });
 }
 
-async function handleGetConfigs() {
-  if (!socket?.connected) return;
-  try {
+async function handleGetConfigs(payload) {
+  return runCommand('hub:getConfigs', payload, async () => {
     const files = await listConfigs();
     const configs = [];
     for (const f of files) {
@@ -169,47 +292,138 @@ async function handleGetConfigs() {
         configs.push({ name: f, content: result.content });
       } catch { configs.push({ name: f, content: '' }); }
     }
-    socket.emit('nginx:configs', configs);
-  } catch (err) {
-    console.error('[hubAgent] getConfigs error:', err.message);
-  }
+    if (socket?.connected) socket.emit('nginx:configs', configs);
+    return { count: configs.length };
+  });
+}
+
+async function handleSaveConfig(payload) {
+  return runCommand('hub:saveConfig', payload, async ({ filename, content }) => {
+    if (typeof filename !== 'string' || !filename.trim()) throw new Error('filename is required');
+    if (typeof content !== 'string') throw new Error('content must be a string');
+
+    // saveConfig() validates the filename, keeps the write inside the nginx
+    // config directory, tests with isNginxTestOk() and restores the previous
+    // bytes when nginx rejects the result.
+    const r = await saveConfig(filename, content);
+    if (!r?.success) throw new Error(r?.output || 'nginx rejected the config');
+
+    pushNginxStatus();
+    pushDomainConfigs();
+    notifyLocalDashboard('nginx');
+    return { filename, output: r.output ?? '' };
+  });
 }
 
 async function handleGetLogs(payload) {
-  if (!socket?.connected) return;
-  try {
-    const result = await getLogs(payload?.lines ?? 200);
-    socket.emit('nginx:logs', result);
-  } catch (err) {
-    console.error('[hubAgent] getLogs error:', err.message);
-  }
+  return runCommand('hub:getLogs', payload, async ({ lines }) => {
+    const result = await getLogs(lines ?? 200);
+    if (socket?.connected) socket.emit('nginx:logs', result);
+    return { lines: result?.lines?.length ?? 0 };
+  });
 }
 
 async function handleManageDomain(payload) {
-  if (!getPermissions().manageDomains) return;
-  const { handleHubDomainCommand } = await import('./domains-db.js');
-  await handleHubDomainCommand(payload);
-  // Re-sync configs to hub immediately after any domain mutation
-  pushDomainHealth();
-  pushDomainConfigs();
+  return runCommand('hub:manageDomain', payload, async (p) => {
+    const { handleHubDomainCommand } = await import('./domains-db.js');
+    const result = await handleHubDomainCommand(p);
+    if (result && result.ok === false) throw new Error(result.error || 'domain command failed');
+
+    // Re-sync to the hub and refresh any open local dashboard tab.
+    pushDomainHealth();
+    pushDomainConfigs();
+    notifyLocalDashboard('domains');
+    return result ?? null;
+  });
 }
 
 async function handleManageSSL(payload) {
-  if (!getPermissions().manageSSL) return;
-  const { handleHubSslCommand } = await import('./cert-operations.js');
-  await handleHubSslCommand(payload);
+  return runCommand('hub:manageSSL', payload, async (p) => {
+    const { handleHubSslCommand } = await import('./cert-operations.js');
+    const result = await handleHubSslCommand(p);
+    if (result && result.ok === false) throw new Error(result.error || 'ssl command failed');
+
+    pushCertExpiry();
+    pushDomainConfigs();
+    notifyLocalDashboard('ssl');
+    return result ?? null;
+  });
+}
+
+// ─── Permission + revision sync ───────────────────────────────────────────────
+
+/**
+ * Sends the permission catalog and the current state to the Hub.
+ * Called on connect and whenever permissions change, so the Hub UI can grey
+ * out actions immediately instead of waiting for a poll.
+ */
+export function pushPermissions() {
+  if (!socket?.connected) return;
+  try {
+    socket.emit('permissions:state', {
+      tree: PERMISSION_TREE,
+      permissions: getHubPermissions(),
+      comingSoon: COMING_SOON_PERMISSION_IDS,
+    });
+  } catch { /* non-fatal */ }
+}
+
+/**
+ * Watches the shared revision counter.
+ *
+ * The CLI runs in a different process from the agent, so an in-process event
+ * cannot reach here. core/hubLink.js bumps a counter in SQLite on every change
+ * the Hub should learn about; polling it is a cheap read and only triggers a
+ * push when it actually moved — far better than the old 5-minute interval.
+ */
+let lastRevision = -1;
+
+async function checkRevision() {
+  if (!socket?.connected) return;
+  try {
+    const rev = getHubRevision();
+    if (rev === lastRevision) return;
+    lastRevision = rev;
+
+    pushPermissions();
+    pushDomainConfigs();
+    pushDomainHealth();
+    pushCertExpiry();
+    pushServiceState();
+  } catch { /* non-fatal */ }
+}
+
+/**
+ * Tells the local dashboard's own browser tabs that something changed, so the
+ * open UI refreshes the affected section without a page reload.
+ * @param {'domains'|'ssl'|'nginx'} section
+ */
+function notifyLocalDashboard(section) {
+  try {
+    emitLocalChange(section);
+  } catch { /* socketManager may not be initialised */ }
 }
 
 // ─── Lifecycle ─────────────────────────────────────────────────────────────────
 
 function startHeartbeats() {
   stopHeartbeats(); // clear any existing intervals first
+
+  // Forget the revision we had last pushed. Anything could have changed while
+  // the socket was down, and the hub may have been restarted or re-seeded, so
+  // the next poll must be allowed to push even if the counter has not moved.
+  lastRevision = -1;
   intervals.push(setInterval(pushNginxStatus, 5_000));
   intervals.push(setInterval(pushResources, 30_000));
   intervals.push(setInterval(pushDomainHealth, 60_000));
   intervals.push(setInterval(pushDomainConfigs, 5 * 60_000));
   intervals.push(setInterval(pushChannelsList, 5 * 60_000));
   intervals.push(setInterval(pushCertExpiry, 12 * 60 * 60 * 1000));
+  // Both of these shell out to PM2, so they are deliberately infrequent.
+  intervals.push(setInterval(pushServiceState, 5 * 60_000));
+  intervals.push(setInterval(pushProcesses, 60_000));
+  // Cheap shared signal so CLI-side changes reach the Hub in seconds.
+  intervals.push(setInterval(checkRevision, REVISION_POLL_MS));
   // Push immediately on connect
   pushNginxStatus();
   pushResources();
@@ -217,11 +431,22 @@ function startHeartbeats() {
   pushDomainConfigs();
   pushChannelsList();
   pushCertExpiry();
+  pushPermissions();
+  pushServiceState();
+  pushProcesses();
 }
 
 function stopHeartbeats() {
   for (const id of intervals) clearInterval(id);
   intervals = [];
+}
+
+function cancelRejoin() {
+  if (rejoinTimer) {
+    clearTimeout(rejoinTimer);
+    rejoinTimer = null;
+  }
+  rejoinDelay = 0;
 }
 
 export function initHubAgent() {
@@ -235,6 +460,7 @@ export function initHubAgent() {
   const { hubUrl, serverId, secret } = link;
   const url = resolveHubOrigin(hubUrl);
 
+  cancelRejoin();
   agentState = { status: HUB_AGENT_STATUS.CONNECTING, lastError: null, attempts: 0 };
 
   // Bind handlers to this specific instance. Re-pairing replaces `socket`, and
@@ -253,10 +479,11 @@ export function initHubAgent() {
   self.on('connect', () => {
     if (!isCurrent()) return;
     console.log('[hubAgent] Connected to hub');
+    cancelRejoin();
     agentState = { status: HUB_AGENT_STATUS.CONNECTED, lastError: null, attempts: 0 };
     // Push server metadata so the hub can tailor the domain form (SSL paths, etc.)
     const { sslDir } = loadConfig();
-    self.emit('server:info', { platform: process.platform, sslDir: sslDir ?? '' });
+    self.emit('server:info', { platform: platformName, sslDir: sslDir ?? '' });
     startHeartbeats();
   });
 
@@ -264,12 +491,36 @@ export function initHubAgent() {
     if (!isCurrent()) return;
     console.log('[hubAgent] Disconnected:', reason);
     stopHeartbeats();
-    // A server-side disconnect after a secret rotation lands here; the next
-    // handshake attempt is what tells us whether we were rejected.
+
     if (agentState.status === HUB_AGENT_STATUS.CONNECTED) {
       setState(HUB_AGENT_STATUS.CONNECTING, null);
     }
+
+    // 'io server disconnect' means the hub closed us deliberately — the most
+    // common cause is a rotated secret. socket.io will not retry on its own
+    // for this reason, so re-dial here: the next handshake either succeeds or
+    // fails with INVALID_SECRET, which is how we reach the 'rejected' state.
+    if (reason === 'io server disconnect') scheduleRejoin();
   });
+
+  /** Manual re-dial with its own capped backoff (socket.io's is not used here). */
+  function scheduleRejoin() {
+    if (rejoinTimer) return;
+
+    rejoinDelay = rejoinDelay
+      ? Math.min(rejoinDelay * 2, RECONNECT_DELAY_MAX)
+      : RECONNECT_DELAY_MIN;
+
+    rejoinTimer = setTimeout(() => {
+      rejoinTimer = null;
+      if (!isCurrent()) return;
+      // A rejection already decided the outcome; do not fight it.
+      if (agentState.status === HUB_AGENT_STATUS.REJECTED) return;
+      try {
+        self.connect();
+      } catch { /* manager torn down */ }
+    }, rejoinDelay);
+  }
 
   self.on('connect_error', (err) => {
     const message = err?.message ?? 'unknown error';
@@ -284,12 +535,17 @@ export function initHubAgent() {
       } catch { /* already torn down */ }
 
       if (!isCurrent()) return;
+      cancelRejoin();
       setState(HUB_AGENT_STATUS.REJECTED, describeRejection(message));
       stopHeartbeats();
       return;
     }
 
     if (!isCurrent()) return;
+
+    // A manual re-dial that fails on the transport gets its own retry, since
+    // socket.io's backoff is not driving this attempt.
+    if (!self.active) scheduleRejoin();
 
     // Transport/network failure — socket.io keeps retrying with backoff.
     agentState = {
@@ -305,11 +561,13 @@ export function initHubAgent() {
   self.on('hub:manageSSL', handleManageSSL);
   self.on('hub:nginxAction', handleNginxAction);
   self.on('hub:getConfigs', handleGetConfigs);
+  self.on('hub:saveConfig', handleSaveConfig);
   self.on('hub:getLogs', handleGetLogs);
 }
 
 export function stopHubAgent() {
   stopHeartbeats();
+  cancelRejoin();
   if (socket) {
     try {
       socket.io.reconnection(false);

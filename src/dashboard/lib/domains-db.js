@@ -1,11 +1,13 @@
 import fs from 'fs/promises';
 import path from 'node:path';
 import { dbGet, dbSet } from '../../core/db.js';
-import { DOMAIN_DEFAULTS, migrateDomain, generateConf } from '../../core/nginx-conf-generator.js';
+import { DOMAIN_DEFAULTS, migrateDomain } from '../../core/nginx-conf-generator.js';
+import { writeConfWithTest } from '../../core/nginx-apply.js';
 import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk } from '../../core/platform.js';
 import { saveDomainNotifConfig } from '../../core/domainNotifier.js';
+import { bumpHubRevision } from '../../core/hubLink.js';
 
 // Re-export DOMAIN_DEFAULTS for consumers
 export { DOMAIN_DEFAULTS, migrateDomain };
@@ -25,6 +27,15 @@ export function getDomains() {
  */
 export function saveDomains(arr) {
   dbSet('domains', arr);
+
+  // Every domain write goes through here — dashboard, CLI and hub alike — so
+  // this is the one place that can tell the agent "something changed". The
+  // agent polls the counter every few seconds and pushes only when it moves,
+  // which is what gets CLI-side edits to the Hub in seconds instead of
+  // waiting for the 5-minute config heartbeat.
+  try {
+    bumpHubRevision();
+  } catch { /* never block a domain save on hub bookkeeping */ }
 }
 
 /**
@@ -67,8 +78,8 @@ export async function handleHubDomainCommand(payload) {
   switch (action) {
 
     case 'create': {
-      if (!domain?.name) { console.warn('[hubAgent] create: missing domain.name'); return; }
-      if (findDomain(domain.name)) { console.warn('[hubAgent] create: domain already exists:', domain.name); return; }
+      if (!domain?.name) return { ok: false, error: 'domain.name is required' };
+      if (findDomain(domain.name)) return { ok: false, error: `Domain ${domain.name} already exists` };
 
       const newDomain = createDomain({
         name: domain.name,
@@ -84,14 +95,10 @@ export async function handleHubDomainCommand(payload) {
         advanced: { ...DOMAIN_DEFAULTS.advanced, ...domain.advanced },
       });
 
-      try { await generateConf(newDomain); } catch (err) {
-        console.error('[hubAgent] create: generateConf failed:', err.message); return;
-      }
-
-      const testResult = await run(isWindows ? nginxTestCmd(nginxDir) : 'nginx -t', { cwd: nginxDir });
-      if (!isNginxTestOk(testResult)) {
-        try { await fs.unlink(newDomain.configFile); } catch { /* ignore */ }
-        console.error('[hubAgent] create: nginx test failed'); return;
+      // Shared core apply (same path as the CLI and the dashboard API).
+      const created = await writeConfWithTest(newDomain);
+      if (!created.ok) {
+        return { ok: false, error: created.error ?? 'nginx rejected the new config' };
       }
 
       const domains = getDomains();
@@ -102,14 +109,15 @@ export async function handleHubDomainCommand(payload) {
         try { saveDomainNotifConfig(domain.name, domain.notifications); } catch { /* non-fatal */ }
       }
 
+      bumpHubRevision();
       console.log('[hubAgent] domain created:', domain.name);
-      break;
+      return { ok: true, action: 'create', domain: domain.name };
     }
 
     case 'update': {
       const targetName = name ?? domain?.name;
       const existing = targetName ? findDomain(targetName) : null;
-      if (!existing) { console.warn('[hubAgent] update: domain not found:', targetName); return; }
+      if (!existing) return { ok: false, error: `Domain ${targetName} not found` };
 
       const updates = domain ?? {};
       const updatedDomain = {
@@ -123,40 +131,34 @@ export async function handleHubDomainCommand(payload) {
         updatedAt: new Date().toISOString(),
       };
 
-      const bakPath = existing.configFile ? `${existing.configFile}.bak` : null;
-      if (bakPath) { try { await fs.copyFile(existing.configFile, bakPath); } catch { /* skip */ } }
-
-      try { await generateConf(updatedDomain); } catch (err) {
-        console.error('[hubAgent] update: generateConf failed:', err.message); return;
-      }
-
-      const testResult = await run(isWindows ? nginxTestCmd(nginxDir) : 'nginx -t', { cwd: nginxDir });
-      if (!isNginxTestOk(testResult)) {
-        if (bakPath) { try { await fs.rename(bakPath, existing.configFile); } catch { /* ignore */ } }
-        console.error('[hubAgent] update: nginx test failed'); return;
+      // Shared core apply — restores the previous config exactly if it fails,
+      // so the .bak dance is no longer needed here.
+      const updatedResult = await writeConfWithTest(updatedDomain);
+      if (!updatedResult.ok) {
+        return { ok: false, error: updatedResult.error ?? 'nginx rejected the updated config' };
       }
 
       const domains = getDomains();
       const idx = domains.findIndex((d) => d.name === existing.name);
       domains[idx] = updatedDomain;
       saveDomains(domains);
-      if (bakPath) { try { await fs.unlink(bakPath); } catch { /* ignore */ } }
 
       if (updates.notifications && typeof updates.notifications === 'object') {
         try { saveDomainNotifConfig(existing.name, updates.notifications); } catch { /* non-fatal */ }
       }
 
+      bumpHubRevision();
       console.log('[hubAgent] domain updated:', existing.name);
-      break;
+      return { ok: true, action: 'update', domain: existing.name };
     }
 
     case 'delete': {
       const domain = findDomain(name);
-      if (!domain) { console.warn('[hubAgent] delete: domain not found:', name); return; }
+      if (!domain) return { ok: false, error: `Domain ${name} not found` };
 
       if (domain.configFile) {
         try { await fs.unlink(domain.configFile); } catch (err) {
-          if (err.code !== 'ENOENT') { console.error('[hubAgent] delete: unlink failed:', err.message); return; }
+          if (err.code !== 'ENOENT') return { ok: false, error: `Could not remove config: ${err.message}` };
         }
       }
 
@@ -173,16 +175,17 @@ export async function handleHubDomainCommand(payload) {
 
       // Reload nginx so the deleted domain stops being served
       await run(isWindows ? nginxReloadCmd(nginxDir) : 'sudo -n /usr/bin/systemctl reload nginx', { cwd: nginxDir });
-      break;
+      bumpHubRevision();
+      return { ok: true, action: 'delete', domain: name };
     }
 
     case 'toggle': {
       const domain = findDomain(name);
-      if (!domain) { console.warn('[hubAgent] toggle: domain not found:', name); return; }
+      if (!domain) return { ok: false, error: `Domain ${name} not found` };
 
       const isEnabled = domain.enabled !== false;
       const confPath = domain.configFile;
-      if (!confPath) { console.warn('[hubAgent] toggle: no configFile for domain:', name); return; }
+      if (!confPath) return { ok: false, error: `Domain ${name} has no config file` };
 
       const basePath = confPath.replace(/\.disabled$/, '');
       const enabledPath = basePath;
@@ -190,7 +193,7 @@ export async function handleHubDomainCommand(payload) {
 
       if (isEnabled) {
         try { await fs.rename(enabledPath, disabledPath); } catch (err) {
-          console.error('[hubAgent] toggle disable: rename failed:', err.message); return;
+          return { ok: false, error: `Could not disable: ${err.message}` };
         }
         const domains = getDomains();
         const idx = domains.findIndex((d) => d.name === name);
@@ -198,12 +201,12 @@ export async function handleHubDomainCommand(payload) {
         saveDomains(domains);
       } else {
         try { await fs.rename(disabledPath, enabledPath); } catch (err) {
-          console.error('[hubAgent] toggle enable: rename failed:', err.message); return;
+          return { ok: false, error: `Could not enable: ${err.message}` };
         }
         const testResult = await run(isWindows ? nginxTestCmd(nginxDir) : 'nginx -t', { cwd: nginxDir });
         if (!isNginxTestOk(testResult)) {
           await fs.rename(enabledPath, disabledPath).catch(() => {});
-          console.error('[hubAgent] toggle enable: nginx test failed'); return;
+          return { ok: false, error: 'nginx rejected the config after enabling' };
         }
         const domains = getDomains();
         const idx = domains.findIndex((d) => d.name === name);
@@ -212,19 +215,20 @@ export async function handleHubDomainCommand(payload) {
       }
 
       await run(isWindows ? nginxReloadCmd(nginxDir) : 'sudo -n /usr/bin/systemctl reload nginx', { cwd: nginxDir });
+      bumpHubRevision();
       console.log('[hubAgent] domain toggled:', name, '→', !isEnabled);
-      break;
+      return { ok: true, action: 'toggle', domain: name, enabled: !isEnabled };
     }
 
     case 'reload': {
       const testResult = await run(isWindows ? nginxTestCmd(nginxDir) : 'nginx -t', { cwd: nginxDir });
-      if (!isNginxTestOk(testResult)) { console.error('[hubAgent] reload: nginx test failed'); return; }
+      if (!isNginxTestOk(testResult)) return { ok: false, error: 'nginx config test failed' };
       await run(isWindows ? nginxReloadCmd(nginxDir) : 'sudo -n /usr/bin/systemctl reload nginx', { cwd: nginxDir });
       console.log('[hubAgent] nginx reloaded for domain:', name);
-      break;
+      return { ok: true, action: 'reload', domain: name };
     }
 
     default:
-      console.warn('[hubAgent] handleHubDomainCommand: unknown action:', action);
+      return { ok: false, error: `Unknown domain action: ${action}` };
   }
 }

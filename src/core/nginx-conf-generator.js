@@ -10,7 +10,129 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { loadConfig } from './config.js';
-import { isWindows } from './platform.js';
+import { isWindows, toNginxPath, toEscapedNginxPath } from './platform.js';
+
+/**
+ * How certificate paths are written into a generated config.
+ * 'forward'  — C:/nginx/certs/a.pem   (default everywhere; the only form on Linux)
+ * 'escaped'  — "C:\\nginx\\certs\\a.pem"  (Windows fallback, quoted + doubled)
+ */
+export const CERT_PATH_STYLES = Object.freeze({ FORWARD: 'forward', ESCAPED: 'escaped' });
+
+/** Comment written above the SSL directives, explaining the path form in use. */
+const CERT_PATH_COMMENTS = {
+  [CERT_PATH_STYLES.FORWARD]:
+    '# Windows: certificate paths use forward slashes (backslashes can be read as escape sequences by nginx).',
+  [CERT_PATH_STYLES.ESCAPED]:
+    '# Windows: certificate paths use escaped backslashes in quotes (nginx reads each \\\\ as one literal backslash).',
+};
+
+/** Path prefix Let's Encrypt fetches during an HTTP-01 challenge. */
+export const ACME_CHALLENGE_PATH = '/.well-known/acme-challenge/';
+
+/** Default loopback port the temporary challenge listener binds. */
+export const DEFAULT_ACME_CHALLENGE_PORT = 8089;
+
+/**
+ * Builds the location block that forwards ACME challenge requests to the
+ * temporary listener this process starts during issuance.
+ *
+ * `^~` makes it a prefix match that wins outright, so neither `location /`
+ * nor any regex location can intercept the challenge.
+ *
+ * @param {number} [port] Loopback port of the challenge listener
+ * @returns {string} Indented nginx location block
+ */
+export function buildChallengeLocation(port = DEFAULT_ACME_CHALLENGE_PORT) {
+  const target = `http://127.0.0.1:${Number(port) || DEFAULT_ACME_CHALLENGE_PORT}`;
+  return [
+    ` # ACME HTTP-01 challenge — answered by Easy DevOps so nginx never stops.`,
+    ` location ^~ ${ACME_CHALLENGE_PATH} {`,
+    ` proxy_pass ${target};`,
+    ` proxy_set_header Host $host;`,
+    ` }`,
+  ].join('\n');
+}
+
+/**
+ * True when a config already contains an ACME challenge location.
+ * Used to detect configs generated before this feature existed.
+ *
+ * @param {string} confText
+ * @returns {boolean}
+ */
+export function hasChallengeLocation(confText) {
+  if (typeof confText !== 'string') return false;
+  return new RegExp(
+    `location\\s+\\^~\\s+${ACME_CHALLENGE_PATH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`
+  ).test(confText);
+}
+
+/**
+ * Extracts the addresses a config's port-80 server blocks listen on.
+ *
+ * The preflight needs this: a config that says `listen 203.0.113.5:80` is not
+ * reachable on 127.0.0.1, and probing the wrong address would look like a
+ * broken challenge setup when nothing is actually wrong.
+ *
+ * @param {string} confText
+ * @param {number} [port] Port to filter on
+ * @returns {Array<{ host: string, port: number, wildcard: boolean }>}
+ */
+export function parseListenAddresses(confText, port = 80) {
+  if (typeof confText !== 'string') return [];
+
+  // Strip comments so a commented-out `# listen 80;` is never counted, then
+  // match anywhere rather than at line start — directives are not always on
+  // their own line in hand-edited configs.
+  const stripped = confText.replace(/#[^\n]*/g, '');
+
+  const found = [];
+  const re = /\blisten\s+([^;]+);/g;
+  let match;
+
+  while ((match = re.exec(stripped)) !== null) {
+    // Strip option words such as `default_server`, `ssl`, `http2`.
+    const spec = match[1].trim().split(/\s+/)[0];
+    if (!spec) continue;
+
+    let host = null;
+    let listenPort = null;
+
+    if (/^\[(.+)\]:(\d+)$/.test(spec)) {
+      const m = spec.match(/^\[(.+)\]:(\d+)$/);        // [::]:80
+      host = m[1];
+      listenPort = Number(m[2]);
+    } else if (/^\d+$/.test(spec)) {
+      listenPort = Number(spec);                        // 80
+      host = '0.0.0.0';
+    } else if (/^([^:]+):(\d+)$/.test(spec)) {
+      const m = spec.match(/^([^:]+):(\d+)$/);          // 1.2.3.4:80
+      host = m[1];
+      listenPort = Number(m[2]);
+    } else {
+      continue;                                         // unix: sockets etc.
+    }
+
+    if (listenPort !== port) continue;
+
+    const wildcard = host === '0.0.0.0' || host === '*' || host === '::' || host === '[::]';
+    found.push({ host, port: listenPort, wildcard });
+  }
+
+  return found;
+}
+
+/**
+ * Formats a certificate path for inclusion in a config file.
+ * @param {string} p
+ * @param {string} style One of CERT_PATH_STYLES
+ * @returns {string}
+ */
+function formatCertPath(p, style) {
+  if (isWindows && style === CERT_PATH_STYLES.ESCAPED) return toEscapedNginxPath(p);
+  return toNginxPath(p);
+}
 
 /** Returns the conf.d directory for domain config files. */
 export function getConfDDir(nginxDir) {
@@ -160,9 +282,12 @@ export function migrateDomain(d) {
  * @param {Object} domain - Domain configuration object (v2 schema)
  * @param {string} nginxDir - Nginx directory path
  * @param {string} sslDir - SSL certificate directory path
+ * @param {Object} [options]
+ * @param {string} [options.certPathStyle] - One of CERT_PATH_STYLES (default 'forward')
  * @returns {string} Complete nginx conf content for the domain
  */
-export function buildConf(domain, nginxDir, sslDir) {
+export function buildConf(domain, nginxDir, sslDir, options = {}) {
+  const certPathStyle = options.certPathStyle ?? CERT_PATH_STYLES.FORWARD;
   const {
     name,
     port,
@@ -207,9 +332,14 @@ export function buildConf(domain, nginxDir, sslDir) {
   // Build rate limiting zone name (dots → underscores)
   const rateLimitZone = name.replace(/\./g, '_').replace(/\*/g, 'wildcard');
 
-  // SSL cert/key paths - use sslDir convention if empty
-  const certPath = ssl?.certPath || `${sslDir}/${name}/fullchain.pem`;
-  const keyPath = ssl?.keyPath || `${sslDir}/${name}/privkey.pem`;
+  // SSL cert/key paths — fall back to the sslDir convention when unset.
+  // sslDir is normalised first so a Windows value (C:\ssl) does not produce a
+  // mixed-separator path like C:\ssl/example.com/fullchain.pem.
+  const sslBase = toNginxPath(sslDir).replace(/\/+$/, '');
+  const rawCertPath = ssl?.certPath || `${sslBase}/${name}/fullchain.pem`;
+  const rawKeyPath = ssl?.keyPath || `${sslBase}/${name}/privkey.pem`;
+  const certPath = formatCertPath(rawCertPath, certPathStyle);
+  const keyPath = formatCertPath(rawKeyPath, certPathStyle);
 
   // Build the config sections
   const sections = [];
@@ -225,21 +355,54 @@ export function buildConf(domain, nginxDir, sslDir) {
   const mainServerNames = wildcardEnabled ? `*.${name} ${name}` : (www ? `${name} www.${name}` : name);
   const redirectServerNames = wildcardEnabled ? `*.${name} ${name}` : (www ? `${name} www.${name}` : name);
 
+  // The ACME HTTP-01 challenge location, emitted into every port-80 server
+  // block so certificates can be issued and renewed without stopping nginx.
+  const challengeLocation = buildChallengeLocation(options.acmeChallengePort);
+
   // ─── WWW Redirect (non-SSL, non-wildcard only) ───────────────────────────────
+  //
+  // NOTE: the redirect lives in `location /`, NOT at server level. nginx runs a
+  // server-level `return` during the rewrite phase, before location matching,
+  // so a server-level redirect would swallow the challenge request and answer
+  // 301 instead of serving the token.
   if (www && !ssl?.enabled && !wildcardEnabled) {
     sections.push(`server {
  listen 80;
  server_name www.${name};
+${challengeLocation}
+ location / {
  return 301 http://${name}$request_uri;
+ }
  }`);
   }
 
   // ─── HTTP → HTTPS Redirect ──────────────────────────────────────────────────
+  // Same rule as above: the redirect must sit inside `location /`.
   if (ssl?.enabled && ssl?.redirect) {
     sections.push(`server {
  listen 80;
  server_name ${redirectServerNames};
+${challengeLocation}
+ location / {
  return 301 https://${name}$request_uri;
+ }
+ }`);
+  }
+
+  // ─── Challenge-only port 80 (SSL on, redirect off) ──────────────────────────
+  //
+  // Without this the domain has no port-80 listener at all, so an HTTP-01
+  // renewal could never reach us and every renewal would be forced into
+  // standalone mode (stopping nginx). This block serves the ACME path and
+  // nothing else — plain HTTP traffic still gets a 404, as before.
+  if (ssl?.enabled && !ssl?.redirect) {
+    sections.push(`server {
+ listen 80;
+ server_name ${redirectServerNames};
+${challengeLocation}
+ location / {
+ return 404;
+ }
  }`);
   }
 
@@ -253,9 +416,18 @@ export function buildConf(domain, nginxDir, sslDir) {
   mainBlock.push(` listen ${listenPort};`);
   mainBlock.push(` server_name ${serverNames};`);
 
+  // When this block is the port-80 listener (SSL off) it must answer the ACME
+  // challenge too. `location ^~` outranks the `location /` proxy below.
+  if (!ssl?.enabled) {
+    mainBlock.push(``);
+    mainBlock.push(challengeLocation);
+  }
+
   // SSL configuration
   if (ssl?.enabled) {
     mainBlock.push(``);
+    // The comment is Windows-only: on Linux the path form never varies.
+    if (isWindows) mainBlock.push(` ${CERT_PATH_COMMENTS[certPathStyle]}`);
     mainBlock.push(` ssl_certificate ${certPath};`);
     mainBlock.push(` ssl_certificate_key ${keyPath};`);
   }
@@ -367,11 +539,14 @@ export function buildConf(domain, nginxDir, sslDir) {
  * @param {Object} domain - Domain configuration object
  * @returns {Promise<string>} Path to the generated conf file
  */
-export async function generateConf(domain) {
-  const { nginxDir, sslDir } = loadConfig();
+export async function generateConf(domain, options = {}) {
+  const { nginxDir, sslDir, acmeChallengePort } = loadConfig();
   const confDir = getConfDDir(nginxDir);
   const confPath = path.join(confDir, `${domain.name}.conf`);
-  const confContent = buildConf(domain, nginxDir, sslDir);
+  const confContent = buildConf(domain, nginxDir, sslDir, {
+    acmeChallengePort,
+    ...options,
+  });
 
   // Ensure conf.d directory exists
   await fs.mkdir(confDir, { recursive: true });
@@ -388,21 +563,27 @@ export async function generateConf(domain) {
 }
 
 /**
- * Generates a default SSL certificate path for a domain based on platform.
+ * Generates the default SSL certificate paths for a domain.
+ *
+ * Always returns forward slashes on Windows, matching what is written into the
+ * config. The sslDir argument is honoured on every platform: certificates are
+ * actually issued into `path.join(sslDir, domainName)`, so suggesting a
+ * different fixed directory pointed users at files that were never there.
+ *
  * @param {string} domainName - Domain name
  * @param {string} platform - 'win32' or 'linux'
  * @param {string} sslDir - SSL directory from config
  * @returns {Object} { certPath, keyPath }
  */
 export function getDefaultCertPaths(domainName, platform, sslDir) {
-  if (platform === 'win32') {
-    return {
-      certPath: `C:\\easy-devops\\ssl\\${domainName}\\fullchain.pem`,
-      keyPath: `C:\\easy-devops\\ssl\\${domainName}\\privkey.pem`,
-    };
-  }
+  const fallback = platform === 'win32' ? 'C:\\easy-devops\\ssl' : '/etc/easy-devops/ssl';
+  const base = String(sslDir || fallback)
+    .replace(/\\/g, '/')
+    .replace(/\/{2,}/g, '/')
+    .replace(/\/+$/, '');
+
   return {
-    certPath: `${sslDir}/${domainName}/fullchain.pem`,
-    keyPath: `${sslDir}/${domainName}/privkey.pem`,
+    certPath: `${base}/${domainName}/fullchain.pem`,
+    keyPath: `${base}/${domainName}/privkey.pem`,
   };
 }

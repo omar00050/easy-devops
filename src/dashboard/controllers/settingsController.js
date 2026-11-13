@@ -2,23 +2,39 @@ import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
-import { loadConfig, saveConfig } from '../../core/config.js';
+import {
+	loadConfig, saveConfig, BIND_ALL, BIND_LOOPBACK, BIND_LOOPBACK_V6,
+	AUTH_MODES, isLoopbackBind, effectiveAuthMode,
+} from '../../core/config.js';
+import { isLoopbackAddress } from '../lib/localRequest.js';
+import { hashPassword, validateNewPassword } from '../../core/passwords.js';
 import { validatePort, validateEmail } from '../../core/validators.js';
 import { run, runWithStdin } from '../../core/shell.js';
 import { checkPermissionsConfigured } from '../../core/permissions.js';
 import { dbGet, dbSet } from '../../core/db.js';
+import { saveDomains } from '../lib/domains-db.js';
 import { loadChannels, saveChannels, sendNotification } from '../../core/notifier.js';
 
 class SettingsController {
 	get(req, res) {
 		try {
 			const config = loadConfig();
-			const { dashboardPort, nginxDir, sslDir, acmeEmail } = config;
+			const { dashboardPort, nginxDir, sslDir, acmeEmail, dashboardBindAddress } = config;
+			const hasPassword = Boolean(config.dashboardPasswordHash || config.dashboardPassword);
+			// Neither the password nor its hash is ever returned.
 			res.json({
 				dashboardPort,
 				nginxDir,
 				sslDir,
 				acmeEmail,
+				dashboardBindAddress,
+				bindsToLoopbackOnly: isLoopbackBind(dashboardBindAddress),
+				dashboardAuth: effectiveAuthMode(config),
+				// Whether the UI may offer 'none' at all: the bind must be loopback
+				// and the person asking must be on this machine.
+				canUseNoPassword: isLoopbackBind(dashboardBindAddress) &&
+					isLoopbackAddress(req.ip ?? req.socket?.remoteAddress),
+				hasPassword,
 				platform: process.platform === 'win32' ? 'win32' : 'linux',
 			});
 		} catch (err) {
@@ -26,17 +42,72 @@ class SettingsController {
 		}
 	}
 
-	update(req, res) {
+	async update(req, res) {
 		try {
-			const { dashboardPort, dashboardPassword, nginxDir, sslDir, acmeEmail } = req.body;
+			const {
+				dashboardPort, dashboardPassword, nginxDir, sslDir, acmeEmail, dashboardBindAddress,
+				dashboardAuth,
+			} = req.body;
+
+			const current = loadConfig();
 
 			if (dashboardPort !== undefined) {
 				const portError = validatePort(parseInt(dashboardPort, 10));
 				if (portError) return res.status(400).json({ error: portError });
 			}
 
-			if (dashboardPassword !== undefined && typeof dashboardPassword !== 'string') {
-				return res.status(400).json({ error: 'Password must be a string' });
+			// A password set from here is held to the same minimum as the
+			// first-run one, and is never stored in clear.
+			if (dashboardPassword !== undefined) {
+				const problem = validateNewPassword(dashboardPassword);
+				if (problem) return res.status(400).json({ error: problem });
+			}
+
+			if (dashboardBindAddress !== undefined &&
+					![BIND_ALL, BIND_LOOPBACK, BIND_LOOPBACK_V6].includes(dashboardBindAddress)) {
+				return res.status(400).json({
+					error: `Bind address must be ${BIND_LOOPBACK} (this machine only) or ${BIND_ALL} (all interfaces)`,
+				});
+			}
+
+			if (dashboardAuth !== undefined &&
+					![AUTH_MODES.PASSWORD, AUTH_MODES.NONE].includes(dashboardAuth)) {
+				return res.status(400).json({
+					error: `Authentication must be '${AUTH_MODES.PASSWORD}' or '${AUTH_MODES.NONE}'`,
+				});
+			}
+
+			// ── The auth/bind interlock ──────────────────────────────────────
+			//
+			// 'none' is only safe while nothing but this machine can reach the
+			// listener, so the two settings are validated TOGETHER against the
+			// state this request would produce — not against the current state.
+			// Otherwise a single request could set both and slip through by
+			// checking each against the old value.
+			const nextAuth = dashboardAuth ?? current.dashboardAuth;
+			const nextBind = dashboardBindAddress ?? current.dashboardBindAddress;
+
+			if (nextAuth === AUTH_MODES.NONE && !isLoopbackBind(nextBind)) {
+				// Which half the user is changing decides which message helps.
+				const changingBind = dashboardBindAddress !== undefined &&
+					dashboardBindAddress !== current.dashboardBindAddress;
+
+				return res.status(400).json({
+					error: changingBind
+						? 'This dashboard has no password, so it can only listen on this machine. Set a password first, then change where it listens.'
+						: `Running without a password requires the dashboard to listen on this machine only (currently ${nextBind}).`,
+					reason: changingBind ? 'bind_requires_password' : 'no_auth_requires_loopback',
+				});
+			}
+
+			// Turning auth OFF is only ever done from the machine itself.
+			if (dashboardAuth === AUTH_MODES.NONE &&
+					current.dashboardAuth !== AUTH_MODES.NONE &&
+					!isLoopbackAddress(req.ip ?? req.socket?.remoteAddress)) {
+				return res.status(403).json({
+					error: 'Removing the password can only be done from this machine.',
+					reason: 'no_auth_requires_local_request',
+				});
 			}
 
 			if (nginxDir !== undefined && (typeof nginxDir !== 'string' || nginxDir.trim() === '')) {
@@ -51,17 +122,40 @@ class SettingsController {
 				if (emailError) return res.status(400).json({ error: emailError });
 			}
 
-			const currentConfig = loadConfig();
+			const currentConfig = current;
 			const updates = {};
 
 			if (dashboardPort !== undefined) updates.dashboardPort = parseInt(dashboardPort, 10);
-			if (dashboardPassword !== undefined) updates.dashboardPassword = dashboardPassword;
+			if (dashboardPassword !== undefined) {
+				updates.dashboardPasswordHash = await hashPassword(dashboardPassword);
+				// Drop any legacy plain-text copy at the same time.
+				updates.dashboardPassword = '';
+			}
+			if (dashboardBindAddress !== undefined) updates.dashboardBindAddress = dashboardBindAddress;
+			if (dashboardAuth !== undefined) updates.dashboardAuth = dashboardAuth;
+
+			// Setting a password implies wanting one; switching to 'password'
+			// without one leaves the first-run screen as the way back in, which
+			// is recoverable but not what anyone means by saving a password.
+			if (dashboardPassword !== undefined && dashboardAuth === undefined) {
+				updates.dashboardAuth = AUTH_MODES.PASSWORD;
+			}
 			if (nginxDir !== undefined) updates.nginxDir = nginxDir.trim();
 			if (sslDir !== undefined) updates.sslDir = sslDir.trim();
 			if (acmeEmail !== undefined) updates.acmeEmail = acmeEmail.trim();
 
 			saveConfig({ ...currentConfig, ...updates });
-			res.json({ success: true });
+
+			// The port and the bind address only take effect on restart, so say so
+			// rather than letting the user think the change is already live.
+			const needsRestart = updates.dashboardPort !== undefined ||
+				updates.dashboardBindAddress !== undefined;
+
+			res.json({
+				success: true,
+				needsRestart,
+				dashboardAuth: effectiveAuthMode({ ...currentConfig, ...updates }),
+			});
 		} catch (err) {
 			res.status(500).json({ error: 'Internal server error' });
 		}
@@ -149,7 +243,14 @@ class SettingsController {
 		try {
 			const config = loadConfig();
 			const domains = dbGet('domains') || [];
-			const { dashboardPassword: _pw, ...safeConfig } = config;
+			// Strip BOTH the legacy plain-text password and the hash: a backup is
+			// a file the user downloads and may share, and a scrypt hash is still
+			// a credential worth cracking offline.
+			const {
+				dashboardPassword: _pw,
+				dashboardPasswordHash: _pwHash,
+				...safeConfig
+			} = config;
 			const backup = {
 				version: 1,
 				exportedAt: new Date().toISOString(),
@@ -171,10 +272,23 @@ class SettingsController {
 				return res.status(400).json({ error: 'Invalid backup: missing config' });
 			}
 			const current = loadConfig();
-			const merged = { ...current, ...config, dashboardPassword: current.dashboardPassword };
+			// A backup may predate hashed passwords and the bind setting. Never let
+			// one restore a plain-text password or silently re-open the listener.
+			const merged = {
+				...current,
+				...config,
+				dashboardPassword: current.dashboardPassword,
+				dashboardPasswordHash: current.dashboardPasswordHash,
+				dashboardBindAddress: current.dashboardBindAddress,
+				dashboardAuth: current.dashboardAuth,
+			};
 			saveConfig(merged);
+			// Through saveDomains(), not dbSet: restoring a backup replaces the
+			// whole domain set, which the Hub must learn about like any other
+			// domain write. A bare dbSet skipped the revision bump and left the
+			// Hub showing the pre-restore list until the next restart.
 			if (Array.isArray(domains)) {
-				dbSet('domains', domains);
+				saveDomains(domains);
 			}
 			res.json({ success: true });
 		} catch (err) {

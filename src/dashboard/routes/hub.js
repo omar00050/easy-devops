@@ -6,18 +6,11 @@ import {
   hubStatus,
   updatePermissions,
 } from '../controllers/hubController.js';
+import { requireAuth } from '../lib/requireAuth.js';
 
 const router = Router();
 
-// Auth middleware — reuse the same pattern as other routes in this project
-function requireAuth(req, res, next) {
-  if (req.session.authenticated === true) {
-    return next();
-  } else {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-}
-
+// The shared gate — see lib/requireAuth.js.
 router.use(requireAuth);
 
 // The hub generates connection strings; this server only consumes them.

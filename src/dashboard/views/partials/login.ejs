@@ -95,7 +95,34 @@
 
     <!-- Login Card -->
     <div class="login-card w-full text-left" style="animation: card-enter 500ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards;">
-      <div class="mb-6">
+      <!--
+        First run: no password exists yet, so the only thing on offer is
+        setting one. There is deliberately no way to skip this — an empty
+        password used to be a valid login.
+      -->
+      <template v-if="login.needsSetup">
+        <p style="
+          font-size: 13px; color: var(--color-muted);
+          margin-top: 0; margin-bottom: 20px; font-weight: 500; line-height: 1.6;
+        ">
+          No dashboard password is set yet. Choose one to protect this dashboard —
+          at least {{ login.minLength }} characters.
+        </p>
+
+        <div class="mb-4">
+          <label class="login-label">New password</label>
+          <input v-model="login.password" type="password" class="login-input"
+            :placeholder="'At least ' + login.minLength + ' characters'" @keyup.enter="doSetup" />
+        </div>
+
+        <div class="mb-6">
+          <label class="login-label">Confirm password</label>
+          <input v-model="login.confirm" type="password" class="login-input"
+            placeholder="Repeat the password" @keyup.enter="doSetup" />
+        </div>
+      </template>
+
+      <div v-else class="mb-6">
         <label class="login-label">Password</label>
         <input v-model="login.password" type="password" class="login-input" placeholder="Enter dashboard password" @keyup.enter="doLogin" />
       </div>
@@ -113,18 +140,52 @@
         {{ login.error }}
       </div>
 
-      <button @click="doLogin" :disabled="login.loading" class="login-btn gap-2">
+      <button v-if="login.needsSetup" @click="doSetup" :disabled="login.loading" class="login-btn gap-2">
+        <svg v-if="login.loading" class="w-4 h-4 animate-spin inline-block -ml-1" fill="none" viewBox="0 0 24 24">
+          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+        </svg>
+        {{ login.loading ? 'Saving...' : 'Set a password' }}
+      </button>
+
+      <!--
+        Shown only when the server says so: the dashboard must listen on this
+        machine only AND this page must have been opened from this machine.
+        Anywhere else the option does not appear at all.
+      -->
+      <template v-if="login.needsSetup && login.canUseNoPassword">
+        <div style="
+          display: flex; align-items: center; gap: 12px;
+          margin: 20px 0 16px; color: var(--color-muted);
+          font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700;
+        ">
+          <span style="flex: 1; height: 1px; background: var(--color-border);"></span>
+          or
+          <span style="flex: 1; height: 1px; background: var(--color-border);"></span>
+        </div>
+
+        <button @click="doSetupNoPassword" :disabled="login.loading"
+          class="login-btn gap-2"
+          style="background: transparent; border: 1px solid var(--color-border); color: var(--color-foreground);">
+          No password (this machine only)
+        </button>
+
+        <p style="
+          text-align: center; font-size: 11px; color: var(--color-muted);
+          margin-top: 12px; margin-bottom: 0; font-weight: 500; line-height: 1.6;
+        ">
+          The dashboard stays reachable from this computer only. You can set a
+          password later in Settings.
+        </p>
+      </template>
+
+      <button v-else @click="doLogin" :disabled="login.loading" class="login-btn gap-2">
         <svg v-if="login.loading" class="w-4 h-4 animate-spin inline-block -ml-1" fill="none" viewBox="0 0 24 24">
           <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
           <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
         </svg>
         {{ login.loading ? 'Signing in...' : 'Sign In' }}
       </button>
-
-      <p style="
-        text-align: center; font-size: 12px; color: var(--color-muted);
-        margin-top: 24px; margin-bottom: 0; font-weight: 500;
-      ">No password set? Leave blank and press Sign In.</p>
     </div>
 
     <!-- Bottom Theme Controls (Pill) -->

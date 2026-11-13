@@ -16,13 +16,9 @@ import inquirer from 'inquirer';
 import ora from 'ora';
 import fs from 'fs/promises';
 import path from 'path';
-import http from 'http';
-import net from 'net';
-import * as acme from 'acme-client';
-import os from 'os';
-import { run, runLive } from '../../core/shell.js';
+import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
-import { isWindows } from '../../core/platform.js';
+import { issueCertificate, describeIssuance, prepareDomainForHttpChallenge } from '../../core/ssl-issuer.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -31,63 +27,6 @@ function getSslDir() {
   return sslDir;
 }
 
-/**
- * Loads or generates the ACME account private key.
- * The key is persisted at {sslDir}/.account/account.key
- */
-async function getAccountKey(sslDir) {
-  const keyPath = path.join(sslDir, '.account', 'account.key');
-  const accountDir = path.dirname(keyPath);
-  if (!isWindows) {
-    const user = os.userInfo().username;
-    await run(`sudo -n mkdir -p "${accountDir}"`);
-    await run(`sudo -n chown ${user}:${user} "${accountDir}"`);
-  } else {
-    await fs.mkdir(accountDir, { recursive: true });
-  }
-  try {
-    return await fs.readFile(keyPath);
-  } catch {
-    const key = await acme.crypto.createPrivateKey();
-    await fs.writeFile(keyPath, key);
-    return key;
-  }
-}
-
-/**
- * Checks if port 80 is free (can be bound).
- * Used for HTTP-01 challenge validation.
- */
-async function isPort80Free() {
-  return new Promise((resolve) => {
-    const srv = net.createServer();
-    srv.listen(80, () => {
-      srv.close(() => resolve(true));
-    });
-    srv.on('error', () => resolve(false));
-  });
-}
-
-/**
- * Stops nginx to free port 80 for HTTP-01 challenge.
- */
-async function stopNginx() {
-  const cmd = isWindows
-    ? 'taskkill /f /IM nginx.exe'
-    : 'systemctl stop nginx';
-  await run(cmd);
-}
-
-/**
- * Starts nginx after HTTP-01 challenge completes.
- */
-async function startNginx() {
-  const { nginxDir } = loadConfig();
-  const cmd = isWindows
-    ? `& "${nginxDir}\\nginx.exe"`
-    : 'systemctl start nginx';
-  await run(cmd);
-}
 
 // ─── Certificate Listing ──────────────────────────────────────────────────────
 
@@ -188,263 +127,18 @@ function renderCertRow(cert) {
 // ─── Certificate Issuance ─────────────────────────────────────────────────────
 
 /**
- * Issues a new SSL certificate using Let's Encrypt (acme-client).
+ * Issues (or renews) a certificate for a domain.
  *
- * HTTP-01: stops nginx, starts temp HTTP server on port 80, validates, restarts nginx.
- * DNS-01: no nginx interaction; caller handles TXT record via onDnsChallenge callback.
+ * Thin wrapper over core/ssl-issuer.js, which is the single implementation
+ * shared by the CLI, the dashboard API and the Hub command path. It keeps
+ * nginx running by default — see that module for the challenge strategy.
  *
- * @param {string} domainName - The primary domain name
- * @param {{
- *   www?: boolean,
- *   validationMethod?: 'http' | 'dns',
- *   email?: string | null,
- *   onDnsChallenge?: (txtName: string, txtValue: string) => Promise<void>
- * }} options
- * @returns {Promise<{ success: boolean, certPath: string|null, keyPath: string|null, error: object|null }>}
+ * @param {string} domainName
+ * @param {Object} options See issueCertificate() in core/ssl-issuer.js
+ * @returns {Promise<Object>} Result object from issueCertificate()
  */
-export async function issueCert(domainName, {
-  www = false,
-  wildcard = false,
-  validationMethod = 'http',
-  email = null,
-  onDnsChallenge = null,
-} = {}) {
-  const sslDir = getSslDir();
-  const config = loadConfig();
-
-  // Email is required for Let's Encrypt
-  const acmeEmail = email || config.acmeEmail;
-  if (!acmeEmail) {
-    return {
-      success: false,
-      certPath: null,
-      keyPath: null,
-      error: {
-        step: 'email configuration',
-        cause: 'No email address configured. Let\'s Encrypt requires an email for account creation.',
-        consequence: 'No certificate was issued. Configure acmeEmail in settings or provide email parameter.',
-        nginxRunning: true,
-        configSaved: false,
-      },
-    };
-  }
-
-  // Ensure certificate directory exists
-  const certDir = path.join(sslDir, domainName);
-  if (!isWindows) {
-    const user = os.userInfo().username;
-    await run(`sudo -n mkdir -p "${certDir}"`);
-    await run(`sudo -n chown ${user}:${user} "${certDir}"`);
-  } else {
-    await fs.mkdir(certDir, { recursive: true });
-  }
-
-  // Load or create account key
-  const accountKey = await getAccountKey(sslDir);
-
-  // Create ACME client (Let's Encrypt production)
-  const client = new acme.Client({
-    directoryUrl: acme.directory.letsencrypt.production,
-    accountKey,
-  });
-
-  // Wildcard requires DNS-01 — enforce it here
-  if (wildcard && validationMethod === 'http') {
-    return {
-      success: false,
-      certPath: null,
-      keyPath: null,
-      error: {
-        step: 'validation method',
-        cause: 'Wildcard certificates require DNS-01 validation, not HTTP-01.',
-        consequence: 'No certificate was issued. Change validation method to DNS.',
-        nginxRunning: true,
-        configSaved: false,
-      },
-    };
-  }
-
-  // altNames: wildcard includes both bare domain and *.domain
-  const altNames = wildcard
-    ? [domainName, `*.${domainName}`]
-    : (www ? [domainName, `www.${domainName}`] : [domainName]);
-  const [domainKey, csr] = await acme.crypto.createCsr({
-    commonName: domainName,
-    altNames,
-  });
-
-  // ─── HTTP-01 Challenge ─────────────────────────────────────────────────────
-  if (validationMethod === 'http') {
-    // Stop nginx to free port 80
-    await stopNginx();
-
-    // Check port 80 is free
-    const portFree = await isPort80Free();
-    if (!portFree) {
-      await startNginx();
-      return {
-        success: false,
-        certPath: null,
-        keyPath: null,
-        error: {
-          step: 'port 80 check',
-          cause: 'Port 80 is still in use after stopping nginx. Another process may be binding it.',
-          consequence: 'No certificate was issued. nginx has been restarted.',
-          nginxRunning: true,
-          configSaved: false,
-        },
-      };
-    }
-
-    // Create temporary HTTP server for challenge
-    const challengeTokens = new Map();
-    let httpServer;
-
-    const challengeCreateFn = async (authz, challenge, keyAuthorization) => {
-      challengeTokens.set(challenge.token, keyAuthorization);
-    };
-
-    const challengeRemoveFn = async (authz, challenge, keyAuthorization) => {
-      challengeTokens.delete(challenge.token);
-    };
-
-    // Start temp HTTP server on port 80
-    httpServer = http.createServer((req, res) => {
-      const url = new URL(req.url, `http://${req.headers.host}`);
-      if (url.pathname.startsWith('/.well-known/acme-challenge/')) {
-        const token = url.pathname.split('/').pop();
-        const keyAuth = challengeTokens.get(token);
-        if (keyAuth) {
-          res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
-          res.end(keyAuth);
-          return;
-        }
-      }
-      res.writeHead(404);
-      res.end('Not found');
-    });
-
-    await new Promise((resolve, reject) => {
-      httpServer.listen(80, (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-
-    try {
-      // Execute ACME challenge — returns the signed certificate PEM
-      // challengePriority forces http-01 only so acme-client never falls back to dns-01
-      const cert = await client.auto({
-        csr,
-        email: acmeEmail,
-        termsOfServiceAgreed: true,
-        challengePriority: ['http-01'],
-        challengeCreateFn,
-        challengeRemoveFn,
-      });
-
-      // Close HTTP server
-      await new Promise((resolve) => httpServer.close(resolve));
-
-      // Restart nginx
-      await startNginx();
-
-      // Write certificate files
-      const certPath = path.join(certDir, 'fullchain.pem');
-      const keyPath = path.join(certDir, 'privkey.pem');
-
-      await fs.writeFile(keyPath, domainKey);
-      await fs.writeFile(certPath, cert);
-
-      return { success: true, certPath, keyPath, error: null };
-    } catch (err) {
-      // Ensure server is closed and nginx restarted on error
-      await new Promise((resolve) => httpServer.close(resolve));
-      await startNginx();
-      return {
-        success: false,
-        certPath: null,
-        keyPath: null,
-        error: {
-          step: 'ACME validation',
-          cause: err.message || 'HTTP-01 challenge failed.',
-          consequence: 'No certificate was issued. nginx has been restarted.',
-          nginxRunning: true,
-          configSaved: false,
-        },
-      };
-    }
-  }
-
-  // ─── DNS-01 Challenge ──────────────────────────────────────────────────────
-  if (validationMethod === 'dns') {
-    const challengeCreateFn = async (authz, challenge, keyAuthorization) => {
-      const txtName = `_acme-challenge.${domainName}`;
-      const txtValue = keyAuthorization;
-
-      // Yield TXT record to caller and pause until they confirm DNS is set.
-      // onDnsChallenge is async — it returns only after the user confirms
-      // (dashboard: /create-confirm resolves the deferred; CLI: inquirer prompt).
-      if (onDnsChallenge) {
-        await onDnsChallenge(txtName, txtValue);
-      }
-      // challengeCreateFn returning here signals acme-client to proceed with validation.
-    };
-
-    const challengeRemoveFn = async () => {
-      // No-op: TXT record cleanup is the user's responsibility.
-    };
-
-    try {
-      // Execute ACME challenge — returns the signed certificate PEM
-      // challengePriority forces dns-01 only so acme-client never tries http-01
-      
-      const cert = await client.auto({
-        csr,
-        email: acmeEmail,
-        termsOfServiceAgreed: true,
-        challengePriority: ['dns-01'],
-        challengeCreateFn,
-        challengeRemoveFn,
-      });
-
-      // Write certificate files
-      const certPath = path.join(certDir, 'fullchain.pem');
-      const keyPath = path.join(certDir, 'privkey.pem');
-
-      await fs.writeFile(keyPath, domainKey);
-      await fs.writeFile(certPath, cert);
-
-      return { success: true, certPath, keyPath, error: null };
-    } catch (err) {
-      return {
-        success: false,
-        certPath: null,
-        keyPath: null,
-        error: {
-          step: 'ACME validation',
-          cause: err.message || 'DNS-01 challenge failed.',
-          consequence: 'No certificate was issued. nginx was not affected.',
-          nginxRunning: true,
-          configSaved: false,
-        },
-      };
-    }
-  }
-
-  // Invalid validation method
-  return {
-    success: false,
-    certPath: null,
-    keyPath: null,
-    error: {
-      step: 'validation method',
-      cause: `Invalid validation method: ${validationMethod}. Must be 'http' or 'dns'.`,
-      consequence: 'No certificate was issued.',
-      nginxRunning: true,
-      configSaved: false,
-    },
-  };
+export async function issueCert(domainName, options = {}) {
+  return issueCertificate(domainName, options);
 }
 
 /**
@@ -462,13 +156,35 @@ export async function renewExpiring(certs) {
   const expiring = certs.filter(c => c.daysLeft !== null && c.daysLeft < 30);
   if (expiring.length === 0) return [];
 
+  const { findDomain } = await import('../../dashboard/lib/domains-db.js');
+
   const results = [];
   for (const cert of expiring) {
+    // Same prepare step as a single renew: regenerate a config that predates
+    // the ACME challenge location so this renewal can use proxy mode, instead
+    // of silently falling back to stopping nginx.
+    const record = findDomain(cert.domain);
+    let prepared = null;
+    if (record) {
+      prepared = await prepareDomainForHttpChallenge(record);
+      if (!prepared.ok) {
+        results.push({
+          domain: cert.domain,
+          success: false,
+          exitCode: 1,
+          error: prepared.error,
+        });
+        continue;
+      }
+    }
+
     const result = await issueCert(cert.domain, { validationMethod: 'http' });
     results.push({
       domain: cert.domain,
       success: result.success,
       exitCode: result.success ? 0 : 1,
+      configRegenerated: Boolean(prepared?.regenerated),
+      summary: describeIssuance(result),
     });
   }
   return results;
@@ -607,7 +323,14 @@ export async function showSslManager() {
         if (result.success) {
           console.log(chalk.green('\n ✓ Certificate created successfully'));
           console.log(chalk.gray(` Cert: ${result.certPath}`));
-          console.log(chalk.gray(` Key: ${result.keyPath}\n`));
+          console.log(chalk.gray(` Key: ${result.keyPath}`));
+          // Say whether nginx stayed up, or fell back and for how long.
+          const summary = describeIssuance(result);
+          if (summary) {
+            const warn = result.fellBack || result.staging || result.nginxRestored === false;
+            console.log((warn ? chalk.yellow : chalk.gray)(` ${summary}`));
+          }
+          console.log();
         } else {
           const e = result.error;
           console.log(chalk.red('\n ✗ Certificate creation failed'));

@@ -1,17 +1,14 @@
 import { GoodDB, SQLiteDriver } from 'good.db';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import { fileURLToPath } from 'url';
+import { getDataDir, isDevDataDir } from './platform.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Store the database in the user's home directory so it survives npm updates.
-// Linux/macOS: ~/.config/easy-devops/
-// Windows:     %APPDATA%\easy-devops\  (falls back to home dir if APPDATA unset)
-const DATA_DIR = process.platform === 'win32'
-  ? path.join(process.env.APPDATA || os.homedir(), 'easy-devops')
-  : path.join(os.homedir(), '.config', 'easy-devops');
+// Resolved once per process. The location lives in core/platform.js so the
+// database, sessions and logs all agree on it — see getDataDir().
+const DATA_DIR = getDataDir();
 
 const DB_PATH = path.join(DATA_DIR, 'easy-devops.sqlite');
 
@@ -19,6 +16,11 @@ const DB_PATH = path.join(DATA_DIR, 'easy-devops.sqlite');
 const OLD_DATA_DIR = path.join(__dirname, '..', '..', 'data');
 const OLD_DB_PATH = path.join(OLD_DATA_DIR, 'easy-devops.sqlite');
 function migrateIfNeeded() {
+  // Never migrate into a dev/test data directory: the migration RENAMES the
+  // legacy database, so running with --dev (or any EASY_DEVOPS_DATA_DIR)
+  // would consume the real installation's data.
+  if (isDevDataDir()) return;
+
   try {
     if (fs.existsSync(OLD_DB_PATH) && !fs.existsSync(DB_PATH)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -40,13 +42,32 @@ try {
 
 let db;
 
+/**
+ * The read cache is deliberately OFF.
+ *
+ * good.db's cache is a plain in-process LRU with no TTL and no invalidation
+ * across connections: the first `get` of a key stores the value, and every
+ * later `get` in that process returns it forever (the map holds 1024 entries
+ * and this app uses a handful of keys, so nothing is ever evicted).
+ *
+ * Easy DevOps runs as SEVERAL processes against ONE database file — the CLI,
+ * the dashboard (which hosts the hub agent) and any `ezz` invocation. With the
+ * cache on, a value written by the CLI was invisible to the running dashboard
+ * for the life of that process, so the agent's revision poll could never see a
+ * CLI-side change and those changes never reached the Hub.
+ *
+ * Measured cost of reading straight from SQLite: ~50us for a scalar key and
+ * ~150us for the whole domain list. The dashboard reads at a few hundred ops
+ * per minute, so this is invisible — and correctness here cannot be opted into
+ * per call site without every future caller having to remember.
+ */
 function createDbConnection() {
   return new GoodDB(new SQLiteDriver({ path: DB_PATH }), {
     nested: "..",
     nestedIsEnabled: true,
     cache: {
       capacity: 1024,
-      isEnabled: true,
+      isEnabled: false,
     }
   });
 }

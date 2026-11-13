@@ -12,6 +12,11 @@
  *  5. Run: npm install -g easy-devops@<latest>
  *  6. Re-start dashboard if it was running before
  *  7. Clear the saved state key
+ *
+ * When the dashboard runs as a PM2 service, steps 4 and 6 collapse into a
+ * single `pm2 restart` after the install: PM2 owns the process, so stopping it
+ * by pid would only make PM2 revive it on the OLD code, and starting a second
+ * detached copy would fight the service for the port.
  */
 
 import chalk from 'chalk';
@@ -24,6 +29,7 @@ import { run } from '../../core/shell.js';
 import { dbGet, dbSet, closeDb, initDb } from '../../core/db.js';
 import { loadConfig } from '../../core/config.js';
 import { getDashboardStatus, startDashboard, stopDashboard } from './dashboard.js';
+import * as service from '../../core/service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require   = createRequire(import.meta.url);
@@ -52,6 +58,14 @@ function isNewer(latest, current) {
 
 async function recoverIfNeeded() {
   const saved = dbGet('update-pre-dashboard');
+
+  // A service-managed dashboard needs no recovery prompt: PM2 brought it back
+  // on its own, or `ezz service restart` will.
+  if (saved?.service) {
+    dbSet('update-pre-dashboard', null);
+    return;
+  }
+
   if (!saved?.wasRunning) return;
 
   console.log(chalk.yellow('\n  A previous update left the dashboard stopped.'));
@@ -77,16 +91,30 @@ async function recoverIfNeeded() {
 // ─── Perform update ───────────────────────────────────────────────────────────
 
 async function performUpdate(latestVersion) {
+  // Whether PM2 manages the dashboard changes how it is stopped and started,
+  // so it has to be decided before anything is touched.
+  let svc = null;
+  try {
+    svc = await service.status();
+  } catch { /* PM2 absent or unreadable — fall back to the detached path */ }
+  const managedByService = Boolean(svc?.installed && svc?.sameUser);
+
   // Step 1 — snapshot dashboard state and persist it
   const status = await getDashboardStatus();
   dbSet('update-pre-dashboard', {
-    wasRunning: status.running,
+    wasRunning: managedByService ? false : status.running,
     pid:        status.pid,
     port:       status.port,
+    service:    managedByService,
   });
 
-  // Step 2 — stop dashboard if running
-  if (status.running) {
+  // Step 2 — stop the dashboard if running.
+  // Under PM2 it is left alone: a restart after the install picks up the new
+  // code in one step, and killing it by pid would just have PM2 bring the old
+  // version back.
+  if (managedByService) {
+    console.log(chalk.gray(`  Dashboard runs as the service "${svc.appName}" — it will be restarted after the update.`));
+  } else if (status.running) {
     const sp = ora('Stopping dashboard...').start();
     await stopDashboard(status.pid);
     sp.succeed('Dashboard stopped');
@@ -115,7 +143,14 @@ async function performUpdate(latestVersion) {
   const saved = dbGet('update-pre-dashboard');
   dbSet('update-pre-dashboard', null);
 
-  if (saved?.wasRunning) {
+  // Bring the dashboard back the same way it was running before.
+  if (saved?.service || managedByService) {
+    const restSp = ora('Restarting the service...').start();
+    const res = await service.restart();
+    res.ok
+      ? restSp.succeed('Service restarted on the new version')
+      : restSp.fail('Could not restart the service — run `ezz service restart`');
+  } else if (saved?.wasRunning) {
     const port    = saved.port || loadConfig().dashboardPort;
     const restSp  = ora(`Restarting dashboard on port ${port}...`).start();
     const res     = await startDashboard(port);

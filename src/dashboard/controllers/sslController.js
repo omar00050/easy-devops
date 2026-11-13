@@ -1,5 +1,7 @@
 import { listAllCerts } from '../lib/cert-reader.js';
 import { issueCert, renewCert } from '../../cli/managers/ssl-manager.js';
+import { describeIssuance, prepareDomainForHttpChallenge } from '../../core/ssl-issuer.js';
+import { findDomain } from '../lib/domains-db.js';
 import { loadConfig } from '../../core/config.js';
 import { promises as dns } from 'dns';
 
@@ -8,7 +10,7 @@ import { promises as dns } from 'dns';
 // or when cancelled. Entries older than 10 minutes are forcibly removed.
 const pendingDnsChallenges = new Map();
 
-setInterval(() => {
+const dnsSweepTimer = setInterval(() => {
   const now = Date.now();
   for (const [domain, state] of pendingDnsChallenges) {
     if (now - state.createdAt > 10 * 60 * 1000) {
@@ -17,6 +19,24 @@ setInterval(() => {
     }
   }
 }, 60000);
+
+/**
+ * Stops the DNS-challenge sweep and rejects anything still pending.
+ *
+ * Called by the dashboard's shutdown(): this interval is created at module
+ * load and would otherwise keep the event loop alive, so `ezz --dash` would
+ * never exit on Ctrl+C. Safe to call more than once.
+ */
+export function stopSslController() {
+  clearInterval(dnsSweepTimer);
+
+  for (const [domain, state] of pendingDnsChallenges) {
+    try {
+      state.confirmDeferred.reject(new Error('Dashboard is shutting down'));
+    } catch { /* already settled */ }
+    pendingDnsChallenges.delete(domain);
+  }
+}
 
 class SslController {
   async create(req, res, next) {
@@ -110,11 +130,40 @@ class SslController {
         return;
       }
 
-      // HTTP validation path (synchronous — responds when complete)
+      // HTTP validation path (synchronous — responds when complete).
+      //
+      // Flow 2: make sure nginx can answer the challenge first. For a domain
+      // that is already configured this regenerates a stale config; for a new
+      // one it writes a temporary HTTP-only config. Either way nginx is only
+      // reloaded, never stopped.
+      const existing = findDomain(domainKey);
+      let prepared = null;
+      if (existing) {
+        prepared = await prepareDomainForHttpChallenge(existing);
+        if (!prepared.ok) {
+          return res.status(500).json({
+            error: 'challenge_setup_failed',
+            detail: prepared.error,
+            hint: 'nginx could not be prepared to answer the ACME challenge. Check the nginx config and try again.',
+          });
+        }
+      }
+
       const result = await issueCert(domainKey, { www: !!www, validationMethod: 'http', email: acmeEmail });
 
       if (result.success) {
-        return res.json({ success: true, certPath: result.certPath, keyPath: result.keyPath });
+        // Tell the UI how the challenge ran: proxy (nginx stayed up), or a
+        // standalone fallback with how long nginx was stopped.
+        return res.json({
+          success: true,
+          certPath: result.certPath,
+          keyPath: result.keyPath,
+          mode: result.mode,
+          fellBack: result.fellBack,
+          nginxDownMs: result.nginxDownMs,
+          staging: result.staging,
+          summary: describeIssuance(result),
+        });
       }
 
       const { step } = result.error;
@@ -178,7 +227,18 @@ class SslController {
       pendingDnsChallenges.delete(domainKey);
 
       if (result.success) {
-        return res.json({ success: true, certPath: result.certPath, keyPath: result.keyPath });
+        // Tell the UI how the challenge ran: proxy (nginx stayed up), or a
+        // standalone fallback with how long nginx was stopped.
+        return res.json({
+          success: true,
+          certPath: result.certPath,
+          keyPath: result.keyPath,
+          mode: result.mode,
+          fellBack: result.fellBack,
+          nginxDownMs: result.nginxDownMs,
+          staging: result.staging,
+          summary: describeIssuance(result),
+        });
       }
       return res.status(500).json({ success: false, error: result.error });
     } catch (error) {
@@ -236,10 +296,36 @@ class SslController {
         return res.status(404).json({ error: `Domain '${domain}' not found` });
       }
 
+      // Flow 1: a config generated before the ACME challenge location existed
+      // cannot answer the challenge. Regenerate it (reload only) and say so.
+      const domainRecord = findDomain(domain);
+      let prepared = null;
+      if (domainRecord) {
+        prepared = await prepareDomainForHttpChallenge(domainRecord);
+        if (!prepared.ok) {
+          return res.status(500).json({
+            error: 'challenge_setup_failed',
+            detail: prepared.error,
+            hint: 'nginx could not be prepared to answer the ACME challenge.',
+          });
+        }
+      }
+
       const result = await renewCert(domain, { validationMethod: 'http', email: config.acmeEmail });
 
       if (result.success) {
-        return res.json({ success: true, certPath: result.certPath, keyPath: result.keyPath });
+        // Tell the UI how the challenge ran: proxy (nginx stayed up), or a
+        // standalone fallback with how long nginx was stopped.
+        return res.json({
+          success: true,
+          certPath: result.certPath,
+          keyPath: result.keyPath,
+          mode: result.mode,
+          fellBack: result.fellBack,
+          nginxDownMs: result.nginxDownMs,
+          staging: result.staging,
+          summary: describeIssuance(result),
+        });
       }
 
       const { step } = result.error;
@@ -272,12 +358,37 @@ class SslController {
       const results = [];
 
       for (const cert of expiring) {
+        // Same prepare step as a single renew: regenerate a config that
+        // predates the ACME challenge location so this renewal can use proxy
+        // mode, instead of silently falling back to stopping nginx.
+        const record = findDomain(cert.domain);
+        let prepared = null;
+        if (record) {
+          prepared = await prepareDomainForHttpChallenge(record);
+          if (!prepared.ok) {
+            results.push({
+              domain: cert.domain,
+              success: false,
+              certPath: null,
+              keyPath: null,
+              error: 'challenge_setup_failed',
+              detail: prepared.error,
+            });
+            continue;
+          }
+        }
+
         const result = await renewCert(cert.domain, { validationMethod: 'http', email: config.acmeEmail });
         results.push({
           domain: cert.domain,
           success: result.success,
           certPath: result.certPath,
           keyPath: result.keyPath,
+          mode: result.mode,
+          fellBack: result.fellBack,
+          nginxDownMs: result.nginxDownMs,
+          configRegenerated: Boolean(prepared?.regenerated),
+          summary: describeIssuance(result),
         });
       }
 

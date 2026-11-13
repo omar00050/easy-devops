@@ -9,7 +9,7 @@
  * - getShell() — Returns OS-resolved shell descriptor { shell, flag }
  * - run(cmd, options) — Executes a command and captures output; never throws
  * - runLive(cmd, options) — Executes a command, streaming output to the terminal; never throws
- * - runInteractive(cmd, options) — Executes a command with full stdio inheritance (Linux only); never throws
+ * - runInteractive(cmd, options) — Executes a command with full stdio inheritance, for commands that prompt; never throws
  * - runWithStdin(cmd, argsArray, stdinData) — Spawns a process with stdin piping; never throws
  *
  * CommandResult shape (returned by run()):
@@ -156,8 +156,13 @@ export function runLive(cmd, options = {}) {
 
 /**
  * Executes a shell command with full stdio inheritance (stdin/stdout/stderr all
- * pass through to the terminal). Intended for Linux-only interactive commands
- * such as `sudo -v` that need to read a password from the user.
+ * pass through to the terminal), for commands that must prompt the user
+ * themselves — `sudo -v` on Linux, and `schtasks /RP *` on Windows, where
+ * Windows collects the account password so that Easy DevOps never handles it.
+ *
+ * The implementation is platform-agnostic; the caller is responsible for
+ * checking that a real terminal exists (`process.stdin.isTTY`), since there is
+ * nothing to prompt on in a dashboard request or a PM2-managed process.
  *
  * Never throws.
  *

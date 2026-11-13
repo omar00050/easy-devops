@@ -13,7 +13,9 @@ import {
   saveHubPermissions,
   getLinkStatus,
 } from '../../core/hubLink.js';
-import { stopHubAgent, initHubAgent, getHubAgentStatus } from '../lib/hubAgent.js';
+import { PERMISSION_TREE, COMING_SOON_PERMISSION_IDS } from '../../core/hubPermissions.js';
+import { getDataDir, isDevDataDir } from '../../core/platform.js';
+import { stopHubAgent, initHubAgent, getHubAgentStatus, pushPermissions } from '../lib/hubAgent.js';
 
 // POST /api/hub/connect
 // Body: { connectionString: 'ezops://hubUrl|serverId|secret' }
@@ -51,7 +53,14 @@ export function hubStatus(req, res) {
 // Body: { reloadNginx?: boolean, manageDomains?: boolean, manageSSL?: boolean }
 export function updatePermissions(req, res) {
   const permissions = saveHubPermissions(req.body ?? {});
-  return res.json({ permissions });
+
+  // Push the new state to the Hub immediately so its UI greys out actions
+  // without waiting for a poll. Non-fatal: the agent may not be connected.
+  try {
+    pushPermissions();
+  } catch { /* not linked, or socket down */ }
+
+  return res.json({ permissions, tree: PERMISSION_TREE, comingSoon: COMING_SOON_PERMISSION_IDS });
 }
 
 /**
@@ -67,9 +76,19 @@ function hubStatusPayload() {
     hubUrl: link.hubUrl,
     serverId: link.serverId,
     permissions: link.permissions,
+    // The catalog travels with the status so the UI never hard-codes it.
+    tree: PERMISSION_TREE,
+    comingSoon: COMING_SOON_PERMISSION_IDS,
     connected: agent.connected,
     status: agent.status,
     lastError: agent.lastError,
     attempts: agent.attempts,
+    // Which database this dashboard — and therefore this agent — is actually
+    // using. `--dev` and EASY_DEVOPS_DATA_DIR point at a different file from
+    // the normal one, so a CLI and a dashboard can be editing two separate
+    // domain lists with no visible sign of it. Showing the path makes that
+    // mismatch obvious instead of looking like a sync bug.
+    dataDir: getDataDir(),
+    devDataDir: isDevDataDir(),
   };
 }

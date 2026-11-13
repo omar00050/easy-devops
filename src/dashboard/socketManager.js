@@ -4,6 +4,8 @@ import path from 'path';
 import { Server as SocketIO } from 'socket.io';
 
 import { getStatus } from './lib/nginx-service.js';
+import { socketRequireAuth } from './lib/requireAuth.js';
+import { socketRequireLocalRequest } from './lib/localRequest.js';
 import { listAllCerts } from './lib/cert-reader.js';
 import { loadConfig } from '../core/config.js';
 import { dbGet } from '../core/db.js';
@@ -22,6 +24,10 @@ import {
 
 let connectedClients = 0;
 const activeTails = new Map();
+
+// Handles kept so stopSocket() can shut everything down cleanly.
+const pollTimers = [];
+let ioServer = null;
 
 /**
  * Emit nginx status and handle notification state transitions.
@@ -242,8 +248,42 @@ function stopTail(socketId) {
 /**
  * Initialize the Socket.IO server.
  */
-function initSocket(httpServer) {
+function initSocket(httpServer, sessionMiddleware, getBinding) {
   const io = new SocketIO(httpServer);
+  ioServer = io;
+
+  // The socket stream is not a lesser surface than the REST API: it carries
+  // nginx status, domain health and live log tails. It gets the same session
+  // check.
+  //
+  // `io.engine.use` runs the express-session middleware on the handshake
+  // request, which is what puts `socket.request.session` in place for
+  // socketRequireAuth to read. Without the middleware there is no session
+  // object at all, and the guard then refuses every connection — which is the
+  // correct direction to fail, but would break the dashboard, so it is worth
+  // noticing rather than shipping.
+  if (typeof sessionMiddleware === 'function') {
+    io.engine.use(sessionMiddleware);
+  } else {
+    console.error('[socketManager] no session middleware supplied — refusing all socket connections');
+  }
+
+  // Host / Origin / X-EZ-Request, before the session check — the handshake is
+  // as reachable from a hostile page as any POST is, and a socket has no
+  // "safe method", so the custom header is required unconditionally.
+  //
+  // This is why the browser client must NOT force transports: ['websocket']:
+  // browsers cannot set headers on a WebSocket upgrade. socket.io's default
+  // starts with HTTP polling, where extraHeaders does apply, and the
+  // handshake is authenticated there before any upgrade happens.
+  if (typeof getBinding === 'function') {
+    io.use(socketRequireLocalRequest(getBinding));
+  } else {
+    console.error('[socketManager] no binding supplied — refusing all socket connections');
+    io.use((socket, next) => next(new Error('FORBIDDEN')));
+  }
+
+  io.use(socketRequireAuth);
 
   io.on('connection', (socket) => {
     connectedClients++;
@@ -263,20 +303,77 @@ function initSocket(httpServer) {
     });
   });
 
-  // Poll domain health every 60 seconds
-  setInterval(() => {
-    if (connectedClients > 0) emitDomainHealth(io);
-  }, 60_000);
+  // Tracked so stopSocket() can clear them — otherwise these keep the event
+  // loop alive and the process never exits on Ctrl+C.
+  pollTimers.push(
+    // Poll domain health every 60 seconds
+    setInterval(() => {
+      if (connectedClients > 0) emitDomainHealth(io);
+    }, 60_000),
 
-  // Broadcast nginx status to all clients every 5 seconds
-  setInterval(() => {
-    if (connectedClients > 0) emitNginxStatus(io);
-  }, 5000);
+    // Broadcast nginx status to all clients every 5 seconds
+    setInterval(() => {
+      if (connectedClients > 0) emitNginxStatus(io);
+    }, 5000),
 
-  // Check cert expiry every 12 hours
-  setInterval(() => {
-    if (connectedClients > 0) emitCertNotifications(io);
-  }, 12 * 60 * 60 * 1000);
+    // Check cert expiry every 12 hours
+    setInterval(() => {
+      if (connectedClients > 0) emitCertNotifications(io);
+    }, 12 * 60 * 60 * 1000)
+  );
+
+  return io;
 }
 
-export { initSocket };
+/**
+ * Tells every open dashboard tab that a section changed, so the UI can refresh
+ * just that part instead of reloading the page.
+ *
+ * Used when a change did NOT originate in this browser — most importantly when
+ * the Hub applies a command through hubAgent.js. Without it an operator
+ * watching the local dashboard would see stale data after a remote action.
+ *
+ * Safe to call before initSocket(): it simply does nothing.
+ *
+ * @param {'domains'|'ssl'|'nginx'|'settings'} section
+ * @param {Object} [detail] Optional extra context for the client
+ */
+function emitLocalChange(section, detail = {}) {
+  if (!ioServer) return;
+  try {
+    ioServer.emit('local:changed', { section, source: 'hub', at: Date.now(), ...detail });
+  } catch { /* non-fatal */ }
+}
+
+/**
+ * Stops everything initSocket() started: the polling intervals, every active
+ * log tail (each is a spawned child process), and the Socket.io server itself.
+ * Safe to call more than once.
+ *
+ * @returns {Promise<void>} Resolves once the Socket.io server has closed
+ */
+async function stopSocket() {
+  for (const id of pollTimers) clearInterval(id);
+  pollTimers.length = 0;
+
+  // Kill the tail/Get-Content children; stopTail() removes each map entry.
+  for (const socketId of [...activeTails.keys()]) stopTail(socketId);
+
+  connectedClients = 0;
+
+  const io = ioServer;
+  ioServer = null;
+  if (!io) return;
+
+  await new Promise((resolve) => {
+    // close() disconnects clients and stops accepting new ones. It is given a
+    // short grace period so a wedged client cannot block shutdown.
+    const done = setTimeout(resolve, 2000);
+    io.close(() => {
+      clearTimeout(done);
+      resolve();
+    });
+  });
+}
+
+export { initSocket, stopSocket, emitLocalChange };

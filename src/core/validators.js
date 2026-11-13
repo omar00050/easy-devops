@@ -109,6 +109,12 @@ export function validateHubUrl(hubUrl) {
     return 'Hub URL must not have leading or trailing spaces';
   }
 
+  // Reject any other scheme explicitly. Without this, "file://x" is silently
+  // re-prefixed below and parses as the host "file", which hides the mistake.
+  if (hubUrl.includes('://') && !/^https?:\/\//i.test(hubUrl)) {
+    return 'Hub URL must use http or https';
+  }
+
   // Bare hosts are allowed; the agent defaults them to https.
   const candidate = /^https?:\/\//i.test(hubUrl) ? hubUrl : `https://${hubUrl}`;
 
@@ -125,9 +131,19 @@ export function validateHubUrl(hubUrl) {
   if (!parsed.hostname) {
     return 'Hub URL is missing a host';
   }
+  // The hub never issues credentials inside the URL; refuse to store any.
+  if (parsed.username || parsed.password) {
+    return 'Hub URL must not contain credentials';
+  }
 
   return null;
 }
+
+/** Upper bound on a pasted connection string (real ones are ~150 chars). */
+const MAX_CONNECTION_STRING_LENGTH = 2048;
+
+/** serverId / secret shape: URL-safe token, no whitespace or control chars. */
+const SAFE_TOKEN = /^[A-Za-z0-9._~-]{1,200}$/;
 
 /**
  * Validates an Easy DevOps Hub connection string.
@@ -147,6 +163,12 @@ export function validateConnectionString(str) {
   const trimmed = str.trim();
   const PREFIX = 'ezops://';
 
+  // A real string is ~150 characters. Cap it so a pasted blob is rejected
+  // before it is persisted to SQLite or sent as a handshake credential.
+  if (trimmed.length > MAX_CONNECTION_STRING_LENGTH) {
+    return 'Connection string is too long';
+  }
+
   if (!trimmed.toLowerCase().startsWith(PREFIX)) {
     return 'Connection string must start with ezops://';
   }
@@ -163,6 +185,11 @@ export function validateConnectionString(str) {
 
   if (!serverId) return 'Connection string is missing the server ID';
   if (!secret) return 'Connection string is missing the secret';
+
+  // Identifiers the hub mints are URL-safe tokens (cuid / uuid / hex). Reject
+  // anything with whitespace or control characters rather than storing it.
+  if (!SAFE_TOKEN.test(serverId)) return 'Connection string has an invalid server ID';
+  if (!SAFE_TOKEN.test(secret)) return 'Connection string has an invalid secret';
 
   return null;
 }

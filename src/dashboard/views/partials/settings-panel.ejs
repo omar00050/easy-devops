@@ -38,6 +38,74 @@
 	<!-- Tab Content: General Settings -->
 	<div v-show="settingsTab === 'general'" class="space-y-6">
 
+		<!--
+			Background service summary. Installing is done from the CLI (on
+			Windows the at-boot task needs an elevated, interactive terminal so
+			Windows can prompt for the account password), so this is a read-only
+			summary that points at the Processes page for the details.
+		-->
+		<div class="stat-card overflow-hidden relative">
+			<div class="absolute top-0 left-0 w-full h-1"
+				:class="svc.status && svc.status.running ? 'bg-green-500/40' : 'bg-yellow-500/40'"></div>
+			<div class="p-6 border-b border-border/50 bg-black/5 dark:bg-white/5">
+				<h3 class="form-label !mb-0 font-bold">Background service</h3>
+				<p class="text-[11px] text-muted mt-1 font-bold tracking-wide uppercase opacity-70">
+					Whether Easy DevOps keeps running after you close the terminal
+				</p>
+			</div>
+			<div class="p-6 bg-background">
+				<div v-if="svc.loading && !svc.status" class="text-sm text-muted">Checking…</div>
+
+				<div v-else-if="svc.status && !svc.status.pm2.installed" class="space-y-2">
+					<p class="text-sm text-muted">Not set up — PM2 is not installed.</p>
+					<p class="text-[13px] text-foreground">
+						Run <code class="font-mono">{{ svc.status.cliHint }}</code>
+					</p>
+				</div>
+
+				<div v-else-if="svc.status" class="space-y-4">
+					<div class="grid grid-cols-3 gap-4">
+						<div>
+							<p class="text-[10px] uppercase tracking-widest text-muted font-bold">Installed</p>
+							<p class="text-sm font-semibold mt-1"
+								:class="svc.status.installed ? 'text-green-500' : 'text-yellow-500'">
+								{{ svc.status.installed ? 'Yes' : 'No' }}
+							</p>
+						</div>
+						<div>
+							<p class="text-[10px] uppercase tracking-widest text-muted font-bold">Running</p>
+							<p class="text-sm font-semibold mt-1"
+								:class="svc.status.running ? 'text-green-500' : 'text-yellow-500'">
+								{{ svc.status.running ? 'Yes' : (svc.status.status || 'No') }}
+							</p>
+						</div>
+						<div>
+							<p class="text-[10px] uppercase tracking-widest text-muted font-bold">On boot</p>
+							<p class="text-sm font-semibold mt-1"
+								:class="svc.status.enabledOnBoot ? 'text-green-500' : 'text-yellow-500'">
+								{{ describeBoot(svc.status) }}
+							</p>
+						</div>
+					</div>
+
+					<div v-if="!svc.status.installed || !svc.status.enabledOnBoot"
+						class="px-4 py-3 rounded-[10px] text-[13px] border bg-yellow-500/10 border-yellow-500/20 text-yellow-600 dark:text-yellow-500">
+						<span v-if="!svc.status.installed">
+							Easy DevOps stops when this terminal closes and will not return after a reboot.
+						</span>
+						<span v-else>
+							The service will not start on boot, so it will not return after a reboot.
+						</span>
+						Run <code class="font-mono">{{ svc.status.cliHint }}</code>
+					</div>
+
+					<button @click="loadPage('processes')" class="btn btn-secondary text-xs">
+						Open Processes
+					</button>
+				</div>
+			</div>
+		</div>
+
 		<!-- Application Configuration Card -->
 		<div class="stat-card overflow-hidden relative">
 			<div class="absolute top-0 left-0 w-full h-1 bg-primary/40"></div>
@@ -52,6 +120,71 @@
 						<label class="form-label">Dashboard Port</label>
 						<input v-model.number="settings.dashboardPort" type="number" class="form-input" placeholder="6443" />
 						<p class="text-[11px] text-muted mt-2 font-bold tracking-wide uppercase opacity-70">Restart dashboard after changing</p>
+					</div>
+
+					<!--
+						How the dashboard authenticates.
+
+						"No password" is a real option for a single-user machine, not a
+						loophole: the server refuses it unless the listener is bound to
+						this machine only, and refuses to open the listener up again
+						while it is in force. Both halves are re-checked server-side —
+						this control only reflects what is permitted.
+					-->
+					<div class="w-full">
+						<label class="form-label">Authentication</label>
+						<select v-model="settings.dashboardAuth" class="form-input">
+							<option value="password">Password required</option>
+							<option value="none" :disabled="!settings.canUseNoPassword && settings.dashboardAuth !== 'none'">
+								No password (this machine only)
+							</option>
+						</select>
+
+						<p v-if="settings.dashboardAuth === 'none'"
+							class="text-[11px] mt-2 font-bold tracking-wide uppercase opacity-70 text-yellow-600 dark:text-yellow-500">
+							No login — reachable from this machine only
+						</p>
+						<p v-else-if="!settings.hasPassword"
+							class="text-[11px] mt-2 font-bold tracking-wide uppercase opacity-70 text-yellow-600 dark:text-yellow-500">
+							No password set yet — set one below
+						</p>
+						<p v-else class="text-[11px] text-muted mt-2 font-bold tracking-wide uppercase opacity-70">
+							A password is required to sign in
+						</p>
+
+						<p v-if="!settings.canUseNoPassword && settings.dashboardAuth !== 'none'"
+							class="text-[11px] text-muted mt-1 font-bold tracking-wide uppercase opacity-70">
+							To remove the password, set Listen On to this machine only
+						</p>
+					</div>
+
+					<!--
+						Who can reach the dashboard. Loopback-only is the safer default
+						and the one new Linux installs get; an existing install keeps
+						listening everywhere until it is changed here.
+					-->
+					<div class="w-full">
+						<label class="form-label">Listen On</label>
+						<select v-model="settings.dashboardBindAddress" class="form-input">
+							<option value="127.0.0.1">This machine only (127.0.0.1)</option>
+							<option value="0.0.0.0">All interfaces (0.0.0.0)</option>
+						</select>
+						<p class="text-[11px] mt-2 font-bold tracking-wide uppercase opacity-70"
+							:class="settings.bindsToLoopbackOnly ? 'text-muted' : 'text-yellow-600 dark:text-yellow-500'">
+							<span v-if="settings.bindsToLoopbackOnly">
+								Currently {{ settings.dashboardBindAddress }} — reachable only from this machine
+							</span>
+							<span v-else>
+								Currently {{ settings.dashboardBindAddress }} — reachable from the network
+							</span>
+						</p>
+						<p class="text-[11px] text-muted mt-1 font-bold tracking-wide uppercase opacity-70">
+							Restart dashboard after changing
+						</p>
+						<p v-if="settings.dashboardAuth === 'none'"
+							class="text-[11px] mt-1 font-bold tracking-wide uppercase opacity-70 text-yellow-600 dark:text-yellow-500">
+							Locked to this machine while there is no password
+						</p>
 					</div>
 
 					<div class="w-full">
@@ -224,6 +357,25 @@
 				<p class="text-[11px] text-muted mt-1 font-bold tracking-wide uppercase opacity-70">Monitor and control this server from a central dashboard</p>
 			</div>
 
+			<!--
+				Which database this dashboard is using. `--dev` and
+				EASY_DEVOPS_DATA_DIR point at a different file, so a CLI started
+				without the same flag edits a different domain list entirely.
+				That looks exactly like a broken sync, so show it here.
+			-->
+			<div v-if="hub.status.dataDir" class="px-6 py-3 border-b border-border/50 flex items-start gap-2 flex-wrap text-[11px]">
+				<span class="font-bold uppercase tracking-wide text-muted opacity-70">Data directory</span>
+				<code class="font-mono text-[11px] text-foreground break-all">{{ hub.status.dataDir }}</code>
+				<span v-if="hub.status.devDataDir"
+					class="px-1.5 py-0.5 rounded bg-yellow-500/15 text-yellow-600 dark:text-yellow-500 font-bold uppercase tracking-wide">
+					dev override
+				</span>
+				<span v-if="hub.status.devDataDir" class="w-full text-muted">
+					This is not the normal data directory. The CLI must run with the same override, or it will
+					read and write a different domain list.
+				</span>
+			</div>
+
 			<!-- Not linked state — paste the string the hub issued -->
 			<div v-if="!hub.status.linked" class="p-8 space-y-6 bg-background">
 				<div class="space-y-2">
@@ -278,19 +430,51 @@
 				</div>
 
 				<div class="space-y-3">
-					<p class="text-xs font-bold uppercase tracking-wide text-muted">Allow Hub To</p>
-					<label class="flex items-center gap-3 cursor-pointer">
-						<input type="checkbox" v-model="hub.status.permissions.reloadNginx" @change="saveHubPermissions" class="w-4 h-4" />
-						<span class="text-sm">Reload Nginx</span>
-					</label>
-					<label class="flex items-center gap-3 cursor-pointer">
-						<input type="checkbox" v-model="hub.status.permissions.manageDomains" @change="saveHubPermissions" class="w-4 h-4" />
-						<span class="text-sm">Manage Domains</span>
-					</label>
-					<label class="flex items-center gap-3 cursor-pointer">
-						<input type="checkbox" v-model="hub.status.permissions.manageSSL" @change="saveHubPermissions" class="w-4 h-4" />
-						<span class="text-sm">Manage SSL</span>
-					</label>
+					<div>
+						<p class="text-xs font-bold uppercase tracking-wide text-muted">Allow Hub To</p>
+						<p class="text-[11px] text-muted mt-1 opacity-70">
+							Monitoring (metrics, nginx status, domains, certificate expiry) is always on and is not listed here.
+							These toggles are enforced on this server — the Hub cannot grant itself anything.
+						</p>
+					</div>
+
+					<div v-for="group in hub.status.tree" :key="group.id" class="border border-border/50 rounded-[10px] overflow-hidden">
+						<!-- Group header: checked / unchecked / indeterminate -->
+						<label class="flex items-start gap-3 p-3 cursor-pointer bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-colors">
+							<input type="checkbox" class="w-4 h-4 mt-0.5 shrink-0"
+								:checked="hubGroupChecked(group)"
+								:indeterminate.prop="hubGroupIndeterminate(group)"
+								@change="toggleHubGroup(group)" />
+							<span class="min-w-0">
+								<span class="text-sm font-semibold block">{{ group.label }}</span>
+								<span class="text-[11px] text-muted block mt-0.5">{{ group.description }}</span>
+							</span>
+						</label>
+
+						<!-- Children -->
+						<div class="divide-y divide-border/30">
+							<label v-for="child in group.children" :key="child.id"
+								class="flex items-start gap-3 py-2.5 pl-10 pr-3"
+								:class="child.comingSoon ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:bg-black/5 dark:hover:bg-white/5'">
+								<input type="checkbox" class="w-3.5 h-3.5 mt-0.5 shrink-0"
+									:checked="hub.status.permissions[child.id] === true"
+									:disabled="child.comingSoon"
+									@change="toggleHubPermission(child)" />
+								<span class="min-w-0">
+									<span class="text-[13px] font-medium">
+										{{ child.label }}
+										<span v-if="child.comingSoon"
+											class="ml-2 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-yellow-500/15 text-yellow-600 dark:text-yellow-500 border border-yellow-500/25">
+											Coming soon
+										</span>
+									</span>
+									<span class="text-[11px] text-muted block mt-0.5">{{ child.description }}</span>
+								</span>
+							</label>
+						</div>
+					</div>
+
+					<p class="text-[11px] text-muted opacity-70">{{ hubGrantedCount() }} permission(s) granted.</p>
 				</div>
 
 				<button @click="unlinkHub" :disabled="hub.loading" class="btn btn-secondary text-red-500 border-red-500/30 hover:bg-red-500/10">

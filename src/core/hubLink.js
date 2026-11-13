@@ -23,17 +23,25 @@
 
 import { dbGet, dbSet, dbDelete } from './db.js';
 import { validateConnectionString } from './validators.js';
+import {
+  defaultPermissions,
+  normalizePermissions,
+  setPermission,
+  setGroup,
+  isLegacyPermissions,
+  migrateLegacyPermissions,
+} from './hubPermissions.js';
 
 const HUB_LINK_KEY = 'hub-link';
 const HUB_PERMISSIONS_KEY = 'hub-permissions';
+const HUB_REVISION_KEY = 'hub-revision';
 const PREFIX = 'ezops://';
 
-/** Permissions start fully denied — the hub cannot act until the user opts in. */
-export const DEFAULT_HUB_PERMISSIONS = {
-  reloadNginx: false,
-  manageDomains: false,
-  manageSSL: false,
-};
+/**
+ * Permissions start fully denied — the hub cannot act until the user opts in.
+ * The shape comes from the catalog in core/hubPermissions.js.
+ */
+export const DEFAULT_HUB_PERMISSIONS = defaultPermissions();
 
 /**
  * Agent statuses surfaced to the UI.
@@ -193,30 +201,77 @@ export function clearHubLink() {
 }
 
 /**
- * Read the per-hub permission flags, merged over the deny-all defaults.
- * @returns {{ reloadNginx: boolean, manageDomains: boolean, manageSSL: boolean }}
+ * Read the permission map, normalised against the catalog.
+ *
+ * Migrates the pre-tree {reloadNginx, manageDomains, manageSSL} shape on first
+ * read and persists the result, so the migration happens once and is
+ * idempotent — a second call sees catalog ids and skips it.
+ *
+ * @returns {Object<string, boolean>}
  */
 export function getHubPermissions() {
   const stored = dbGet(HUB_PERMISSIONS_KEY);
-  if (!stored || typeof stored !== 'object') return { ...DEFAULT_HUB_PERMISSIONS };
-  return { ...DEFAULT_HUB_PERMISSIONS, ...stored };
+
+  if (isLegacyPermissions(stored)) {
+    const migrated = migrateLegacyPermissions(stored);
+    dbSet(HUB_PERMISSIONS_KEY, migrated);
+    bumpHubRevision();
+    return migrated;
+  }
+
+  return normalizePermissions(stored);
 }
 
 /**
- * Update permission flags. Only known boolean keys are applied; anything else
- * is ignored so a malformed request cannot widen what the hub may do.
- * @param {object} updates
- * @returns {object} The persisted permissions
+ * Apply permission changes.
+ *
+ * Accepts either individual leaf ids ({ 'nginx.stop': true }) or whole groups
+ * ({ groups: { nginx: true } }), which sets every grantable child. Unknown and
+ * comingSoon ids are ignored, so a malformed request cannot widen access.
+ *
+ * @param {Object} updates
+ * @returns {Object<string, boolean>} The persisted permissions
  */
 export function saveHubPermissions(updates) {
-  const current = getHubPermissions();
-  const next = { ...current };
+  let next = getHubPermissions();
 
-  for (const key of Object.keys(DEFAULT_HUB_PERMISSIONS)) {
-    if (typeof updates?.[key] === 'boolean') next[key] = updates[key];
+  if (updates && typeof updates.groups === 'object' && updates.groups !== null) {
+    for (const [groupId, enabled] of Object.entries(updates.groups)) {
+      if (typeof enabled === 'boolean') next = setGroup(next, groupId, enabled);
+    }
+  }
+
+  for (const [id, enabled] of Object.entries(updates ?? {})) {
+    if (id === 'groups') continue;
+    if (typeof enabled === 'boolean') next = setPermission(next, id, enabled);
   }
 
   dbSet(HUB_PERMISSIONS_KEY, next);
+  bumpHubRevision();
+  return next;
+}
+
+// ─── Change revision ──────────────────────────────────────────────────────────
+//
+// The CLI and the dashboard are separate processes, so the agent (which lives
+// in the dashboard) cannot be notified in-process when the CLI changes
+// something. A counter in SQLite is the cheapest shared signal: the agent polls
+// it every few seconds and pushes only when it actually moved.
+
+/** @returns {number} Current revision. */
+export function getHubRevision() {
+  const n = dbGet(HUB_REVISION_KEY);
+  return typeof n === 'number' ? n : 0;
+}
+
+/**
+ * Increment the revision. Call after any change the Hub should learn about
+ * promptly: domains, certificates, permissions.
+ * @returns {number} The new revision
+ */
+export function bumpHubRevision() {
+  const next = getHubRevision() + 1;
+  dbSet(HUB_REVISION_KEY, next);
   return next;
 }
 

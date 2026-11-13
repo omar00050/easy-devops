@@ -53,16 +53,37 @@ createApp({
       authenticated: false,
       page: 'overview',
 
-      login: { password: '', error: '', loading: false },
+      login: {
+        password: '', confirm: '', error: '', loading: false,
+        // Replaced by minPasswordLength from GET /api/auth as soon as it
+        // answers; this is only the value used before that first response.
+        needsSetup: false, minLength: 6,
+        // Offered only when the server says this request is local and the
+        // dashboard listens on this machine only.
+        canUseNoPassword: false,
+        authMode: 'password',
+      },
 
       navItems: [
         { id: 'overview', label: 'Overview', icon: '⚡' },
         { id: 'nginx', label: 'Nginx', icon: '🌐' },
         { id: 'ssl', label: 'SSL Certs', icon: '🔒' },
         { id: 'domains', label: 'Domains', icon: '🔗' },
+        { id: 'processes', label: 'Processes', icon: '🧩' },
         { id: 'logs', label: 'Logs', icon: '📋' },
         { id: 'settings', label: 'Settings', icon: '⚙️' },
       ],
+
+      // Background service (PM2) and the process list.
+      svc: {
+        status: null, loading: false, restarting: false, message: '', error: false,
+      },
+      processes: {
+        apps: [], loading: false, pm2Installed: false, currentUser: '',
+        busy: null, message: '', error: false,
+        logsFor: null, logLines: [],
+        confirm: null,
+      },
 
       nginx: {
         status: null, loading: false,
@@ -123,6 +144,8 @@ createApp({
         dashboardPort: '', nginxDir: '', sslDir: '', acmeEmail: '',
         password: '', loading: false, msg: '', error: '',
         platform: 'linux', // T022: Platform from settings API
+        dashboardBindAddress: '', bindsToLoopbackOnly: false,
+        dashboardAuth: 'password', canUseNoPassword: false, hasPassword: false,
       },
       settingsTab: 'general', // 'general' | 'notifications' | 'hub'
 
@@ -131,6 +154,7 @@ createApp({
         status: {
           linked: false, connected: false, status: 'not_linked',
           hubUrl: null, serverId: null, permissions: {},
+          tree: [], comingSoon: [],
           lastError: null, attempts: 0,
         },
         form: { connectionString: '' },
@@ -250,18 +274,26 @@ createApp({
     document.documentElement.classList.toggle('dark', this.theme === 'dark');
     document.documentElement.setAttribute('data-accent', this.accent);
 
-    // Check if already authenticated
+    // Check if already authenticated, and whether this is a first run.
     try {
       const r = await fetch('/api/auth');
       const d = await r.json();
+      this.login.needsSetup = d.needsSetup === true;
+      this.login.canUseNoPassword = d.canUseNoPassword === true;
+      this.login.authMode = d.authMode || 'password';
+      if (typeof d.minPasswordLength === 'number') this.login.minLength = d.minPasswordLength;
       if (d.authenticated) { this.authenticated = true; this.loadPage('overview'); }
     } catch { /* server may not be up yet */ }
 
-    // T022: Load settings to get platform for SSL path auto-population
-    await this.loadSettings();
+    // Settings are behind the session now, so only load them once signed in.
+    if (this.authenticated) await this.loadSettings();
 
     // Real-time nginx status via Socket.io
-    const socket = io();
+    // extraHeaders reaches the server because socket.io's default transport
+    // order starts with HTTP polling, where headers can be set. Do NOT add
+    // transports: ['websocket'] here — browsers cannot set headers on a
+    // WebSocket upgrade, and the handshake would be refused.
+    const socket = io({ extraHeaders: { 'X-EZ-Request': '1' } });
     socket.on('nginx:status', (status) => {
       this.nginx.status = status;
     });
@@ -273,6 +305,22 @@ createApp({
       for (const r of results) map[r.name] = r.up;
       this.domainHealth = map;
     });
+    // A change applied by the Hub (or any other process) — refresh just the
+    // affected section so the open tab does not show stale data.
+    socket.on('local:changed', ({ section }) => {
+      if (section === 'domains') {
+        this.loadDomains();
+        if (this.page === 'ssl') this.loadCerts();
+      } else if (section === 'ssl') {
+        this.loadCerts();
+        this.loadDomains();
+      } else if (section === 'nginx') {
+        this.loadNginxStatus();
+        if (this.page === 'nginx') this.loadNginxConfigs();
+      }
+      if (this.settingsTab === 'hub') this.loadHubStatus();
+    });
+
     socket.on('logs:line', ({ line, logFile }) => {
       if (!this.logs.paused && logFile === this.logs.activeLog) {
         this.logs.lines.push(line);
@@ -285,11 +333,39 @@ createApp({
   methods: {
     // ── Core API helper ────────────────────────────────────────────────────────
     async api(method, path, body) {
-      const opts = { method, headers: { 'Content-Type': 'application/json' } };
+      const opts = {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          // Proves the request came from the dashboard's own page rather than
+          // another website in this browser: a cross-site form cannot set a
+          // custom header, and a cross-site fetch that tries triggers a CORS
+          // preflight the server never approves. Required on every
+          // state-changing request — see dashboard/lib/localRequest.js.
+          'X-EZ-Request': '1',
+        },
+      };
       if (body !== undefined) opts.body = JSON.stringify(body);
       const r = await fetch(path, opts);
       const data = await r.json().catch(() => ({}));
+
+      // Any 401 means the session is gone — expired, or the server restarted
+      // with a new session secret. Drop straight back to the login screen
+      // instead of leaving a half-dead page showing stale data.
+      if (r.status === 401 && path !== '/api/login' && path !== '/api/setup') {
+        this.handleUnauthorized(data);
+      }
+
       return { ok: r.ok, status: r.status, data };
+    },
+
+    /** Returns the UI to the login screen after the session was refused. */
+    handleUnauthorized(data) {
+      if (this.authenticated) this.login.error = 'Your session ended. Please sign in again.';
+      this.authenticated = false;
+      this.login.password = '';
+      this.login.confirm = '';
+      if (data && data.needsSetup === true) this.login.needsSetup = true;
     },
 
     // ── Theme ─────────────────────────────────────────────────────────────────
@@ -301,13 +377,83 @@ createApp({
       this.login.loading = true; this.login.error = '';
       const r = await this.api('POST', '/api/login', { password: this.login.password });
       this.login.loading = false;
-      if (r.ok) { this.authenticated = true; this.login.password = ''; this.loadPage('overview'); }
-      else { this.login.error = r.data.error || 'Invalid password'; }
+
+      if (r.ok) {
+        this.authenticated = true;
+        this.login.password = '';
+        this.login.confirm = '';
+        this.login.needsSetup = false;
+        await this.loadSettings();
+        this.loadPage('overview');
+        return;
+      }
+
+      // The server decides when setup is needed; the page follows it.
+      if (r.data && r.data.needsSetup === true) this.login.needsSetup = true;
+      this.login.error = r.data.error || 'Invalid password';
+    },
+
+    /**
+     * First run: run without a password.
+     *
+     * Only reachable when the server reported canUseNoPassword, which means
+     * the dashboard listens on this machine only AND this request came from
+     * this machine. The server re-checks both; this is just the button.
+     */
+    async doSetupNoPassword() {
+      this.login.error = '';
+      this.login.loading = true;
+      const r = await this.api('POST', '/api/setup', { mode: 'none' });
+      this.login.loading = false;
+
+      if (r.ok) {
+        this.authenticated = true;
+        this.login.needsSetup = false;
+        this.login.authMode = 'none';
+        await this.loadSettings();
+        this.loadPage('overview');
+        return;
+      }
+
+      this.login.error = r.data.error || 'Could not save that choice';
+    },
+
+    /** First run: set the initial password, which also signs the user in. */
+    async doSetup() {
+      this.login.error = '';
+
+      if (this.login.password.length < this.login.minLength) {
+        this.login.error = 'The password must be at least ' + this.login.minLength + ' characters.';
+        return;
+      }
+      if (this.login.password !== this.login.confirm) {
+        this.login.error = 'The two passwords do not match.';
+        return;
+      }
+
+      this.login.loading = true;
+      const r = await this.api('POST', '/api/setup', { password: this.login.password });
+      this.login.loading = false;
+
+      if (r.ok) {
+        this.authenticated = true;
+        this.login.password = '';
+        this.login.confirm = '';
+        this.login.needsSetup = false;
+        await this.loadSettings();
+        this.loadPage('overview');
+        return;
+      }
+
+      this.login.error = r.data.error || 'Could not set the password';
     },
 
     async doLogout() {
       await this.api('POST', '/api/logout');
       this.authenticated = false;
+      this.login.password = '';
+      this.login.confirm = '';
+      this.login.error = '';
     },
 
     // ── Navigation (T021: Nav click guard) ────────────────────────────────────
@@ -330,6 +476,9 @@ createApp({
 
     async loadPage(p) {
       if (this.page === 'logs' && p !== 'logs') this.unsubscribeLogs();
+      // The hub status poll only exists for the settings page; leaving it must
+      // not leave a timer re-polling in the background.
+      if (p !== 'settings') this.stopHubPoll();
       this.page = p;
       if (p === 'overview') {
         await Promise.all([this.loadNginxStatus(), this.loadSSL(), this.loadDomains()]);
@@ -338,12 +487,140 @@ createApp({
       } else if (p === 'ssl') { await this.loadSSL(); }
       else if (p === 'domains') { await this.loadDomains(); }
       else if (p === 'logs') { this.subscribeToLogs(this.logs.activeLog); }
-      else if (p === 'settings') { await Promise.all([this.loadSettings(), this.loadPermissionsStatus(), this.loadChannels(), this.loadHubStatus()]); }
+      else if (p === 'processes') { await this.loadProcessesPage(); }
+      else if (p === 'settings') { await Promise.all([this.loadSettings(), this.loadPermissionsStatus(), this.loadChannels(), this.loadHubStatus(), this.loadServiceStatus()]); }
     },
 
     // ── Collapsible Sections ────────────────────────────────────────────
     toggleSection(sectionId) {
       this.sections[sectionId] = !this.sections[sectionId];
+    },
+
+    // ── Background service + processes ────────────────────────────────────────
+
+    /** Both panels on the Processes page come from two independent reads. */
+    async loadProcessesPage() {
+      await Promise.all([this.loadServiceStatus(), this.loadProcesses()]);
+    },
+
+    async loadServiceStatus() {
+      this.svc.loading = true;
+      const r = await this.api('GET', '/api/service');
+      this.svc.loading = false;
+      if (r.ok) this.svc.status = r.data;
+    },
+
+    async loadProcesses() {
+      this.processes.loading = true;
+      const r = await this.api('GET', '/api/processes');
+      this.processes.loading = false;
+      if (!r.ok) {
+        this.processes.error = true;
+        this.processes.message = r.data?.error || 'Could not read the process list';
+        return;
+      }
+      this.processes.apps = r.data.apps || [];
+      this.processes.pm2Installed = Boolean(r.data.pm2?.installed);
+      this.processes.currentUser = r.data.currentUser || '';
+      this.processes.error = false;
+      this.processes.message = '';
+    },
+
+    describeBoot(status) {
+      if (!status) return 'No';
+      // null means the init system could not be inspected (non-systemd Linux);
+      // showing "No" there would be a confident lie.
+      if (status.enabledOnBoot === null) return 'Unknown';
+      if (!status.enabledOnBoot) return 'No';
+      if (status.bootMode === 'logon') return 'At logon';
+      if (status.bootMode === 'boot') return 'At startup';
+      return 'Yes';
+    },
+
+    formatBytes(bytes) {
+      if (bytes === null || bytes === undefined) return '—';
+      if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB';
+      return Math.round(bytes / (1024 * 1024)) + ' MB';
+    },
+
+    formatDuration(ms) {
+      if (ms === null || ms === undefined || ms < 0) return '—';
+      const s = Math.floor(ms / 1000);
+      if (s < 60) return s + 's';
+      const m = Math.floor(s / 60);
+      if (m < 60) return m + 'm';
+      const h = Math.floor(m / 60);
+      if (h < 24) return h + 'h ' + (m % 60) + 'm';
+      return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+    },
+
+    /**
+     * Acts on one PM2 process.
+     *
+     * Anything Easy DevOps did not create asks first: the user may be looking
+     * at an unrelated production app that happens to share this PM2.
+     */
+    async processAction(app, action) {
+      if (!app.managed && (action === 'stop' || action === 'restart')) {
+        this.processes.confirm = { name: app.name, action };
+        return;
+      }
+      await this.runProcessAction(app.name, action);
+    },
+
+    async runConfirmedProcessAction() {
+      const pending = this.processes.confirm;
+      this.processes.confirm = null;
+      if (pending) await this.runProcessAction(pending.name, pending.action);
+    },
+
+    async runProcessAction(name, action) {
+      this.processes.busy = name;
+      this.processes.message = '';
+      const r = await this.api('POST', `/api/processes/${encodeURIComponent(name)}/${action}`);
+      this.processes.busy = null;
+
+      if (r.ok) {
+        this.processes.error = false;
+        this.processes.message = `${name}: ${action} done`;
+      } else {
+        this.processes.error = true;
+        this.processes.message = r.data?.error || `Could not ${action} ${name}`;
+      }
+      await this.loadProcessesPage();
+    },
+
+    async showProcessLogs(app) {
+      this.processes.busy = app.name;
+      const r = await this.api('GET', `/api/processes/${encodeURIComponent(app.name)}/logs?lines=200`);
+      this.processes.busy = null;
+      if (r.ok) {
+        this.processes.logsFor = app.name;
+        this.processes.logLines = r.data.lines || [];
+      } else {
+        this.processes.error = true;
+        this.processes.message = r.data?.error || 'Could not read the logs';
+      }
+    },
+
+    /**
+     * Restarts the service. Safe from the dashboard on both platforms: it needs
+     * no elevation and no password prompt, unlike installing the boot task.
+     */
+    async restartService() {
+      this.svc.restarting = true;
+      this.svc.message = '';
+      const r = await this.api('POST', '/api/service/restart');
+      this.svc.restarting = false;
+
+      if (r.ok) {
+        this.svc.error = false;
+        this.svc.message = 'Service restarted. The dashboard may take a moment to come back.';
+      } else {
+        this.svc.error = true;
+        this.svc.message = r.data?.error || 'Could not restart the service';
+      }
+      await this.loadServiceStatus();
     },
 
     // ── Nginx ─────────────────────────────────────────────────────────────────
@@ -777,13 +1054,17 @@ createApp({
           const domain = this.domains.form.name;
           if (domain) {
             const platform = this.settings.platform;
-            if (platform === 'win32') {
-              this.domains.form.ssl.certPath = `C:\\easy-devops\\ssl\\${domain}\\fullchain.pem`;
-              this.domains.form.ssl.keyPath = `C:\\easy-devops\\ssl\\${domain}\\privkey.pem`;
-            } else {
-              this.domains.form.ssl.certPath = `/etc/easy-devops/ssl/${domain}/fullchain.pem`;
-              this.domains.form.ssl.keyPath = `/etc/easy-devops/ssl/${domain}/privkey.pem`;
-            }
+            // Always forward slashes, including on Windows: nginx reads a
+            // backslash as an escape character, so C:\nginx\test\... would
+            // have its \n and \t turned into a newline and a tab.
+            // Use the configured sslDir — that is where certs are issued.
+            const fallback = platform === 'win32' ? 'C:/easy-devops/ssl' : '/etc/easy-devops/ssl';
+            const base = String(this.settings.sslDir || fallback)
+              .replace(/\\/g, '/')
+              .replace(/\/{2,}/g, '/')
+              .replace(/\/+$/, '');
+            this.domains.form.ssl.certPath = `${base}/${domain}/fullchain.pem`;
+            this.domains.form.ssl.keyPath = `${base}/${domain}/privkey.pem`;
           }
         }
       }
@@ -800,6 +1081,11 @@ createApp({
         this.settings.sslDir = r.data.sslDir;
         this.settings.acmeEmail = r.data.acmeEmail || '';
         this.settings.platform = r.data.platform || 'linux'; // T022
+        this.settings.dashboardBindAddress = r.data.dashboardBindAddress || '';
+        this.settings.bindsToLoopbackOnly = r.data.bindsToLoopbackOnly === true;
+        this.settings.dashboardAuth = r.data.dashboardAuth || 'password';
+        this.settings.canUseNoPassword = r.data.canUseNoPassword === true;
+        this.settings.hasPassword = r.data.hasPassword === true;
       }
     },
 
@@ -841,19 +1127,27 @@ createApp({
           status: r.data.status || 'not_linked',
           hubUrl: r.data.hubUrl,
           serverId: r.data.serverId,
-          permissions: r.data.permissions || { reloadNginx: false, manageDomains: false, manageSSL: false },
+          permissions: r.data.permissions || {},
+          tree: Array.isArray(r.data.tree) ? r.data.tree : [],
+          comingSoon: Array.isArray(r.data.comingSoon) ? r.data.comingSoon : [],
           lastError: r.data.lastError || null,
           attempts: r.data.attempts || 0,
         };
         // Keep polling only while the outcome is still undecided.
-        if (this.hub.status.status === 'connecting') this.scheduleHubPoll();
+        // Keep polling while the outcome can still change on its own.
+        // 'unreachable' is included because the agent retries in the
+        // background and can recover without any user action — without this
+        // the tab would keep showing "Hub unreachable" after it reconnected.
+        // 'rejected' and 'not_linked' need the user, so polling stops there.
+        if (this.hub.status.status === 'connecting') this.scheduleHubPoll(2000);
+        else if (this.hub.status.status === 'unreachable') this.scheduleHubPoll(15000);
         else this.stopHubPoll();
       }
     },
 
-    scheduleHubPoll() {
+    scheduleHubPoll(delayMs = 2000) {
       this.stopHubPoll();
-      this.hub.pollTimer = setTimeout(() => this.loadHubStatus(), 2000);
+      this.hub.pollTimer = setTimeout(() => this.loadHubStatus(), delayMs);
     },
 
     stopHubPoll() {
@@ -867,16 +1161,23 @@ createApp({
       this.hub.loading = true;
       this.hub.msg = '';
       this.hub.error = '';
-      const r = await this.api('POST', '/api/hub/connect', {
-        connectionString: this.hub.form.connectionString,
-      });
-      this.hub.loading = false;
-      if (r.ok) {
-        this.hub.form.connectionString = '';
-        this.hub.msg = 'Connection string saved. Connecting to the hub…';
-        await this.loadHubStatus();
-      } else {
-        this.hub.error = r.data?.error || 'Failed to connect to the hub';
+      try {
+        const r = await this.api('POST', '/api/hub/connect', {
+          connectionString: this.hub.form.connectionString,
+        });
+        if (r.ok) {
+          this.hub.form.connectionString = '';
+          this.hub.msg = 'Connection string saved. Connecting to the hub…';
+          await this.loadHubStatus();
+        } else {
+          this.hub.error = r.data?.error || 'Failed to connect to the hub';
+        }
+      } catch (e) {
+        // fetch() rejects when the dashboard is unreachable; without this the
+        // button would stay disabled forever.
+        this.hub.error = 'Could not reach the dashboard. Please try again.';
+      } finally {
+        this.hub.loading = false;
       }
     },
 
@@ -885,25 +1186,73 @@ createApp({
       this.hub.loading = true;
       this.hub.msg = '';
       this.hub.error = '';
-      const r = await this.api('DELETE', '/api/hub/link');
-      this.hub.loading = false;
-      if (r.ok) {
-        this.stopHubPoll();
-        this.hub.status = {
-          linked: false, connected: false, status: 'not_linked',
-          hubUrl: null, serverId: null, permissions: {},
-          lastError: null, attempts: 0,
-        };
-        this.hub.form.connectionString = '';
-        this.hub.msg = 'Unlinked from hub.';
+      try {
+        const r = await this.api('DELETE', '/api/hub/link');
+        if (r.ok) {
+          this.stopHubPoll();
+          this.hub.status = {
+            linked: false, connected: false, status: 'not_linked',
+            hubUrl: null, serverId: null, permissions: {},
+            lastError: null, attempts: 0,
+          };
+          this.hub.form.connectionString = '';
+          this.hub.msg = 'Unlinked from hub.';
+        } else {
+          this.hub.error = r.data?.error || 'Failed to unlink from the hub';
+        }
+      } catch (e) {
+        this.hub.error = 'Could not reach the dashboard. Please try again.';
+      } finally {
+        this.hub.loading = false;
       }
     },
 
-    async saveHubPermissions() {
-      const r = await this.api('PUT', '/api/hub/permissions', this.hub.status.permissions);
-      if (r.ok) {
-        this.hub.status.permissions = r.data.permissions;
+    // ── Permission tree ───────────────────────────────────────────────────────
+
+    /** 'on' | 'off' | 'partial' for a group's checkbox. */
+    hubGroupState(group) {
+      const grantable = (group.children || []).filter(c => !c.comingSoon);
+      if (grantable.length === 0) return 'off';
+      const on = grantable.filter(c => this.hub.status.permissions[c.id] === true).length;
+      if (on === 0) return 'off';
+      if (on === grantable.length) return 'on';
+      return 'partial';
+    },
+
+    hubGroupChecked(group) { return this.hubGroupState(group) === 'on'; },
+    hubGroupIndeterminate(group) { return this.hubGroupState(group) === 'partial'; },
+
+    /** Toggling a group sets every grantable child the same way. */
+    async toggleHubGroup(group) {
+      const turnOn = this.hubGroupState(group) !== 'on';
+      for (const child of group.children || []) {
+        if (child.comingSoon) continue;
+        this.hub.status.permissions[child.id] = turnOn;
       }
+      await this.persistHubPermissions({ groups: { [group.id]: turnOn } });
+    },
+
+    async toggleHubPermission(child) {
+      if (child.comingSoon) return;
+      const next = !this.hub.status.permissions[child.id];
+      this.hub.status.permissions[child.id] = next;
+      await this.persistHubPermissions({ [child.id]: next });
+    },
+
+    async persistHubPermissions(payload) {
+      this.hub.error = '';
+      const r = await this.api('PUT', '/api/hub/permissions', payload);
+      if (r.ok) {
+        // Trust the server's normalised answer over local optimism.
+        this.hub.status.permissions = r.data.permissions || {};
+      } else {
+        this.hub.error = r.data?.error || 'Failed to save permissions';
+        await this.loadHubStatus();
+      }
+    },
+
+    hubGrantedCount() {
+      return Object.values(this.hub.status.permissions || {}).filter(Boolean).length;
     },
 
     async loadChannels() {
@@ -1015,10 +1364,21 @@ createApp({
         acmeEmail: this.settings.acmeEmail,
       };
       if (this.settings.password) payload.dashboardPassword = this.settings.password;
+      if (this.settings.dashboardBindAddress) {
+        payload.dashboardBindAddress = this.settings.dashboardBindAddress;
+      }
+      if (this.settings.dashboardAuth) payload.dashboardAuth = this.settings.dashboardAuth;
       const r = await this.api('POST', '/api/settings', payload);
       this.settings.loading = false;
-      if (r.ok) { this.settings.msg = 'Settings saved ✓'; this.settings.password = ''; }
-      else { this.settings.error = r.data.error || 'Save failed'; }
+      if (r.ok) {
+        // The port and the bind address only apply on restart; saying "saved"
+        // alone would imply the change is already in force.
+        this.settings.msg = r.data.needsRestart
+          ? 'Settings saved ✓ — restart the dashboard for the port and bind address to take effect'
+          : 'Settings saved ✓';
+        this.settings.password = '';
+        await this.loadSettings();
+      } else { this.settings.error = r.data.error || 'Save failed'; }
     },
 
     openAddChannel() {

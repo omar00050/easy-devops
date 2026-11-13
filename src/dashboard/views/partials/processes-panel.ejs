@@ -1,0 +1,261 @@
+<!-- Processes: the PM2 apps on this server, plus the Easy DevOps service -->
+<div v-show="page === 'processes'" class="space-y-6">
+
+  <!-- ── Background service ───────────────────────────────────────────── -->
+  <div class="stat-card overflow-hidden relative">
+    <div class="absolute top-0 left-0 w-full h-1"
+      :class="svc.status && svc.status.running ? 'bg-green-500/40' : 'bg-yellow-500/40'"></div>
+
+    <div class="p-6 border-b border-border/50 bg-black/5 dark:bg-white/5 flex items-start justify-between gap-4 flex-wrap">
+      <div>
+        <h3 class="form-label !mb-0 font-bold">Background service</h3>
+        <p class="text-[11px] text-muted mt-1 font-bold tracking-wide uppercase opacity-70">
+          Keeps the dashboard running and brings it back after a reboot
+        </p>
+      </div>
+      <button @click="loadProcessesPage" :disabled="svc.loading || processes.loading"
+        class="btn btn-secondary text-xs">
+        {{ (svc.loading || processes.loading) ? 'Refreshing…' : 'Refresh' }}
+      </button>
+    </div>
+
+    <div class="p-6 bg-background space-y-5">
+      <div v-if="svc.loading && !svc.status" class="text-sm text-muted">Checking…</div>
+
+      <template v-else-if="svc.status">
+        <!-- PM2 missing: the one thing that blocks everything else here -->
+        <div v-if="!svc.status.pm2.installed"
+          class="px-4 py-3 rounded-[10px] text-[13px] border bg-yellow-500/10 border-yellow-500/20 text-yellow-600 dark:text-yellow-500">
+          PM2 is not installed on this server. Run
+          <code class="font-mono">ezz service install</code> in a terminal — it asks before
+          installing anything.
+        </div>
+
+        <template v-else>
+          <!-- Status grid -->
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div>
+              <p class="text-[10px] uppercase tracking-widest text-muted font-bold">Installed</p>
+              <p class="text-sm font-semibold mt-1"
+                :class="svc.status.installed ? 'text-green-500' : 'text-yellow-500'">
+                {{ svc.status.installed ? 'Yes' : 'No' }}
+              </p>
+            </div>
+            <div>
+              <p class="text-[10px] uppercase tracking-widest text-muted font-bold">Running</p>
+              <p class="text-sm font-semibold mt-1"
+                :class="svc.status.running ? 'text-green-500' : 'text-yellow-500'">
+                {{ svc.status.running ? 'Yes' : (svc.status.status || 'No') }}
+              </p>
+            </div>
+            <div>
+              <p class="text-[10px] uppercase tracking-widest text-muted font-bold">Start on boot</p>
+              <p class="text-sm font-semibold mt-1"
+                :class="svc.status.enabledOnBoot ? 'text-green-500' : 'text-yellow-500'">
+                {{ describeBoot(svc.status) }}
+              </p>
+            </div>
+            <div>
+              <p class="text-[10px] uppercase tracking-widest text-muted font-bold">PM2</p>
+              <p class="text-sm font-semibold mt-1 text-foreground">
+                {{ svc.status.pm2.version || 'installed' }}
+              </p>
+            </div>
+          </div>
+
+          <!-- App name and data directory, so a dev instance is obvious -->
+          <div class="flex flex-wrap gap-x-6 gap-y-2 text-[11px] text-muted">
+            <span>App <code class="font-mono text-foreground">{{ svc.status.appName }}</code></span>
+            <span v-if="svc.status.dev"
+              class="px-1.5 py-0.5 rounded bg-yellow-500/15 text-yellow-600 dark:text-yellow-500 font-bold uppercase tracking-wide">
+              dev data dir
+            </span>
+            <span>Data <code class="font-mono break-all">{{ svc.status.dataDir }}</code></span>
+          </div>
+
+          <!-- PM2 keeps one process list per OS user -->
+          <div v-if="!svc.status.sameUser"
+            class="px-4 py-3 rounded-[10px] text-[13px] border bg-yellow-500/10 border-yellow-500/20 text-yellow-600 dark:text-yellow-500">
+            The service belongs to OS user <strong>{{ svc.status.appUser }}</strong>, but this
+            dashboard runs as <strong>{{ svc.status.currentUser }}</strong>. PM2 keeps a separate
+            process list per user, so it cannot be controlled from here.
+          </div>
+
+          <!-- Not installed, or not enabled on boot -->
+          <div v-if="!svc.status.installed || !svc.status.enabledOnBoot"
+            class="px-4 py-3 rounded-[10px] text-[13px] border bg-surface border-border/60 text-muted space-y-1">
+            <p v-if="!svc.status.installed">
+              Easy DevOps is not running as a service, so it stops when you close the terminal.
+            </p>
+            <p v-else>
+              The service will not start on boot, so it will not come back after a reboot.
+            </p>
+            <p class="text-foreground">
+              Run <code class="font-mono">{{ svc.status.cliHint }}</code>
+            </p>
+            <!--
+              Installing is CLI-only on Windows: the at-boot task needs
+              administrator rights AND an interactive console, because Windows
+              itself prompts for the account password. A dashboard request has
+              no terminal to prompt on.
+            -->
+            <p v-if="!svc.status.canInstallFromDashboard" class="text-[11px] opacity-80">
+              This cannot be done from the dashboard on Windows — the at-boot task needs an
+              elevated terminal, and Windows must ask you for the account password itself.
+            </p>
+          </div>
+
+          <!-- Restarting an installed service needs no elevation or prompt -->
+          <div v-if="svc.status.installed && svc.status.sameUser" class="flex items-center gap-3 flex-wrap">
+            <button @click="restartService" :disabled="svc.restarting" class="btn btn-secondary text-xs">
+              {{ svc.restarting ? 'Restarting…' : 'Restart service' }}
+            </button>
+            <span class="text-[11px] text-muted">
+              The dashboard will be briefly unavailable while it restarts.
+            </span>
+          </div>
+
+          <div v-if="svc.message"
+            class="px-4 py-3 rounded-[10px] text-[13px] border"
+            :class="svc.error ? 'bg-red-500/10 border-red-500/20 text-red-500'
+                              : 'bg-green-500/10 border-green-500/20 text-green-600 dark:text-green-500'">
+            {{ svc.message }}
+          </div>
+        </template>
+      </template>
+    </div>
+  </div>
+
+  <!-- ── PM2 processes ────────────────────────────────────────────────── -->
+  <div class="stat-card overflow-hidden">
+    <div class="p-6 border-b border-border/50 bg-black/5 dark:bg-white/5">
+      <h3 class="form-label !mb-0 font-bold">
+        PM2 processes
+        <span v-if="processes.apps.length" class="text-xs text-muted font-normal ml-1">
+          {{ processes.apps.length }} total
+        </span>
+      </h3>
+      <p class="text-[11px] text-muted mt-1 font-bold tracking-wide uppercase opacity-70">
+        Everything PM2 is supervising for this user
+      </p>
+    </div>
+
+    <div class="bg-background">
+      <div v-if="processes.loading && !processes.apps.length" class="p-8 text-sm text-muted">Loading…</div>
+
+      <div v-else-if="!processes.pm2Installed" class="p-8 text-center">
+        <p class="text-sm text-muted">PM2 is not installed.</p>
+      </div>
+
+      <div v-else-if="!processes.apps.length" class="p-8 text-center">
+        <p class="text-sm text-muted">PM2 is not supervising anything yet.</p>
+      </div>
+
+      <!-- Tables may scroll sideways; the page body must not -->
+      <div v-else class="overflow-x-auto">
+        <table class="w-full min-w-[46rem] text-left text-sm">
+          <thead>
+            <tr class="border-b border-border text-[10px] uppercase tracking-widest text-muted">
+              <th scope="col" class="px-5 py-3 font-bold">Name</th>
+              <th scope="col" class="px-5 py-3 font-bold">Status</th>
+              <th scope="col" class="px-5 py-3 font-bold tabular-nums">CPU</th>
+              <th scope="col" class="px-5 py-3 font-bold tabular-nums">Memory</th>
+              <th scope="col" class="px-5 py-3 font-bold tabular-nums">Uptime</th>
+              <th scope="col" class="px-5 py-3 font-bold tabular-nums">Restarts</th>
+              <th scope="col" class="px-5 py-3 font-bold text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="app in processes.apps" :key="app.name + '-' + app.pmId"
+              class="border-b border-border/50 last:border-0">
+              <td class="px-5 py-3">
+                <span class="font-semibold text-foreground">{{ app.name }}</span>
+                <!--
+                  Apps Easy DevOps created are labelled. Everything else is
+                  listed but only ever acted on by an explicit click, and asks
+                  for confirmation first.
+                -->
+                <span v-if="app.managed"
+                  class="ml-2 px-1.5 py-0.5 rounded bg-primary/10 text-primary text-[10px] font-bold uppercase tracking-wide">
+                  Easy DevOps
+                </span>
+                <span v-if="app.user && app.user !== processes.currentUser"
+                  class="ml-2 px-1.5 py-0.5 rounded bg-yellow-500/15 text-yellow-600 dark:text-yellow-500 text-[10px] font-bold uppercase tracking-wide">
+                  {{ app.user }}
+                </span>
+              </td>
+              <td class="px-5 py-3">
+                <span :class="app.status === 'online' ? 'text-green-500' : 'text-muted'">
+                  {{ app.status }}
+                </span>
+              </td>
+              <td class="px-5 py-3 tabular-nums text-muted">{{ app.cpu === null ? '—' : app.cpu + '%' }}</td>
+              <td class="px-5 py-3 tabular-nums text-muted">{{ formatBytes(app.memoryBytes) }}</td>
+              <td class="px-5 py-3 tabular-nums text-muted">{{ formatDuration(app.uptimeMs) }}</td>
+              <td class="px-5 py-3 tabular-nums text-muted">{{ app.restarts }}</td>
+              <td class="px-5 py-3">
+                <div class="flex items-center justify-end gap-1.5 flex-wrap">
+                  <button v-if="app.status !== 'online'" @click="processAction(app, 'start')"
+                    :disabled="processes.busy === app.name" class="btn btn-secondary !px-2 !py-1 text-[11px]">
+                    Start
+                  </button>
+                  <button v-else @click="processAction(app, 'stop')"
+                    :disabled="processes.busy === app.name" class="btn btn-secondary !px-2 !py-1 text-[11px]">
+                    Stop
+                  </button>
+                  <button @click="processAction(app, 'restart')"
+                    :disabled="processes.busy === app.name" class="btn btn-secondary !px-2 !py-1 text-[11px]">
+                    Restart
+                  </button>
+                  <button @click="showProcessLogs(app)"
+                    :disabled="processes.busy === app.name" class="btn btn-secondary !px-2 !py-1 text-[11px]">
+                    Logs
+                  </button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div v-if="processes.message" class="px-5 py-3 border-t border-border/50 text-[13px]"
+        :class="processes.error ? 'text-red-500' : 'text-green-600 dark:text-green-500'">
+        {{ processes.message }}
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Logs for one process ─────────────────────────────────────────── -->
+  <div v-if="processes.logsFor" class="stat-card overflow-hidden">
+    <div class="p-6 border-b border-border/50 bg-black/5 dark:bg-white/5 flex items-center justify-between gap-4">
+      <h3 class="form-label !mb-0 font-bold">Logs — {{ processes.logsFor }}</h3>
+      <button @click="processes.logsFor = null; processes.logLines = []"
+        class="btn btn-secondary text-xs">Close</button>
+    </div>
+    <pre class="bg-background p-5 text-[12px] font-mono text-muted overflow-x-auto max-h-96 overflow-y-auto whitespace-pre-wrap">{{ processes.logLines.join('\n') || '(no output)' }}</pre>
+  </div>
+
+  <!-- ── Confirm acting on a process ez did not create ─────────────────── -->
+  <div v-if="processes.confirm"
+    class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50"
+    @click.self="processes.confirm = null">
+    <div class="stat-card max-w-md w-full overflow-hidden">
+      <div class="p-6 border-b border-border/50 bg-black/5 dark:bg-white/5">
+        <h3 class="form-label !mb-0 font-bold">Not an Easy DevOps process</h3>
+      </div>
+      <div class="p-6 bg-background space-y-4">
+        <p class="text-sm text-muted">
+          <code class="font-mono text-foreground">{{ processes.confirm.name }}</code> was not created
+          by Easy DevOps. {{ processes.confirm.action === 'stop' ? 'Stopping' : 'Restarting' }} it
+          affects whatever else relies on it.
+        </p>
+        <div class="flex gap-3 justify-end">
+          <button @click="processes.confirm = null" class="btn btn-secondary text-xs">Cancel</button>
+          <button @click="runConfirmedProcessAction" class="btn btn-primary text-xs">
+            {{ processes.confirm.action }} anyway
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

@@ -10,11 +10,15 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import { loadConfig } from '../../core/config.js';
 import { dbGet, dbSet } from '../../core/db.js';
+import { getDataDir } from '../../core/platform.js';
 import { run } from '../../core/shell.js';
 
 const __dirname  = path.dirname(fileURLToPath(import.meta.url));
 const isWindows  = process.platform === 'win32';
-const LOG_PATH   = path.resolve(__dirname, '../../../data/dashboard.log');
+// Principle IV: logs live in the user's data directory, never inside the
+// package — a package-relative path is wiped by `npm update`. Follows
+// EASY_DEVOPS_DATA_DIR in dev mode like the database and sessions do.
+const LOG_PATH   = path.join(getDataDir(), 'logs', 'dashboard.log');
 const SERVER_PATH = path.resolve(__dirname, '../../dashboard/server.js');
 
 // ─── Port helpers ─────────────────────────────────────────────────────────────
@@ -165,23 +169,41 @@ export default async function dashboardMenu() {
   while (true) {
     const spinner = ora('Checking dashboard status...').start();
     const status = await getDashboardStatus();
+    // When PM2 manages the dashboard, this menu must not start or stop it:
+    // a detached copy would fight the service for the port, and a kill by pid
+    // would simply be undone by PM2.
+    let svc = null;
+    try {
+      const service = await import('../../core/service.js');
+      svc = await service.status();
+    } catch { /* PM2 absent — the detached path is the only one */ }
     spinner.stop();
 
+    const managed = Boolean(svc?.installed);
     const url = `http://localhost:${status.port}`;
 
     console.log(chalk.bold('\n  Dashboard'));
     console.log(chalk.gray('  ' + '─'.repeat(40)));
 
-    if (status.running) {
+    if (managed) {
+      const state = svc.running ? chalk.green('✅ Running') : chalk.yellow('⏸ Not running');
+      console.log(`  ${state}  |  ${chalk.cyan(url)}  |  service ${chalk.bold(svc.appName)}`);
+      console.log(chalk.gray(`  Managed by PM2 — use \`ezz service\` to start, stop or restart it.`));
+      if (!svc.sameUser && svc.appUser) {
+        console.log(chalk.yellow(`  ⚠ Owned by OS user "${svc.appUser}"; it cannot be controlled from this account.`));
+      }
+    } else if (status.running) {
       console.log(`  ${chalk.green('✅ Running')}  |  ${chalk.cyan(url)}  |  PID ${status.pid}`);
     } else {
       console.log(`  ${chalk.red('❌ Stopped')}  |  port ${status.configPort}`);
     }
     console.log();
 
-    const choices = status.running
-      ? ['Open in browser', 'Stop dashboard', 'How to use', new inquirer.Separator(), '← Back']
-      : ['Start dashboard', 'How to use', new inquirer.Separator(), '← Back'];
+    const choices = managed
+      ? ['Open in browser', 'How to use', new inquirer.Separator(), '← Back']
+      : status.running
+        ? ['Open in browser', 'Stop dashboard', 'How to use', new inquirer.Separator(), '← Back']
+        : ['Start dashboard', 'How to use', new inquirer.Separator(), '← Back'];
 
     let choice;
     try {
