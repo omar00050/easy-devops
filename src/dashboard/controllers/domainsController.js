@@ -2,9 +2,9 @@ import fs from 'fs/promises';
 import path from 'path';
 import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
-import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../lib/domains-db.js';
+import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../../core/domains-db.js';
 import { writeConfWithTest } from '../../core/nginx-apply.js';
-import { getCertExpiry } from '../lib/cert-reader.js';
+import { getCertExpiry } from '../../core/cert-reader.js';
 import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk, hasBackslashPath } from '../../core/platform.js';
 import {
   validateDomainName, validatePort, validateUpstreamType,

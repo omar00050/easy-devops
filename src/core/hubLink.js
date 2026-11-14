@@ -180,6 +180,14 @@ export function saveHubLink(link) {
     dbSet(HUB_PERMISSIONS_KEY, { ...DEFAULT_HUB_PERMISSIONS });
   }
 
+  // Pairing is exactly the kind of change another process must learn about
+  // promptly, and it was the one change that did NOT bump the counter. The
+  // consequence was concrete: pairing from the dashboard while the daemon owns
+  // the jobs left the daemon unaware, so it never connected its agent, while
+  // the dashboard started one of its own — which is how two sockets with the
+  // same serverId ended up evicting each other.
+  bumpHubRevision();
+
   return { ok: true, link: { hubUrl, serverId, secret } };
 }
 
@@ -194,10 +202,16 @@ export function saveConnectionString(str) {
   return saveHubLink(parsed.link);
 }
 
-/** Remove the link and its permission flags. */
+/**
+ * Remove the link and its permission flags.
+ *
+ * Bumps the revision for the same reason saveHubLink() does: another process
+ * may be holding an agent open against credentials that no longer exist.
+ */
 export function clearHubLink() {
   dbDelete(HUB_LINK_KEY);
   dbDelete(HUB_PERMISSIONS_KEY);
+  bumpHubRevision();
 }
 
 /**

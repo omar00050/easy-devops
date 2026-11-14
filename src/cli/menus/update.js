@@ -29,7 +29,7 @@ import { run } from '../../core/shell.js';
 import { dbGet, dbSet, closeDb, initDb } from '../../core/db.js';
 import { loadConfig } from '../../core/config.js';
 import { getDashboardStatus, startDashboard, stopDashboard } from './dashboard.js';
-import * as service from '../../core/service.js';
+import * as service from '../../core/service/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require   = createRequire(import.meta.url);
@@ -91,13 +91,15 @@ async function recoverIfNeeded() {
 // ─── Perform update ───────────────────────────────────────────────────────────
 
 async function performUpdate(latestVersion) {
-  // Whether PM2 manages the dashboard changes how it is stopped and started,
-  // so it has to be decided before anything is touched.
+  // Whether a native background service is installed changes how the update
+  // finishes: a service is restarted on the new version, while a detached
+  // dashboard has to be started again by hand. Decided before anything is
+  // touched, because the update replaces the files this reads.
   let svc = null;
   try {
     svc = await service.status();
-  } catch { /* PM2 absent or unreadable — fall back to the detached path */ }
-  const managedByService = Boolean(svc?.installed && svc?.sameUser);
+  } catch { /* unreadable — fall back to the detached path */ }
+  const managedByService = Boolean(svc?.service?.installed);
 
   // Step 1 — snapshot dashboard state and persist it
   const status = await getDashboardStatus();
@@ -109,11 +111,15 @@ async function performUpdate(latestVersion) {
   });
 
   // Step 2 — stop the dashboard if running.
-  // Under PM2 it is left alone: a restart after the install picks up the new
-  // code in one step, and killing it by pid would just have PM2 bring the old
-  // version back.
+  //
+  // With a native service installed, the background work is NOT the dashboard:
+  // the daemon runs it, and the service manager restarts the daemon on the new
+  // version after the install. Killing it by pid here would just have the
+  // service manager bring the old version straight back.
   if (managedByService) {
-    console.log(chalk.gray(`  Dashboard runs as the service "${svc.appName}" — it will be restarted after the update.`));
+    console.log(chalk.gray(
+      `  The background service (${svc.mechanism}) will be restarted after the update.`,
+    ));
   } else if (status.running) {
     const sp = ora('Stopping dashboard...').start();
     await stopDashboard(status.pid);

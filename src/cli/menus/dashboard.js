@@ -169,41 +169,43 @@ export default async function dashboardMenu() {
   while (true) {
     const spinner = ora('Checking dashboard status...').start();
     const status = await getDashboardStatus();
-    // When PM2 manages the dashboard, this menu must not start or stop it:
-    // a detached copy would fight the service for the port, and a kill by pid
-    // would simply be undone by PM2.
-    let svc = null;
+
+    // The background SERVICE no longer runs the dashboard — it runs the daemon,
+    // which serves no UI. So this menu always owns starting and stopping the
+    // dashboard; what the service state changes is only what to tell the user
+    // about monitoring.
+    let background = null;
     try {
-      const service = await import('../../core/service.js');
-      svc = await service.status();
-    } catch { /* PM2 absent — the detached path is the only one */ }
+      const { backgroundServiceState } = await import('../../core/service/index.js');
+      background = backgroundServiceState();
+    } catch { /* unreadable state: the dashboard lines below still apply */ }
     spinner.stop();
 
-    const managed = Boolean(svc?.installed);
     const url = `http://localhost:${status.port}`;
 
     console.log(chalk.bold('\n  Dashboard'));
     console.log(chalk.gray('  ' + '─'.repeat(40)));
 
-    if (managed) {
-      const state = svc.running ? chalk.green('✅ Running') : chalk.yellow('⏸ Not running');
-      console.log(`  ${state}  |  ${chalk.cyan(url)}  |  service ${chalk.bold(svc.appName)}`);
-      console.log(chalk.gray(`  Managed by PM2 — use \`ezz service\` to start, stop or restart it.`));
-      if (!svc.sameUser && svc.appUser) {
-        console.log(chalk.yellow(`  ⚠ Owned by OS user "${svc.appUser}"; it cannot be controlled from this account.`));
-      }
-    } else if (status.running) {
+    if (status.running) {
       console.log(`  ${chalk.green('✅ Running')}  |  ${chalk.cyan(url)}  |  PID ${status.pid}`);
     } else {
       console.log(`  ${chalk.red('❌ Stopped')}  |  port ${status.configPort}`);
     }
+
+    // Whether monitoring survives closing the dashboard is a separate fact,
+    // and the one users were surprised by.
+    if (background?.running) {
+      console.log(chalk.gray(`  Background service running (pid ${background.pid}) — monitoring continues without this page.`));
+    } else if (background?.installed) {
+      console.log(chalk.yellow('  Background service installed but not running') + chalk.gray(' — `ezz service start`'));
+    } else {
+      console.log(chalk.gray('  No background service — monitoring runs only while the dashboard is open.'));
+    }
     console.log();
 
-    const choices = managed
-      ? ['Open in browser', 'How to use', new inquirer.Separator(), '← Back']
-      : status.running
-        ? ['Open in browser', 'Stop dashboard', 'How to use', new inquirer.Separator(), '← Back']
-        : ['Start dashboard', 'How to use', new inquirer.Separator(), '← Back'];
+    const choices = status.running
+      ? ['Open in browser', 'Stop dashboard', 'How to use', new inquirer.Separator(), '← Back']
+      : ['Start dashboard', 'How to use', new inquirer.Separator(), '← Back'];
 
     let choice;
     try {

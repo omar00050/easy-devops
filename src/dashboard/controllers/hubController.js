@@ -14,8 +14,9 @@ import {
   getLinkStatus,
 } from '../../core/hubLink.js';
 import { PERMISSION_TREE, COMING_SOON_PERMISSION_IDS } from '../../core/hubPermissions.js';
-import { getDataDir, isDevDataDir } from '../../core/platform.js';
-import { stopHubAgent, initHubAgent, getHubAgentStatus, pushPermissions } from '../lib/hubAgent.js';
+import { getDataDir, isDevDataDir, isDefaultDataDir } from '../../core/platform.js';
+import { inspect } from '../../core/daemon/lock.js';
+import { stopHubAgent, initHubAgent, getHubAgentStatus, pushPermissions } from '../../core/hub/agent.js';
 
 // POST /api/hub/connect
 // Body: { connectionString: 'ezops://hubUrl|serverId|secret' }
@@ -28,19 +29,53 @@ export function connectAgent(req, res) {
   const saved = saveHubLink(parsed.link);
   if (!saved.ok) return res.status(400).json({ error: saved.error });
 
-  // Restart the agent so it picks up the new credentials.
+  // The agent belongs to whichever process owns the background jobs. Starting
+  // one HERE while a daemon is running produced two sockets with the same
+  // serverId, and the hub keeps only one per server — so they evicted each
+  // other every few seconds, for ever.
+  //
+  // saveHubLink() bumps the revision counter, which the daemon's watcher picks
+  // up within a few seconds and reconciles its own agent against. So the
+  // correct action in that case is to do nothing more.
+  const daemon = inspect();
+
+  if (daemon.running) {
+    return res.json({
+      ok: true,
+      status: hubStatusPayload(),
+      agentOwner: 'daemon',
+      detail: `The background service (pid ${daemon.lock?.pid}) owns the Hub connection `
+        + 'and will pick up the new pairing within a few seconds.',
+    });
+  }
+
+  // No daemon: this dashboard is the job owner, so it holds the agent.
+  // initHubAgent() is idempotent, but stopping first keeps the intent explicit.
   stopHubAgent();
   initHubAgent();
 
-  return res.json({ ok: true, status: hubStatusPayload() });
+  return res.json({ ok: true, status: hubStatusPayload(), agentOwner: 'dashboard' });
 }
 
 // DELETE /api/hub/link
 // Unlinks from the hub: stops the agent and clears stored link + permissions.
 export function unlinkHub(req, res) {
+  // Stopping a local agent is always safe: if the daemon owns it, there is no
+  // socket here to stop. clearHubLink() bumps the revision, which is how the
+  // daemon learns to drop its own.
   stopHubAgent();
   clearHubLink();
-  return res.json({ ok: true });
+
+  const daemon = inspect();
+  return res.json({
+    ok: true,
+    ...(daemon.running
+      ? {
+        agentOwner: 'daemon',
+        detail: 'The background service will drop its Hub connection within a few seconds.',
+      }
+      : {}),
+  });
 }
 
 // GET /api/hub/status
@@ -84,11 +119,17 @@ function hubStatusPayload() {
     lastError: agent.lastError,
     attempts: agent.attempts,
     // Which database this dashboard — and therefore this agent — is actually
-    // using. `--dev` and EASY_DEVOPS_DATA_DIR point at a different file from
-    // the normal one, so a CLI and a dashboard can be editing two separate
-    // domain lists with no visible sign of it. Showing the path makes that
-    // mismatch obvious instead of looking like a sync bug.
+    // using. A non-default directory means a CLI and a dashboard can be editing
+    // two separate domain lists with no visible sign of it, so the path is
+    // shown to make that obvious instead of looking like a sync bug.
+    //
+    // The two flags answer different questions, and conflating them was a bug:
+    //   defaultDataDir — is this the ordinary location? A service install
+    //                    passes EASY_DEVOPS_DATA_DIR and is still ordinary.
+    //   devDataDir     — is this a DEVELOPMENT run (staging certificates,
+    //                    `-dev` names)? Only `--dev`/EZ_DEV or `.dev-data`.
     dataDir: getDataDir(),
+    defaultDataDir: isDefaultDataDir(getDataDir()),
     devDataDir: isDevDataDir(),
   };
 }

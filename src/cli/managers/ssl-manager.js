@@ -156,7 +156,7 @@ export async function renewExpiring(certs) {
   const expiring = certs.filter(c => c.daysLeft !== null && c.daysLeft < 30);
   if (expiring.length === 0) return [];
 
-  const { findDomain } = await import('../../dashboard/lib/domains-db.js');
+  const { findDomain } = await import('../../core/domains-db.js');
 
   const results = [];
   for (const cert of expiring) {

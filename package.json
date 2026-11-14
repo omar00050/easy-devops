@@ -37,6 +37,8 @@
   },
   "files": [
     "src/",
+    "!src/dashboard/ui/",
+    "dist/ui/",
     "data/.gitkeep",
     "install.bat",
     "install.ps1",
@@ -44,7 +46,12 @@
   ],
   "scripts": {
     "start": "node src/cli/index.js",
-    "test": "echo \" no test specified\"",
+    "dev": "node src/cli/index.js --dev",
+    "build:ui": "npm --prefix src/dashboard/ui install && npm --prefix src/dashboard/ui run build",
+    "prepublishOnly": "npm run build:ui && npm test",
+    "test": "node e2e/run.mjs",
+    "test:e2e": "node e2e/run.mjs",
+    "test:e2e:check": "node e2e/run.mjs --check",
     "dashboard": "node src/dashboard/server.js",
     "system-info": "node src/cli/index.js system-info"
   },
@@ -64,6 +71,7 @@
     "inquirer": "^9.2.12",
     "ora": "^7.0.1",
     "session-file-store": "^1.5.0",
-    "socket.io": "^4.8.3"
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3"
   }
 }

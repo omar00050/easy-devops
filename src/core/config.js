@@ -26,6 +26,23 @@ export const AUTH_MODES = Object.freeze({
 });
 
 /**
+ * Which dashboard UI the server serves at `/`.
+ *
+ *   new     — the built React app in dist/ui. THE default.
+ *   classic — the EJS + Vue page in src/dashboard/views. A temporary fallback,
+ *             for an operator who hits a regression in the new UI and needs a
+ *             working dashboard immediately.
+ *
+ * `--classic-ui` overrides this for one run; the setting is what a background
+ * service reads. A missing dist/ui build falls back to classic with the build
+ * command printed, so the dashboard always starts. See dashboard/server.js.
+ */
+export const UI_MODES = Object.freeze({
+  CLASSIC: 'classic',
+  NEW: 'new',
+});
+
+/**
  * True when a bind address only accepts connections from this machine.
  * @param {string} addr
  * @returns {boolean}
@@ -60,6 +77,8 @@ const DEFAULTS = {
     // dashboard can now run 24/7, so a new install listens on loopback only
     // until the user decides otherwise.
     dashboardBindAddress: BIND_LOOPBACK,
+    dashboardUi: UI_MODES.NEW,
+    dashboardUiMigrated: true,
     acmeEmail: '',
     acmeChallengePort: 8089,
     sslChallengeMode: 'auto',
@@ -77,6 +96,8 @@ const DEFAULTS = {
     // binding to loopback there would break the common "reach it from my
     // laptop" setup without warning.
     dashboardBindAddress: BIND_ALL,
+    dashboardUi: UI_MODES.NEW,
+    dashboardUiMigrated: true,
     acmeEmail: '',
     acmeChallengePort: 8089,
     sslChallengeMode: 'auto',
@@ -120,6 +141,22 @@ export function loadConfig() {
         !hasStoredPassword(stored) && isLoopbackBind(merged.dashboardBindAddress)
           ? AUTH_MODES.NONE
           : AUTH_MODES.PASSWORD;
+      migrated = true;
+    }
+
+    // The React dashboard became the default. An existing install has
+    // `classic` written down — not because anyone chose it, but because it was
+    // the default and `--new-ui` was the only way to see the other one. So a
+    // stored `classic` is moved to `new` exactly ONCE, recorded by
+    // `dashboardUiMigrated`, and a later deliberate `classic` is then left
+    // alone for ever. Without the marker, every load would undo the choice of
+    // an operator who really does want the old page.
+    if (merged.dashboardUi === UI_MODES.CLASSIC && !merged.dashboardUiMigrated) {
+      merged.dashboardUi = UI_MODES.NEW;
+      merged.dashboardUiMigrated = true;
+      migrated = true;
+    } else if (!merged.dashboardUiMigrated) {
+      merged.dashboardUiMigrated = true;
       migrated = true;
     }
 

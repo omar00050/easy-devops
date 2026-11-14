@@ -1,8 +1,8 @@
 /**
- * dashboard/lib/cert-operations.js
+ * core/cert-operations.js
  *
  * Certificate actions the Hub can request. Permission checking happens in
- * hubAgent.js before any of this runs; these functions assume they are
+ * core/hub/agent.js before any of this runs; these functions assume they are
  * allowed and concentrate on doing the work and reporting the outcome.
  *
  * Every handler returns { ok, error, ... } so the agent can acknowledge the
@@ -11,9 +11,9 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { loadConfig } from '../../core/config.js';
-import { describeIssuance, prepareDomainForHttpChallenge } from '../../core/ssl-issuer.js';
-import { bumpHubRevision } from '../../core/hubLink.js';
+import { loadConfig } from './config.js';
+import { describeIssuance, prepareDomainForHttpChallenge } from './ssl-issuer.js';
+import { bumpHubRevision } from './hubLink.js';
 import { listAllCerts } from './cert-reader.js';
 import { getDomains, findDomain } from './domains-db.js';
 

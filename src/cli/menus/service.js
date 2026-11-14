@@ -1,24 +1,27 @@
 /**
  * cli/menus/service.js
  *
- * `ezz service install | uninstall | status | restart | logs`
+ * `ezz service install | uninstall | status | start | stop | restart | logs | repair`
  *
- * The CLI is the only place the Windows "server" boot mode can be set up: it
- * needs administrator rights and a real terminal, because Windows itself
- * prompts for the account password (see core/service.js). The dashboard can
- * only report on it.
+ * The CLI owns every question. `core/service/` sequences the work but never
+ * prompts, so the dashboard cannot trigger anything interactive and the core
+ * stays callable from a test with no terminal.
  *
- * Nothing here installs PM2 or pm2-logrotate without asking.
+ * Installing a Windows service in Server mode needs an Administrator terminal,
+ * which is why that path is CLI-only and says so. **No password is ever
+ * requested here or anywhere below it** — on Linux sudo does its own asking,
+ * and the Windows service runs as a virtual account that has no password.
  */
 
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import ora from 'ora';
-import { isWindows, isDevDataDir, getDataDir } from '../../core/platform.js';
-import * as service from '../../core/service.js';
-import * as runner from '../../core/runner.js';
 
-const ACTIONS = ['install', 'uninstall', 'status', 'restart', 'logs'];
+import { isWindows, isDevDataDir, getDataDir } from '../../core/platform.js';
+import * as service from '../../core/service/index.js';
+import { describeLegacy } from '../../core/service/legacy.js';
+
+const ACTIONS = ['install', 'uninstall', 'status', 'start', 'stop', 'restart', 'logs', 'repair'];
 
 /**
  * Entry point for the `service` command.
@@ -38,355 +41,724 @@ export async function serviceCommand(action) {
     case 'status': return showStatus();
     case 'install': return doInstall();
     case 'uninstall': return doUninstall();
+    case 'start': return doStart();
+    case 'stop': return doStop();
     case 'restart': return doRestart();
     case 'logs': return showLogs();
+    case 'repair': return doRepair();
     default: return 1;
+  }
+}
+
+// ─── Shared rendering ─────────────────────────────────────────────────────────
+
+const dot = (ok) => (ok ? chalk.green('●') : chalk.red('●'));
+/** Unknown is its own colour: it is a missing answer, not a failure. */
+const maybeDot = (v) => (v === null || v === undefined ? chalk.yellow('●') : dot(v));
+
+const MECHANISM_LABELS = {
+  systemd: 'systemd unit',
+  winsw: 'Windows Service (WinSW)',
+  'startup-supervisor': 'Startup-folder supervisor',
+  none: 'none',
+};
+
+/**
+ * A timestamp a person can read, in their own timezone.
+ *
+ * ISO-8601 UTC ("2026-11-14T23:21:18.682Z") was being printed straight from
+ * the stored value, which is both the wrong clock for the reader and harder to
+ * scan than it needs to be. The stored value stays ISO — it is a record — and
+ * only the display is converted.
+ *
+ * @param {string|number|null} value ISO string or epoch milliseconds
+ * @returns {string}
+ */
+function localTime(value) {
+  if (value === null || value === undefined) return '—';
+
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+    + `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function humanDuration(ms) {
+  if (ms === null || ms === undefined) return '—';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h ${m % 60}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
+function printWarnings(warnings) {
+  if (!warnings?.length) return;
+  console.log();
+  for (const warning of warnings) {
+    const [first, ...rest] = String(warning).split('\n');
+    console.log('  ' + chalk.yellow('⚠ ') + chalk.yellow(first));
+    for (const line of rest) console.log('    ' + chalk.gray(line));
   }
 }
 
 // ─── status ───────────────────────────────────────────────────────────────────
 
 /**
- * Renders the service state. Also used after install/uninstall so the user
- * always sees the result rather than just a success line.
+ * Renders the service state. Also used after install/uninstall, so the user
+ * always sees the resulting state rather than only a success line.
  * @returns {Promise<number>}
  */
 export async function showStatus() {
   const spinner = ora('Checking the service…').start();
-  const s = await service.status();
+  let s;
+  try {
+    s = await service.status();
+  } catch (err) {
+    spinner.fail(`Could not read the service state: ${err.message}`);
+    return 1;
+  }
   spinner.stop();
 
   console.log();
-  console.log('  ' + chalk.bold('Easy DevOps service'));
-  console.log('  ' + chalk.gray('─'.repeat(52)));
+  console.log('  ' + chalk.bold('Easy DevOps background service'));
+  console.log('  ' + chalk.gray('─'.repeat(58)));
 
-  if (!s.pm2.installed) {
-    console.log('  ' + chalk.yellow('PM2 is not installed.'));
-    console.log('  ' + chalk.gray('Run `ezz service install` to set it up.'));
+  if (isDevDataDir()) {
+    console.log('  ' + chalk.bgYellow.black(' DEV MODE ') + chalk.yellow(`  data ${getDataDir()}`));
     console.log();
-    return 0;
   }
 
-  const dot = (ok) => (ok ? chalk.green('●') : chalk.red('●'));
-  // Unknown is its own colour: it is not a failure, it is a missing answer.
-  const bootDot = (v) => (v === null ? chalk.yellow('●') : dot(v));
+  const modeLabel = s.mode ? ` (${s.mode})` : '';
+  console.log(`  Mechanism      ${MECHANISM_LABELS[s.mechanism] ?? s.mechanism}${chalk.gray(modeLabel)}`);
+  console.log(`  Installed      ${dot(s.service.installed)} ${s.service.installed ? 'yes' : 'no'}`);
 
-  // The version is only read when the PM2 daemon is already running: asking
-  // for it would start one, and a status check must not do that.
-  const pm2Label = s.pm2.version
-    ? `v${s.pm2.version}`
-    : chalk.gray('installed (daemon not running)');
-  console.log(`  PM2            ${pm2Label}  ${chalk.gray(s.pm2.path ?? '')}`);
-  console.log(`  App            ${s.appName}${s.dev ? chalk.yellow('  (dev)') : ''}`);
-  console.log(`  Installed      ${dot(s.installed)} ${s.installed ? 'yes' : 'no'}`);
-  console.log(`  Running        ${dot(s.running)} ${s.running ? 'yes' : `no${s.status ? ` (${s.status})` : ''}`}`);
-  console.log(`  Start on boot  ${bootDot(s.enabledOnBoot)} ${describeBoot(s)}`);
-  console.log(`  Data directory ${chalk.gray(s.dataDir)}`);
-
-  if (s.app) {
-    const mem = s.app.memoryBytes ? `${Math.round(s.app.memoryBytes / 1048576)} MB` : '—';
-    const up = s.app.uptimeMs !== null ? humanDuration(s.app.uptimeMs) : '—';
-    console.log(`  Process        pid ${s.app.pid ?? '—'}  cpu ${s.app.cpu ?? 0}%  mem ${mem}  up ${up}  restarts ${s.app.restarts}`);
+  if (s.mode === service.MODES.PERSONAL) {
+    console.log(`  Starts         ${chalk.gray('at logon (nothing runs before you sign in)')}`);
+  } else {
+    console.log(`  Running        ${dot(s.service.running)} ${s.service.running ? 'yes' : `no${s.service.state ? ` (${s.service.state})` : ''}`}`);
+    console.log(`  Start on boot  ${maybeDot(s.service.enabledOnBoot)} ${describeBoot(s.service.enabledOnBoot)}`);
   }
 
-  // PM2 keeps one process list per user; another account's service is
-  // invisible here and cannot be controlled from this session.
-  if (!s.sameUser) {
+  // The daemon's own heartbeat, which is the authority on whether background
+  // work is actually happening. A service manager reporting "running" is not
+  // the same thing.
+  //
+  // "stopped by you" is its own state, in its own colour: a user who stopped
+  // it deliberately must not be told their service crashed.
+  const d = s.daemon;
+  const daemonLine = d.running
+    ? `running (pid ${d.pid}, since ${localTime(d.startedAt)}, up ${humanDuration(d.startedAt ? Date.now() - d.startedAt : null)})`
+    : s.stoppedByUser
+      ? chalk.yellow('stopped by you') + chalk.gray(s.stoppedAt ? ` at ${localTime(s.stoppedAt)}` : '')
+      : `not running ${chalk.gray(`— ${d.detail}`)}`;
+
+  const daemonDot = d.running ? dot(true) : s.stoppedByUser ? chalk.yellow('●') : dot(false);
+  console.log(`  Daemon         ${daemonDot} ${daemonLine}`);
+
+  if (s.service.restarts) {
+    console.log(`  Restarts       ${s.service.crashLooping ? chalk.red(s.service.restarts) : s.service.restarts}`);
+  }
+
+  console.log(`  Data directory ${chalk.gray(s.dataDir)}${s.serverMode ? chalk.gray('  (server mode)') : ''}`);
+  console.log(`  Dashboard UI   ${chalk.gray(s.dashboardUi ?? 'unknown')}`);
+
+  // Runtime: the service's pinned Node next to the one in this shell.
+  const rt = s.runtime;
+  console.log();
+  console.log(`  System Node    ${rt.systemNode.version} ${chalk.gray(rt.systemNode.path)}`);
+
+  if (rt.pinned && rt.pinned.kind !== 'none') {
+    const label = rt.pinned.version ?? chalk.red('not runnable');
+    const kind = { symlink: 'link', copy: 'copy', recorded: 'recorded path', 'real file': 'file' }[rt.pinned.kind] ?? rt.pinned.kind;
+    console.log(`  Service Node   ${label} ${chalk.gray(`(${kind}: ${rt.pinned.path})`)}`);
+    if (rt.pinned.target && rt.pinned.target !== rt.pinned.path) {
+      console.log(`                 ${chalk.gray(`→ ${rt.pinned.target}`)}`);
+    }
+  } else {
+    console.log(`  Service Node   ${chalk.gray('not pinned yet')}`);
+  }
+
+  if (rt.manager?.managed) {
+    console.log(`  Version manager${chalk.gray(` ${rt.manager.manager} — the service is pinned so switching versions cannot break it`)}`);
+  }
+
+  printWarnings(s.warnings);
+
+  if (!s.service.installed) {
     console.log();
-    console.log('  ' + chalk.yellow(`⚠ The service belongs to OS user "${s.appUser}", but you are "${s.currentUser}".`));
-    console.log('  ' + chalk.gray('PM2 keeps a separate process list per user, so you cannot control it from here.'));
-    console.log('  ' + chalk.gray(`Sign in as "${s.appUser}" to manage it.`));
-  }
-
-  if (s.pm2Home) {
-    console.log('  ' + chalk.gray(`PM2_HOME       ${s.pm2Home}`));
-  }
-
-  if (s.bootDetail) {
-    console.log();
-    console.log('  ' + chalk.gray(s.bootDetail));
+    console.log('  ' + chalk.gray('Install it with: ') + chalk.white('ezz service install'));
   }
 
   console.log();
   return 0;
 }
 
-function describeBoot(s) {
-  // null means "could not be determined" — a non-systemd Linux, say — and must
-  // not be shown as a confident "no".
-  if (s.enabledOnBoot === null) return 'unknown';
-  if (!s.enabledOnBoot) return 'no';
-  if (s.bootMode === service.BOOT_MODES.LOGON) return 'yes — at logon';
-  if (s.bootMode === service.BOOT_MODES.BOOT) return 'yes — at system startup';
-  return 'yes';
+function describeBoot(enabled) {
+  if (enabled === null || enabled === undefined) return 'unknown';
+  return enabled ? 'yes' : 'no';
 }
 
 // ─── install ──────────────────────────────────────────────────────────────────
 
 async function doInstall() {
   console.log();
-  console.log('  ' + chalk.bold('Install the Easy DevOps service'));
-  console.log('  ' + chalk.gray('─'.repeat(52)));
+  console.log('  ' + chalk.bold('Install the Easy DevOps background service'));
+  console.log('  ' + chalk.gray('─'.repeat(58)));
+
   if (isDevDataDir()) {
-    console.log('  ' + chalk.bgYellow.black(' DEV MODE ') +
-      chalk.yellow(`  app "${runner.appName(true)}", data ${getDataDir()}`));
+    console.log('  ' + chalk.bgYellow.black(' DEV MODE ') + chalk.yellow(`  data ${getDataDir()}`));
   }
   console.log();
 
-  // ── PM2 ────────────────────────────────────────────────────────────────────
-  let pm2 = await runner.detect();
-  let installPm2 = false;
+  // ── Windows: Server or Personal ──────────────────────────────────────────
+  let mode = null;
 
-  if (!pm2.installed) {
-    console.log('  PM2 keeps the dashboard running and restarts it after a crash or a reboot.');
-    const { yes } = await prompt({
-      type: 'confirm', name: 'yes',
-      message: 'PM2 is not installed. Install it globally now (npm install -g pm2)?',
-      default: true,
-    });
-    if (!yes) {
-      console.log('  ' + chalk.gray('Nothing was changed. PM2 is required for the service.'));
-      console.log();
-      return 1;
-    }
-    installPm2 = true;
-  } else {
-    console.log(`  PM2 ${chalk.gray(`v${pm2.version ?? '?'}`)} found at ${chalk.gray(pm2.path)}`);
-  }
+  if (isWindows) {
+    const suggested = await service.suggestWindowsMode();
 
-  // ── pm2-logrotate ──────────────────────────────────────────────────────────
-  let installLogrotate = false;
-  const logrotatePresent = pm2.installed
-    ? await runner.hasLogrotate({ pm2Path: pm2.path ?? 'pm2' })
-    : false;
-
-  if (!logrotatePresent) {
-    const { yes } = await prompt({
-      type: 'confirm', name: 'yes',
-      message: 'Install pm2-logrotate too, so PM2 logs cannot fill the disk?',
-      default: true,
-    });
-    installLogrotate = yes;
-  }
-
-  // ── Start on boot ──────────────────────────────────────────────────────────
-  const bootMode = await chooseBootMode();
-  if (bootMode === undefined) {
-    console.log('  ' + chalk.gray('Cancelled. Nothing was changed.'));
+    console.log('  ' + chalk.gray(`Detected: ${suggested.detail}`));
     console.log();
-    return 1;
+
+    if (suggested.isServerEdition) {
+      // On a server the answer is clear, so it is stated rather than asked:
+      // the machine exists to serve and nobody is logged in most of the time.
+      console.log('  ' + chalk.white('This is Windows Server, so Server mode is the right choice.'));
+      console.log('  ' + chalk.gray('It runs as a real Windows Service, starts before anyone logs in,'));
+      console.log('  ' + chalk.gray('and needs an Administrator terminal once. You will NOT be asked'));
+      console.log('  ' + chalk.gray('for a password: the service uses a Windows-managed account.'));
+      console.log();
+
+      const { confirmServer } = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'confirmServer',
+        message: 'Install in Server mode?',
+        default: true,
+      }]);
+      mode = confirmServer ? service.MODES.SERVER : service.MODES.PERSONAL;
+    } else {
+      const { chosen } = await inquirer.prompt([{
+        type: 'list',
+        name: 'chosen',
+        message: 'How should the background service run?',
+        default: service.MODES.PERSONAL,
+        choices: [
+          {
+            name: 'Personal — starts when you log in. No administrator rights needed.',
+            value: service.MODES.PERSONAL,
+          },
+          {
+            name: 'Server — a real Windows Service, starts at boot. Needs an Administrator terminal once.',
+            value: service.MODES.SERVER,
+          },
+        ],
+      }]);
+      mode = chosen;
+    }
+
+    if (mode === service.MODES.SERVER) {
+      console.log();
+      console.log('  ' + chalk.yellow('Server mode will move your data to C:\\ProgramData\\easy-devops'));
+      console.log('  ' + chalk.gray('so the service account and your CLI can share one database.'));
+      console.log('  ' + chalk.gray('It is copied, verified, and the original is kept as a backup.'));
+      console.log();
+
+      const { confirmMove } = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'confirmMove',
+        message: 'Continue?',
+        default: true,
+      }]);
+      if (!confirmMove) {
+        console.log('  ' + chalk.gray('Nothing was changed.'));
+        return 0;
+      }
+    }
   }
 
+  // ── The old PM2 setup ────────────────────────────────────────────────────
+  let removeLegacy = false;
+  const found = await service.legacy.detectLegacy();
+
+  if (found.found) {
+    console.log();
+    console.log(describeLegacy(found.items).split('\n').map((l) => `  ${chalk.yellow(l)}`).join('\n'));
+    console.log();
+
+    const { cleanup } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'cleanup',
+      message: 'Remove the old PM2-based setup?',
+      default: true,
+    }]);
+    removeLegacy = cleanup;
+  }
+
+  // ── Install ──────────────────────────────────────────────────────────────
   console.log();
   const spinner = ora('Installing…').start();
-  const res = await service.install({ installPm2, installLogrotate, bootMode });
-  spinner.stop();
+  const lines = [];
 
-  for (const step of res.steps) {
-    const mark = step.ok ? chalk.green('✓') : chalk.yellow('•');
-    console.log(`  ${mark} ${step.step}${step.detail ? chalk.gray(`  ${firstLine(step.detail)}`) : ''}`);
+  let result;
+  try {
+    result = await service.install({
+      mode,
+      removeLegacy,
+      log: (line) => { lines.push(line); spinner.text = line; },
+    });
+  } catch (err) {
+    spinner.fail(`Install failed: ${err.message}`);
+    return 1;
   }
 
-  if (!res.ok) {
+  spinner.stop();
+  for (const line of lines) console.log('  ' + chalk.gray(line));
+
+  if (!result.ok) {
     console.log();
-    console.log('  ' + chalk.red(res.error ?? 'Install failed.'));
+
+    if (result.manual) {
+      // No systemd: not a failure, just a different answer.
+      console.log('  ' + chalk.yellow(result.reason));
+      console.log();
+      console.log(result.manual.split('\n').map((l) => `  ${l}`).join('\n'));
+      console.log();
+      return 0;
+    }
+
+    console.log('  ' + chalk.red('Install failed.'));
+    console.log(String(result.reason).split('\n').map((l) => `  ${l}`).join('\n'));
+
+    if (result.needsElevation) {
+      console.log();
+      console.log('  ' + chalk.gray('No password is needed — only elevation.'));
+    }
     console.log();
     return 1;
   }
 
-  // On Linux PM2 prints a command that must be run as root. Showing it beats
-  // adding sudoers rules for something done once.
-  if (res.sudoCommand) {
-    console.log();
-    console.log('  ' + chalk.bold('One more step — run this as root to finish start-on-boot:'));
-    console.log();
-    console.log('    ' + chalk.cyan(res.sudoCommand));
-    console.log();
-    console.log('  ' + chalk.gray('Easy DevOps does not run this for you, so it needs no sudoers rules.'));
+  console.log();
+  console.log('  ' + chalk.green('✓ Installed.'));
+
+  if (result.migrated) {
+    console.log('  ' + chalk.gray(`Data moved to ${result.dataDir}`));
+    if (result.backup) console.log('  ' + chalk.gray(`Backup kept at ${result.backup}`));
   }
 
-  await showStatus();
-  return 0;
+  if (result.legacy?.removed?.length) {
+    console.log('  ' + chalk.gray(`Removed from the old setup: ${result.legacy.removed.join(', ')}`));
+  }
+  for (const failure of result.legacy?.failed ?? []) {
+    console.log('  ' + chalk.yellow(`⚠ could not remove ${failure.name}: ${failure.reason}`));
+  }
+  for (const failure of result.aclFailures ?? []) {
+    console.log('  ' + chalk.yellow(`⚠ ${failure.path}: ${failure.reason}`));
+  }
+
+  if (result.mode === service.MODES.PERSONAL) {
+    console.log();
+    console.log('  ' + chalk.white('It will start automatically the next time you log in.'));
+    console.log('  ' + chalk.gray(`Supervisor log: ${result.logFile}`));
+    console.log();
+
+    // Offer to start it now, through exactly the same path as
+    // `ezz service start`. The old message suggested `ezz daemon` instead,
+    // which is wrong for this purpose: that runs a daemon in the foreground
+    // tied to the terminal, so closing the window stops it. The supervisor is
+    // what should own it.
+    const started = await offerToStart();
+    if (started !== null) return started;
+
+    return 0;
+  }
+
+  if (result.daemon?.pid) {
+    console.log('  ' + chalk.gray(`Daemon reported in after ${Math.round(result.daemon.waitedMs / 1000)}s (pid ${result.daemon.pid})`));
+  }
+
+  console.log();
+  return showStatus();
 }
 
 /**
- * Asks how the service should come back after a reboot.
+ * Asks whether to start the service now, and does it the same way
+ * `ezz service start` does.
  *
- * Windows gets the two modes described in core/service.js. Linux and macOS
- * have one answer — PM2's own init-system hook — so there is nothing to ask
- * beyond whether to set it up.
- *
- * @returns {Promise<string|null|undefined>} mode, null to skip, undefined if cancelled
+ * @returns {Promise<number|null>} An exit code, or null when not started
  */
-async function chooseBootMode() {
-  if (!isWindows) {
-    const { yes } = await prompt({
-      type: 'confirm', name: 'yes',
-      message: 'Start the service automatically on boot?',
+async function offerToStart() {
+  // Already up — a Server-mode install starts the service itself, and so does a
+  // repair. Nothing to offer.
+  if (service.backgroundServiceState().running) return null;
+
+  let answer;
+  try {
+    ({ answer } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'answer',
+      message: 'Start it now?',
       default: true,
-    });
-    return yes ? service.BOOT_MODES.BOOT : null;
+    }]));
+  } catch (err) {
+    // Ctrl+C at the prompt is not a failure: the install succeeded.
+    if (err.name === 'ExitPromptError') return null;
+    throw err;
   }
 
-  const suggested = await service.defaultBootMode();
-  const isServer = suggested === service.BOOT_MODES.BOOT;
-
-  if (isServer) {
+  if (!answer) {
+    console.log('  ' + chalk.gray('Not started. Start it any time with: ') + chalk.white('ezz service start'));
     console.log();
-    console.log('  ' + chalk.gray('Windows Server detected — defaulting to start at system startup.'));
+    return null;
   }
 
-  const { mode } = await prompt({
-    type: 'list',
-    name: 'mode',
-    message: 'How should the service start after a reboot?',
-    default: suggested,
-    choices: [
-      {
-        name: 'Server — at system startup, even with nobody logged in (needs Administrator + your password, asked by Windows)',
-        value: service.BOOT_MODES.BOOT,
-      },
-      {
-        name: 'Personal/dev machine — at logon only; signing out stops it (no Administrator, no password)',
-        value: service.BOOT_MODES.LOGON,
-      },
-      { name: "Don't start on boot", value: null },
-    ],
-  });
-
-  if (mode === service.BOOT_MODES.BOOT) {
-    // Fail early with the real reason rather than after PM2 work is done.
-    if (!(await service.isElevated())) {
-      console.log();
-      console.log('  ' + chalk.yellow('That mode needs administrator rights.'));
-      console.log('  ' + chalk.gray('Open an Administrator PowerShell and run `ezz service install` again,'));
-      console.log('  ' + chalk.gray('or choose the personal/dev machine mode.'));
-      console.log();
-      return undefined;
-    }
-    if (!process.stdin.isTTY) {
-      console.log();
-      console.log('  ' + chalk.yellow('Windows must prompt for the account password, which needs a real terminal.'));
-      console.log();
-      return undefined;
-    }
-    console.log();
-    console.log('  ' + chalk.gray('Windows will now ask for your account password. Easy DevOps never sees it:'));
-    console.log('  ' + chalk.gray('schtasks collects it directly and stores it in the Windows credential vault.'));
-  }
-
-  return mode;
+  return doStart();
 }
 
 // ─── uninstall ────────────────────────────────────────────────────────────────
 
 async function doUninstall() {
-  const s = await service.status();
+  const current = await service.status().catch(() => null);
 
   console.log();
-  if (!s.installed && !s.enabledOnBoot) {
-    console.log('  ' + chalk.gray('The service is not installed. Nothing to do.'));
+  console.log('  ' + chalk.bold('Remove the Easy DevOps background service'));
+  console.log('  ' + chalk.gray('─'.repeat(58)));
+  console.log();
+
+  // Nothing to remove: say so and stop, rather than asking the user to confirm
+  // removing something that does not exist and then reporting success. The one
+  // thing still worth offering is cleaning up the OLD PM2-based setup, and only
+  // when some of it is actually there.
+  if (current && !current.service.installed) {
+    console.log('  ' + chalk.white('No background service is installed.'));
+    console.log('  ' + chalk.gray('Nothing to remove.'));
+
+    const leftovers = await service.legacy.detectLegacy();
+    if (!leftovers.found) {
+      console.log();
+      console.log('  ' + chalk.gray('Install one with: ') + chalk.white('ezz service install'));
+      console.log();
+      return 0;
+    }
+
     console.log();
+    console.log(describeLegacy(leftovers.items).split('\n').map((l) => `  ${chalk.yellow(l)}`).join('\n'));
+    console.log();
+
+    const { cleanupOnly } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'cleanupOnly',
+      message: 'Remove the old PM2-based setup?',
+      default: true,
+    }]);
+
+    if (!cleanupOnly) {
+      console.log('  ' + chalk.gray('Nothing was changed.'));
+      return 0;
+    }
+
+    const spinner = ora('Removing the old setup...').start();
+    const cleaned = await service.legacy.removeLegacy({
+      items: leftovers.items,
+      log: (line) => { spinner.text = line; },
+    });
+    spinner.stop();
+
+    if (cleaned.removed.length) {
+      console.log('  ' + chalk.green(`✓ Removed: ${cleaned.removed.join(', ')}`));
+    }
+    for (const failure of cleaned.failed) {
+      console.log('  ' + chalk.yellow(`⚠ could not remove ${failure.name}: ${failure.reason}`));
+    }
+    console.log();
+    return cleaned.ok ? 0 : 1;
+  }
+
+  const { confirm } = await inquirer.prompt([{
+    type: 'confirm',
+    name: 'confirm',
+    message: 'Remove the background service? Monitoring will then only run while a dashboard is open.',
+    default: false,
+  }]);
+
+  if (!confirm) {
+    console.log('  ' + chalk.gray('Nothing was changed.'));
     return 0;
   }
 
-  const { yes } = await prompt({
-    type: 'confirm', name: 'yes',
-    message: `Remove the service "${s.appName}" and its start-on-boot entry?`,
-    default: false,
-  });
-  if (!yes) {
-    console.log('  ' + chalk.gray('Cancelled.'));
+  // ── Decision 5: the data location is an explicit question ────────────────
+  //
+  // Uninstalling must never silently move the data back to %APPDATA%. While
+  // the marker exists, ProgramData holds the live data; relocating it without
+  // asking would be a surprise, and the per-user copy is the stale one.
+  let keepServerDataLocation = true;
+
+  if (current?.serverMode) {
+    console.log();
+    console.log('  ' + chalk.white(`Your data currently lives at ${current.dataDir}`));
+    console.log();
+
+    const { dataChoice } = await inquirer.prompt([{
+      type: 'list',
+      name: 'dataChoice',
+      message: 'What should happen to it?',
+      default: 'keep',
+      choices: [
+        {
+          name: `Keep it where it is (recommended) — the CLI and dashboard keep using ${current.dataDir}`,
+          value: 'keep',
+        },
+        {
+          name: 'Move it back to %APPDATA%\\easy-devops — copied, verified, with a backup kept',
+          value: 'move',
+        },
+      ],
+    }]);
+    keepServerDataLocation = dataChoice === 'keep';
+  }
+
+  // ── The old PM2 setup ────────────────────────────────────────────────────
+  let removeLegacy = false;
+  const found = await service.legacy.detectLegacy();
+
+  if (found.found) {
+    console.log();
+    console.log(describeLegacy(found.items).split('\n').map((l) => `  ${chalk.yellow(l)}`).join('\n'));
+    console.log();
+
+    const { cleanup } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'cleanup',
+      message: 'Remove the old PM2-based setup as well?',
+      default: true,
+    }]);
+    removeLegacy = cleanup;
+  }
+
+  console.log();
+  const spinner = ora('Removing…').start();
+  const lines = [];
+
+  let result;
+  try {
+    result = await service.uninstall({
+      keepServerDataLocation,
+      removeLegacy,
+      log: (line) => { lines.push(line); spinner.text = line; },
+    });
+  } catch (err) {
+    spinner.fail(`Uninstall failed: ${err.message}`);
+    return 1;
+  }
+
+  spinner.stop();
+  for (const line of lines) console.log('  ' + chalk.gray(line));
+
+  if (!result.ok) {
+    console.log();
+    console.log('  ' + chalk.red('Uninstall failed.'));
+    console.log(String(result.reason).split('\n').map((l) => `  ${l}`).join('\n'));
     console.log();
     return 1;
   }
 
-  const spinner = ora('Removing…').start();
-  const res = await service.uninstall();
-  spinner.stop();
-
-  for (const step of res.steps) {
-    const mark = step.ok ? chalk.green('✓') : chalk.yellow('•');
-    console.log(`  ${mark} ${step.step}${step.detail ? chalk.gray(`  ${firstLine(step.detail)}`) : ''}`);
-  }
-
-  // PM2 itself is deliberately left installed: other apps may rely on it.
   console.log();
-  console.log('  ' + chalk.gray('PM2 itself was left installed — other apps may be using it.'));
-
-  // The boot mechanism is shared, so removing it would stop OTHER apps coming
-  // back after a reboot. Say so rather than leaving it looking like a failure.
-  if (res.keptBootMechanism) {
-    console.log();
-    console.log('  ' + chalk.yellow('Start-on-boot was left in place.'));
-    console.log('  ' + chalk.gray(
-      res.remainingApps.length
-        ? `PM2 still manages: ${res.remainingApps.join(', ')} — removing it would stop those`
-        : 'the PM2 app list could not be read, so it was left alone to be safe'));
-    console.log('  ' + chalk.gray('coming back after a reboot.'));
+  console.log('  ' + chalk.green('✓ Removed.'));
+  for (const note of result.notes ?? []) {
+    console.log(('  ' + chalk.gray(note)).replace(/\n/g, '\n  '));
+  }
+  if (result.movedData) {
+    console.log('  ' + chalk.gray(`Data moved back to ${result.dataDir}`));
+    if (result.backup) console.log('  ' + chalk.gray(`Backup kept at ${result.backup}`));
+  }
+  if (result.legacy?.removed?.length) {
+    console.log('  ' + chalk.gray(`Removed from the old setup: ${result.legacy.removed.join(', ')}`));
   }
 
-  if (res.sudoCommand) {
-    console.log();
-    console.log('  ' + chalk.bold('Run this as root to remove the boot hook:'));
-    console.log();
-    console.log('    ' + chalk.cyan(res.sudoCommand));
-  }
-
+  console.log();
+  console.log('  ' + chalk.gray('Monitoring and notifications now run only while a dashboard is open.'));
   console.log();
   return 0;
 }
 
-// ─── restart / logs ───────────────────────────────────────────────────────────
+// ─── stop / start ─────────────────────────────────────────────────────────────
+
+async function doStop() {
+  const spinner = ora('Stopping the background service…').start();
+  const lines = [];
+
+  let result;
+  try {
+    result = await service.stop({ log: (line) => { lines.push(line); spinner.text = line; } });
+  } catch (err) {
+    spinner.fail(`Stop failed: ${err.message}`);
+    return 1;
+  }
+
+  spinner.stop();
+  for (const line of lines) console.log('  ' + chalk.gray(line));
+
+  if (!result.ok) {
+    console.log();
+    console.log('  ' + chalk.red('Could not stop it.'));
+    console.log(String(result.reason).split('\n').map((l) => `  ${l}`).join('\n'));
+    console.log();
+    return 1;
+  }
+
+  console.log();
+  console.log('  ' + chalk.green(result.alreadyStopped ? '✓ Already stopped.' : '✓ Stopped.'));
+  if (result.detail) console.log('  ' + chalk.gray(result.detail));
+
+  // The difference from uninstall is the thing a user most needs to hear.
+  console.log();
+  console.log('  ' + chalk.gray('This is temporary. It starts again '
+    + (result.mode === service.MODES.PERSONAL ? 'at your next logon' : 'at the next boot') + ','));
+  console.log('  ' + chalk.gray('or right now with: ') + chalk.white('ezz service start'));
+  console.log('  ' + chalk.gray('To remove it permanently: ') + chalk.white('ezz service uninstall'));
+  console.log();
+  console.log('  ' + chalk.yellow('Monitoring and notifications are not running while it is stopped.'));
+  console.log();
+  return 0;
+}
+
+async function doStart() {
+  const spinner = ora('Starting the background service…').start();
+  const lines = [];
+
+  let result;
+  try {
+    result = await service.start({ log: (line) => { lines.push(line); spinner.text = line; } });
+  } catch (err) {
+    spinner.fail(`Start failed: ${err.message}`);
+    return 1;
+  }
+
+  spinner.stop();
+  for (const line of lines) console.log('  ' + chalk.gray(line));
+
+  if (!result.ok) {
+    console.log();
+    if (result.alreadyRunning) {
+      console.log('  ' + chalk.yellow('Already running.'));
+      console.log('  ' + chalk.gray(result.reason));
+      console.log();
+      return 0;
+    }
+    console.log('  ' + chalk.red('Could not start it.'));
+    console.log(String(result.reason).split('\n').map((l) => `  ${l}`).join('\n'));
+    if (result.needsElevation) {
+      console.log();
+      console.log('  ' + chalk.gray('No password is needed — only elevation.'));
+    }
+    console.log();
+    return 1;
+  }
+
+  console.log();
+  console.log('  ' + chalk.green(`✓ Started (pid ${result.pid}, reported in after ${Math.round(result.waitedMs / 1000)}s).`));
+  console.log();
+  return 0;
+}
+
+// ─── restart ──────────────────────────────────────────────────────────────────
 
 async function doRestart() {
   const spinner = ora('Restarting the service…').start();
-  const res = await service.restart();
-  if (res.ok) spinner.succeed('Service restarted');
-  else spinner.fail(firstLine(res.output) || 'Could not restart the service');
+
+  let result;
+  try {
+    result = await service.restart({ log: (line) => { spinner.text = line; } });
+  } catch (err) {
+    spinner.fail(`Restart failed: ${err.message}`);
+    return 1;
+  }
+
+  if (!result.ok) {
+    spinner.stop();
+    console.log();
+    console.log('  ' + chalk.red('Restart failed.'));
+    console.log(String(result.reason).split('\n').map((l) => `  ${l}`).join('\n'));
+    console.log();
+    return 1;
+  }
+
+  spinner.succeed(`Restarted (pid ${result.pid}, reported in after ${Math.round(result.waitedMs / 1000)}s)`);
   console.log();
-  return res.ok ? 0 : 1;
+  return 0;
 }
 
+// ─── logs ─────────────────────────────────────────────────────────────────────
+
 async function showLogs() {
-  const spinner = ora('Reading service logs…').start();
-  const res = await service.logs({ lines: 200 });
+  const spinner = ora('Reading the service log…').start();
+
+  let result;
+  try {
+    result = await service.logs({ lines: 80 });
+  } catch (err) {
+    spinner.fail(`Could not read the log: ${err.message}`);
+    return 1;
+  }
   spinner.stop();
 
-  if (!res.ok && res.lines.length === 0) {
-    console.log('  ' + chalk.yellow(firstLine(res.output) || 'No logs available.'));
+  console.log();
+  console.log('  ' + chalk.bold('Service log') + chalk.gray(`  ${result.source}`));
+  console.log('  ' + chalk.gray('─'.repeat(58)));
+
+  if (!result.output?.trim()) {
+    console.log('  ' + chalk.gray('(empty)'));
+  } else {
+    for (const line of result.output.split('\n')) console.log('  ' + line);
+  }
+
+  console.log();
+  return result.ok ? 0 : 1;
+}
+
+// ─── repair ───────────────────────────────────────────────────────────────────
+
+async function doRepair() {
+  console.log();
+  console.log('  ' + chalk.bold('Repair the Easy DevOps service'));
+  console.log('  ' + chalk.gray('─'.repeat(58)));
+  console.log('  ' + chalk.gray('Re-pins the Node runtime, re-applies permissions, and restarts it.'));
+  console.log();
+
+  const spinner = ora('Repairing…').start();
+  const lines = [];
+
+  let result;
+  try {
+    result = await service.repair({ log: (line) => { lines.push(line); spinner.text = line; } });
+  } catch (err) {
+    spinner.fail(`Repair failed: ${err.message}`);
+    return 1;
+  }
+
+  spinner.stop();
+  for (const line of lines) console.log('  ' + chalk.gray(line));
+
+  if (!result.ok) {
+    console.log();
+    console.log('  ' + chalk.red('Repair failed.'));
+    console.log(String(result.reason).split('\n').map((l) => `  ${l}`).join('\n'));
+    if (result.needsElevation) {
+      console.log();
+      console.log('  ' + chalk.gray('No password is needed — only elevation.'));
+    }
     console.log();
     return 1;
   }
 
   console.log();
-  for (const line of res.lines) console.log('  ' + chalk.gray(line));
-  console.log();
-  return 0;
-}
-
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
-/** inquirer prompt that treats Ctrl+C as a decline rather than a crash. */
-async function prompt(question) {
-  try {
-    return await inquirer.prompt([question]);
-  } catch (err) {
-    if (err?.name === 'ExitPromptError') return { [question.name]: question.type === 'confirm' ? false : null };
-    throw err;
+  console.log('  ' + chalk.green('✓ Repaired.'));
+  for (const failure of result.aclFailures ?? []) {
+    console.log('  ' + chalk.yellow(`⚠ ${failure.path}: ${failure.reason}`));
   }
-}
-
-function firstLine(text) {
-  return String(text ?? '').split(/\r?\n/).find((l) => l.trim()) ?? '';
-}
-
-function humanDuration(ms) {
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ${m % 60}m`;
-  return `${Math.floor(h / 24)}d ${h % 24}h`;
+  console.log();
+  return showStatus();
 }

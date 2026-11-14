@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="description" content="Easy DevOps dashboard — nginx, domains, certificates, processes and Hub in one place." />
+    <title>Easy DevOps</title>
+    <link rel="icon" href="/brand/favicon.ico" sizes="any" />
+    <link
+      rel="icon"
+      type="image/png"
+      sizes="16x16"
+      href="/brand/favicon-16.png"
+      data-ez-icon
+      data-dark="/brand/favicon-16.png"
+      data-light="/brand/favicon-light-16.png"
+    />
+    <link
+      rel="icon"
+      type="image/png"
+      sizes="32x32"
+      href="/brand/favicon-32.png"
+      data-ez-icon
+      data-dark="/brand/favicon-32.png"
+      data-light="/brand/favicon-light-32.png"
+    />
+    <link rel="icon" type="image/png" sizes="192x192" href="/brand/icon-192.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/brand/apple-touch-icon.png" />
+    <script>
+      // Applies the saved theme before first paint so the page never flashes
+      // the wrong background. Dark is the default when nothing is stored.
+      (function () {
+        try {
+          var stored = localStorage.getItem('ez-theme');
+          if (stored === 'light' || stored === 'dark') {
+            document.documentElement.dataset.theme = stored;
+          }
+        } catch (_) {
+          /* storage blocked: keep the dark default */
+        }
+
+        // Keep the favicon variant in sync with the theme attribute.
+        function syncIcons() {
+          var light = document.documentElement.dataset.theme === 'light';
+          document.querySelectorAll('link[data-ez-icon]').forEach(function (link) {
+            var next = light ? link.getAttribute('data-light') : link.getAttribute('data-dark');
+            if (next) link.setAttribute('href', next);
+          });
+        }
+        function watchIcons() {
+          syncIcons();
+          new MutationObserver(syncIcons).observe(document.documentElement, {
+            attributes: true,
+            attributeFilter: ['data-theme'],
+          });
+        }
+        if (document.readyState === 'loading') {
+          document.addEventListener('DOMContentLoaded', watchIcons);
+        } else {
+          watchIcons();
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

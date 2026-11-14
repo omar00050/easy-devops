@@ -99,8 +99,19 @@ function directoryUrl(staging) {
 /**
  * Staging is used when explicitly enabled, and always in dev data mode, so
  * development and testing can never consume production rate limits.
+ *
+ * Exported so the decision can be asserted directly. That matters more than it
+ * looks: `isDevDataDir()` used to be true whenever `EASY_DEVOPS_DATA_DIR` was
+ * set, and every installed service sets it — so a real install silently issued
+ * **staging certificates**, which browsers reject, on the user's real domains.
+ * A test that pins "service data directory ⇒ production ACME" is the guard
+ * against that coming back.
+ *
+ * @param {Object} config
+ * @param {boolean} [override]
+ * @returns {boolean}
  */
-function useStaging(config, override) {
+export function useStaging(config, override) {
   if (typeof override === 'boolean') return override;
   if (isDevDataDir()) return true;
   return Boolean(config.acmeStaging);

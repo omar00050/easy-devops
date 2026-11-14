@@ -1,13 +1,13 @@
 import fs from 'fs/promises';
 import path from 'node:path';
-import { dbGet, dbSet } from '../../core/db.js';
-import { DOMAIN_DEFAULTS, migrateDomain } from '../../core/nginx-conf-generator.js';
-import { writeConfWithTest } from '../../core/nginx-apply.js';
-import { run } from '../../core/shell.js';
-import { loadConfig } from '../../core/config.js';
-import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk } from '../../core/platform.js';
-import { saveDomainNotifConfig } from '../../core/domainNotifier.js';
-import { bumpHubRevision } from '../../core/hubLink.js';
+import { dbGet, dbSet } from './db.js';
+import { DOMAIN_DEFAULTS, migrateDomain } from './nginx-conf-generator.js';
+import { writeConfWithTest } from './nginx-apply.js';
+import { run } from './shell.js';
+import { loadConfig } from './config.js';
+import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk } from './platform.js';
+import { saveDomainNotifConfig } from './domainNotifier.js';
+import { bumpHubRevision } from './hubLink.js';
 
 // Re-export DOMAIN_DEFAULTS for consumers
 export { DOMAIN_DEFAULTS, migrateDomain };

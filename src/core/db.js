@@ -2,7 +2,7 @@ import { GoodDB, SQLiteDriver } from 'good.db';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getDataDir, isDevDataDir } from './platform.js';
+import { getDataDir, isDefaultDataDir } from './platform.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -16,10 +16,18 @@ const DB_PATH = path.join(DATA_DIR, 'easy-devops.sqlite');
 const OLD_DATA_DIR = path.join(__dirname, '..', '..', 'data');
 const OLD_DB_PATH = path.join(OLD_DATA_DIR, 'easy-devops.sqlite');
 function migrateIfNeeded() {
-  // Never migrate into a dev/test data directory: the migration RENAMES the
-  // legacy database, so running with --dev (or any EASY_DEVOPS_DATA_DIR)
-  // would consume the real installation's data.
-  if (isDevDataDir()) return;
+  // Only ever migrate INTO the default data directory. The migration RENAMES
+  // the legacy database, so running against any other directory — `--dev`, a
+  // test's temp directory, or anything else pointed at by
+  // EASY_DEVOPS_DATA_DIR — would consume the real installation's data.
+  //
+  // This used to ask `isDevDataDir()`, which returned true for ANY redirected
+  // directory and so happened to express the same rule. It no longer does:
+  // dev mode is now about intent, and every installed service passes a data
+  // directory without being a dev run. `isDefaultDataDir()` states the actual
+  // requirement — "this is a real installation's own directory" — rather than
+  // relying on a second question that used to have the same answer.
+  if (!isDefaultDataDir(DATA_DIR)) return;
 
   try {
     if (fs.existsSync(OLD_DB_PATH) && !fs.existsSync(DB_PATH)) {

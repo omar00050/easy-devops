@@ -8,6 +8,8 @@
 #   --help, -h           Print this help and exit 0
 #   --version VERSION    Skip picker; use the specified Node.js version
 #   --keep-node          Skip Node.js management; proceed to dependency install
+#   --service            Install the background service without asking
+#   --no-service         Skip the background service without asking
 #
 # Exit codes:
 #   0  Installation completed successfully
@@ -121,6 +123,8 @@ Options:
                        version directly (e.g., --version 20.11.1)
   --keep-node          Skip Node.js management entirely; proceed straight to
                        dependency installation with whatever Node.js is active
+  --service            Install the background service without asking
+  --no-service         Do not install the background service, and do not ask
 
 Exit codes:
   0  Installation completed successfully
@@ -131,6 +135,8 @@ Examples:
   bash install.sh                   # Interactive install
   bash install.sh --version 20      # Install Node.js 20.x (latest patch)
   bash install.sh --keep-node       # Skip Node.js management
+  bash install.sh --service         # Unattended, with the background service
+  bash install.sh --no-service      # Unattended, without it
 EOF
 }
 
@@ -139,6 +145,8 @@ EOF
 # ---------------------------------------------------------------------------
 FORCED_VERSION=""
 KEEP_NODE=false
+# ask | yes | no — whether to install the background service at the end.
+SERVICE_CHOICE="ask"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -160,6 +168,14 @@ while [ "$#" -gt 0 ]; do
       ;;
     --keep-node)
       KEEP_NODE=true
+      shift
+      ;;
+    --service)
+      SERVICE_CHOICE="yes"
+      shift
+      ;;
+    --no-service)
+      SERVICE_CHOICE="no"
       shift
       ;;
     *)
@@ -517,5 +533,108 @@ if [ "$NODE_ACTION" != "keep" ]; then
     . "$HOME/.zshrc" 2>/dev/null || true
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# Offer to install the background service
+#
+# Asked LAST, after Node and the package are in place, because `ezz` has to be
+# runnable for the answer to mean anything.
+#
+# Reading from /dev/tty rather than stdin is what makes this work under
+#   curl -fsSL .../install.sh | bash
+# where stdin is the pipe carrying the script itself. A plain `read` there
+# consumes script text, or sees EOF and silently takes the default — and this
+# is the one question whose default decides whether the user's server is
+# monitored at all. If there is no terminal (a CI run, a Dockerfile), the
+# prompt is skipped and the command is printed instead.
+# ---------------------------------------------------------------------------
+maybe_install_service() {
+  # An explicit flag means do not ask.
+  if [ "$SERVICE_CHOICE" = "no" ]; then
+    printf '  Skipping the background service (--no-service).\n'
+    printf '  Install it later with: ezz service install\n\n'
+    return 0
+  fi
+
+  # Open the terminal on fd 3 ONCE, and let the open itself decide whether
+  # there is one. A "[ -r /dev/tty ]" test is not enough: it can pass while the
+  # open then fails with "No such device or address" on a process that has no
+  # controlling terminal -- measured, not assumed. That leaked an error to the
+  # user and then fell through to the default, and the default here is yes.
+  # Guessing yes on a question that runs sudo is the wrong direction.
+  # The braces matter: "exec 3</dev/tty 2>/dev/null" still lets the SHELL print
+  # its own "No such device or address" before the redirection takes effect.
+  # Grouping puts the shell's own diagnostic inside the redirect too.
+  _has_tty=false
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    _has_tty=true
+  fi
+
+  if [ "$SERVICE_CHOICE" != "yes" ]; then
+    if [ "$_has_tty" != "true" ]; then
+      # Unattended: never guess on a question that needs sudo.
+      printf '  No terminal available, so the background service was not installed.\n'
+      printf '  Install it with:   ezz service install\n'
+      printf '  Or non-interactively: bash install.sh --service\n\n'
+      return 0
+    fi
+
+    printf '\n'
+    printf '  Easy DevOps can run a background service that keeps monitoring,\n'
+    printf '  notifications and the Hub agent alive even with no dashboard open.\n'
+    printf '  It installs a systemd unit running as your user. sudo will ask for\n'
+    printf '  your password itself; nothing here stores or sees it.\n'
+    printf '\n'
+    printf '  Install the background service now? (recommended for servers) [Y/n] '
+
+    _answer=""
+    IFS= read -r _answer <&3 || _answer=""
+
+    case "$_answer" in
+      [Nn]|[Nn][Oo])
+        printf '\n  Skipped. Install it later with: ezz service install\n\n'
+        exec 3<&-
+        return 0
+        ;;
+    esac
+  fi
+
+  printf '\n  Installing the background service...\n\n'
+
+  # Resolve the CLI the same way a user would, then fall back to the checkout.
+  _ez=""
+  if command -v ezz >/dev/null 2>&1; then
+    _ez="ezz"
+  elif command -v easy-devops >/dev/null 2>&1; then
+    _ez="easy-devops"
+  elif [ -f "$EASYDEVOPS_DIR/src/cli/index.js" ]; then
+    _ez="node \"$EASYDEVOPS_DIR/src/cli/index.js\""
+  else
+    printf '  Could not find the ezz command, so the service was not installed.\n'
+    printf '  Open a new terminal and run: ezz service install\n\n'
+    if [ "$_has_tty" = "true" ]; then exec 3<&-; fi
+    return 0
+  fi
+
+  # stdin comes from the terminal for the same reason as the prompt above:
+  # "ezz service install" runs sudo, and sudo must be able to ask.
+  _installed=false
+  if [ "$_has_tty" = "true" ]; then
+    if eval "$_ez service install" <&3; then _installed=true; fi
+    exec 3<&-
+  elif eval "$_ez service install"; then
+    _installed=true
+  fi
+
+  if [ "$_installed" = "true" ]; then
+    return 0
+  fi
+
+  printf '\n  The service was not installed. Nothing else was changed.\n'
+  printf '  You can retry with: ezz service install\n\n'
+  return 0
+}
+
+maybe_install_service
 
 exit 0

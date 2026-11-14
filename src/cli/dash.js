@@ -10,6 +10,7 @@
 
 import chalk from 'chalk';
 import { getDataDir, isDevDataDir } from '../core/platform.js';
+import { inspect } from '../core/daemon/lock.js';
 
 /** How long a graceful shutdown may take before the process is forced out. */
 const FORCE_EXIT_MS = 5000;
@@ -38,6 +39,8 @@ export async function runDashboard() {
   console.log('  ' + chalk.white(url));
   console.log('  ' + chalk.gray('Press Ctrl+C to stop'));
   console.log();
+
+  printBackgroundServiceNotice();
 
   let stopping = false;
 
@@ -76,4 +79,32 @@ export async function runDashboard() {
 
   process.on('SIGINT', () => { stop('SIGINT'); });
   process.on('SIGTERM', () => { stop('SIGTERM'); });
+}
+
+/**
+ * Says whether monitoring survives closing this terminal.
+ *
+ * This is the single most confusing thing about the old design and the reason
+ * the daemon exists: notifications, domain health and the Hub agent only ran
+ * while a dashboard was open, and nothing said so. A user who closed the
+ * window believed they were still being watched.
+ *
+ * So the dashboard now states which of the two situations it is in — and when
+ * it is the one doing the work, it says what to install to make that
+ * permanent, rather than merely warning.
+ */
+function printBackgroundServiceNotice() {
+  const state = inspect();
+
+  if (state.running) {
+    console.log('  ' + chalk.green('● Background service is running.'));
+    console.log('  ' + chalk.gray(`  This dashboard is the interface only (service pid ${state.lock?.pid}).`));
+    console.log();
+    return;
+  }
+
+  console.log('  ' + chalk.yellow('▲ No background service is running.'));
+  console.log('  ' + chalk.gray('  Monitoring and notifications run in THIS window and stop when you close it.'));
+  console.log('  ' + chalk.white('  ezz service install') + chalk.gray('   keep them running in the background'));
+  console.log();
 }

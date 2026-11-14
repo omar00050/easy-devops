@@ -4,7 +4,7 @@ import os from 'os';
 import crypto from 'crypto';
 import {
 	loadConfig, saveConfig, BIND_ALL, BIND_LOOPBACK, BIND_LOOPBACK_V6,
-	AUTH_MODES, isLoopbackBind, effectiveAuthMode,
+	AUTH_MODES, UI_MODES, isLoopbackBind, effectiveAuthMode,
 } from '../../core/config.js';
 import { isLoopbackAddress } from '../lib/localRequest.js';
 import { hashPassword, validateNewPassword } from '../../core/passwords.js';
@@ -12,7 +12,7 @@ import { validatePort, validateEmail } from '../../core/validators.js';
 import { run, runWithStdin } from '../../core/shell.js';
 import { checkPermissionsConfigured } from '../../core/permissions.js';
 import { dbGet, dbSet } from '../../core/db.js';
-import { saveDomains } from '../lib/domains-db.js';
+import { saveDomains } from '../../core/domains-db.js';
 import { loadChannels, saveChannels, sendNotification } from '../../core/notifier.js';
 
 class SettingsController {
@@ -30,6 +30,9 @@ class SettingsController {
 				dashboardBindAddress,
 				bindsToLoopbackOnly: isLoopbackBind(dashboardBindAddress),
 				dashboardAuth: effectiveAuthMode(config),
+				// Anything unrecognised reads as classic, which is also the
+				// default. The value only takes effect on restart.
+				dashboardUi: config.dashboardUi === UI_MODES.NEW ? UI_MODES.NEW : UI_MODES.CLASSIC,
 				// Whether the UI may offer 'none' at all: the bind must be loopback
 				// and the person asking must be on this machine.
 				canUseNoPassword: isLoopbackBind(dashboardBindAddress) &&
@@ -46,7 +49,7 @@ class SettingsController {
 		try {
 			const {
 				dashboardPort, dashboardPassword, nginxDir, sslDir, acmeEmail, dashboardBindAddress,
-				dashboardAuth,
+				dashboardAuth, dashboardUi,
 			} = req.body;
 
 			const current = loadConfig();
@@ -74,6 +77,13 @@ class SettingsController {
 					![AUTH_MODES.PASSWORD, AUTH_MODES.NONE].includes(dashboardAuth)) {
 				return res.status(400).json({
 					error: `Authentication must be '${AUTH_MODES.PASSWORD}' or '${AUTH_MODES.NONE}'`,
+				});
+			}
+
+			if (dashboardUi !== undefined &&
+					![UI_MODES.CLASSIC, UI_MODES.NEW].includes(dashboardUi)) {
+				return res.status(400).json({
+					error: `Dashboard UI must be '${UI_MODES.CLASSIC}' or '${UI_MODES.NEW}'`,
 				});
 			}
 
@@ -133,6 +143,7 @@ class SettingsController {
 			}
 			if (dashboardBindAddress !== undefined) updates.dashboardBindAddress = dashboardBindAddress;
 			if (dashboardAuth !== undefined) updates.dashboardAuth = dashboardAuth;
+			if (dashboardUi !== undefined) updates.dashboardUi = dashboardUi;
 
 			// Setting a password implies wanting one; switching to 'password'
 			// without one leaves the first-run screen as the way back in, which
@@ -146,15 +157,18 @@ class SettingsController {
 
 			saveConfig({ ...currentConfig, ...updates });
 
-			// The port and the bind address only take effect on restart, so say so
-			// rather than letting the user think the change is already live.
+			// The port, the bind address and the UI choice only take effect on
+			// restart, so say so rather than letting the user think the change is
+			// already live.
 			const needsRestart = updates.dashboardPort !== undefined ||
-				updates.dashboardBindAddress !== undefined;
+				updates.dashboardBindAddress !== undefined ||
+				updates.dashboardUi !== undefined;
 
 			res.json({
 				success: true,
 				needsRestart,
 				dashboardAuth: effectiveAuthMode({ ...currentConfig, ...updates }),
+				dashboardUi: updates.dashboardUi ?? currentConfig.dashboardUi,
 			});
 		} catch (err) {
 			res.status(500).json({ error: 'Internal server error' });

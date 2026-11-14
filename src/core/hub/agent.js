@@ -1,19 +1,26 @@
-// src/dashboard/lib/hubAgent.js
+// src/core/hub/agent.js
 // Persistent outbound Socket.io agent that connects Easy DevOps to the Hub SaaS.
-// Activated automatically on dashboard startup when hub-link exists in SQLite.
+//
+// Lives in core because it is background work, not dashboard work: the daemon
+// runs it when a daemon is running, and an open dashboard runs it only while
+// no daemon is (see core/jobs/index.js). It was in src/dashboard/lib/ when the
+// dashboard was the only long-running process.
+//
+// Activated when hub-link exists in SQLite.
 
 import { io } from 'socket.io-client';
+import { createHash } from 'crypto';
 import os from 'os';
-import { dbGet } from '../../core/db.js';
-import { loadConfig } from '../../core/config.js';
-import { run } from '../../core/shell.js';
-import { getStatus, start as nginxStart, stop as nginxStop, restart as nginxRestart, test as nginxTest, reload as nginxReload, listConfigs, getConfig, saveConfig, getLogs } from './nginx-service.js';
-import { emitLocalChange } from '../socketManager.js';
-import { isWindows, platformName } from '../../core/platform.js';
-import { listAllCerts } from './cert-reader.js';
-import * as serviceCore from '../../core/service.js';
-import * as runner from '../../core/runner.js';
-import { loadChannels } from '../../core/notifier.js';
+import { dbGet } from '../db.js';
+import { loadConfig } from '../config.js';
+import { run } from '../shell.js';
+import { getStatus, start as nginxStart, stop as nginxStop, restart as nginxRestart, test as nginxTest, reload as nginxReload, listConfigs, getConfig, saveConfig, getLogs } from '../nginx-service.js';
+import { publish } from '../jobs/bus.js';
+import { isWindows, platformName, isDevDataDir } from '../platform.js';
+import { listAllCerts } from '../cert-reader.js';
+import { backgroundServiceState } from '../service/index.js';
+import * as runner from '../runner.js';
+import { loadChannels } from '../notifier.js';
 import {
   getHubLink,
   getHubPermissions,
@@ -22,12 +29,12 @@ import {
   isAuthRejection,
   describeRejection,
   HUB_AGENT_STATUS,
-} from '../../core/hubLink.js';
+} from '../hubLink.js';
 import {
   PERMISSION_TREE,
   COMING_SOON_PERMISSION_IDS,
   checkCommandAllowed,
-} from '../../core/hubPermissions.js';
+} from '../hubPermissions.js';
 
 /** How often the agent checks the shared revision counter. */
 const REVISION_POLL_MS = 3_000;
@@ -143,28 +150,36 @@ async function pushChannelsList() {
  * runs under PM2 with start-on-boot arranged, an agent that stops reporting is
  * a genuine outage rather than someone having closed a terminal.
  *
- * Deliberately cheap and side-effect free — service.status() never starts the
- * PM2 daemon, so a server that does not use PM2 is not given one just because
- * it is paired with a Hub.
+ * Deliberately cheap and side-effect free: the state is a lock read and a few
+ * existsSync calls, and the PM2 probe never starts a PM2 daemon — so a server
+ * that does not use PM2 is not given one just because it is paired with a Hub.
  */
 async function pushServiceState() {
   if (!socket?.connected) return;
   try {
-    const s = await serviceCore.status();
+    // The NATIVE service, not the PM2 app. This used to report a PM2
+    // installation, which made "offline means really down" a much weaker
+    // signal than the Hub believed: the agent lived inside the dashboard, so
+    // there was nothing left to report when the dashboard closed.
+    const s = backgroundServiceState();
+    const pm2 = await runner.detect({ probeVersion: false });
+
     socket.emit('service:state', {
       installed: s.installed,
       running: s.running,
-      status: s.status,
-      enabledOnBoot: s.enabledOnBoot,
-      bootMode: s.bootMode,
-      appName: s.appName,
-      dev: s.dev,
-      pm2Installed: s.pm2.installed,
-      pm2Version: s.pm2.version,
-      sameUser: s.sameUser,
-      appUser: s.appUser,
-      restarts: s.app?.restarts ?? 0,
-      uptimeMs: s.app?.uptimeMs ?? null,
+      status: s.detail,
+      mechanism: s.mechanism,
+      mode: s.mode,
+      startsAt: s.startsAt,
+      stoppedByUser: s.stoppedByUser,
+      jobsRunningHere: s.jobsRunningHere,
+      enabledOnBoot: s.installed,
+      dev: isDevDataDir(),
+      // The user's OWN PM2 installation, which is a different thing and the
+      // only reason these two fields still exist.
+      pm2Installed: pm2.installed,
+      pm2Version: pm2.version,
+      uptimeMs: s.startedAt ? Date.now() - s.startedAt : null,
     });
   } catch { /* non-fatal */ }
 }
@@ -297,10 +312,50 @@ async function handleGetConfigs(payload) {
   });
 }
 
+/**
+ * Decides whether a `hub:saveConfig` should also reload nginx.
+ *
+ * Saving and reloading are two different capabilities, and a server may grant
+ * one without the other: `nginx.config.edit` lets the Hub change a file that
+ * `nginx -t` accepts, while `nginx.reload` lets it affect live traffic. An
+ * operator who allows editing but not reloading has said something specific,
+ * so a `reload: true` from the Hub must not quietly override it.
+ *
+ * The save therefore always stands on its own, and a refused reload is
+ * reported rather than treated as a failure — the file is written and valid
+ * either way.
+ *
+ * Exported so the decision can be tested without nginx: it is a pure function
+ * of the payload and the stored permission map.
+ *
+ * @param {Object} payload The command payload
+ * @param {Object} permissions The granted permission map
+ * @returns {{ requested: boolean, allowed: boolean, reason: string|null }}
+ */
+export function resolveSaveConfigReload(payload, permissions) {
+  // Only an explicit `true` asks for a reload. Anything else — absent, false,
+  // "true", 1 — is not a request, because a reload affects live traffic and
+  // should never happen through a loose coercion.
+  const requested = payload?.reload === true;
+  if (!requested) return { requested: false, allowed: false, reason: null };
+
+  const verdict = checkCommandAllowed('hub:reloadNginx', {}, permissions);
+  return {
+    requested: true,
+    allowed: verdict.allowed,
+    reason: verdict.allowed ? null : verdict.reason,
+  };
+}
+
 async function handleSaveConfig(payload) {
-  return runCommand('hub:saveConfig', payload, async ({ filename, content }) => {
+  return runCommand('hub:saveConfig', payload, async (body) => {
+    const { filename, content } = body;
     if (typeof filename !== 'string' || !filename.trim()) throw new Error('filename is required');
     if (typeof content !== 'string') throw new Error('content must be a string');
+
+    // Decided BEFORE the write, so the answer cannot depend on anything the
+    // save itself changes.
+    const wanted = resolveSaveConfigReload(body, getPermissions());
 
     // saveConfig() validates the filename, keeps the write inside the nginx
     // config directory, tests with isNginxTestOk() and restores the previous
@@ -308,10 +363,32 @@ async function handleSaveConfig(payload) {
     const r = await saveConfig(filename, content);
     if (!r?.success) throw new Error(r?.output || 'nginx rejected the config');
 
+    const result = {
+      filename,
+      output: r.output ?? '',
+      reloadRequested: wanted.requested,
+      reloaded: false,
+      reloadDetail: wanted.reason,
+    };
+
+    if (wanted.requested && wanted.allowed) {
+      // The config has already passed `nginx -t`, so this is the only step
+      // left. A reload that fails does NOT undo the save: the file on disk is
+      // valid, and rolling it back would discard a good edit over a transient
+      // reload problem. It is reported instead.
+      const reloaded = await nginxReload();
+      result.reloaded = Boolean(reloaded?.success);
+      result.reloadDetail = result.reloaded
+        ? (reloaded.output ?? '').trim() || 'nginx reloaded'
+        : `the config was saved and is valid, but the reload failed: ${(reloaded?.output ?? '').trim() || 'no output'}`;
+    } else if (!wanted.requested) {
+      result.reloadDetail = 'no reload was requested; the new config takes effect on the next reload';
+    }
+
     pushNginxStatus();
     pushDomainConfigs();
     notifyLocalDashboard('nginx');
-    return { filename, output: r.output ?? '' };
+    return result;
   });
 }
 
@@ -325,7 +402,7 @@ async function handleGetLogs(payload) {
 
 async function handleManageDomain(payload) {
   return runCommand('hub:manageDomain', payload, async (p) => {
-    const { handleHubDomainCommand } = await import('./domains-db.js');
+    const { handleHubDomainCommand } = await import('../domains-db.js');
     const result = await handleHubDomainCommand(p);
     if (result && result.ok === false) throw new Error(result.error || 'domain command failed');
 
@@ -339,7 +416,7 @@ async function handleManageDomain(payload) {
 
 async function handleManageSSL(payload) {
   return runCommand('hub:manageSSL', payload, async (p) => {
-    const { handleHubSslCommand } = await import('./cert-operations.js');
+    const { handleHubSslCommand } = await import('../cert-operations.js');
     const result = await handleHubSslCommand(p);
     if (result && result.ok === false) throw new Error(result.error || 'ssl command failed');
 
@@ -394,14 +471,22 @@ async function checkRevision() {
 }
 
 /**
- * Tells the local dashboard's own browser tabs that something changed, so the
- * open UI refreshes the affected section without a page reload.
- * @param {'domains'|'ssl'|'nginx'} section
+ * Tells any open dashboard that something changed, so the UI refreshes the
+ * affected section without a page reload.
+ *
+ * This used to call the socket layer directly, which is what tied the agent to
+ * a process that had a Socket.io server in it. It now publishes to the job bus,
+ * and the transport is someone else's problem: a dashboard running the jobs
+ * itself forwards it to its own browsers, and the daemon forwards it over IPC
+ * to a dashboard in another process. The payload is unchanged, so
+ * docs/api-contract.md still describes it exactly.
+ *
+ * @param {'domains'|'ssl'|'nginx'|'settings'} section
  */
 function notifyLocalDashboard(section) {
   try {
-    emitLocalChange(section);
-  } catch { /* socketManager may not be initialised */ }
+    publish('local:changed', { section, source: 'hub', at: Date.now() });
+  } catch { /* never let a listener break a hub command */ }
 }
 
 // ─── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -459,6 +544,27 @@ export function initHubAgent() {
 
   const { hubUrl, serverId, secret } = link;
   const url = resolveHubOrigin(hubUrl);
+
+  // Tear down any existing socket FIRST.
+  //
+  // This is the fix for a connection flap that looked like a hub problem.
+  // Reassigning `socket` below without disconnecting the old one left it
+  // CONNECTED but unreferenced — and the hub keeps one socket per serverId
+  // (agentServer.ts), evicting the older when a second arrives. The evicted
+  // client sees 'io server disconnect', re-dials, and evicts the other one:
+  // two sockets taking turns, "Connected"/"Disconnected" every few seconds,
+  // for ever. Reproduced against a test hub, which counted two live sockets
+  // from a single process.
+  //
+  // So this function is now idempotent: calling it twice leaves exactly one
+  // socket. That matters because it is reachable from more than one place —
+  // the job owner starts it, and re-pairing restarts it.
+  stopHubAgent();
+
+  // Recorded AFTER the teardown, because stopHubAgent() clears it. Setting it
+  // first left it null, so the next reconcile saw a mismatch and redialled —
+  // the very churn this signature exists to prevent.
+  activeLink = linkSignature(link);
 
   cancelRejoin();
   agentState = { status: HUB_AGENT_STATUS.CONNECTING, lastError: null, attempts: 0 };
@@ -550,7 +656,7 @@ export function initHubAgent() {
     // Transport/network failure — socket.io keeps retrying with backoff.
     agentState = {
       status: HUB_AGENT_STATUS.UNREACHABLE,
-      lastError: `Cannot reach the hub (${message}). Retrying…`,
+      lastError: `Cannot reach the hub (${message}). Retrying...`,
       attempts: agentState.attempts + 1,
     };
     console.error('[hubAgent] Connection error:', message);
@@ -565,9 +671,74 @@ export function initHubAgent() {
   self.on('hub:getLogs', handleGetLogs);
 }
 
+/**
+ * Identity of the pairing a socket was started with.
+ *
+ * Used to decide whether a stored pairing CHANGED, which is a different
+ * question from whether the agent happens to be connected right now. The
+ * secret is included as a hash so a rotated secret counts as a change, and
+ * never as plain text — this value is compared, logged and kept in memory.
+ */
+function linkSignature(link) {
+  if (!link) return null;
+  const secretMark = createHash('sha256').update(String(link.secret ?? '')).digest('hex').slice(0, 12);
+  return `${resolveHubOrigin(link.hubUrl)}|${link.serverId}|${secretMark}`;
+}
+
+/** The signature the current socket was created for, or null when stopped. */
+let activeLink = null;
+
+/**
+ * Brings the agent into line with the stored pairing, and does nothing
+ * otherwise.
+ *
+ * Called by the job owner when the shared revision counter moves, which is how
+ * a pairing made in the dashboard or the CLI reaches the process that actually
+ * holds the agent.
+ *
+ * ── Why this compares identity, not connectedness ──────────────────────────
+ *
+ * The first version re-ran `initHubAgent()` whenever the agent was not
+ * CONNECTED. That looked harmless and was not: the revision counter also moves
+ * on every domain, certificate and permission change, so a busy server tore
+ * the socket down and redialled it repeatedly — including while it was still
+ * mid-connect, which is a perfectly normal state. It showed up as Hub updates
+ * arriving seconds late.
+ *
+ * So a socket that exists and was created for the pairing that is still stored
+ * is left strictly alone, connected or not: socket.io's own reconnection is
+ * what handles a transport problem, and this function must not fight it.
+ *
+ * @returns {{ action: 'none'|'started'|'restarted'|'stopped', reason: string }}
+ */
+export function reconcileHubAgent() {
+  const link = getHubLink();
+
+  if (!link) {
+    if (!socket && !activeLink) return { action: 'none', reason: 'not linked, no agent running' };
+    stopHubAgent();
+    return { action: 'stopped', reason: 'the pairing was removed' };
+  }
+
+  const wanted = linkSignature(link);
+
+  if (!socket) {
+    initHubAgent();
+    return { action: 'started', reason: 'a pairing exists but no agent was running' };
+  }
+
+  if (activeLink !== wanted) {
+    initHubAgent();
+    return { action: 'restarted', reason: 'the pairing changed' };
+  }
+
+  return { action: 'none', reason: 'the agent already matches the stored pairing' };
+}
+
 export function stopHubAgent() {
   stopHeartbeats();
   cancelRejoin();
+  activeLink = null;
   if (socket) {
     try {
       socket.io.reconnection(false);

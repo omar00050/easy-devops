@@ -1,7 +1,7 @@
-import { listAllCerts } from '../lib/cert-reader.js';
+import { listAllCerts } from '../../core/cert-reader.js';
 import { issueCert, renewCert } from '../../cli/managers/ssl-manager.js';
 import { describeIssuance, prepareDomainForHttpChallenge } from '../../core/ssl-issuer.js';
-import { findDomain } from '../lib/domains-db.js';
+import { findDomain } from '../../core/domains-db.js';
 import { loadConfig } from '../../core/config.js';
 import { promises as dns } from 'dns';
 

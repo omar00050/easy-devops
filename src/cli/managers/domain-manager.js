@@ -17,7 +17,7 @@ import fs from 'fs/promises';
 import Table from 'cli-table3';
 import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
-import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../../dashboard/lib/domains-db.js';
+import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../../core/domains-db.js';
 import { getDefaultCertPaths } from '../../core/nginx-conf-generator.js';
 import { writeConfWithTest, findBackslashCertPaths } from '../../core/nginx-apply.js';
 import { prepareDomainForHttpChallenge, describeIssuance } from '../../core/ssl-issuer.js';

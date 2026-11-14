@@ -9,8 +9,10 @@
  * load before the database is initialised.
  */
 
+import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { createHash } from 'crypto';
 
 export const isWindows = process.platform === 'win32';
 
@@ -23,11 +25,76 @@ export const DATA_DIR_ENV = 'EASY_DEVOPS_DATA_DIR';
  */
 export const TEST_MODE_ENV = 'EZ_TEST';
 
-/** The data directory a normal installation uses. */
-function realDataDir() {
+/**
+ * The per-user data directory: where a normal, non-service install lives.
+ */
+function userDataDir() {
   return isWindows
     ? path.join(process.env.APPDATA || os.homedir(), 'easy-devops')
     : path.join(os.homedir(), '.config', 'easy-devops');
+}
+
+/**
+ * The machine-wide data directory, used when the Windows service is installed.
+ *
+ * A Windows service running as `NT SERVICE\EasyDevOps` has no `%APPDATA%` of
+ * the installing user — a virtual account's profile is not that user's — so a
+ * per-user directory cannot be shared between the service and the CLI. Putting
+ * the data under ProgramData is what lets the service, the CLI and the
+ * dashboard all see one database.
+ */
+export function programDataDir() {
+  return path.join(process.env.ProgramData || 'C:\\ProgramData', 'easy-devops');
+}
+
+/**
+ * Marker written by `ezz service install` in Server mode.
+ *
+ * Its presence — not the service's running state — is what selects the
+ * machine-wide directory. That distinction matters: a stopped or uninstalled
+ * service must not silently move the data back to `%APPDATA%`, because the
+ * data in ProgramData is then the real data and the per-user directory is a
+ * stale copy. `ezz service uninstall` asks before moving anything and removes
+ * this marker only if the user chooses to move back.
+ */
+export function serverModeMarkerPath() {
+  return path.join(programDataDir(), '.server-mode');
+}
+
+/**
+ * Cached because getDataDir() is called on nearly every code path and this
+ * would otherwise be a filesystem stat each time. The migration is the only
+ * thing that changes the answer within one process's life, and it calls
+ * resetDataDirCache() when it does.
+ */
+let serverModeCache = null;
+
+/** True when this machine is in Server mode (the marker exists). */
+export function isServerMode() {
+  if (!isWindows) return false;
+  if (serverModeCache !== null) return serverModeCache;
+
+  try {
+    serverModeCache = fs.existsSync(serverModeMarkerPath());
+  } catch {
+    // An unreadable ProgramData is not Server mode. Erring toward the per-user
+    // directory keeps a non-elevated CLI working rather than failing outright.
+    serverModeCache = false;
+  }
+
+  return serverModeCache;
+}
+
+/** Forgets the cached Server-mode answer. Called by the data-dir migration. */
+export function resetDataDirCache() {
+  serverModeCache = null;
+}
+
+/**
+ * The data directory a normal installation uses, Server mode included.
+ */
+function realDataDir() {
+  return isServerMode() ? programDataDir() : userDataDir();
 }
 
 /** Case-insensitive on Windows, where paths are not case-sensitive. */
@@ -64,7 +131,15 @@ function isDirWithin(child, parent) {
  * @param {string|undefined} override The raw EASY_DEVOPS_DATA_DIR value
  */
 function assertTestDataDir(override) {
+  // Every directory a real installation could be using, not just the one it
+  // would resolve to right now. Server mode depends on a marker file, so
+  // whether `realDataDir()` returns ProgramData varies with machine state —
+  // and a guard that protected only the currently-selected directory would
+  // leave the other one exposed on exactly the machines where it matters.
+  // Both are refused unconditionally.
   const real = realDataDir();
+  const forbidden = [userDataDir()];
+  if (isWindows) forbidden.push(programDataDir());
 
   const fail = (reason) => {
     throw new Error(
@@ -97,11 +172,13 @@ function assertTestDataDir(override) {
   // the suite while telling the user their temp directory "is" the real one.
   if (isDirWithin(resolved, os.tmpdir())) return;
 
-  // Anywhere else, the real directory must not be reachable: not the same
-  // directory, not inside it, and not a parent of it (%APPDATA% itself).
-  if (isSameDir(resolved, real)) fail('it points at the real data directory');
-  if (isDirWithin(resolved, real)) fail('it points inside the real data directory');
-  if (isDirWithin(real, resolved)) fail('it contains the real data directory');
+  // Anywhere else, no real directory may be reachable: not the same directory,
+  // not inside it, and not a parent of it (%APPDATA% or ProgramData itself).
+  for (const dir of forbidden) {
+    if (isSameDir(resolved, dir)) fail(`it points at a real data directory (${dir})`);
+    if (isDirWithin(resolved, dir)) fail(`it points inside a real data directory (${dir})`);
+    if (isDirWithin(dir, resolved)) fail(`it contains a real data directory (${dir})`);
+  }
 }
 
 /**
@@ -132,9 +209,150 @@ export function getDataDir() {
   return realDataDir();
 }
 
-/** True when the data directory came from EASY_DEVOPS_DATA_DIR (dev mode). */
+/**
+ * Env var that explicitly marks a development run.
+ *
+ * Exists because "dev mode" and "a redirected data directory" are different
+ * questions, and conflating them caused a real incident — see below.
+ */
+export const DEV_MODE_ENV = 'EZ_DEV';
+
+/** The project-local directory `--dev` points at. */
+const DEV_DIR_NAME = '.dev-data';
+
+/**
+ * True for a DEVELOPMENT run: Let's Encrypt staging, `-dev` process names, and
+ * the legacy data migration skipped.
+ *
+ * It used to be `Boolean(process.env.EASY_DEVOPS_DATA_DIR)` — the mere presence
+ * of a redirected data directory. That was wrong and shipped a serious bug: the
+ * Windows Personal-mode launcher sets `EASY_DEVOPS_DATA_DIR` to the ordinary
+ * `%APPDATA%\easy-devops` so the service and the CLI agree on one location, and
+ * that alone put the daemon into dev mode — issuing **staging certificates**,
+ * which browsers reject, on a user's real domains. The same trap applied to the
+ * systemd unit and the Windows service, both of which also set the variable.
+ *
+ * So dev mode is now decided by intent, never by a side effect:
+ *
+ *   1. `EZ_DEV=1` — set explicitly by `--dev`.
+ *   2. the resolved directory IS a `.dev-data` directory — which is what
+ *      `--dev` points at, so an inherited environment still reads as dev
+ *      without the flag having to be passed down.
+ *
+ * A redirected directory that is neither of those is a production install that
+ * simply keeps its data somewhere specific. That is the normal case for every
+ * installed service.
+ *
+ * @returns {boolean}
+ */
 export function isDevDataDir() {
-  return Boolean(process.env[DATA_DIR_ENV]?.trim());
+  if (process.env[DEV_MODE_ENV] === '1') return true;
+
+  const override = process.env[DATA_DIR_ENV]?.trim();
+  if (!override) return false;
+
+  // Compared on the final path segment rather than against one absolute path,
+  // so a checkout anywhere still reads as dev.
+  return path.basename(path.resolve(override)).toLowerCase() === DEV_DIR_NAME;
+}
+
+/**
+ * True when `dir` is exactly what getDataDir() would resolve to with no
+ * override at all.
+ *
+ * Service and launcher definitions use this to decide whether to pass
+ * `EASY_DEVOPS_DATA_DIR` in the environment. When the answer is the default,
+ * passing it is redundant — and redundant environment variables are not free:
+ * the one that was being passed here turned on dev mode, because dev mode used
+ * to be inferred from its mere presence. That inference is fixed, and the
+ * variable is also no longer set needlessly, so a future regression of either
+ * one on its own cannot reproduce the bug.
+ *
+ * @param {string} dir
+ * @returns {boolean}
+ */
+export function isDefaultDataDir(dir) {
+  if (!dir) return false;
+  return isSameDir(dir, realDataDir());
+}
+
+/**
+ * Command that reports whether this is a Windows Server edition.
+ *
+ * `InstallationType` in the CurrentVersion key is `Client`, `Server` or
+ * `Server Core`. It is the right signal and the cheapest: `os.release()` does
+ * not distinguish a server from a workstation at all (both report 10.0.x), and
+ * the WMI route (`Get-CimInstance Win32_OperatingSystem`) takes seconds to
+ * start its service on a cold machine. Measured on Windows 10: this returns
+ * `Client` immediately.
+ *
+ * Returns the raw value on stdout, so the caller decides what it means.
+ *
+ * @returns {string}
+ */
+export function windowsEditionQueryCmd() {
+  return "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion')"
+    + '.InstallationType';
+}
+
+/**
+ * Command that reports the Windows product name, for display.
+ * @returns {string}
+ */
+export function windowsProductNameCmd() {
+  return "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion').ProductName";
+}
+
+/**
+ * Address the daemon listens on for local event delivery to a dashboard.
+ *
+ * Two different kinds of thing behind one name, which is why it lives here:
+ *
+ *  - Windows: a named pipe. `\\.\pipe\...` is a name in a kernel namespace,
+ *    not a path on disk — it cannot live in the data directory, so the data
+ *    directory is HASHED into the name instead. That keeps a dev instance
+ *    (`--dev`, its own data dir) from talking to the real one, which sharing a
+ *    fixed pipe name would otherwise allow.
+ *  - Everything else: a Unix socket file inside the data directory, which
+ *    gives the same isolation for free and inherits the directory's
+ *    permissions.
+ *
+ * @param {string} dataDir
+ * @returns {string}
+ */
+export function daemonIpcPath(dataDir) {
+  if (!isWindows) return path.join(dataDir, 'daemon.sock');
+
+  // A short, stable hash: the pipe namespace is flat and a full path would be
+  // both too long and full of characters that are not allowed in a pipe name.
+  const key = createHash('sha256').update(path.resolve(dataDir).toLowerCase()).digest('hex').slice(0, 12);
+  return `\\\\.\\pipe\\easy-devops-${key}`;
+}
+
+/**
+ * Where an nginx log file actually lives.
+ *
+ * The only correct resolver, and the reason it exists: three places resolved
+ * this independently and one of them was wrong. `getLogs()` in
+ * core/nginx-service.js read `<nginxDir>/logs/error.log` unconditionally,
+ * which is the Windows layout — so on Linux, where a distribution nginx logs
+ * to /var/log/nginx, the dashboard's log view was permanently empty. The live
+ * tail in the socket layer had the branch right, which is why the bug showed
+ * up as "the tail works but the log page does not".
+ *
+ * @param {string} nginxDir
+ * @param {'error'|'access'} [which]
+ * @returns {string}
+ */
+export function nginxLogPath(nginxDir, which = 'error') {
+  const file = which === 'access' ? 'access.log' : 'error.log';
+
+  // A Windows nginx is a self-contained directory: binary, conf and logs.
+  if (isWindows) return path.join(nginxDir, 'logs', file);
+
+  // On Linux the package puts logs under /var/log, not under the config
+  // directory, and nginxDir there is /etc/nginx.
+  return `/var/log/nginx/${file}`;
 }
 
 /**
@@ -196,7 +414,7 @@ export function nginxReloadCmd(nginxDir) {
 // On Windows nginx.exe must be launched detached with the nginx directory as
 // its working directory, otherwise it resolves relative paths such as
 // logs/error.log against our cwd and dies on startup. This is the same
-// Start-Process form dashboard/lib/nginx-service.js already uses successfully.
+// Start-Process form core/nginx-service.js already uses successfully.
 
 /**
  * Command that starts nginx as a long-running service.
