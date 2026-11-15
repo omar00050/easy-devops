@@ -38,13 +38,17 @@ are fed by the socket tail, so access history is unavailable before subscribing.
 Live and REST status return e.g. `"nginx/1.26.2"`. The UI renders it as-is. Worth
 one line in §2.4 so no client double-prefixes it.
 
-## 5. `service.cliHint` is a sentence, not a command
+## 5. `service.cliHint` is a sentence, not a command — superseded in 2.0.0
 
 `GET /api/service` returns `cliHint` as a complete sentence with the command in
 backticks, e.g. ``Run `ezz service install` in an Administrator PowerShell to set
 up the service.`` The UI no longer reads it (see #11; the sentence mixes PM2 and
 the Easy DevOps service). If it stays, document the format or split it into
 `cliCommand` and `cliDescription` so clients do not need to parse prose.
+
+Contract 2.0.0 removed `cliHint` along with the other PM2-era fields;
+`install { command, needsElevation, shell }` is the structured replacement and
+the UI reads only that. Nothing left to do here.
 
 ## 6. Pin the SSL certificate object
 
@@ -76,15 +80,16 @@ The UI clears its buffer before each subscribe so reconnects replace the tail
 instead of duplicating it. A note in §3.2 would save the next client that
 duplication bug.
 
-## 9. Decide on the first-run setup code
+## 9. Decide on the first-run setup code — done in 2.1.0
 
-The UI can render a “Setup code” field when `GET /api/auth` reports
-`setupCodeRequired: true`, and sends `setupCode` in `POST /api/setup`. Neither
-field exists in the contract or the backend, and the old UI never asked for one.
-Options: implement it (recommended if the public setup endpoint may ever be
-reachable beyond loopback), or confirm it is not planned and the UI will drop the
-mock scenario and the dormant field. As it stands the field is unreachable
-against the real API.
+Resolved by contract 2.1.0: `GET /api/auth` now advertises
+`setupCodeRequired` and `setupCodeExpiresAt`, and `POST /api/setup` accepts
+`setupCode`. The first-run screen collects the code when required. When the
+contract reports a required code with `setupCodeExpiresAt: null` — the code is
+past its 24 hours or was burned after 20 failed attempts — the screen shows
+“This code has expired. Get a new one with: ezz dashboard setup-code” instead
+of calling the submission invalid. `?mock=setupcode` (`123456`) and
+`?mock=setupcode-expired` exercise both paths.
 
 ## 10. Document the remaining payload shapes the UI consumes
 
@@ -97,7 +102,7 @@ These are used in full but only named in the contract:
 
 Pinning these would let the contract tests cover the UI adapter directly.
 
-## 11. Expose the native background-service state in `GET /api/service`
+## 11. Expose the native background-service state in `GET /api/service` — done in 2.0.0
 
 Phase 1 moved Easy DevOps from a PM2 app to a native daemon, but the HTTP
 response still describes the old model. On a machine where the daemon **is**
@@ -151,7 +156,17 @@ Keep `pm2`, `dev`, `dataDir` and `install { command, needsElevation, shell }`:
 the UI uses those for “your own PM2 apps”, the dev badge, the data directory and
 the per-mode install guidance.
 
-## 12. Add native `POST /api/service/start|stop|restart`
+Shipped as requested in contract 2.0.0. `GET /api/service` is now
+`{ backgroundService, pm2, dev, dataDir, install }`; `backgroundService` carries
+every field above plus `heartbeatAgeMs`, `jobsOwnerPid`, `jobsOwnerRole`,
+`dataDir`, `serverMode` and `detail`, and the full status adds `state`,
+`enabledOnBoot`, `restarts`, `crashLooping`, `warnings` and `runtime`. The
+PM2-era top-level fields are gone and the UI no longer reads or infers them.
+Note that `service:changed` and the lifecycle responses carry the cheap half
+(no `state`/`runtime`/`warnings`), so the UI overlays that snapshot and re-fetches
+`GET /api/service` for the rich fields.
+
+## 12. Add native `POST /api/service/start|stop|restart` — done in 2.0.0
 
 The UI has no service controls because the only existing endpoint,
 `POST /api/service/restart`, restarts the PM2 app `ez-dashboard` — wrong target
@@ -169,7 +184,16 @@ Administrator context, and systemd requires sudo. Return e.g.
 instead of failing opaquely; the UI will show the command rather than pretend
 it can elevate. The UI will add start/stop/restart buttons once these exist.
 
-## 13. Update the contract to the native service model
+Shipped as requested in contract 2.0.0: success returns
+`{ ok, action, output, backgroundService }`; `403 elevation_required` carries
+`action`, `message`, `command` and `shell` (Windows Server mode and systemd have
+different commands); `409 not_installed` carries `command: "ezz service install"`;
+`409 already_running` and `500 action_failed` carry `backgroundService`. The
+Processes card now has Start / Stop / Restart with confirmations, renders the
+elevation command with a copy button, and treats `already_running` as an
+informational toast.
+
+## 13. Update the contract to the native service model — done in 2.0.0
 
 `docs/api-contract.md` is **version 1.4.0** (the UI task referenced 1.2.0) and
 §2.7 still documents the removed model: a Task Scheduler task, a PM2 app named
@@ -178,3 +202,8 @@ it can elevate. The UI will add start/stop/restart buttons once these exist.
 `backgroundService` (#11) and the lifecycle endpoints (#12), and drop the
 password wording: the Windows service runs as `NT SERVICE\EasyDevOps` and never
 needs an account password.
+
+Contract 2.0.0 does exactly that. It also documents the `service:changed` socket
+event, which the UI now uses to update the card, banner, sidebar and overview
+without a reload, with a 15 s GET fallback while the Processes page is open and
+on socket reconnect. No open items remain in #11–#13.

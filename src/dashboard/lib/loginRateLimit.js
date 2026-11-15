@@ -12,6 +12,15 @@
  * In memory means the counters reset when the dashboard restarts. That is an
  * accepted limit: the point is to make online guessing impractical, not to
  * survive a restart, and an attacker cannot trigger a restart from outside.
+ *
+ * ── Separate budgets ───────────────────────────────────────────────────────
+ *
+ * Callers name a BUCKET, and each bucket counts independently per IP. Login
+ * and first-run setup are different questions, and sharing one counter would
+ * mean a few mistyped setup codes locked the user out of logging in, or that
+ * an attacker could burn the setup budget by failing logins. The setup code
+ * additionally has a global cap of its own, in core/setupCode.js — that is the
+ * part a per-IP limit cannot provide.
  */
 
 /** Attempts allowed per window, per IP. */
@@ -46,8 +55,9 @@ function prune(now) {
  * @param {import('express').Request} req
  * @returns {string}
  */
-export function clientKey(req) {
-  return req.ip || req.socket?.remoteAddress || 'unknown';
+export function clientKey(req, bucket = 'login') {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  return `${bucket}:${ip}`;
 }
 
 /**
@@ -57,12 +67,13 @@ export function clientKey(req) {
  *
  * @param {import('express').Request} req
  * @param {number} [now] Injectable clock, for tests
+ * @param {string} [bucket] Which budget to count against ('login' | 'setup')
  * @returns {{ allowed: boolean, remaining: number, retryAfterSeconds: number }}
  */
-export function recordAttempt(req, now = Date.now()) {
+export function recordAttempt(req, now = Date.now(), bucket = 'login') {
   prune(now);
 
-  const key = clientKey(req);
+  const key = clientKey(req, bucket);
   const existing = attempts.get(key);
 
   if (!existing || now >= existing.resetAt) {
@@ -94,9 +105,10 @@ export function recordAttempt(req, now = Date.now()) {
  * and then got in is not left near the limit.
  *
  * @param {import('express').Request} req
+ * @param {string} [bucket]
  */
-export function clearAttempts(req) {
-  attempts.delete(clientKey(req));
+export function clearAttempts(req, bucket = 'login') {
+  attempts.delete(clientKey(req, bucket));
 }
 
 /** Drops every counter. For tests and for a clean shutdown. */

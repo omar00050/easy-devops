@@ -39,6 +39,7 @@ import type {
   ProcessLogs,
   ProcessesResponse,
   RenewAllResult,
+  ServiceActionResponse,
   ServiceStatus,
   Settings,
   SettingsUpdate,
@@ -247,6 +248,9 @@ export const api = {
 
   service: {
     status: (signal?: AbortSignal) => request<ServiceStatus>('/service', { signal }),
+    start: () => request<ServiceActionResponse>('/service/start', { method: 'POST' }),
+    stop: () => request<ServiceActionResponse>('/service/stop', { method: 'POST' }),
+    restart: () => request<ServiceActionResponse>('/service/restart', { method: 'POST' }),
   },
 
   settings: {

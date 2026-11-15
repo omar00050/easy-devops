@@ -163,6 +163,73 @@ function showUsageInfo() {
   console.log();
 }
 
+// ─── `ezz dashboard <action>` ─────────────────────────────────────────────────
+
+const DASHBOARD_ACTIONS = ['setup-code'];
+
+/**
+ * Issues a new first-run setup code and prints it.
+ *
+ * CLI-only, deliberately: the code's whole purpose is to prove that whoever is
+ * setting the first password can read this machine's terminal or its service
+ * log. An endpoint that handed it out would defeat it, so there is none — and
+ * this is also the only way back once a code has expired or been invalidated
+ * by too many wrong guesses.
+ *
+ * @returns {Promise<number>} Process exit code
+ */
+async function issueSetupCode() {
+  const { loadConfig } = await import('../../core/config.js');
+  const setupCode = await import('../../core/setupCode.js');
+
+  const config = loadConfig();
+
+  if (!setupCode.setupPending(config)) {
+    console.log();
+    console.log('  ' + chalk.white('The dashboard is already set up.'));
+    console.log('  ' + chalk.gray('A setup code only applies before the first password is set.'));
+    console.log('  ' + chalk.gray('Change the password in the dashboard under Settings.'));
+    console.log();
+    // Any leftover code is removed rather than left outstanding.
+    if (setupCode.clear()) {
+      console.log('  ' + chalk.gray('An outstanding code was cleared.'));
+      console.log();
+    }
+    return 0;
+  }
+
+  const issued = await setupCode.issue();
+
+  for (const line of setupCode.describe({ code: issued.code, expiresAt: issued.expiresAt })) {
+    console.log(line);
+  }
+  console.log('  ' + chalk.gray('This replaces any code issued earlier.'));
+  console.log();
+
+  return 0;
+}
+
+/**
+ * Entry point for the `dashboard` command.
+ *
+ * @param {string} action
+ * @returns {Promise<number>} Process exit code
+ */
+export async function dashboardCommand(action) {
+  if (!DASHBOARD_ACTIONS.includes(action)) {
+    process.stderr.write(
+      `Unknown dashboard action: ${action}\n` +
+      `Available: ${DASHBOARD_ACTIONS.join(', ')}\n`
+    );
+    return 1;
+  }
+
+  switch (action) {
+    case 'setup-code': return issueSetupCode();
+    default: return 1;
+  }
+}
+
 // ─── Menu ─────────────────────────────────────────────────────────────────────
 
 export default async function dashboardMenu() {

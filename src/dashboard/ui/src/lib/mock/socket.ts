@@ -7,6 +7,7 @@
 
 import type { RealtimeClient } from '../socket';
 import type { DomainHealthEntry, LogLine, NginxStatus, NotificationEvent, ServerEvents } from '../types';
+import { mockServiceSnapshot, subscribeMockServiceChanges } from './index';
 
 type Handler = (payload: unknown) => void;
 
@@ -42,6 +43,7 @@ export async function createMockSocket(): Promise<RealtimeClient> {
   let intervals: ReturnType<typeof setInterval>[] = [];
   let logTimer: ReturnType<typeof setInterval> | null = null;
   let lineIndex = 0;
+  let unsubscribeService: (() => void) | null = null;
 
   const fire = <K extends keyof ServerEvents>(event: K, payload: ServerEvents[K]): void => {
     for (const handler of handlers.get(event) ?? []) handler(payload);
@@ -126,6 +128,14 @@ export async function createMockSocket(): Promise<RealtimeClient> {
           fire('connect', undefined);
           fire('nginx:status', MOCK_NGINX);
           fire('domain:health', MOCK_HEALTH);
+          // socketManager keeps the last `service:changed` and replays it to
+          // every new connection; mirror that so the card is live on connect.
+          const snapshot = mockServiceSnapshot();
+          if (snapshot) fire('service:changed', snapshot);
+          unsubscribeService?.();
+          unsubscribeService = subscribeMockServiceChanges((payload) => {
+            if (connected) fire('service:changed', payload);
+          });
         }, 120),
         setTimeout(() => {
           fire(
@@ -160,6 +170,8 @@ export async function createMockSocket(): Promise<RealtimeClient> {
       if (!connected) return;
       connected = false;
       stopTimers();
+      unsubscribeService?.();
+      unsubscribeService = null;
       fire('disconnect', undefined);
     },
   };

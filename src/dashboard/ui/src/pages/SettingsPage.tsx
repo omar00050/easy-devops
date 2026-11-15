@@ -592,6 +592,11 @@ export function SettingsPage() {
                   >
                     {serviceStateLabel(serviceView)}
                   </div>
+                  {serviceView.stoppedByUser && serviceView.stoppedAtLabel && (
+                    <div className="mt-0.5 text-2xs text-faint">
+                      Stopped {serviceView.stoppedAtLabel}
+                    </div>
+                  )}
                 </div>
                 <div>
                   <div className="text-2xs font-medium uppercase tracking-wider text-faint">

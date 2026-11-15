@@ -346,6 +346,25 @@ export function seedApps(): ProcessApp[] {
       managed: false,
       dataDir: null,
     },
+    {
+      // A PM2 module, not one of the user's apps. It lives under PM2_HOME and
+      // has no usage numbers, the way PM2 reports modules on Windows.
+      name: 'pm2-logrotate',
+      pmId: 3,
+      pid: 2502,
+      status: 'online',
+      cpu: 0,
+      memoryBytes: 0,
+      startedAt: Date.now() - 12 * 3_600_000,
+      uptimeMs: 12 * 3_600_000,
+      restarts: 1,
+      unstableRestarts: 0,
+      execPath: '/home/deploy/.pm2/modules/pm2-logrotate/pm2-logrotate.js',
+      cwd: '/home/deploy/.pm2/modules/pm2-logrotate',
+      user: 'deploy',
+      managed: false,
+      dataDir: null,
+    },
   ];
 }
 
@@ -358,39 +377,51 @@ export function seedProcesses(): ProcessesResponse {
   };
 }
 
-/** Mirrors the daemon shape the backend will expose (UI_NEEDS.md #11). */
+/** Mirrors docs/api-contract.md 2.0.0 `GET /api/service`. */
 export function seedService(): ServiceStatus {
   return {
     pm2: { installed: true, version: '6.0.14', path: '/usr/local/bin/pm2' },
     dev: false,
     dataDir: '/var/lib/easy-devops',
-    bootMode: null,
     backgroundService: {
       running: true,
       connected: true,
       pid: 2190,
       version: '1.2.1',
       startedAt: Date.now() - 2 * 86_400_000,
+      heartbeatAgeMs: 4_000,
       jobsRunningHere: false,
+      jobsOwnerPid: 2190,
+      jobsOwnerRole: 'daemon',
       mechanism: 'systemd',
       mode: null,
       installed: true,
       startsAt: 'boot',
       stoppedByUser: false,
       stoppedAt: null,
+      dataDir: '/var/lib/easy-devops',
+      serverMode: false,
+      detail: null,
+      state: 'active',
+      enabledOnBoot: true,
+      restarts: 0,
+      crashLooping: false,
+      warnings: [],
       runtime: {
         systemNode: { path: '/usr/bin/node', version: 'v22.11.0', abi: '127' },
         pinned: {
           kind: 'symlink',
           path: '/var/lib/easy-devops/runtime/node',
+          target: '/usr/bin/node',
           version: 'v22.11.0',
           exists: true,
           broken: false,
           differsFromSystem: false,
         },
+        manager: { managed: false, manager: null },
+        mixed: { mixed: false, msiPath: null, managed: null },
         warnings: [],
       },
-      warnings: [],
     },
     install: { command: 'ezz service install', needsElevation: false, shell: null },
   };

@@ -11,6 +11,7 @@
  *   service-stopped     signed in, background service installed but stopped
  *   service-stopped-by-you  signed in, stopped deliberately (starts at logon)
  *   service-not-installed   signed in, no launcher/service installed
+ *   service-elevation   signed in, lifecycle actions answer 403 + sudo command
  *   login               signed out, password set
  *   setup               first run, no password yet
  *   setupcode           first run with a setup code (mock code: 123456)
@@ -38,6 +39,7 @@ import {
   isoDaysFromNow,
 } from './fixtures';
 import type {
+  BackgroundServiceEvent,
   Certificate,
   ChannelInput,
   Domain,
@@ -48,6 +50,7 @@ import type {
   PermissionMap,
   ProcessAction,
   ProcessesResponse,
+  ServiceAction,
   ServiceStatus,
   Settings,
   SslCreateInput,
@@ -59,9 +62,11 @@ export type MockScenario =
   | 'service-stopped'
   | 'service-stopped-by-you'
   | 'service-not-installed'
+  | 'service-elevation'
   | 'login'
   | 'setup'
   | 'setupcode'
+  | 'setupcode-expired'
   | 'none';
 
 const SCENARIOS: MockScenario[] = [
@@ -69,12 +74,14 @@ const SCENARIOS: MockScenario[] = [
   'service-stopped',
   'service-stopped-by-you',
   'service-not-installed',
+  'service-elevation',
   'login',
   'setup',
   'setupcode',
+  'setupcode-expired',
   'none',
 ];
-const STORAGE_PREFIX = 'ez-mock-state-v3';
+const STORAGE_PREFIX = 'ez-mock-state-v4';
 const SCENARIO_KEY = 'ez-mock-scenario';
 
 interface MockState {
@@ -118,6 +125,7 @@ function readScenario(): MockScenario {
 
 function serviceForScenario(scenario: MockScenario): ServiceStatus {
   const service = seedService();
+  const base = service.backgroundService;
   const personalInstall = {
     command: 'ezz service install',
     needsElevation: false,
@@ -126,54 +134,104 @@ function serviceForScenario(scenario: MockScenario): ServiceStatus {
 
   if (scenario === 'service-stopped') {
     service.backgroundService = {
-      ...service.backgroundService,
+      ...base,
       running: false,
       connected: false,
       pid: null,
       version: null,
       startedAt: null,
+      heartbeatAgeMs: null,
       jobsRunningHere: true,
+      jobsOwnerPid: null,
+      jobsOwnerRole: 'dashboard',
+      state: 'inactive',
+      detail: 'The service is stopped.',
     };
   }
 
   if (scenario === 'service-stopped-by-you') {
-    service.bootMode = 'personal';
     service.install = personalInstall;
     service.backgroundService = {
-      ...service.backgroundService,
+      ...base,
       running: false,
       connected: false,
       pid: null,
       version: null,
       startedAt: null,
+      heartbeatAgeMs: null,
       jobsRunningHere: true,
+      jobsOwnerPid: null,
+      jobsOwnerRole: 'dashboard',
       mechanism: 'startup-supervisor',
       mode: 'personal',
       installed: true,
       startsAt: 'logon',
       stoppedByUser: true,
       stoppedAt: new Date(Date.now() - 3_600_000).toISOString(),
+      state: null,
+      enabledOnBoot: true,
+      detail: 'The service is stopped.',
+      // A different runtime from the system Node, with a version manager on
+      // the system one: exercises the comparisons on the Processes card.
+      runtime: {
+        systemNode: {
+          path: 'C:\\Program Files\\nodejs\\node.exe',
+          version: 'v22.11.0',
+          abi: '127',
+        },
+        pinned: {
+          kind: 'copy',
+          path: 'C:\\Users\\deploy\\AppData\\Local\\easy-devops\\runtime\\node.exe',
+          version: 'v20.18.1',
+          exists: true,
+          broken: false,
+          differsFromSystem: true,
+        },
+        manager: { managed: true, manager: 'nvm-windows' },
+        mixed: { mixed: false, msiPath: null, managed: null },
+        warnings: [],
+      },
     };
   }
 
   if (scenario === 'service-not-installed') {
-    service.bootMode = null;
     service.install = personalInstall;
     service.backgroundService = {
+      ...base,
       running: false,
       connected: false,
       pid: null,
       version: null,
       startedAt: null,
+      heartbeatAgeMs: null,
       jobsRunningHere: true,
+      jobsOwnerPid: null,
+      jobsOwnerRole: 'dashboard',
       mechanism: 'startup-supervisor',
       mode: 'personal',
       installed: false,
       startsAt: 'logon',
       stoppedByUser: false,
       stoppedAt: null,
+      state: null,
+      enabledOnBoot: null,
+      restarts: 0,
+      crashLooping: false,
       runtime: null,
       warnings: [],
+      detail: 'The service is not installed.',
+    };
+  }
+
+  if (scenario === 'service-elevation') {
+    // Installed and running, but every lifecycle action needs sudo, so the
+    // UI must show the command instead of claiming success.
+    service.backgroundService = {
+      ...base,
+      mechanism: 'systemd',
+      mode: null,
+      installed: true,
+      startsAt: 'boot',
     };
   }
 
@@ -188,7 +246,8 @@ function createState(scenario: MockScenario): MockState {
 
   const authenticated =
     scenario === 'dashboard' || scenario === 'none' || scenario.startsWith('service-');
-  const firstRun = scenario === 'setup' || scenario === 'setupcode';
+  const firstRun =
+    scenario === 'setup' || scenario === 'setupcode' || scenario === 'setupcode-expired';
 
   return {
     scenario,
@@ -251,6 +310,31 @@ function persist(): void {
 }
 
 const clone = <T>(value: T): T => structuredClone(value);
+
+type ServiceChangeListener = (payload: BackgroundServiceEvent) => void;
+const serviceChangeListeners = new Set<ServiceChangeListener>();
+
+/** The same cheap snapshot the real `service:changed` event carries. */
+export function mockServiceSnapshot(): BackgroundServiceEvent | null {
+  try {
+    return clone(getState().service.backgroundService);
+  } catch {
+    return null;
+  }
+}
+
+export function subscribeMockServiceChanges(listener: ServiceChangeListener): () => void {
+  serviceChangeListeners.add(listener);
+  return () => {
+    serviceChangeListeners.delete(listener);
+  };
+}
+
+function notifyServiceChanged(): void {
+  const snapshot = mockServiceSnapshot();
+  if (!snapshot) return;
+  for (const listener of [...serviceChangeListeners]) listener(snapshot);
+}
 
 function delay(ms?: number): Promise<void> {
   const wait = ms ?? 140 + Math.random() * 180;
@@ -394,6 +478,8 @@ function processLogLines(name: string): string[] {
 }
 
 function getAuthPayload(s: MockState) {
+  const codePending =
+    (s.scenario === 'setupcode' || s.scenario === 'setupcode-expired') && !s.setupConfigured;
   return {
     authenticated: s.authMode === 'none' ? true : s.authenticated,
     needsSetup: s.authMode === 'password' && !s.hasPassword,
@@ -401,7 +487,10 @@ function getAuthPayload(s: MockState) {
     canUseNoPassword: s.settings.bindsToLoopbackOnly,
     bindAddress: s.settings.dashboardBindAddress,
     minPasswordLength: 6,
-    ...(s.scenario === 'setupcode' && !s.setupConfigured ? { setupCodeRequired: true } : {}),
+    setupCodeRequired: codePending,
+    // Null when the code is no longer usable, matching core/setupCode.js.
+    setupCodeExpiresAt:
+      codePending && s.scenario !== 'setupcode-expired' ? Date.now() + 24 * 60 * 60 * 1000 : null,
   };
 }
 
@@ -448,6 +537,9 @@ function handle(
     const password = String(data.password ?? '');
     if (password.length < 6) {
       fail(400, 'Password must be at least 6 characters long.');
+    }
+    if (s.scenario === 'setupcode-expired') {
+      fail(400, 'That setup code has expired. Issue a new one on the server: ezz dashboard setup-code');
     }
     if (s.scenario === 'setupcode' && data.setupCode !== '123456') {
       fail(400, 'That setup code is not valid.');
@@ -710,6 +802,86 @@ function handle(
   if (path === '/processes' && method === 'GET') return s.processes;
 
   if (path === '/service' && method === 'GET') return s.service;
+
+  const serviceActionMatch = /^\/service\/(start|stop|restart)$/.exec(path);
+  if (serviceActionMatch && method === 'POST') {
+    const action = serviceActionMatch[1] as ServiceAction;
+    const bg = s.service.backgroundService;
+
+    if (!bg.installed) {
+      fail(409, 'not_installed', {
+        action,
+        message: 'The background service is not installed.',
+        command: 'ezz service install',
+        backgroundService: clone(bg),
+      });
+    }
+
+    if (s.scenario === 'service-elevation') {
+      fail(403, 'elevation_required', {
+        action,
+        message: `${action === 'start' ? 'Starting' : action === 'stop' ? 'Stopping' : 'Restarting'} the service needs root, and the dashboard cannot elevate itself.`,
+        command: `sudo systemctl ${action} easy-devops`,
+        shell: 'a terminal with sudo',
+        backgroundService: clone(bg),
+      });
+    }
+
+    if (action === 'start' && bg.running) {
+      fail(409, 'already_running', {
+        action,
+        message: 'The background service is already running.',
+        backgroundService: clone(bg),
+      });
+    }
+
+    if (action === 'stop' && bg.running) {
+      s.service.backgroundService = {
+        ...bg,
+        running: false,
+        connected: false,
+        pid: null,
+        version: null,
+        startedAt: null,
+        heartbeatAgeMs: null,
+        jobsRunningHere: true,
+        jobsOwnerPid: null,
+        jobsOwnerRole: 'dashboard',
+        stoppedByUser: true,
+        stoppedAt: new Date().toISOString(),
+        state: 'inactive',
+        detail: 'The service is stopped.',
+      };
+    } else if (action !== 'stop') {
+      const pid = 4000 + Math.floor(Math.random() * 800);
+      s.service.backgroundService = {
+        ...bg,
+        running: true,
+        connected: true,
+        pid,
+        version: '1.2.1',
+        startedAt: Date.now(),
+        heartbeatAgeMs: 1_000,
+        jobsRunningHere: false,
+        jobsOwnerPid: pid,
+        jobsOwnerRole: 'daemon',
+        stoppedByUser: false,
+        stoppedAt: null,
+        state: 'active',
+        detail: null,
+        restarts: action === 'restart' ? bg.restarts + 1 : bg.restarts,
+      };
+    }
+
+    persist();
+    notifyServiceChanged();
+    return {
+      ok: true,
+      action,
+      output: `service ${action}: ok`,
+      backgroundService: clone(s.service.backgroundService),
+    };
+  }
 
   const processMatch = /^\/processes\/([^/]+)\/(logs|start|stop|restart|reload)$/.exec(path);
   if (processMatch) {
@@ -1005,4 +1177,5 @@ export function resetMockState(): void {
   const scenario = readScenario();
   state = createState(scenario);
   persist();
+  notifyServiceChanged();
 }

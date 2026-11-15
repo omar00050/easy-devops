@@ -47,6 +47,7 @@ import { dbGet, dbSet } from '../db.js';
 import { inspect as inspectLock, HEARTBEAT_INTERVAL_MS } from '../daemon/lock.js';
 import { requestStop, clearStopRequest, isStopRequested } from '../daemon/stopRequest.js';
 import { inspect as inspectOwner } from '../jobs/owner.js';
+import { probe, invalidate } from '../probeCache.js';
 
 import * as systemd from './systemd.js';
 import * as windowsService from './windowsService.js';
@@ -298,6 +299,8 @@ function recordStarted() {
  * @returns {Promise<Object>}
  */
 export async function install({ mode = null, removeLegacy = false, log = () => {}, deps = {} } = {}) {
+  // What the probes measure is about to change.
+  invalidateProbes();
   // A stop request left over from a previous install would make the daemon
   // exit the moment it started. Install is an explicit "I want this running".
   (deps.clearStopRequest ?? clearStopRequest)({ dataDir: getDataDir() });
@@ -518,6 +521,8 @@ export async function uninstall({
   log = () => {},
   deps = {},
 } = {}) {
+  // What the probes measure is about to change.
+  invalidateProbes();
   const mech = resolveMechanism();
   const result = { mechanism: mech.mechanism, mode: mech.mode, notes: [], dataDir: getDataDir() };
 
@@ -591,6 +596,8 @@ export async function uninstall({
  * @returns {Promise<Object>}
  */
 export async function stop({ log = () => {}, deps = {} } = {}) {
+  // What the probes measure is about to change.
+  invalidateProbes();
   const mech = resolveMechanism();
   const dataDir = getDataDir();
   const before = inspectLock({ dataDir });
@@ -670,6 +677,8 @@ export async function stop({ log = () => {}, deps = {} } = {}) {
  * @returns {Promise<Object>}
  */
 export async function start({ log = () => {}, deps = {} } = {}) {
+  // What the probes measure is about to change.
+  invalidateProbes();
   const mech = resolveMechanism();
   const dataDir = getDataDir();
 
@@ -747,6 +756,8 @@ export async function start({ log = () => {}, deps = {} } = {}) {
  * It used to refuse outright and tell the user to find the process themselves.
  */
 export async function restart({ log = () => {}, deps = {} } = {}) {
+  // What the probes measure is about to change.
+  invalidateProbes();
   const mech = resolveMechanism();
   const dataDir = getDataDir();
 
@@ -786,14 +797,77 @@ export async function restart({ log = () => {}, deps = {} } = {}) {
 }
 
 /**
- * Everything worth showing about the service.
+ * Cache keys for the probes in `status()`.
  *
- * Deliberately read-only: it starts nothing, creates nothing, and never starts
- * the PM2 daemon (see legacy.detectLegacy).
+ * Named rather than inline so `invalidateProbes()` and the tests refer to the
+ * same strings, and prefixed so one call drops them all.
+ */
+export const PROBE_KEYS = Object.freeze({
+  manager: 'service:manager',
+  runtime: 'service:runtime',
+  legacy: 'service:legacy',
+});
+
+/**
+ * How long each probe stays fresh.
  *
+ * Different numbers because the questions change at different rates, and the
+ * cost of a stale answer differs too:
+ *
+ *  - the service MANAGER's view changes when the user starts or stops
+ *    something, so it has the shortest life - though every one of those
+ *    commands also calls invalidateProbes(), which is what actually keeps it
+ *    correct. The TTL is the backstop for a change made outside this process,
+ *    such as `sc stop` or systemctl by hand.
+ *  - the RUNTIME changes on a repair or a runtime update, both of which
+ *    invalidate.
+ *  - LEGACY leftovers change only when install or uninstall removes them, and
+ *    it is the most expensive probe of the three (PM2 detection, a PM2 app
+ *    list and a schtasks query), so it gets the longest life.
+ */
+export const PROBE_TTL_MS = Object.freeze({
+  [PROBE_KEYS.manager]: 10_000,
+  [PROBE_KEYS.runtime]: 60_000,
+  [PROBE_KEYS.legacy]: 300_000,
+});
+
+/** Drops every cached probe. See the note in core/probeCache.js. */
+export function invalidateProbes() {
+  return invalidate('service:');
+}
+
+/**
+ * Everything `ezz service status` and `GET /api/service` need to say.
+ *
+ * ── Fast and correct at the same time ──────────────────────────────────────
+ *
+ * The cheap facts - the daemon lock, its heartbeat age, whether a stop was
+ * requested, what install recorded - are read FRESH on every call. They cost
+ * microseconds and they are the ones that change on their own.
+ *
+ * The expensive facts each cost a subprocess, and on Windows a subprocess
+ * costs about a second. Those three are:
+ *
+ *   the service manager's view   `sc query` / `systemctl is-active` / a file
+ *   the pinned runtime            `<node> --version`
+ *   legacy PM2 leftovers          PM2 detection, `pm2 jlist`, `schtasks`
+ *
+ * They run in PARALLEL rather than one after another, and with `cache: true`
+ * they come from core/probeCache.js, which answers immediately and refreshes
+ * behind the request. Measured on the machine that reported this: about 20 s
+ * sequential and uncached, about 2 s cold and parallel, single-digit
+ * milliseconds warm.
+ *
+ * `cache: false` is the default, so the CLI keeps getting a freshly measured
+ * answer - someone who has just typed `ezz service status` is asking BECAUSE
+ * something changed. The dashboard passes `cache: true`.
+ *
+ * @param {Object} [opts]
+ * @param {boolean} [opts.cache]       Serve cached probes, refresh behind
+ * @param {number} [opts.coldWaitMs]   Max wait when a probe has never run
  * @returns {Promise<Object>}
  */
-export async function status({ deps = {} } = {}) {
+export async function status({ cache = false, coldWaitMs, deps = {} } = {}) {
   const mech = resolveMechanism();
   const dataDir = getDataDir();
   const config = loadConfig();
@@ -820,24 +894,67 @@ export async function status({ deps = {} } = {}) {
     warnings: [],
   };
 
-  if (!isWindows) {
-    out.service = await (deps.systemd ?? systemd).status(deps.systemdOpts ?? {});
-  } else if (mech.mode === MODES.SERVER) {
-    out.service = await (deps.windowsService ?? windowsService).status({
-      dataDir,
-      config,
-      granted: recorded.granted ?? [],
-      ...(deps.windowsServiceOpts ?? {}),
+  // ── The three expensive probes, together ─────────────────────────────────
+  const managerProbe = () => {
+    if (!isWindows) return (deps.systemd ?? systemd).status(deps.systemdOpts ?? {});
+    if (mech.mode === MODES.SERVER) {
+      return (deps.windowsService ?? windowsService).status({
+        dataDir,
+        config,
+        granted: recorded.granted ?? [],
+        ...(deps.windowsServiceOpts ?? {}),
+      });
+    }
+    // Personal mode reads files only, so it is already cheap; it goes through
+    // the same path for one shape rather than for speed.
+    return (deps.windowsPersonal ?? windowsPersonal).status(deps.windowsPersonalOpts ?? {});
+  };
+
+  const runtimeProbe = () => (deps.inspectRuntime ?? inspectRuntime)({
+    dataDir,
+    recordedNodeExe: recorded.nodeExe ?? null,
+  });
+
+  const legacyProbe = () => (deps.detectLegacy ?? legacy.detectLegacy)(deps.legacy ?? {});
+
+  const read = async (key, producer) => {
+    if (!cache) return { value: await producer(), ageMs: 0, fresh: true, pending: false, refreshing: false };
+    return probe(key, producer, {
+      ttlMs: PROBE_TTL_MS[key],
+      ...(coldWaitMs === undefined ? {} : { coldWaitMs }),
     });
-    if (out.service.acl && !out.service.acl.ok) out.warnings.push(out.service.acl.reason);
-  } else {
-    out.service = (deps.windowsPersonal ?? windowsPersonal).status(deps.windowsPersonalOpts ?? {});
+  };
+
+  const [manager, runtimeRead, legacyRead] = await Promise.all([
+    read(PROBE_KEYS.manager, managerProbe),
+    read(PROBE_KEYS.runtime, runtimeProbe),
+    read(PROBE_KEYS.legacy, legacyProbe),
+  ]);
+
+  // A pending probe must not become a crash or a lie. The shape stays the
+  // same and `probes` below says which parts are not measured yet, so a client
+  // can render the rest and ask again.
+  out.service = manager.value ?? { installed: null, running: null, state: null, pending: true, warnings: [] };
+  out.runtime = runtimeRead.value ?? null;
+  out.legacy = legacyRead.value?.items ?? [];
+
+  if (isWindows && mech.mode === MODES.SERVER && out.service.acl && !out.service.acl.ok) {
+    out.warnings.push(out.service.acl.reason);
+  }
+  if (isWindows && mech.mode !== MODES.SERVER) {
     out.warnings.push(...(out.service.warnings ?? []));
   }
+  out.warnings.push(...(out.runtime?.warnings ?? []));
 
-  // Runtime: the service's Node next to the system's, plus the nvm warnings.
-  out.runtime = await inspectRuntime({ dataDir, recordedNodeExe: recorded.nodeExe ?? null });
-  out.warnings.push(...(out.runtime.warnings ?? []));
+  // What the caller needs to know about the measurement itself: how old it is,
+  // and whether anything is still being measured.
+  out.probes = {
+    cached: Boolean(cache),
+    ageMs: Math.max(manager.ageMs ?? 0, runtimeRead.ageMs ?? 0, legacyRead.ageMs ?? 0),
+    fresh: manager.fresh && runtimeRead.fresh && legacyRead.fresh,
+    pending: manager.pending || runtimeRead.pending || legacyRead.pending,
+    refreshing: manager.refreshing || runtimeRead.refreshing || legacyRead.refreshing,
+  };
 
   if (out.service.crashLooping) {
     out.warnings.push(
@@ -889,16 +1006,34 @@ export async function status({ deps = {} } = {}) {
     );
   }
 
-  const found = await legacy.detectLegacy(deps.legacy ?? {});
-  out.legacy = found.items;
-  if (found.found) {
+  if (out.legacy.length > 0) {
     out.warnings.push(
-      `${found.items.length} leftover(s) from the old PM2-based service are still set up. `
+      `${out.legacy.length} leftover(s) from the old PM2-based service are still set up. `
       + 'Run `ezz service install` or `ezz service uninstall` to be offered their removal.',
     );
   }
 
   return out;
+}
+
+/**
+ * Fills the probe cache without anyone waiting for it.
+ *
+ * Called once when the dashboard starts, so the first page load finds the
+ * answers already there instead of paying for six subprocesses while someone
+ * is watching a spinner.
+ *
+ * @param {Object} [opts]
+ * @returns {Promise<void>}
+ */
+export async function warmProbes({ deps = {} } = {}) {
+  try {
+    await status({ cache: true, coldWaitMs: 60_000, deps });
+  } catch (err) {
+    // A warm-up that fails changes nothing: the next real request probes
+    // again. It must never stop the dashboard from starting.
+    process.stderr?.write?.(`[service] could not warm the status probes: ${err.message}\n`);
+  }
 }
 
 /** Recent service logs. */
@@ -926,6 +1061,8 @@ export async function logs({ lines = 50, which = 'out', deps = {} } = {}) {
  * points at, which is why `status` names it in its warnings.
  */
 export async function repair({ log = () => {}, deps = {} } = {}) {
+  // What the probes measure is about to change.
+  invalidateProbes();
   const mech = resolveMechanism();
   const dataDir = getDataDir();
 
@@ -970,6 +1107,22 @@ function record(details) {
 /** The recorded install details, for callers that only need to read them. */
 export function recordedState() {
   return dbGet(STATE_KEY) ?? {};
+}
+
+/**
+ * Updates the recorded runtime path without re-recording an install.
+ *
+ * `ezz runtime update` needs exactly this and nothing else: the service is
+ * already installed, only the binary it runs changed. Exported rather than
+ * duplicated there so `service-state` keeps one writer, and so `installedAt`
+ * is not overwritten by what is not an install.
+ *
+ * @param {Object} details
+ * @param {string} details.nodeExe
+ */
+export function recordRuntime({ nodeExe }) {
+  const existing = dbGet(STATE_KEY) ?? {};
+  dbSet(STATE_KEY, { ...existing, nodeExe, runtimeUpdatedAt: new Date().toISOString() });
 }
 
 export { legacy, runtimeNodePath };

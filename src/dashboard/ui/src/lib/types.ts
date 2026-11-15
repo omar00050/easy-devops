@@ -17,8 +17,14 @@ export interface AuthStatus {
   canUseNoPassword: boolean;
   bindAddress: string;
   minPasswordLength: number;
-  /** Advertised by servers that gate first-run setup behind a code. */
-  setupCodeRequired?: boolean;
+  /** True while first-run setup is pending and a code is required. */
+  setupCodeRequired: boolean;
+  /**
+   * Epoch ms when the outstanding setup code stops being valid, or null when
+   * no usable code is outstanding (none issued, expired, or burned). Meaningful
+   * only alongside `setupCodeRequired`.
+   */
+  setupCodeExpiresAt: number | null;
 }
 
 // ─── Domains ─────────────────────────────────────────────────────────────────
@@ -230,45 +236,79 @@ export interface ProcessLogs {
 }
 
 export interface ServiceRuntimeNode {
-  path: string;
+  path: string | null;
   version: string | null;
   kind?: string;
   abi?: string;
   exists?: boolean;
   broken?: boolean;
+  target?: string | null;
   differsFromSystem?: boolean;
+}
+
+export interface ServiceRuntimeManager {
+  managed: boolean;
+  manager: string | null;
 }
 
 /** Mirrors core/service/runtime.js inspectRuntime(). */
 export interface ServiceRuntime {
   systemNode: ServiceRuntimeNode;
   pinned: ServiceRuntimeNode | null;
-  warnings?: string[];
+  manager?: ServiceRuntimeManager;
+  mixed?: { mixed: boolean; msiPath: string | null; managed: string | null };
+  warnings: string[];
 }
 
+export type ServiceMechanismWire = 'systemd' | 'winsw' | 'startup-supervisor';
+export type ServiceStartsAt = 'logon' | 'boot';
+
 /**
- * The Easy DevOps daemon — not PM2. `running` is read from the daemon lock
- * file; `connected` only says whether this dashboard has a live event channel.
- *
- * mechanism/mode/installed/startsAt/stoppedByUser/runtime are already computed
- * by core/service/index.js but are not exposed over HTTP yet; see UI_NEEDS.md.
+ * The cheap half of the service state: a lock read and a database read.
+ * `GET /api/service` and the `service:changed` socket event both carry this.
  */
-export interface BackgroundServiceStatus {
+export interface BackgroundServiceLiveStatus {
   running: boolean;
   connected: boolean;
   pid: number | null;
   version: string | null;
   startedAt: number | null;
+  heartbeatAgeMs: number | null;
   jobsRunningHere: boolean;
-  mechanism?: 'startup-supervisor' | 'winsw' | 'systemd' | string;
-  mode?: 'personal' | 'server' | string | null;
-  installed?: boolean;
-  startsAt?: 'logon' | 'boot' | string | null;
-  stoppedByUser?: boolean;
-  stoppedAt?: string | null;
-  runtime?: ServiceRuntime | null;
-  warnings?: string[];
+  jobsOwnerPid: number | null;
+  jobsOwnerRole: 'daemon' | 'dashboard' | string | null;
+  mechanism: ServiceMechanismWire;
+  mode: 'personal' | 'server' | null;
+  installed: boolean;
+  startsAt: ServiceStartsAt;
+  stoppedByUser: boolean;
+  stoppedAt: string | null;
+  dataDir: string;
+  serverMode: boolean;
+  detail: string | null;
 }
+
+/**
+ * What `GET /api/service` returns. The socket event is the cheap half above
+ * (the controller's rich fields need the service manager and runtime probes),
+ * so a client merges the event over the last full read.
+ */
+export interface BackgroundServiceStatus extends BackgroundServiceLiveStatus {
+  state: string | null;
+  enabledOnBoot: boolean | null;
+  restarts: number;
+  crashLooping: boolean;
+  warnings: string[];
+  runtime: ServiceRuntime | null;
+}
+
+/**
+ * The `service:changed` payload. The contract promises the full object; the
+ * dashboard's bridge publishes the cheap half, so the rich fields are optional
+ * and a merge keeps the last known values.
+ */
+export type BackgroundServiceEvent = BackgroundServiceLiveStatus &
+  Partial<Pick<BackgroundServiceStatus, 'state' | 'enabledOnBoot' | 'restarts' | 'crashLooping' | 'warnings' | 'runtime'>>;
 
 /** Structured form of the CLI install instructions. */
 export interface ServiceInstallInfo {
@@ -281,13 +321,17 @@ export interface ServiceStatus {
   pm2: Pm2Info;
   dev: boolean;
   dataDir: string;
-  /**
-   * Records the Windows mode chosen at install ("personal" | "server").
-   * "logon" and "boot" are PM2-era leftovers and are not used for the daemon.
-   */
-  bootMode: string | null;
   backgroundService: BackgroundServiceStatus;
   install: ServiceInstallInfo;
+}
+
+export type ServiceAction = 'start' | 'stop' | 'restart';
+
+export interface ServiceActionResponse {
+  ok: true;
+  action: ServiceAction;
+  output: string | null;
+  backgroundService: BackgroundServiceEvent;
 }
 
 // ─── Settings ────────────────────────────────────────────────────────────────
@@ -446,6 +490,7 @@ export interface ServerEvents {
   'notification:new': NotificationEvent;
   'logs:line': LogLine;
   'local:changed': LocalChangeEvent;
+  'service:changed': BackgroundServiceEvent;
   connect: undefined;
   disconnect: undefined;
   connect_error: Error;
@@ -459,6 +504,12 @@ export interface ApiErrorPayload {
   detail?: string;
   hint?: string;
   output?: string;
+  /** Service lifecycle failures: elevation_required / not_installed / action_failed. */
+  action?: ServiceAction;
+  message?: string;
+  command?: string;
+  shell?: string;
+  backgroundService?: BackgroundServiceEvent;
   expected?: string;
   found?: string[];
   certPath?: string;

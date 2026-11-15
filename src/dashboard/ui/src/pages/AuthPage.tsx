@@ -15,6 +15,7 @@ import { useAuth } from '../app/AuthProvider';
 import { useTheme } from '../app/ThemeProvider';
 import { MOCK_ENABLED } from '../lib/api';
 import { ApiError } from '../lib/errors';
+import type { AuthStatus } from '../lib/types';
 import { useDocumentTitle } from '../hooks/useResource';
 import { cn } from '../lib/cn';
 import { Button, IconButton } from '../components/ui/Button';
@@ -27,6 +28,19 @@ const HIGHLIGHTS = [
   'Processes, notifications and Hub pairing built in',
   'Local-first: no Docker, no cloud account',
 ];
+
+const SETUP_CODE_EXPIRED =
+  'This code has expired. Get a new one with: ezz dashboard setup-code';
+
+/**
+ * The API reports null once the outstanding code is no longer usable (past
+ * its 24 hours, or burned after too many attempts), while still requiring a
+ * code — so null with `setupCodeRequired` means expired, not absent.
+ */
+function setupCodeExpired(auth: AuthStatus | null): boolean {
+  if (auth?.setupCodeRequired !== true) return false;
+  return auth.setupCodeExpiresAt === null || auth.setupCodeExpiresAt <= Date.now();
+}
 
 function AuthBrand({ compact = false }: { compact?: boolean }) {
   return (
@@ -217,6 +231,7 @@ function SetupForm() {
   const minLength = auth?.minPasswordLength ?? 8;
   const canGoPasswordless = auth?.canUseNoPassword === true;
   const needsCode = auth?.setupCodeRequired === true;
+  const codeExpired = setupCodeExpired(auth);
 
   const [choice, setChoice] = useState<'password' | 'none'>('password');
   const [setupCode, setSetupCode] = useState('');
@@ -252,6 +267,13 @@ function SetupForm() {
       const apiError = err instanceof ApiError ? err : null;
       if (apiError?.status === 409) {
         await retryBoot();
+        return;
+      }
+      // The expiry timestamp already told us this code cannot work. Show that
+      // instead of the server's "not valid" — the next step is a new code,
+      // not another guess.
+      if (apiError?.status === 400 && setupCodeExpired(auth)) {
+        setError(null);
         return;
       }
       setError(apiError);
@@ -322,6 +344,12 @@ function SetupForm() {
             </button>
           )}
         </div>
+
+        {needsCode && codeExpired && (
+          <InlineAlert tone="warning" title={SETUP_CODE_EXPIRED} className="mt-4">
+            Run that on the server, then reload this page to enter the new code.
+          </InlineAlert>
+        )}
 
         {needsCode && (
           <TextInput
@@ -461,7 +489,7 @@ export function AuthPage() {
           <p className="mt-2 leading-relaxed">
             Mock mode: any password works. Add{' '}
             <code className="rounded bg-inset px-1 py-0.5 font-mono">
-              ?mock=login|setup|setupcode|none
+              ?mock=login|setup|setupcode|setupcode-expired|none
             </code>{' '}
             to the URL to preview each state.
           </p>

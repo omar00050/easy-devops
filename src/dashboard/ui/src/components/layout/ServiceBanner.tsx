@@ -1,5 +1,5 @@
 import { useMemo, useState, type ReactNode } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { ArrowRight, X } from 'lucide-react';
 import { useService } from '../../app/ServiceProvider';
 import { InlineAlert } from '../ui/States';
@@ -45,8 +45,10 @@ function bannerFor(view: ServiceView): BannerCopy {
       title: 'The background service is stopped',
       body: (
         <>
-          You stopped it, so monitoring and notifications are paused. It starts again{' '}
-          {startsPhrase(view)}, or run <Command>ezz service start</Command> to start it now.
+          You stopped it
+          {view.stoppedAtLabel ? ` on ${view.stoppedAtLabel}` : ''}, so monitoring and
+          notifications are paused. It starts again {startsPhrase(view)}, or run{' '}
+          <Command>ezz service start</Command> to start it now.
         </>
       ),
       action: 'Open Processes',
@@ -57,30 +59,24 @@ function bannerFor(view: ServiceView): BannerCopy {
     code: 'not_running',
     tone: 'warning',
     title: 'The background service is not running',
-    body:
-      view.installed === false ? (
-        <>
-          Monitoring and notifications would run in this dashboard and stop when it closes. Set up the
-          service with <Command>{view.installCommand}</Command>.
-        </>
-      ) : (
-        <>
-          Monitoring and notifications run in this dashboard and stop when it closes. Start the service
-          with <Command>ezz service start</Command>
-          {view.installed === null ? (
-            <>
-              , or set it up with <Command>{view.installCommand}</Command>
-            </>
-          ) : null}
-          .
-        </>
-      ),
+    body: view.installed ? (
+      <>
+        Monitoring and notifications run in this dashboard and stop when it closes. Start the service
+        with <Command>ezz service start</Command>.
+      </>
+    ) : (
+      <>
+        Monitoring and notifications would run in this dashboard and stop when it closes. Set up the
+        service with <Command>{view.installCommand}</Command>.
+      </>
+    ),
     action: 'Open Processes',
   };
 }
 
 export function ServiceBanner() {
   const { service } = useService();
+  const { pathname } = useLocation();
   const [dismissed, setDismissed] = useState<string | null>(() => {
     try {
       return sessionStorage.getItem(DISMISS_KEY);
@@ -91,9 +87,18 @@ export function ServiceBanner() {
 
   const view = describeService(service);
   const copy = view ? bannerFor(view) : null;
+  const showAction = pathname !== '/processes';
   const signature = useMemo(() => {
     if (!view || !copy) return '';
-    return [copy.code, view.pid, view.startedAt, view.stoppedByUser, view.installed].join('|');
+    return [
+      copy.code,
+      view.pid,
+      view.startedAt,
+      view.stoppedByUser,
+      view.stoppedAt,
+      view.startsAt,
+      view.installed,
+    ].join('|');
   }, [view, copy]);
 
   if (!view || !copy || dismissed === signature) return null;
@@ -114,16 +119,18 @@ export function ServiceBanner() {
         title={copy.title}
         action={
           <div className="flex items-center gap-1">
-            <Link
-              to="/processes"
-              className={cn(
-                'inline-flex items-center gap-1 rounded-sm px-2 py-1 text-xs font-medium text-ink',
-                'border border-line bg-raised transition-colors hover:border-line-strong hover:bg-inset'
-              )}
-            >
-              {copy.action}
-              <ArrowRight className="size-3" aria-hidden="true" />
-            </Link>
+            {showAction && (
+              <Link
+                to="/processes"
+                className={cn(
+                  'inline-flex items-center gap-1 rounded-sm px-2 py-1 text-xs font-medium text-ink',
+                  'border border-line bg-raised transition-colors hover:border-line-strong hover:bg-inset'
+                )}
+              >
+                {copy.action}
+                <ArrowRight className="size-3" aria-hidden="true" />
+              </Link>
+            )}
             <IconButton label="Dismiss banner" size="sm" onClick={dismiss}>
               <X className="size-3.5" aria-hidden="true" />
             </IconButton>

@@ -444,8 +444,14 @@ export function OverviewPage() {
                       ? serviceView.mechanismDetail
                       : `${serviceView.mechanismLabel} · starts ${serviceView.startsAtLabel.toLowerCase()}`
                     : serviceView.stoppedByUser
-                      ? 'You stopped it; it starts again automatically.'
-                      : 'Monitoring runs in this window.'
+                      ? serviceView.installed
+                        ? `You stopped it${
+                            serviceView.stoppedAtLabel ? ` on ${serviceView.stoppedAtLabel}` : ''
+                          }; it starts again automatically.`
+                        : 'You stopped it; start it to resume monitoring.'
+                      : serviceView.installed
+                        ? 'Monitoring runs in this window.'
+                        : 'Not installed; monitoring runs in this window.'
               }
               icon={Boxes}
               tone={!serviceView ? 'neutral' : serviceView.running ? 'ok' : 'warn'}

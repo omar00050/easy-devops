@@ -86,6 +86,12 @@ graph TD
 | `domains-db.js`, `cert-operations.js` | The domain store, and the certificate actions the Hub can request. Also moved from `dashboard/lib/` |
 | `hub/agent.js` | The outbound Hub agent. Background work, so it follows job ownership |
 | `hubLink.js` | Pairing state for the optional Hub |
+| `installSource.js` | npm install, git clone or loose copy — and therefore how this copy is updated |
+| `updater.js` | `ezz update`: stop, replace, refresh the Server-mode copy, start, verify, roll back |
+| `cleanup.js` | The reclaimable-file inventory. Scans; deletes only what it is handed |
+| `purge.js` | `ezz uninstall --purge`: back up first, then remove the service, runtime and data |
+| `setupCode.js` | The one-time first-run setup code. Printed locally, stored hashed, never transmitted |
+| `service/runtimeUpdate.js` | Moving the service onto another Node: smoke test, swap, verify, roll back |
 | `validators.js`, `detector.js`, `permissions.js` | Input validation, system detection, Linux sudoers setup |
 
 Two constraints worth knowing before you add code:
@@ -124,6 +130,18 @@ point. That ordering matters — see the next section.
 | `--dev` | Points `EASY_DEVOPS_DATA_DIR` at `.dev-data/` in the project. Also forces Let's Encrypt **staging** |
 | `--classic-ui` | Serves the old EJS page instead of the React build in `dist/ui`. Overrides the `dashboardUi` setting for this run. A temporary fallback |
 | `--new-ui` | Accepted and ignored — the React UI is the default. Prints a note saying so |
+| `--purge` | With `uninstall`: actually remove Easy DevOps. Without it, `uninstall` only explains the difference from `service uninstall` |
+| `--days N` | With `cleanup`: the age at which a log counts as reclaimable (default 14) |
+| `--yes` | Answers the confirmations. `cleanup --yes` touches only the unambiguous groups — never a Node version, never PM2 |
+
+### Commands that only exist in the CLI
+
+| Command | Why not the dashboard or the Hub |
+|---|---|
+| `ezz update` | It replaces the running package and stops the service, so the process serving the request is the one being replaced. `whyCliOnly()` in `core/updater.js` is what tells the user that |
+| `ezz runtime update` | Installing a Node version takes minutes of streamed output, and a Windows Server swap needs an Administrator terminal the dashboard cannot obtain |
+| `ezz uninstall --purge` | It deletes the database the dashboard reads |
+| `ezz dashboard setup-code` | The code's purpose is to prove the caller can read this machine's terminal. An endpoint that handed it out would defeat it |
 
 ---
 

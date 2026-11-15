@@ -6,6 +6,7 @@ import {
   ScrollText,
   ServerCog,
   Square,
+  X,
 } from 'lucide-react';
 import { api, ApiError } from '../lib/api';
 import type {
@@ -13,6 +14,7 @@ import type {
   ProcessApp,
   ProcessLogs,
   ProcessesResponse,
+  ServiceAction,
   ServiceRuntime,
 } from '../lib/types';
 import { cn } from '../lib/cn';
@@ -29,7 +31,7 @@ import { useService } from '../app/ServiceProvider';
 import { PageHeader } from '../components/layout/PageHeader';
 import { Card, CardBody, CardHeader } from '../components/ui/Card';
 import { Badge, StatusDot, type Tone } from '../components/ui/Badge';
-import { Button } from '../components/ui/Button';
+import { Button, IconButton } from '../components/ui/Button';
 import { CopyButton } from '../components/ui/CopyButton';
 import { Modal } from '../components/ui/Modal';
 import {
@@ -44,8 +46,9 @@ import { useToast } from '../components/ui/Toast';
 
 function failureText(error: unknown, fallback: string): string {
   if (error instanceof ApiError) {
-    const detail = typeof error.payload.detail === 'string' ? error.payload.detail : null;
-    return detail ?? error.message;
+    if (typeof error.payload.detail === 'string') return error.payload.detail;
+    if (typeof error.payload.message === 'string') return error.payload.message;
+    return error.message;
   }
   return error instanceof Error ? error.message : fallback;
 }
@@ -55,6 +58,38 @@ function statusTone(status: string): Tone {
   if (status === 'errored') return 'bad';
   if (status === 'stopping' || status === 'launching') return 'warn';
   return 'neutral';
+}
+
+// PM2 reports 0 for CPU and memory it cannot measure, which is common on
+// Windows. A live process cannot occupy 0 bytes, so 0 means "not reported".
+function metricPercent(value: number | null): string {
+  return value === null || value === 0 ? '—' : formatPercent(value);
+}
+
+function metricBytes(value: number | null): string {
+  return value === null || value === 0 ? '—' : formatBytes(value);
+}
+
+/**
+ * PM2 modules are installed under `<PM2 home>/modules/<name>` and run from
+ * there. The API has no module flag, so the path is the only marker.
+ */
+function isPm2Module(app: ProcessApp, pm2Home: string | null): boolean {
+  const home = pm2Home?.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() ?? null;
+  return [app.execPath, app.cwd].some((value) => {
+    if (!value) return false;
+    const path = value.replace(/\\/g, '/').toLowerCase();
+    if (home && path.startsWith(`${home}/modules/`)) return true;
+    return /(^|\/)(\.pm2|pm2)\/modules\//.test(path);
+  });
+}
+
+interface ServiceGuidance {
+  kind: 'elevation' | 'install';
+  action: ServiceAction;
+  command: string;
+  shell: string | null;
+  message: string | null;
 }
 
 function Metric({ label, value }: { label: string; value: string }) {
@@ -103,17 +138,19 @@ function NodeFact({
   version,
   path,
   broken = false,
+  emptyLabel = 'Unknown',
 }: {
   label: string;
   version: string | null;
   path: string | null;
   broken?: boolean;
+  emptyLabel?: string;
 }) {
   return (
     <div>
       <div className="text-2xs text-faint">{label}</div>
       <div className={cn('text-xs font-medium', broken ? 'text-warn' : 'text-ink')}>
-        {version ?? (broken ? 'Missing' : 'Unknown')}
+        {version ?? (broken ? 'Missing' : emptyLabel)}
       </div>
       <div className="break-all font-mono text-2xs text-faint">{path ?? '—'}</div>
     </div>
@@ -129,7 +166,9 @@ function RuntimeBlock({ runtime }: { runtime: ServiceRuntime }) {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-2xs font-medium uppercase tracking-wider text-faint">Node runtime</div>
         {view.broken ? (
-          <Badge tone="warn">service copy missing</Badge>
+          <Badge tone="warn">service runtime missing</Badge>
+        ) : !view.pinned ? (
+          <Badge tone="warn">not pinned</Badge>
         ) : view.sameAsSystem ? (
           <Badge tone="neutral">same as system</Badge>
         ) : (
@@ -138,14 +177,28 @@ function RuntimeBlock({ runtime }: { runtime: ServiceRuntime }) {
       </div>
       <div className="mt-2 grid gap-3 sm:grid-cols-2">
         <NodeFact
-          label="Service"
+          label="Service Node"
           version={view.serviceVersion}
           path={view.servicePath}
           broken={view.broken}
+          emptyLabel={view.pinned ? 'Unknown' : 'Not pinned'}
         />
-        <NodeFact label="System" version={view.systemVersion} path={view.systemPath} />
+        <NodeFact label="System Node" version={view.systemVersion} path={view.systemPath} />
       </div>
-      {!view.sameAsSystem && !view.broken && view.serviceVersion && (
+      {view.manager && (
+        <p className="mt-2 text-2xs text-faint">
+          The system Node is managed by {view.manager}. The service uses its own pinned binary so
+          switching versions cannot break it.
+        </p>
+      )}
+      {!view.pinned && !view.broken && (
+        <p className="mt-2 text-2xs text-faint">
+          No pinned Node was found. The service will start with whatever{' '}
+          <code className="font-mono">node</code> its launcher resolves;{' '}
+          <code className="font-mono">ezz service repair</code> pins one.
+        </p>
+      )}
+      {view.pinned && !view.sameAsSystem && !view.broken && view.serviceVersion && (
         <p className="mt-2 text-2xs text-faint">
           The service is pinned to a different Node than this dashboard. That is normal after an
           upgrade; <code className="font-mono">ezz service repair</code> re-pins it.
@@ -196,16 +249,123 @@ function ProcessLogsModal({ app, onClose }: { app: ProcessApp; onClose: () => vo
   );
 }
 
+function ProcessRow({
+  app,
+  isModule,
+  busy,
+  currentUser,
+  onAction,
+  onLogs,
+}: {
+  app: ProcessApp;
+  isModule: boolean;
+  busy: { name: string; action: ProcessAction } | null;
+  currentUser: string | null;
+  onAction: (app: ProcessApp, action: ProcessAction, isModule: boolean) => void;
+  onLogs: (app: ProcessApp) => void;
+}) {
+  const isBusy = busy?.name === app.name;
+  const otherUser = Boolean(app.user && currentUser && app.user !== currentUser);
+
+  return (
+    <li className="px-4 py-3.5 sm:px-5">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusDot tone={statusTone(app.status)} pulse={app.status === 'online'} />
+            <span className="truncate text-sm font-medium text-ink">{app.name}</span>
+            <Badge tone={statusTone(app.status)}>{app.status}</Badge>
+            {isModule && <Badge tone="info">module</Badge>}
+            {otherUser && <Badge tone="warn">{app.user}</Badge>}
+          </div>
+          {(app.execPath || app.cwd) && (
+            <p className="mt-0.5 truncate font-mono text-2xs text-faint">
+              {app.execPath ?? app.cwd}
+            </p>
+          )}
+        </div>
+
+        <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+          {app.status === 'online' ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              loading={isBusy && busy?.action === 'stop'}
+              disabled={isBusy || otherUser}
+              icon={<Square className="size-3" aria-hidden="true" />}
+              onClick={() => onAction(app, 'stop', isModule)}
+            >
+              Stop
+            </Button>
+          ) : (
+            <Button
+              variant="secondary"
+              size="sm"
+              loading={isBusy && busy?.action === 'start'}
+              disabled={isBusy || otherUser}
+              icon={<Play className="size-3" aria-hidden="true" />}
+              onClick={() => onAction(app, 'start', isModule)}
+            >
+              Start
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            loading={isBusy && busy?.action === 'restart'}
+            disabled={isBusy || otherUser}
+            icon={<RotateCw className="size-3.5" aria-hidden="true" />}
+            onClick={() => onAction(app, 'restart', isModule)}
+          >
+            Restart
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={isBusy}
+            icon={<ScrollText className="size-3.5" aria-hidden="true" />}
+            onClick={() => onLogs(app)}
+          >
+            Logs
+          </Button>
+        </div>
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Metric label="CPU" value={metricPercent(app.cpu)} />
+        <Metric label="Memory" value={metricBytes(app.memoryBytes)} />
+        <Metric label="Uptime" value={formatUptime(app.uptimeMs)} />
+        <Metric
+          label="Restarts"
+          value={
+            app.unstableRestarts > 0
+              ? `${app.restarts} · ${app.unstableRestarts} unstable`
+              : String(app.restarts)
+          }
+        />
+      </div>
+    </li>
+  );
+}
+
 export function ProcessesPage() {
   useDocumentTitle('Processes');
   const toast = useToast();
   const confirm = useConfirm();
-  const { service, loading: serviceLoading, error: serviceError, reload: reloadService } = useService();
+  const {
+    service,
+    loading: serviceLoading,
+    error: serviceError,
+    reload: reloadService,
+    applyBackgroundService,
+  } = useService();
   const serviceView = describeService(service);
 
   const processes = useResource<ProcessesResponse>((signal) => api.processes.list(signal));
   const [busy, setBusy] = useState<{ name: string; action: ProcessAction } | null>(null);
   const [logsFor, setLogsFor] = useState<ProcessApp | null>(null);
+  const [serviceBusy, setServiceBusy] = useState<ServiceAction | null>(null);
+  const [serviceGuidance, setServiceGuidance] = useState<ServiceGuidance | null>(null);
 
   const reloadAll = () => {
     processes.reload();
@@ -213,17 +373,33 @@ export function ProcessesPage() {
   };
 
   usePolling(processes.reload, 15_000);
+  // Fallback if a service:changed event is missed. Skip while a read is still
+  // in flight: the native status probe can take longer than the interval, and
+  // each reload aborts the previous request.
+  usePolling(() => {
+    if (!serviceLoading) reloadService();
+  }, 15_000);
   useRefreshOnVisible(reloadAll);
 
-  const runAction = async (app: ProcessApp, action: ProcessAction) => {
+  const runAction = async (app: ProcessApp, action: ProcessAction, isModule: boolean) => {
     if (busy) return;
     if (action === 'stop' || action === 'restart') {
+      const body = isModule
+        ? action === 'stop'
+          ? app.name.toLowerCase().includes('logrotate')
+            ? `${app.name} rotates PM2's logs. Stopping it lets PM2 logs grow without limit until you start it again. It is a PM2 module, not one of your apps.`
+            : `${app.name} is a PM2 module, not one of your apps. Stopping it changes how PM2 itself behaves.`
+          : `${app.name} is a PM2 module. Restarting it briefly stops the behaviour it adds to PM2.`
+        : `${app.name} is one of your own PM2 apps. ${
+            action === 'stop' ? 'Stopping' : 'Restarting'
+          } it affects whatever else relies on it.`;
       const ok = await confirm({
         title: `${action === 'stop' ? 'Stop' : 'Restart'} ${app.name}?`,
-        body: `${app.name} is one of your own PM2 apps. ${
-          action === 'stop' ? 'Stopping' : 'Restarting'
-        } it affects whatever else relies on it.`,
-        confirmLabel: `${action === 'stop' ? 'Stop' : 'Restart'} anyway`,
+        body,
+        confirmLabel:
+          isModule && action === 'stop'
+            ? 'Stop module anyway'
+            : `${action === 'stop' ? 'Stop' : 'Restart'} anyway`,
         tone: 'danger',
       });
       if (!ok) return;
@@ -244,8 +420,116 @@ export function ProcessesPage() {
     }
   };
 
+  const runServiceAction = async (action: ServiceAction) => {
+    if (!serviceView || serviceBusy) return;
+
+    const startsPhrase =
+      serviceView.startsAt === 'logon'
+        ? 'at your next logon'
+        : serviceView.startsAt === 'boot'
+          ? 'at the next boot'
+          : 'when the service starts';
+    const ok = await confirm(
+      action === 'start'
+        ? {
+            title: 'Start the background service?',
+            body: serviceView.installed
+              ? `Monitoring and notifications keep running after this dashboard closes. From now on it also starts ${startsPhrase}.`
+              : 'The service is not installed; if it cannot start, the exact install command is shown instead.',
+            confirmLabel: 'Start service',
+          }
+        : action === 'stop'
+          ? {
+              title: 'Stop the background service?',
+              body: serviceView.installed
+                ? `Monitoring and notifications pause while it is down. It returns ${startsPhrase} or as soon as you start it again.`
+                : 'Monitoring and notifications pause while it is down. It will not restart until you start it, because it is not installed.',
+              confirmLabel: 'Stop service',
+              tone: 'danger' as const,
+            }
+          : {
+              title: 'Restart the background service?',
+              body: 'Monitoring pauses for a moment while the service restarts. Jobs resume when it is back up.',
+              confirmLabel: 'Restart service',
+              tone: 'danger' as const,
+            }
+    );
+    if (!ok) return;
+
+    setServiceBusy(action);
+    setServiceGuidance(null);
+    try {
+      const result = await api.service[action]();
+      applyBackgroundService(result.backgroundService);
+      toast.success(
+        action === 'start'
+          ? 'Background service started'
+          : action === 'stop'
+            ? 'Background service stopped'
+            : 'Background service restarted',
+        result.output?.trim() || undefined
+      );
+      reloadService();
+    } catch (error) {
+      if (error instanceof ApiError) {
+        if (error.payload.backgroundService) {
+          applyBackgroundService(error.payload.backgroundService);
+        }
+        if (error.status === 403 && error.code === 'elevation_required') {
+          setServiceGuidance({
+            kind: 'elevation',
+            action,
+            command:
+              typeof error.payload.command === 'string'
+                ? error.payload.command
+                : `ezz service ${action}`,
+            shell: typeof error.payload.shell === 'string' ? error.payload.shell : null,
+            message: typeof error.payload.message === 'string' ? error.payload.message : null,
+          });
+          return;
+        }
+        if (error.status === 409 && error.code === 'not_installed') {
+          setServiceGuidance({
+            kind: 'install',
+            action,
+            command:
+              typeof error.payload.command === 'string'
+                ? error.payload.command
+                : service?.install.command ?? 'ezz service install',
+            shell: service?.install.shell ?? null,
+            message: typeof error.payload.message === 'string' ? error.payload.message : null,
+          });
+          return;
+        }
+        if (error.status === 409 && error.code === 'already_running') {
+          toast.info(
+            'The background service is already running.',
+            typeof error.payload.message === 'string' ? error.payload.message : undefined
+          );
+          reloadService();
+          return;
+        }
+        toast.error(
+          `Could not ${action} the background service`,
+          failureText(error, 'The service manager refused the action.')
+        );
+        reloadService();
+        return;
+      }
+      toast.error(
+        `Could not ${action} the background service`,
+        error instanceof Error ? error.message : 'The dashboard could not complete the action.'
+      );
+    } finally {
+      setServiceBusy(null);
+    }
+  };
+
   const apps = (processes.data?.apps ?? []).filter((app) => !app.managed);
   const currentUser = processes.data?.currentUser ?? null;
+  const pm2Home = processes.data?.pm2Home ?? null;
+  const modules = apps.filter((app) => isPm2Module(app, pm2Home));
+  const userApps = apps.filter((app) => !isPm2Module(app, pm2Home));
 
   return (
     <>
@@ -293,9 +577,98 @@ export function ProcessesPage() {
                 </span>
               }
               description="Runs monitoring and notifications in the background, independent of this dashboard."
+              actions={
+                serviceView ? (
+                  serviceView.running ? (
+                    <>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        loading={serviceBusy === 'stop'}
+                        disabled={serviceBusy !== null}
+                        icon={<Square className="size-3" aria-hidden="true" />}
+                        onClick={() => void runServiceAction('stop')}
+                      >
+                        Stop
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        loading={serviceBusy === 'restart'}
+                        disabled={serviceBusy !== null}
+                        icon={<RotateCw className="size-3.5" aria-hidden="true" />}
+                        onClick={() => void runServiceAction('restart')}
+                      >
+                        Restart
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      loading={serviceBusy === 'start'}
+                      disabled={serviceBusy !== null}
+                      icon={<Play className="size-3" aria-hidden="true" />}
+                      onClick={() => void runServiceAction('start')}
+                    >
+                      Start
+                    </Button>
+                  )
+                ) : undefined
+              }
             />
 
             <CardBody className="space-y-4">
+              {serviceGuidance && (
+                <InlineAlert
+                  tone="warning"
+                  title={
+                    serviceGuidance.kind === 'install'
+                      ? 'The background service is not installed'
+                      : `${
+                          serviceGuidance.action === 'start'
+                            ? 'Starting'
+                            : serviceGuidance.action === 'stop'
+                              ? 'Stopping'
+                              : 'Restarting'
+                        } needs ${serviceGuidance.shell ?? 'a terminal with extra rights'}`
+                  }
+                  action={
+                    <IconButton
+                      label="Dismiss"
+                      size="sm"
+                      onClick={() => setServiceGuidance(null)}
+                    >
+                      <X className="size-3.5" aria-hidden="true" />
+                    </IconButton>
+                  }
+                >
+                  {serviceGuidance.message && <p>{serviceGuidance.message}</p>}
+                  <div className="mt-2 rounded-md border border-line bg-canvas p-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <code className="break-all font-mono text-xs text-ink">
+                        {serviceGuidance.command}
+                      </code>
+                      <CopyButton
+                        value={serviceGuidance.command}
+                        label="Copy command"
+                        withText
+                      />
+                    </div>
+                    {serviceGuidance.shell && (
+                      <p className="mt-1.5 text-2xs text-faint">
+                        Run it in {serviceGuidance.shell}.
+                      </p>
+                    )}
+                  </div>
+                  <p className="mt-2 text-2xs text-faint">
+                    {serviceGuidance.kind === 'elevation'
+                      ? 'The dashboard cannot elevate itself or ask for a password. Run the command in a terminal you control.'
+                      : 'The command is run in a terminal, not from this dashboard.'}
+                  </p>
+                </InlineAlert>
+              )}
+
               {serviceError && !service ? (
                 <ErrorState
                   error={serviceError}
@@ -315,6 +688,11 @@ export function ProcessesPage() {
                       label="Status"
                       value={serviceStateLabel(serviceView)}
                       tone={serviceView.running ? 'text-ok' : 'text-warn'}
+                      detail={
+                        serviceView.stoppedByUser && serviceView.stoppedAtLabel
+                          ? `Stopped ${serviceView.stoppedAtLabel}`
+                          : serviceView.detail ?? undefined
+                      }
                     />
                     <ServiceFact
                       label="PID"
@@ -323,13 +701,7 @@ export function ProcessesPage() {
                     <ServiceFact label="Uptime" value={formatUptime(serviceView.uptimeMs)} />
                     <ServiceFact
                       label="Installed"
-                      value={
-                        serviceView.installed === null
-                          ? 'Unknown'
-                          : serviceView.installed
-                            ? 'Yes'
-                            : 'No'
-                      }
+                      value={serviceView.installed ? 'Yes' : 'No'}
                     />
                     <ServiceFact
                       label="Mode"
@@ -339,7 +711,7 @@ export function ProcessesPage() {
                     <ServiceFact label="Starts" value={serviceView.startsAtLabel} />
                     <ServiceFact
                       label="Monitoring runs in"
-                      value={serviceView.jobsRunningHere ? 'This dashboard' : 'Background service'}
+                      value={serviceView.jobsOwnerLabel}
                     />
                     <ServiceFact
                       label="Live channel"
@@ -363,7 +735,7 @@ export function ProcessesPage() {
                     <RuntimeBlock runtime={serviceView.runtime} />
                   ) : (
                     <p className="text-2xs text-faint">
-                      The service and system Node versions are not reported by this API yet.
+                      The service and system Node versions are not available for this install.
                     </p>
                   )}
 
@@ -379,22 +751,27 @@ export function ProcessesPage() {
                       title={
                         serviceView.stoppedByUser
                           ? 'The background service is stopped'
-                          : serviceView.installed === false
+                          : !serviceView.installed
                             ? 'The background service is not set up'
                             : 'The background service is not running'
                       }
                     >
                       {serviceView.stoppedByUser ? (
                         <>
-                          You stopped it. Monitoring and notifications are paused until it starts
-                          again {serviceView.startsAt === 'logon'
+                          You stopped it
+                          {serviceView.stoppedAtLabel
+                            ? ` on ${serviceView.stoppedAtLabel}`
+                            : ''}
+                          . Monitoring and notifications are paused until it starts again{' '}
+                          {serviceView.startsAt === 'logon'
                             ? 'at your next logon'
                             : serviceView.startsAt === 'boot'
                               ? 'at the next boot'
                               : 'when the service starts'}
-                          . Start it now with <code className="font-mono">ezz service start</code>.
+                          . Use Start above, or run{' '}
+                          <code className="font-mono">ezz service start</code>.
                         </>
-                      ) : serviceView.installed === false ? (
+                      ) : !serviceView.installed ? (
                         <>
                           Monitoring and notifications run in this dashboard and stop when it
                           closes. Set up the service with{' '}
@@ -403,15 +780,8 @@ export function ProcessesPage() {
                       ) : (
                         <>
                           Monitoring and notifications run in this dashboard and stop when it closes.
-                          Start the service with <code className="font-mono">ezz service start</code>
-                          {serviceView.installed === null ? (
-                            <>
-                              , or set it up with{' '}
-                              <code className="font-mono">{serviceView.installCommand}</code> if it was
-                              never installed
-                            </>
-                          ) : null}
-                          .
+                          Start the service with <code className="font-mono">ezz service start</code>,
+                          or use Start above.
                         </>
                       )}
                     </InlineAlert>
@@ -447,8 +817,8 @@ export function ProcessesPage() {
               title={
                 <span className="inline-flex flex-wrap items-center gap-2">
                   Your PM2 apps
-                  {apps.length > 0 && (
-                    <Badge tone="neutral">{pluralize(apps.length, 'app')}</Badge>
+                  {userApps.length > 0 && (
+                    <Badge tone="neutral">{pluralize(userApps.length, 'app')}</Badge>
                   )}
                 </span>
               }
@@ -484,7 +854,7 @@ export function ProcessesPage() {
                 title="PM2 is not installed"
                 description="PM2 is optional. It is only for apps you run yourself; Easy DevOps uses its own background service."
               />
-            ) : apps.length === 0 ? (
+            ) : userApps.length === 0 ? (
               <EmptyState
                 icon={<ScrollText className="size-5" aria-hidden="true" />}
                 title="No PM2 apps of your own"
@@ -492,91 +862,47 @@ export function ProcessesPage() {
               />
             ) : (
               <ul className="divide-y divide-line/70">
-                {apps.map((app) => {
-                  const isBusy = busy?.name === app.name;
-                  const otherUser = Boolean(app.user && currentUser && app.user !== currentUser);
-                  return (
-                    <li key={`${app.name}-${app.pmId ?? 'x'}`} className="px-4 py-3.5 sm:px-5">
-                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <StatusDot tone={statusTone(app.status)} pulse={app.status === 'online'} />
-                            <span className="truncate text-sm font-medium text-ink">{app.name}</span>
-                            <Badge tone={statusTone(app.status)}>{app.status}</Badge>
-                            {otherUser && <Badge tone="warn">{app.user}</Badge>}
-                          </div>
-                          {(app.execPath || app.cwd) && (
-                            <p className="mt-0.5 truncate font-mono text-2xs text-faint">
-                              {app.execPath ?? app.cwd}
-                            </p>
-                          )}
-                        </div>
-
-                        <div className="flex shrink-0 flex-wrap items-center gap-1.5">
-                          {app.status === 'online' ? (
-                            <Button
-                              variant="secondary"
-                              size="sm"
-                              loading={isBusy && busy?.action === 'stop'}
-                              disabled={isBusy || otherUser}
-                              icon={<Square className="size-3" aria-hidden="true" />}
-                              onClick={() => void runAction(app, 'stop')}
-                            >
-                              Stop
-                            </Button>
-                          ) : (
-                            <Button
-                              variant="secondary"
-                              size="sm"
-                              loading={isBusy && busy?.action === 'start'}
-                              disabled={isBusy || otherUser}
-                              icon={<Play className="size-3" aria-hidden="true" />}
-                              onClick={() => void runAction(app, 'start')}
-                            >
-                              Start
-                            </Button>
-                          )}
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            loading={isBusy && busy?.action === 'restart'}
-                            disabled={isBusy || otherUser}
-                            icon={<RotateCw className="size-3.5" aria-hidden="true" />}
-                            onClick={() => void runAction(app, 'restart')}
-                          >
-                            Restart
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            disabled={isBusy}
-                            icon={<ScrollText className="size-3.5" aria-hidden="true" />}
-                            onClick={() => setLogsFor(app)}
-                          >
-                            Logs
-                          </Button>
-                        </div>
-                      </div>
-
-                      <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
-                        <Metric label="CPU" value={formatPercent(app.cpu)} />
-                        <Metric label="Memory" value={formatBytes(app.memoryBytes)} />
-                        <Metric label="Uptime" value={formatUptime(app.uptimeMs)} />
-                        <Metric
-                          label="Restarts"
-                          value={
-                            app.unstableRestarts > 0
-                              ? `${app.restarts} · ${app.unstableRestarts} unstable`
-                              : String(app.restarts)
-                          }
-                        />
-                      </div>
-                    </li>
-                  );
-                })}
+                {userApps.map((app) => (
+                  <ProcessRow
+                    key={`${app.name}-${app.pmId ?? 'x'}`}
+                    app={app}
+                    isModule={false}
+                    busy={busy}
+                    currentUser={currentUser}
+                    onAction={runAction}
+                    onLogs={setLogsFor}
+                  />
+                ))}
               </ul>
             )}
           </Card>
+
+          {modules.length > 0 && (
+            <Card className="overflow-hidden">
+              <CardHeader
+                title={
+                  <span className="inline-flex flex-wrap items-center gap-2">
+                    PM2 modules
+                    <Badge tone="neutral">{pluralize(modules.length, 'module')}</Badge>
+                  </span>
+                }
+                description="Modules extend PM2 itself and are not your apps. Stopping pm2-logrotate lets PM2 logs grow without limit."
+              />
+              <ul className="divide-y divide-line/70">
+                {modules.map((app) => (
+                  <ProcessRow
+                    key={`${app.name}-${app.pmId ?? 'x'}`}
+                    app={app}
+                    isModule={true}
+                    busy={busy}
+                    currentUser={currentUser}
+                    onAction={runAction}
+                    onLogs={setLogsFor}
+                  />
+                ))}
+              </ul>
+            </Card>
+          )}
         </div>
       )}
 

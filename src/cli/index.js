@@ -50,17 +50,44 @@ const CLASSIC_UI_ENV = 'EASY_DEVOPS_CLASSIC_UI';
  * @returns {{ flags: Set<string>, command: string|null, args: string[], unknown: string[] }}
  */
 function parseArgs(argv) {
-  const known = new Set(['dash', 'dev', 'classic-ui', 'new-ui', 'help', 'version']);
+  const known = new Set([
+    'dash', 'dev', 'classic-ui', 'new-ui', 'help', 'version',
+    // Command options. Kept in the same set because the parser runs before
+    // any command module is loaded, and an unknown flag must still be
+    // refused rather than silently ignored.
+    'purge', 'yes',
+  ]);
+  // Options that take a value, so `--days 30` does not leave `30` looking
+  // like a positional argument.
+  const valued = new Set(['days']);
   const flags = new Set();
   const unknown = [];
   const positionals = [];
 
+  const options = {};
+  let expecting = null;
+
   for (const arg of argv) {
+    if (expecting) {
+      options[expecting] = arg;
+      expecting = null;
+      continue;
+    }
+
     if (arg === '-h') { flags.add('help'); continue; }
     if (arg === '-v') { flags.add('version'); continue; }
 
     if (arg.startsWith('--')) {
-      const name = arg.slice(2);
+      const body = arg.slice(2);
+      const eq = body.indexOf('=');
+      const name = eq === -1 ? body : body.slice(0, eq);
+
+      if (valued.has(name)) {
+        if (eq === -1) expecting = name;
+        else options[name] = body.slice(eq + 1);
+        continue;
+      }
+
       if (known.has(name)) flags.add(name);
       else unknown.push(arg);
       continue;
@@ -69,8 +96,11 @@ function parseArgs(argv) {
     positionals.push(arg);
   }
 
+  if (expecting) unknown.push(`--${expecting} (missing its value)`);
+
   return {
     flags,
+    options,
     command: positionals[0] ?? null,
     args: positionals.slice(1),
     unknown,
@@ -94,6 +124,14 @@ Commands:
   service <action>  Install and manage the native background service.
                     Actions: install, uninstall, status, start, stop,
                     restart, logs, repair
+  runtime <action>  The Node runtime the service is pinned to.
+                    Actions: status, update
+  update            Update Easy DevOps itself, then restart the service.
+  cleanup           List reclaimable files (runtime backups, old logs, stale
+                    locks, nginx .bak files) and remove the ones you choose.
+  uninstall         Remove Easy DevOps. Needs --purge to do anything.
+  dashboard <action>
+                    Actions: setup-code (issue a new first-run setup code)
 
 Options:
   --dash            Start the web dashboard in the foreground and print its
@@ -104,6 +142,13 @@ Options:
   --classic-ui      Serve the old EJS dashboard instead of the React one, for
                     one run. A temporary fallback; overrides the dashboardUi
                     setting.
+  --purge           With "uninstall": remove the service, the pinned runtime
+                    and the data directory, after exporting a backup. nginx,
+                    your sites and your certificates are kept.
+  --days N          With "cleanup": treat logs older than N days as
+                    reclaimable (default 14).
+  --yes             Answer the confirmations yes. For scripts;
+                    "uninstall --purge" still prints what it will do.
   -h, --help        Show this help
   -v, --version     Show the version
 
@@ -117,12 +162,17 @@ Examples:
   ezz service stop          Stop it until the next logon/boot (temporary)
   ezz service start         Start it again now
   ezz daemon                Run the background worker here (debugging)
+  ezz runtime status        Show the pinned Node and the available LTS versions
+  ezz runtime update        Move the service to a newer Node, with rollback
+  ezz update                Update Easy DevOps and restart the service
+  ezz cleanup               Show what can be reclaimed (nothing is deleted)
+  ezz dashboard setup-code  Issue a new first-run setup code
   npm run dev               Interactive menu against .dev-data
 
 `);
 }
 
-const { flags, command, args, unknown } = parseArgs(process.argv.slice(2));
+const { flags, options, command, args, unknown } = parseArgs(process.argv.slice(2));
 
 if (unknown.length > 0) {
   process.stderr.write(`Unknown option: ${unknown.join(', ')}\n`);
@@ -186,6 +236,21 @@ if (flags.has('dash')) {
 } else if (command === 'service') {
   const { serviceCommand } = await import('./menus/service.js');
   process.exit(await serviceCommand(args[0] ?? 'status'));
+} else if (command === 'runtime') {
+  const { runtimeCommand } = await import('./menus/runtime.js');
+  process.exit(await runtimeCommand(args[0] ?? 'status', { yes: flags.has('yes') }));
+} else if (command === 'update') {
+  const { updateCommand } = await import('./menus/update.js');
+  process.exit(await updateCommand({ yes: flags.has('yes') }));
+} else if (command === 'cleanup') {
+  const { cleanupCommand } = await import('./menus/cleanup.js');
+  process.exit(await cleanupCommand({ days: options.days, yes: flags.has('yes') }));
+} else if (command === 'uninstall') {
+  const { uninstallCommand } = await import('./menus/uninstall.js');
+  process.exit(await uninstallCommand({ purge: flags.has('purge'), yes: flags.has('yes') }));
+} else if (command === 'dashboard') {
+  const { dashboardCommand } = await import('./menus/dashboard.js');
+  process.exit(await dashboardCommand(args[0] ?? 'setup-code'));
 } else {
   // Interactive menu: Ctrl+C simply quits.
   process.on('SIGINT', () => process.exit(0));

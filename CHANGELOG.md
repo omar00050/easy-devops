@@ -9,6 +9,121 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### `ezz runtime update` — move the service onto a newer Node, safely
+The service is pinned to one Node binary on purpose, so upgrading Node never
+reached it: it kept running the old binary until something re-pointed it by
+hand, which meant editing a unit file or copying an exe into ProgramData and
+finding out at the next restart whether the native modules still loaded.
+
+- **The new runtime is smoke-tested before anything is touched** — while the old
+  one is still in place and the service is still running. Three checks in
+  increasing cost: it runs and meets the `engines.node` minimum, it can load
+  `better-sqlite3` (the usual failure: an ABI built for another Node), and it
+  can execute the CLI entry point, against a throwaway data directory so a
+  smoke test can never read or write the real one. A failure here leaves the
+  service up and reports that nothing was changed.
+- **Then: stop, swap, start, and wait for the daemon's own heartbeat** — not the
+  service manager's "started", which only means a process was spawned. Any
+  failure rolls back and restarts: Linux re-points the symlink, Windows Server
+  restores `node.exe.prev`, Windows Personal re-records the previous path.
+- **The target is a version manager's LTS list, or the Node already installed.**
+  With nvm or nvm-windows present it offers their LTS versions and installs the
+  chosen one. With no version manager it offers the system Node (MSI, apt, brew)
+  and re-pins the service to it; when that is already the pinned version it says
+  there is nothing to update and prints how to upgrade Node. **It never downloads
+  a runtime**, and **it never uninstalls a Node version** — the old one is what a
+  rollback needs.
+- **Windows Server mode also fixes the app copy's native modules.** The copy
+  under ProgramData holds `better-sqlite3` built for the old ABI; pairing it
+  with a new `node.exe` fails at require time with an error that never mentions
+  Node versions. It is rebuilt in the copy, and if that fails (no build tools,
+  normal on a server) the modules are refreshed from the package.
+- A runtime change under ProgramData is **refused before anything is stopped**
+  when the terminal is not elevated, with the command and "Run as administrator".
+  No password, in any mode.
+
+#### `ezz update` — update Easy DevOps and restart the service
+Non-interactive, and it shares one implementation with the interactive menu, so
+a feature added to one cannot be missing from the other. That had already
+happened: the menu's update never refreshed the Windows Server runtime copy, so
+on Server mode an update replaced the package and left the service running the
+old code.
+
+- **A git clone is detected and npm is not run.** On a clone
+  `npm install -g easy-devops` installs a second copy from the registry and
+  leaves the service running the clone — the update would report success and
+  change nothing. It now says so and prints `git pull`, `npm install`,
+  `ezz service restart` instead. Deciding that is `core/installSource.js`, and
+  `ezz runtime update` surfaces the same fact in its status.
+- Stop, replace, refresh the Server-mode copy, start, then confirm the version
+  the running daemon itself reports. On failure the previous version is
+  reinstalled and the service restarted.
+- The output explains why this is not available from the dashboard or the Hub:
+  the process that performs the update is the one being stopped and replaced, so
+  it could not report what happened.
+
+#### `ezz cleanup` — see what can be reclaimed, then choose
+Dry run first, always: the inventory is printed with a size per item before
+anything is offered, and `scan()` has no path that deletes.
+
+- Groups: old runtime backups (**the newest of each kind is kept**, so the last
+  change can still be undone), Easy DevOps logs older than N days (`--days N`,
+  default 14), temporary files, stale notification claims and a provably dead
+  daemon lock, `.bak` files in the nginx config directory, PM2 logs (via
+  `pm2 flush`, because PM2 holds the files open), and installed Node versions.
+- **Never listed, so they cannot be selected either:** the database and its
+  `-wal`/`-shm` siblings, the settings, anything under `sslDir`, active `.conf`
+  files, the pinned runtime, the version manager's default, any Node version a
+  PM2 app runs, a live daemon lock, and `daemon.stop` — a pending stop request is
+  a deliberate state, not litter, and removing it would restart a service the
+  user stopped on purpose.
+- Node versions are **listed only**, each with the evidence for whether anything
+  refers to it; nothing there is selected by default, and `--yes` never touches
+  them or PM2.
+- A scan runs **no pm2 command at all** when PM2's daemon is down, because every
+  pm2 command would start one.
+
+#### `ezz uninstall --purge` — remove Easy DevOps, keep the web server
+Plain `ezz uninstall` now explains the difference between removing the service
+and removing Easy DevOps, and does nothing else; the destructive reading has to
+be asked for.
+
+- **The backup comes first and is not optional.** The data directory is copied
+  outside itself with a `MANIFEST.txt` explaining how to restore, the copy is
+  verified to contain the database, and the path is printed. If the backup fails,
+  **nothing is removed at all.**
+- Then the service, the pinned runtime (on Linux the link only — never the Node
+  it points at) and the data directory. **nginx, your sites and your
+  certificates are kept**; certificates are an explicit question whose default is
+  keep. It finishes with the one command it cannot run itself —
+  `npm uninstall -g easy-devops` — because npm would be deleting the files it is
+  running from.
+
+#### A one-time setup code protects first-run setup
+`POST /api/setup` is public by necessity — there is no session before the first
+password exists — so on a freshly started dashboard whoever reached that endpoint
+first owned the installation. The transport checks stop a hostile page in the
+user's browser but nothing stops a direct request from anything that can reach
+the port, which on a server bound to `0.0.0.0` is the network.
+
+- Six digits, shown as `418 902` and accepted with or without the space, printed
+  to the terminal and to the service log. Required to set the first password;
+  **not** required for the loopback-only "no password" choice, which is already a
+  stronger constraint.
+- Stored as a scrypt hash and compared with `timingSafeEqual`, like a password.
+  Expires after 24 hours. Rate-limited per IP in **its own budget**, so setup
+  guesses cannot exhaust the login budget or the reverse. After **20 failed
+  attempts across all addresses** the code is burned and only
+  `ezz dashboard setup-code`, run on the machine, issues another — that global
+  cap is what makes six digits defensible.
+- **It never leaves the machine**: not in `GET /api/auth` (which reports only
+  *whether* one is required, and when it expires), not in any other response, not
+  in a Socket.io event, not in the Hub agent's payloads, and not in the
+  downloadable settings backup. A test enumerates every payload and also fails if
+  any file outside a named five gains the ability to read the code at all.
+- The new dashboard UI already had the field and sent `setupCode`; it was dead
+  against the real API. Contract 2.1.0.
+
 #### Starting and stopping the background service from the dashboard
 `POST /api/service/start`, `/api/service/stop` and `/api/service/restart`, behind
 the same auth gate as every other route. They work in Personal mode, where the
@@ -320,6 +435,30 @@ DevOps manages PM2 on your behalf and never implements its own daemon.
   so `ezz service install` can be dispatched.
 
 ### Fixed
+
+- **`install.sh` could not find its own modules, from a clone or from
+  `curl | bash`.** It looked for them at `lib/installer`, which exists neither in
+  the repository nor in the published package — they live at `src/lib/installer`
+  — and its GitHub fallback URL had the same wrong path. So both routes failed,
+  and the failing route then `mkdir -p`'d an empty `lib/installer` into whatever
+  directory the user happened to be standing in. Now: every real layout is
+  searched (the package, a clone, an older checkout), the fallback URL points at
+  `src/lib/installer`, a download goes to a `mktemp -d` directory that is cleaned
+  up on exit rather than into the current one, and `--help` is answered **before**
+  any of that, so asking for help costs no network request and writes nothing.
+  Piped execution is also detected: with `curl | bash` there is no script
+  directory, and the current directory's `package.json` — which may belong to a
+  completely different project — is no longer mistaken for an Easy DevOps
+  checkout.
+- **nvm-windows' LTS list was read from the wrong column.** `nvm list available`
+  prints `CURRENT | LTS | OLD STABLE | OLD UNSTABLE`, and the row begins with a
+  pipe, so index 1 of the split is the CURRENT column: the runtime picker offered
+  23.x as "LTS". Found by testing the parser against real `nvm list available`
+  output.
+- **A leftover `%APPDATA%\nvm` directory made `nvm version` exit 0 with no
+  output**, which was read as "nvm-windows is installed" and then produced an
+  empty version list and a misleading "no newer LTS" message. A version probe now
+  has to print something version-shaped to count as an answer.
 
 - **Starting the background service while a dashboard was open made both of
   them own the jobs, and the Hub evicted them in turn.** The hand-over was a

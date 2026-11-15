@@ -8,7 +8,7 @@ import crypto from 'crypto';
 import session from 'express-session';
 import { loadConfig, UI_MODES } from '../core/config.js';
 import { dbGet, dbSet, closeDb } from '../core/db.js';
-import { getDataDir, isDevDataDir } from '../core/platform.js';
+import { getDataDir, isDevDataDir, TEST_MODE_ENV } from '../core/platform.js';
 import authRouter from './routes/auth.js';
 import domainsRouter from './routes/domains.js';
 import sslRouter from './routes/ssl.js';
@@ -16,6 +16,8 @@ import nginxRouter from './routes/nginx.js';
 import settingsRouter from './routes/settings.js';
 import hubRouter from './routes/hub.js';
 import processesRouter from './routes/processes.js';
+import { ensureCode as ensureSetupCode, describe as describeSetupCode } from '../core/setupCode.js';
+import { warmProbes } from './controllers/processesController.js';
 import { stopSslController } from './controllers/sslController.js';
 import { initSocket, stopSocket } from './socketManager.js';
 import { requireLocalRequest } from './lib/localRequest.js';
@@ -226,6 +228,19 @@ const jobs = startJobs({
   },
 });
 
+/**
+ * Prints the first-run setup code, if one is outstanding.
+ *
+ * Issues one when none is valid, so a dashboard left at the first-run screen
+ * for a day is still completable. Prints the cleartext only when THIS process
+ * issued it: nothing stores the cleartext, which is the point.
+ */
+async function announceSetupCode() {
+  const state = await ensureSetupCode({ config: loadConfig() });
+  if (!state.pending) return;
+  for (const line of describeSetupCode(state)) process.stdout.write(`${line}\n`);
+}
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 // Resolved above the router mounts, which need them for the local-request
@@ -247,6 +262,32 @@ const whenListening = new Promise((resolve, reject) => {
         ? `Dashboard UI: new (${uiDistDir})\n`
         : 'Dashboard UI: classic (EJS)\n'
     );
+
+    // The first-run setup code, while setup is still pending. Printed here
+    // because this is the local terminal (or the log file a detached
+    // dashboard writes to) - the one place it is allowed to appear. It is
+    // never in an API response, a socket event, or anything sent to the Hub.
+    //
+    // Not awaited: hashing the code takes scrypt-time and the server must not
+    // delay listening for it. A failure is reported and nothing else, because
+    // a dashboard that cannot print a code must still start.
+    // Fill the status probes now, so the first page load finds them already
+    // measured. Each one costs a subprocess - about a second each on Windows -
+    // and paying for them while someone watches a spinner is what made
+    // GET /api/service feel broken. Not awaited: the server is already
+    // listening and a warm-up is not a precondition for serving.
+    //
+    // Not under EZ_TEST. A suite starts and kills dashboards in seconds and
+    // never reads a warm answer, so the half-dozen subprocesses per start are
+    // pure cost there - and measurably so: they slowed the suite enough to
+    // push a latency assertion in another suite over its deadline. The warm
+    // path itself is exercised directly in e2e/service-speed.test.mjs.
+    if (process.env[TEST_MODE_ENV] !== '1') warmProbes();
+
+    announceSetupCode().catch((err) => {
+      process.stderr.write(`[setup] could not prepare the setup code: ${err.message}\n`);
+    });
+
     resolve(bound);
   });
 });

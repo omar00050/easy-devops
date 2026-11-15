@@ -25,7 +25,7 @@ import { connectToDaemon } from '../../core/daemon/ipc.js';
 import { publish } from '../../core/jobs/bus.js';
 import { inspect, watchLock } from '../../core/daemon/lock.js';
 import { getDataDir } from '../../core/platform.js';
-import { backgroundServiceState } from '../../core/service/index.js';
+import { backgroundServiceState, invalidateProbes } from '../../core/service/index.js';
 
 let bridge = null;
 let hello = null;
@@ -110,6 +110,14 @@ function announce(dataDir) {
     const signature = JSON.stringify(next);
     if (signature === lastAnnounced) return;
     lastAnnounced = signature;
+
+    // The service state changed, so the cached probes in GET /api/service no
+    // longer describe it. Dropped here rather than only on a TTL, because this
+    // fires the moment a daemon appears or goes away - including when a change
+    // was made by `ezz service start` in another process, which nothing in
+    // THIS process would otherwise know about.
+    invalidateProbes();
+
     publish('service:changed', next);
   } catch (err) {
     console.error('[daemonBridge] could not publish the service state:', err.message);

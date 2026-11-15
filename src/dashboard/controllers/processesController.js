@@ -20,8 +20,45 @@ import * as runner from '../../core/runner.js';
 import * as service from '../../core/service/index.js';
 import { MODES } from '../../core/service/index.js';
 import { daemonStatus } from '../lib/daemonBridge.js';
+import { probe } from '../../core/probeCache.js';
 
 const SERVER_MODE = MODES.SERVER;
+
+/**
+ * PM2 detection, cached beside the service probes.
+ *
+ * `where.exe pm2` measured at about 2 s on the machine that reported this
+ * endpoint as slow, and `pm2 --version` at about 4 s. Whether PM2 is installed
+ * changes when the user installs PM2, so a minute is a long time to be wrong
+ * and a short time to be slow. The `service:` prefix means
+ * `invalidateProbes()` drops this too.
+ */
+const PM2_PROBE_KEY = 'service:pm2';
+const PM2_TTL_MS = 60_000;
+
+/** Produces the PM2 detection result. One place, so the warm-up matches the read. */
+const detectPm2 = () => runner.detect({ probeVersion: runner.isDaemonRunning() });
+
+/**
+ * Fills every probe `GET /api/service` reads, so the next request is warm.
+ *
+ * It has to cover the PM2 probe as well as core's three: warming only core's
+ * left this endpoint's first call waiting on `where.exe pm2` and answering
+ * `pending: true` anyway, which defeated the warm-up entirely. Measured, not
+ * reasoned about - that is exactly what happened the first time.
+ *
+ * Never awaited by a request. Called when the dashboard starts and again after
+ * any lifecycle action, so a user who just pressed Start finds the new state
+ * already measured rather than paying for the probes on their next poll.
+ *
+ * @returns {Promise<void>}
+ */
+export async function warmProbes() {
+  await Promise.allSettled([
+    service.warmProbes(),
+    probe(PM2_PROBE_KEY, detectPm2, { ttlMs: PM2_TTL_MS, coldWaitMs: 60_000 }),
+  ]);
+}
 
 /**
  * What to tell a client that cannot install or elevate by itself.
@@ -52,6 +89,17 @@ function installGuidance(mode) {
 async function runLifecycle(res, action, fn) {
   try {
     const result = await fn();
+
+    // The cached probes describe what just changed. core/service/ invalidates
+    // them before it acts, which keeps a concurrent read honest; this second
+    // call is for after, so the next GET /api/service measures the new state
+    // rather than whatever was true mid-operation.
+    service.invalidateProbes();
+
+    // And re-measure immediately, without the client waiting: a UI that just
+    // pressed Start polls within a second or two, and this is what makes that
+    // poll fast instead of making it pay for the probes.
+    warmProbes().catch(() => { /* the next request probes anyway */ });
 
     if (result.ok) {
       return res.json({
@@ -237,10 +285,17 @@ class ProcessesController {
   async status(req, res) {
     try {
       const [native, pm2] = await Promise.all([
-        service.status(),
-        // `probeVersion: false` and no daemon start: reporting must never bring
-        // a PM2 daemon to life on a machine that does not use one.
-        runner.detect({ probeVersion: runner.isDaemonRunning() }),
+        // `cache: true`: the cheap lock-based state is read fresh every time,
+        // and the three probes that each cost a subprocess come from the cache
+        // and refresh behind the response. See core/probeCache.js for the
+        // measurements that made this necessary - this endpoint took about 20
+        // seconds on Windows, where one spawn costs about a second.
+        service.status({ cache: true }),
+        // Cached for the same reason, and under the same `service:` prefix so
+        // one invalidation covers it. `probeVersion: false` unless PM2's daemon
+        // is already up, and no daemon start: reporting must never bring a PM2
+        // daemon to life on a machine that does not use one.
+        probe(PM2_PROBE_KEY, detectPm2, { ttlMs: PM2_TTL_MS }),
       ]);
 
       // The cheap, synchronous state plus `connected` — the same object the
@@ -263,7 +318,21 @@ class ProcessesController {
         },
 
         // ── Still true, still used ────────────────────────────────────────
-        pm2: { installed: pm2.installed, version: pm2.version, path: pm2.path },
+        pm2: {
+          installed: pm2.value?.installed ?? null,
+          version: pm2.value?.version ?? null,
+          path: pm2.value?.path ?? null,
+        },
+
+        // How old the measured parts are, and whether anything is still being
+        // measured. A client can render immediately and ask again rather than
+        // waiting for a probe it cannot see.
+        probes: {
+          ageMs: Math.max(native.probes?.ageMs ?? 0, pm2.ageMs ?? 0),
+          fresh: Boolean(native.probes?.fresh) && Boolean(pm2.fresh),
+          pending: Boolean(native.probes?.pending) || Boolean(pm2.pending),
+          refreshing: Boolean(native.probes?.refreshing) || Boolean(pm2.refreshing),
+        },
         dev: isDevDataDir(),
         dataDir: getDataDir(),
 

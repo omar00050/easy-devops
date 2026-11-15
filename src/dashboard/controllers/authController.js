@@ -16,6 +16,11 @@
  *   3. Passwords are stored as scrypt hashes (core/passwords.js). An existing
  *      plain-text password still works, and is migrated on the next login.
  *   4. Login is rate limited per IP.
+ *   5. First-run setup requires a one-time code printed on the server
+ *      (core/setupCode.js). This endpoint is public by necessity, so without
+ *      it whoever reaches a freshly started dashboard first owns it. The code
+ *      itself is never in a response — a client learns only whether one is
+ *      required.
  */
 
 import {
@@ -34,6 +39,7 @@ import {
 } from '../../core/passwords.js';
 import { isLoopbackAddress } from '../lib/localRequest.js';
 import { recordAttempt, clearAttempts } from '../lib/loginRateLimit.js';
+import * as setupCode from '../../core/setupCode.js';
 
 /**
  * The password currently in force, whatever form it is stored in.
@@ -161,6 +167,10 @@ class AuthController {
     const config = loadConfig();
     const mode = effectiveAuthMode(config);
 
+    // Whether a code is needed, and when it stops being valid. NEVER the code:
+    // see the "never leaves the machine" note in core/setupCode.js.
+    const code = setupCode.publicState();
+
     res.json({
       // With no password configured there is nothing to authenticate, so the
       // page should render the dashboard rather than a login form.
@@ -173,6 +183,10 @@ class AuthController {
       canUseNoPassword: canUseNoPassword(req, config),
       bindAddress: config.dashboardBindAddress,
       minPasswordLength: MIN_PASSWORD_LENGTH,
+      // Only meaningful while needsSetup is true; false otherwise so a client
+      // cannot read anything into it after setup is done.
+      setupCodeRequired: needsSetup(config) && code.required,
+      setupCodeExpiresAt: needsSetup(config) ? code.expiresAt : null,
     });
   }
 
@@ -185,6 +199,11 @@ class AuthController {
    * Refused once the dashboard is already configured, so it can never be used
    * to take over an installation — changing either setting afterwards
    * requires being signed in and goes through Settings.
+   *
+   * Setting a password also requires the one-time setup code printed on the
+   * server. `mode: 'none'` does not: that path is already restricted to a
+   * loopback bind AND a loopback request, which is a stronger constraint than
+   * the code provides.
    */
   async setup(req, res) {
     const config = loadConfig();
@@ -199,7 +218,7 @@ class AuthController {
       });
     }
 
-    const { mode, password } = req.body ?? {};
+    const { mode, password, setupCode: submittedCode } = req.body ?? {};
 
     if (mode === AUTH_MODES.NONE) {
       if (!canUseNoPassword(req, config)) {
@@ -213,6 +232,42 @@ class AuthController {
 
       saveConfig({ ...loadConfig(), dashboardAuth: AUTH_MODES.NONE });
       return res.json({ ok: true, authMode: AUTH_MODES.NONE });
+    }
+
+    // Counted before the password is validated, and in its own budget: a
+    // guess against the code must cost the same whatever else is wrong with
+    // the request, and must not consume the login budget.
+    const limit = recordAttempt(req, Date.now(), 'setup');
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+      return res.status(429).json({
+        ok: false,
+        error: 'Too many setup attempts. Try again later.',
+        retryAfterSeconds: limit.retryAfterSeconds,
+      });
+    }
+
+    if (setupCode.required()) {
+      const checked = await setupCode.verify(submittedCode);
+      if (!checked.ok) {
+        // One message for missing, wrong and malformed, so a probe cannot tell
+        // "no code was sent" from "that code was wrong". Expired and burned
+        // are told apart, because the user has to be told what to do next.
+        const message = checked.reason === 'expired'
+          ? 'That setup code has expired. Issue a new one on the server: ezz dashboard setup-code'
+          : checked.burned
+            ? 'Too many incorrect setup codes. Issue a new one on the server: ezz dashboard setup-code'
+            : 'That setup code is not valid.';
+
+        if (checked.burned) {
+          console.error(
+            '[auth] the first-run setup code was invalidated after '
+            + `${checked.failures} failed attempts. Issue a new one with: ezz dashboard setup-code`,
+          );
+        }
+
+        return res.status(400).json({ ok: false, error: message });
+      }
     }
 
     const problem = validateNewPassword(password);
@@ -232,6 +287,11 @@ class AuthController {
       return res.status(500).json({ ok: false, error: 'Could not save the password' });
     }
 
+    // Setup is done, so the code has no further purpose. Removed rather than
+    // left to expire: an outstanding credential nobody needs is one more thing
+    // that can be read.
+    setupCode.clear();
+
     // Sign the user straight in: they have just proven they can set it.
     return req.session.regenerate((err) => {
       if (err) {
@@ -239,6 +299,7 @@ class AuthController {
       }
       req.session.authenticated = true;
       clearAttempts(req);
+      clearAttempts(req, 'setup');
       return res.json({ ok: true, authMode: AUTH_MODES.PASSWORD });
     });
   }

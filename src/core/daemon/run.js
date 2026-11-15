@@ -27,6 +27,8 @@ import { startIpcServer } from './ipc.js';
 import { inspect } from './lock.js';
 import { watchForStop } from './stopRequest.js';
 import { getHubAgentStatus } from '../hub/agent.js';
+import { loadConfig } from '../config.js';
+import { ensureCode as ensureSetupCode, describe as describeSetupCode } from '../setupCode.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../../../package.json');
@@ -104,6 +106,19 @@ export async function startDaemon({
   // every Hub command twice.
   const agent = getHubAgentStatus();
   log(`  hub agent      : ${agent?.status ?? 'unknown'}`);
+
+  // The first-run setup code, while the dashboard still has no password.
+  // The daemon's stdout IS the service log (WinSW, systemd, the Startup
+  // supervisor all capture it), which is the second of the two places the
+  // code is allowed to appear - the other being a local terminal. Whichever
+  // of the daemon and the dashboard starts first issues it; the other says
+  // one is outstanding, because nothing stores the cleartext to re-print.
+  try {
+    const code = await ensureSetupCode({ config: loadConfig() });
+    if (code.pending) for (const line of describeSetupCode(code)) log(line);
+  } catch (err) {
+    log(`  setup code     : unavailable (${err.message})`);
+  }
 
   log('');
   log('Running. Background jobs are owned by this process.');

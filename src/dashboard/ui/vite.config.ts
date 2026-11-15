@@ -38,6 +38,9 @@ export default defineConfig({
     emptyOutDir: true,
     target: 'es2022',
     sourcemap: false,
+    // One app bundle by design. The budget that matters is gzipped size
+    // (~145 kB of 300 kB); the socket chunks stay lazy.
+    chunkSizeWarningLimit: 550,
   },
   server: {
     port: 5173,
