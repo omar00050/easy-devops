@@ -12,7 +12,7 @@ import {
   NginxNotFoundError,
   NginxConfigError,
   InvalidFilenameError,
-} from '../lib/nginx-service.js';
+} from '../../core/nginx-service.js';
 
 class NginxController {
   handleError(err, res) {
@@ -115,10 +115,28 @@ class NginxController {
     }
   }
 
+  /**
+   * GET /api/nginx/logs?file=error|access&lines=N
+   *
+   * Both parameters are additive: the previous endpoint took none and always
+   * returned 100 lines of the ERROR log, which is what the defaults still do.
+   * The access log was simply unreachable before — the contract has always
+   * described this endpoint as "access/error lines", so the gap was here.
+   *
+   * `file` is echoed back so a client cannot mistake which log it is showing.
+   */
   async getLogs(req, res, next) {
     try {
-      const result = await getLogs(100);
-      res.json(result);
+      const which = req.query?.file === 'access' ? 'access' : 'error';
+
+      // Clamped rather than rejected, matching the clamp in core/runner.js for
+      // process logs: an out-of-range number is a client bug, not a reason to
+      // show the operator an error instead of their logs.
+      const requested = Number(req.query?.lines);
+      const lines = Math.max(1, Math.min(5000, Number.isFinite(requested) ? requested : 100));
+
+      const result = await getLogs(lines, which);
+      res.json({ ...result, file: which });
     } catch (err) {
       this.handleError(err, res);
     }

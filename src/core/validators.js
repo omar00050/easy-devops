@@ -94,3 +94,102 @@ export function validatePositiveInteger(val, field) {
   }
   return null;
 }
+
+/**
+ * Validates the hub URL portion of a connection string.
+ * Accepts an http/https URL or a bare host, optionally with a port.
+ * @param {string} hubUrl
+ * @returns {string|null}
+ */
+export function validateHubUrl(hubUrl) {
+  if (!hubUrl || typeof hubUrl !== 'string') {
+    return 'Hub URL is required';
+  }
+  if (hubUrl !== hubUrl.trim()) {
+    return 'Hub URL must not have leading or trailing spaces';
+  }
+
+  // Reject any other scheme explicitly. Without this, "file://x" is silently
+  // re-prefixed below and parses as the host "file", which hides the mistake.
+  if (hubUrl.includes('://') && !/^https?:\/\//i.test(hubUrl)) {
+    return 'Hub URL must use http or https';
+  }
+
+  // Bare hosts are allowed; the agent defaults them to https.
+  const candidate = /^https?:\/\//i.test(hubUrl) ? hubUrl : `https://${hubUrl}`;
+
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return 'Invalid hub URL';
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return 'Hub URL must use http or https';
+  }
+  if (!parsed.hostname) {
+    return 'Hub URL is missing a host';
+  }
+  // The hub never issues credentials inside the URL; refuse to store any.
+  if (parsed.username || parsed.password) {
+    return 'Hub URL must not contain credentials';
+  }
+
+  return null;
+}
+
+/** Upper bound on a pasted connection string (real ones are ~150 chars). */
+const MAX_CONNECTION_STRING_LENGTH = 2048;
+
+/** serverId / secret shape: URL-safe token, no whitespace or control chars. */
+const SAFE_TOKEN = /^[A-Za-z0-9._~-]{1,200}$/;
+
+/**
+ * Validates an Easy DevOps Hub connection string.
+ * Expected format: ezops://<hubUrl>|<serverId>|<secret>
+ *
+ * Note: this only checks shape. Whether the hub recognises the serverId and
+ * secret is decided by the hub during the agent handshake.
+ *
+ * @param {string} str
+ * @returns {string|null} Error message, or null if valid
+ */
+export function validateConnectionString(str) {
+  if (!str || typeof str !== 'string') {
+    return 'Connection string is required';
+  }
+
+  const trimmed = str.trim();
+  const PREFIX = 'ezops://';
+
+  // A real string is ~150 characters. Cap it so a pasted blob is rejected
+  // before it is persisted to SQLite or sent as a handshake credential.
+  if (trimmed.length > MAX_CONNECTION_STRING_LENGTH) {
+    return 'Connection string is too long';
+  }
+
+  if (!trimmed.toLowerCase().startsWith(PREFIX)) {
+    return 'Connection string must start with ezops://';
+  }
+
+  const parts = trimmed.slice(PREFIX.length).split('|');
+  if (parts.length !== 3) {
+    return 'Connection string must have the form ezops://hubUrl|serverId|secret';
+  }
+
+  const [hubUrl, serverId, secret] = parts.map((part) => part.trim());
+
+  const hubUrlError = validateHubUrl(hubUrl);
+  if (hubUrlError) return hubUrlError;
+
+  if (!serverId) return 'Connection string is missing the server ID';
+  if (!secret) return 'Connection string is missing the secret';
+
+  // Identifiers the hub mints are URL-safe tokens (cuid / uuid / hex). Reject
+  // anything with whitespace or control characters rather than storing it.
+  if (!SAFE_TOKEN.test(serverId)) return 'Connection string has an invalid server ID';
+  if (!SAFE_TOKEN.test(secret)) return 'Connection string has an invalid secret';
+
+  return null;
+}

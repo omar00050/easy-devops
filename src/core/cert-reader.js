@@ -1,7 +1,7 @@
 import fs from 'fs/promises';
 import path from 'path';
-import { run } from '../../core/shell.js';
-import { loadConfig } from '../../core/config.js';
+import { run } from './shell.js';
+import { loadConfig } from './config.js';
 
 export async function listAllCerts() {
   const { sslDir } = loadConfig();

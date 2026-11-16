@@ -17,8 +17,10 @@ import fs from 'fs/promises';
 import Table from 'cli-table3';
 import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
-import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../../dashboard/lib/domains-db.js';
-import { generateConf, buildConf } from '../../core/nginx-conf-generator.js';
+import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../../core/domains-db.js';
+import { getDefaultCertPaths } from '../../core/nginx-conf-generator.js';
+import { writeConfWithTest, findBackslashCertPaths } from '../../core/nginx-apply.js';
+import { prepareDomainForHttpChallenge, describeIssuance } from '../../core/ssl-issuer.js';
 import { issueCert } from './ssl-manager.js';
 import { isWindows, nginxTestCmd, nginxReloadCmd, combineOutput, isNginxTestOk } from '../../core/platform.js';
 
@@ -69,6 +71,19 @@ async function listDomainsAction() {
   }
 
   console.log('\n' + table.toString() + '\n');
+
+  // Report-only: existing configs are never rewritten automatically.
+  if (isWindows) {
+    const affected = findBackslashCertPaths(domains);
+    if (affected.length > 0) {
+      console.log(chalk.yellow(' ⚠ These domains still have backslash certificate paths:'));
+      for (const d of affected) console.log(chalk.gray(`   ${d.name}  ${d.certPath}`));
+      console.log(chalk.gray(
+        '   nginx can read \\n and \\t in those paths as escape sequences.\n' +
+        '   Edit and save a domain to regenerate it with forward slashes.\n'
+      ));
+    }
+  }
 }
 
 // ─── Add Domain ───────────────────────────────────────────────────────
@@ -127,14 +142,12 @@ async function addDomainAction() {
   let ssl = { ...DOMAIN_DEFAULTS.ssl, enabled: sslAnswers.enabled };
 
   if (ssl.enabled) {
-    const { nginxDir, sslDir } = loadConfig();
+    const { sslDir } = loadConfig();
     const platform = isWindows ? 'win32' : 'linux';
-    const defaultCertPath = platform === 'win32'
-      ? `C:\\easy-devops\\ssl\\${basic.name}\\fullchain.pem`
-      : `${sslDir}/${basic.name}/fullchain.pem`;
-    const defaultKeyPath = platform === 'win32'
-      ? `C:\\easy-devops\\ssl\\${basic.name}\\privkey.pem`
-      : `${sslDir}/${basic.name}/privkey.pem`;
+    // Shared helper: honours sslDir and always suggests forward slashes, which
+    // is the form nginx needs on Windows.
+    const { certPath: defaultCertPath, keyPath: defaultKeyPath } =
+      getDefaultCertPaths(basic.name, platform, sslDir);
 
     const sslDetails = await inquirer.prompt([
       { type: 'input', name: 'certPath', message: 'SSL cert path:', default: defaultCertPath },
@@ -191,6 +204,32 @@ async function addDomainAction() {
 
       if (certAction === 'Create certificate now') {
         const spinner = ora(`Creating certificate for ${basic.name}…`).start();
+        // Flow 2: nginx must be able to answer the challenge before we ask
+        // Let's Encrypt for anything. For a brand-new domain that means
+        // writing an HTTP-only config first (there is no certificate yet, so a
+        // 443 block would fail nginx -t), testing it and reloading.
+        if (!basic.wildcard) {
+          const prep = await prepareDomainForHttpChallenge({
+            name: basic.name,
+            port: basic.port,
+            backendHost: basic.backendHost,
+            upstreamType: basic.upstreamType,
+            www: basic.www,
+            wildcard: basic.wildcard,
+            ssl: { ...ssl, enabled: false },
+          });
+          if (prep.regenerated) {
+            spinner.stop();
+            console.log(chalk.gray(` ${prep.reason}`));
+            spinner.start(`Creating certificate for ${basic.name}...`);
+          }
+          if (!prep.ok) {
+            spinner.fail('Could not prepare nginx for the challenge');
+            console.log(chalk.yellow(`   ${prep.error}`));
+            return;
+          }
+        }
+
         const result = await issueCert(basic.name, { www: basic.www, wildcard: basic.wildcard, validationMethod: basic.wildcard ? 'dns' : 'http' });
         spinner.stop();
 
@@ -287,27 +326,16 @@ async function addDomainAction() {
     advanced,
   });
 
-  // Generate conf and test
+  // Generate conf and test through the shared core apply (same code path the
+  // dashboard and the Hub use, including the Windows cert-path retry).
   const spinner = ora('Generating nginx config...').start();
-  const { nginxDir } = loadConfig();
 
-  try {
-    await generateConf(domain);
-  } catch (err) {
-    spinner.fail('Failed to generate config');
-    console.log(chalk.red(err.message));
-    return;
-  }
+  spinner.text = 'Writing and testing config...';
+  const applied = await writeConfWithTest(domain);
 
-  spinner.text = 'Testing config...';
-  const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
-  const testResult = await run(testCmd, { cwd: nginxDir });
-
-  if (!isNginxTestOk(testResult)) {
+  if (!applied.ok) {
     spinner.fail('Config test failed');
-    console.log(chalk.red('\n' + combineOutput(testResult)));
-    // Clean up failed config
-    try { await import('fs/promises').then(fs => fs.unlink(domain.configFile)); } catch { /* ignore */ }
+    console.log(chalk.red('\n' + applied.error));
     return;
   }
 
@@ -365,24 +393,16 @@ async function editDomainAction() {
   domain.www = updates.www;
   domain.ssl.enabled = updates.sslEnabled;
 
-  // Regenerate config
+  // Regenerate config through the shared core apply. On failure the previous
+  // config content is restored exactly, so a bad edit cannot leave a broken file.
   const spinner = ora('Regenerating config...').start();
-  const { nginxDir } = loadConfig();
 
-  try {
-    await generateConf(domain);
-  } catch (err) {
-    spinner.fail('Failed to generate config');
-    return;
-  }
+  spinner.text = 'Writing and testing config...';
+  const applied = await writeConfWithTest(domain);
 
-  spinner.text = 'Testing config...';
-  const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
-  const testResult = await run(testCmd, { cwd: nginxDir });
-
-  if (!isNginxTestOk(testResult)) {
+  if (!applied.ok) {
     spinner.fail('Config test failed');
-    console.log(chalk.red('\n' + combineOutput(testResult)));
+    console.log(chalk.red('\n' + applied.error));
     return;
   }
 

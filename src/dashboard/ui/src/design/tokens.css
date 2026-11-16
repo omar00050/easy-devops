@@ -1,0 +1,193 @@
+/**
+ * design/tokens.css — the single source of design decisions.
+ *
+ * Every colour, radius, shadow, type size and motion duration the UI uses is
+ * declared here. Components consume the Tailwind names (bg-surface, text-muted,
+ * rounded-lg, duration-[var(--ez-motion-fast)]), never raw hex values.
+ *
+ * Dark is the default and matches the Hub frontend: near-black surfaces, a warm
+ * orange accent. Light is a full second palette, not a filter.
+ */
+
+:root,
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  /* Surfaces */
+  --ez-canvas: #101114;
+  --ez-surface: #17191d;
+  --ez-raised: #1d2025;
+  --ez-inset: #23272d;
+  --ez-line: #2a2f36;
+  --ez-line-strong: #3b424c;
+  --ez-overlay: rgba(6, 7, 9, 0.66);
+
+  /* Text */
+  --ez-ink: #e9ebee;
+  --ez-muted: #a3aab4;
+  --ez-faint: #838b96;
+
+  /* Accent — warm orange, the Hub family colour. `accent` is the fill behind
+     white text (≥4.5:1); `accent-text` is the lighter tint for text and icons
+     on dark surfaces. */
+  --ez-accent: #c6471f;
+  --ez-accent-hover: #b84019;
+  --ez-accent-text: #ef7a4e;
+  --ez-accent-ink: #fff8f5;
+  --ez-accent-soft: rgba(209, 77, 36, 0.14);
+
+  /* Status */
+  --ez-ok: #4cc38a;
+  --ez-ok-soft: rgba(76, 195, 138, 0.13);
+  --ez-warn: #e5b544;
+  --ez-warn-soft: rgba(229, 181, 68, 0.13);
+  --ez-bad: #f0737b;
+  --ez-bad-soft: rgba(240, 115, 123, 0.13);
+  --ez-info: #6db5ff;
+  --ez-info-soft: rgba(109, 181, 255, 0.13);
+
+  /* Elevation */
+  --ez-shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.025), 0 10px 28px rgba(0, 0, 0, 0.24);
+  --ez-shadow-pop: 0 22px 56px rgba(0, 0, 0, 0.55);
+
+  /* Focus ring */
+  --ez-ring: rgba(225, 100, 60, 0.75);
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --ez-canvas: #f4f5f7;
+  --ez-surface: #ffffff;
+  --ez-raised: #f8f9fa;
+  --ez-inset: #eef0f3;
+  --ez-line: #e3e6ea;
+  --ez-line-strong: #c8cdd5;
+  --ez-overlay: rgba(18, 20, 24, 0.44);
+
+  --ez-ink: #1b1e23;
+  --ez-muted: #59626e;
+  --ez-faint: #68707c;
+
+  --ez-accent: #bd401b;
+  --ez-accent-hover: #a63715;
+  --ez-accent-text: #bd401b;
+  --ez-accent-ink: #ffffff;
+  --ez-accent-soft: rgba(189, 64, 27, 0.09);
+
+  --ez-ok: #16794a;
+  --ez-ok-soft: rgba(22, 121, 74, 0.1);
+  --ez-warn: #94690a;
+  --ez-warn-soft: rgba(148, 105, 10, 0.1);
+  --ez-bad: #bd2c3a;
+  --ez-bad-soft: rgba(189, 44, 58, 0.09);
+  --ez-info: #1e66d0;
+  --ez-info-soft: rgba(30, 102, 208, 0.09);
+
+  --ez-shadow-card: 0 1px 2px rgba(16, 24, 40, 0.05), 0 4px 16px rgba(16, 24, 40, 0.04);
+  --ez-shadow-pop: 0 20px 48px rgba(16, 24, 40, 0.18);
+
+  --ez-ring: rgba(189, 64, 27, 0.65);
+}
+
+:root {
+  /* Type — system stack, nothing fetched at runtime */
+  --ez-font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue',
+    Arial, 'Noto Sans', sans-serif;
+  --ez-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono',
+    monospace;
+
+  --ez-text-2xs: 0.6875rem;
+  --ez-text-2xs--line-height: 1rem;
+  --ez-text-xs: 0.75rem;
+  --ez-text-xs--line-height: 1.1rem;
+  --ez-text-sm: 0.8125rem;
+  --ez-text-sm--line-height: 1.3rem;
+  --ez-text-base: 0.875rem;
+  --ez-text-base--line-height: 1.45rem;
+  --ez-text-lg: 1rem;
+  --ez-text-lg--line-height: 1.55rem;
+  --ez-text-xl: 1.25rem;
+  --ez-text-xl--line-height: 1.7rem;
+  --ez-text-2xl: 1.5rem;
+  --ez-text-2xl--line-height: 1.9rem;
+  --ez-text-3xl: 1.875rem;
+  --ez-text-3xl--line-height: 2.25rem;
+
+  /* Radius */
+  --ez-radius-sm: 7px;
+  --ez-radius-md: 11px;
+  --ez-radius-lg: 15px;
+  --ez-radius-xl: 20px;
+  --ez-radius-pill: 999px;
+
+  /* Motion — 150–220ms, ease-out, never bouncy */
+  --ez-motion-fast: 150ms;
+  --ez-motion-base: 200ms;
+  --ez-motion-slow: 220ms;
+  --ez-ease: cubic-bezier(0.2, 0, 0, 1);
+  --ez-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* Layout */
+  --ez-sidebar-width: 232px;
+  --ez-topbar-height: 56px;
+  --ez-content-max: 1240px;
+  --ez-gutter: 24px;
+}
+
+/* Map the tokens above onto Tailwind's utility namespaces. `inline` makes the
+   generated utilities reference the runtime variables, so swapping the
+   data-theme attribute re-colours everything without a re-render. */
+@theme inline {
+  --color-canvas: var(--ez-canvas);
+  --color-surface: var(--ez-surface);
+  --color-raised: var(--ez-raised);
+  --color-inset: var(--ez-inset);
+  --color-line: var(--ez-line);
+  --color-line-strong: var(--ez-line-strong);
+  --color-ink: var(--ez-ink);
+  --color-muted: var(--ez-muted);
+  --color-faint: var(--ez-faint);
+  --color-accent: var(--ez-accent);
+  --color-accent-hover: var(--ez-accent-hover);
+  --color-accent-text: var(--ez-accent-text);
+  --color-accent-ink: var(--ez-accent-ink);
+  --color-accent-soft: var(--ez-accent-soft);
+  --color-ok: var(--ez-ok);
+  --color-ok-soft: var(--ez-ok-soft);
+  --color-warn: var(--ez-warn);
+  --color-warn-soft: var(--ez-warn-soft);
+  --color-bad: var(--ez-bad);
+  --color-bad-soft: var(--ez-bad-soft);
+  --color-info: var(--ez-info);
+  --color-info-soft: var(--ez-info-soft);
+
+  --font-sans: var(--ez-font-sans);
+  --font-mono: var(--ez-font-mono);
+
+  --text-2xs: var(--ez-text-2xs);
+  --text-2xs--line-height: var(--ez-text-2xs--line-height);
+  --text-xs: var(--ez-text-xs);
+  --text-xs--line-height: var(--ez-text-xs--line-height);
+  --text-sm: var(--ez-text-sm);
+  --text-sm--line-height: var(--ez-text-sm--line-height);
+  --text-base: var(--ez-text-base);
+  --text-base--line-height: var(--ez-text-base--line-height);
+  --text-lg: var(--ez-text-lg);
+  --text-lg--line-height: var(--ez-text-lg--line-height);
+  --text-xl: var(--ez-text-xl);
+  --text-xl--line-height: var(--ez-text-xl--line-height);
+  --text-2xl: var(--ez-text-2xl);
+  --text-2xl--line-height: var(--ez-text-2xl--line-height);
+  --text-3xl: var(--ez-text-3xl);
+  --text-3xl--line-height: var(--ez-text-3xl--line-height);
+
+  --radius-sm: var(--ez-radius-sm);
+  --radius-md: var(--ez-radius-md);
+  --radius-lg: var(--ez-radius-lg);
+  --radius-xl: var(--ez-radius-xl);
+  --radius-pill: var(--ez-radius-pill);
+
+  --shadow-card: var(--ez-shadow-card);
+  --shadow-pop: var(--ez-shadow-pop);
+}

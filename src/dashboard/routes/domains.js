@@ -1,8 +1,17 @@
 import express from 'express';
 import DomainsController from '../controllers/domainsController.js';
+import { requireAuth } from '../lib/requireAuth.js';
 
 const router = express.Router();
 const controller = new DomainsController();
+
+/**
+ * Every route below requires a dashboard session. See lib/requireAuth.js —
+ * this is the single gate, and removing it exposes these endpoints to anyone
+ * who can reach the dashboard port.
+ */
+router.use(requireAuth);
+
 
 router.get('/', (req, res, next) => controller.list(req, res, next));
 router.post('/', (req, res, next) => controller.create(req, res, next));

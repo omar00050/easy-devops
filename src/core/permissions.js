@@ -43,21 +43,25 @@ export async function setupLinuxPermissions() {
   await runInteractive(`sudo chown -R ${user}:${user} /etc/nginx/conf.d 2>/dev/null || true`);
 
   // Step 4: write sudoers file
+  // Exactly the commands Easy DevOps runs, and nothing more.
+  //
+  // A bare '/usr/bin/systemctl' used to be granted here, which allowed every
+  // systemctl verb against every unit — far beyond what this tool needs, and
+  // enough to disable or mask unrelated services. certbot is also gone: SSL is
+  // issued in-process with acme-client and no binary is ever invoked.
   const SUDO_RULES = [
     '/usr/bin/systemctl start nginx',
     '/usr/bin/systemctl stop nginx',
     '/usr/bin/systemctl reload nginx',
     '/usr/bin/systemctl restart nginx',
-    '/usr/bin/systemctl',
+    '/usr/bin/systemctl is-active nginx',
+    '/usr/bin/systemctl status nginx',
     `${nginxPath}`,
     `${nginxPath} -t`,
     `${nginxPath} -s reload`,
     `${nginxPath} -s stop`,
     `${nginxPath} -s quit`,
-    '/usr/bin/certbot',
     '/usr/bin/mkdir',
-    '/usr/bin/cp',
-    '/usr/bin/chmod',
     '/usr/bin/chown',
     '/usr/bin/tee',
   ].join(', ');

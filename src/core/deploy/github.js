@@ -1,0 +1,239 @@
+/**
+ * core/deploy/github.js
+ *
+ * What a repository needs in order to deploy through Easy DevOps: the workflow
+ * file, the secrets it reads, and the URL it calls.
+ *
+ * Pure text generation — nothing here talks to GitHub. The dashboard shows the
+ * result as steps to follow. (Creating the secrets through GitHub's API needs
+ * libsodium sealed boxes, which Node's crypto does not provide; doing it would
+ * mean a new dependency, and that is a decision, not a detail.)
+ */
+
+import { DEPLOY_HOOK_PATH } from '../nginx-conf-generator.js';
+
+export const SECRET_URL = 'EZ_DEPLOY_URL';
+export const SECRET_TOKEN = 'EZ_DEPLOY_TOKEN';
+
+/** Where the workflow file belongs in the repository. */
+export function workflowPath(appId) {
+  return `.github/workflows/ez-deploy-${appId}.yml`;
+}
+
+/**
+ * The public URL a CI job calls to deploy an app, or null when the hook is
+ * not reachable from outside yet.
+ *
+ * @param {string} appId
+ * @param {{ enabled: boolean, port: number, bind: string, domain: string|null }} hook
+ * @param {Array<Object>} domains Domain records, to tell whether the chosen one has SSL
+ * @returns {{ url: string|null, mode: 'domain'|'direct'|'none', secure: boolean, note: string }}
+ */
+export function hookUrl(appId, hook, domains = []) {
+  if (!hook?.enabled) {
+    return { url: null, mode: 'none', secure: false, note: 'The deploy hook is switched off.' };
+  }
+
+  if (hook.domain) {
+    const record = domains.find((d) => d.name === hook.domain);
+    if (!record) {
+      return { url: null, mode: 'none', secure: false, note: `The domain ${hook.domain} no longer exists. Pick another one for the deploy hook.` };
+    }
+    if (record.enabled === false) {
+      return { url: null, mode: 'none', secure: false, note: `The domain ${hook.domain} is disabled, so the deploy hook cannot be reached through it.` };
+    }
+    const secure = Boolean(record.ssl?.enabled);
+    return {
+      url: `${secure ? 'https' : 'http'}://${hook.domain}${DEPLOY_HOOK_PATH}${appId}`,
+      mode: 'domain',
+      secure,
+      note: secure
+        ? `Reached through ${hook.domain} over HTTPS.`
+        : `Reached through ${hook.domain} over plain HTTP — the deploy token is sent unencrypted. Enable SSL on that domain.`,
+    };
+  }
+
+  if (hook.bind === '0.0.0.0') {
+    return {
+      url: `http://YOUR_SERVER_ADDRESS:${hook.port}${DEPLOY_HOOK_PATH}${appId}`,
+      mode: 'direct',
+      secure: false,
+      note:
+        `Listening directly on port ${hook.port}, over plain HTTP — the deploy token is sent unencrypted. ` +
+        'Replace YOUR_SERVER_ADDRESS with the server\'s public address, open the port in the firewall, ' +
+        'and prefer exposing the hook through a domain with SSL.',
+    };
+  }
+
+  return {
+    url: null,
+    mode: 'none',
+    secure: false,
+    note: 'The deploy hook only listens on this machine. Expose it through a domain, or let it listen on all interfaces.',
+  };
+}
+
+/** Path of the Hub's CI endpoint, relative to the Hub's origin. Must match hub_backend/src/routes/api/v1/hooks.ts. */
+export const HUB_HOOK_PATH = '/api/v1/hooks/deploy/';
+
+/**
+ * The URL a CI job calls to deploy through the Hub, or null when this server
+ * is not paired.
+ *
+ * Same request, same token and same answers as the server's own deploy hook —
+ * the Hub forwards it down the agent connection the server already holds
+ * open, and the SERVER verifies the token. So the workflow file is identical
+ * either way; only the value of the EZ_DEPLOY_URL secret differs, and the
+ * server needs no inbound port at all.
+ *
+ * @param {string} appId
+ * @param {{ origin: string, serverId: string }|null} hubLink
+ * @param {boolean} allowed Whether the server grants `deploy.ci`
+ */
+export function hubHookUrl(appId, hubLink, allowed) {
+  if (!hubLink?.origin || !hubLink?.serverId) {
+    return { url: null, secure: false, note: 'This server is not paired with a Hub.' };
+  }
+  const url = `${hubLink.origin}${HUB_HOOK_PATH}${hubLink.serverId}/${appId}`;
+  const secure = /^https:\/\//i.test(hubLink.origin);
+  if (!allowed) {
+    return {
+      url,
+      secure,
+      note: 'Turn on “Deploy from CI through the Hub” in Settings → Hub first; until then this server refuses the request.',
+    };
+  }
+  return {
+    url,
+    secure,
+    note: secure
+      ? 'Goes through the Hub over HTTPS. This server needs no inbound port.'
+      : 'Goes through the Hub over plain HTTP — the deploy token is sent unencrypted.',
+  };
+}
+
+/**
+ * The GitHub Actions workflow for an app.
+ *
+ * It triggers the deployment and then WAITS for the outcome, so a failed
+ * deployment is a red check on the commit rather than something discovered
+ * later. No third-party actions: only curl and the shell that every runner
+ * has, so there is nothing to pin and nothing to audit.
+ *
+ * @param {{ appId: string, branch: string }} opts
+ * @returns {string} YAML
+ */
+export function buildWorkflow({ appId, branch }) {
+  return `# Deploys "${appId}" with Easy DevOps on every push to ${branch}.
+# Generated by Easy DevOps — safe to edit.
+#
+# Needs two repository secrets (Settings → Secrets and variables → Actions):
+#   ${SECRET_URL}    the deploy hook URL for this app
+#   ${SECRET_TOKEN}  the deploy token for this app
+name: Deploy ${appId}
+
+on:
+  push:
+    branches: [${JSON.stringify(branch)}]
+  workflow_dispatch:
+
+# One deployment of this app at a time; a newer push waits for the running one.
+concurrency:
+  group: ez-deploy-${appId}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Deploy
+        env:
+          ${SECRET_URL}: \${{ secrets.${SECRET_URL} }}
+          ${SECRET_TOKEN}: \${{ secrets.${SECRET_TOKEN} }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "\${${SECRET_URL}:-}" ] || [ -z "\${${SECRET_TOKEN}:-}" ]; then
+            echo "::error::Set the ${SECRET_URL} and ${SECRET_TOKEN} repository secrets."
+            exit 1
+          fi
+
+          echo "Requesting deployment of $GITHUB_SHA"
+          response=$(curl --silent --show-error --fail-with-body --max-time 30 \\
+            -X POST "$${SECRET_URL}" \\
+            -H "Authorization: Bearer $${SECRET_TOKEN}" \\
+            -H "Content-Type: application/json" \\
+            -d "{\\"ref\\":\\"$GITHUB_SHA\\"}") || { echo "::error::The deploy hook refused the request: $response"; exit 1; }
+
+          run_id=$(printf '%s' "$response" | sed -n 's/.*"runId":"\\([^"]*\\)".*/\\1/p')
+          if [ -z "$run_id" ]; then
+            echo "::error::Unexpected answer from the deploy hook: $response"
+            exit 1
+          fi
+          echo "Deployment $run_id started"
+
+          # Wait for the server to finish: up to 25 minutes, checking every 10s.
+          for attempt in $(seq 1 150); do
+            sleep 10
+            state=$(curl --silent --show-error --max-time 20 \\
+              -H "Authorization: Bearer $${SECRET_TOKEN}" \\
+              "$${SECRET_URL}/runs/$run_id") || { echo "Could not read the status yet, retrying"; continue; }
+
+            status=$(printf '%s' "$state" | sed -n 's/.*"status":"\\([^"]*\\)".*/\\1/p')
+            step=$(printf '%s' "$state" | sed -n 's/.*"step":"\\([^"]*\\)".*/\\1/p')
+
+            case "$status" in
+              running) echo "  ... $step" ;;
+              success) echo "Deployed."; exit 0 ;;
+              rolled_back)
+                echo "::error::The deployment failed and the previous release was restored. $state"
+                exit 1 ;;
+              failed)
+                echo "::error::The deployment failed. $state"
+                exit 1 ;;
+              *) echo "  unexpected status: $state" ;;
+            esac
+          done
+
+          echo "::error::Timed out waiting for the deployment to finish."
+          exit 1
+`;
+}
+
+/**
+ * Everything the "Connect to GitHub" steps need, in one object.
+ *
+ * @param {Object} app An app as returned by dashboardApp()
+ * @param {Object} hook hookSettings()
+ * @param {Array<Object>} domains
+ * @param {{ link: { origin: string, serverId: string }|null, ciAllowed: boolean }} [hub]
+ * @returns {Object}
+ */
+export function describeGithubSetup(app, hook, domains = [], hub = { link: null, ciAllowed: false }) {
+  const target = hookUrl(app.id, hook, domains);
+  const viaHub = hubHookUrl(app.id, hub?.link ?? null, Boolean(hub?.ciAllowed));
+  return {
+    // Both ways of reaching this server, for the user to choose between.
+    // `hookUrl` below stays the direct one, as in contract 2.4.0.
+    targets: [
+      { id: 'hook', label: 'This server’s deploy hook', url: target.url, secure: target.secure, note: target.note },
+      { id: 'hub', label: 'Through the Hub', url: viaHub.url, secure: viaHub.secure, note: viaHub.note, ready: Boolean(viaHub.url && hub?.ciAllowed) },
+    ],
+    hookUrl: target.url,
+    hookMode: target.mode,
+    hookSecure: target.secure,
+    hookNote: target.note,
+    hasToken: Boolean(app.hook?.hasToken),
+    tokenHint: app.hook?.tokenHint ?? null,
+    workflowPath: workflowPath(app.id),
+    workflow: buildWorkflow({ appId: app.id, branch: app.branch }),
+    secrets: [
+      { name: SECRET_URL, value: target.url },
+      // Never readable back: only its hash is stored. The UI shows it once,
+      // at the moment it is generated.
+      { name: SECRET_TOKEN, value: null },
+    ],
+    deployKey: app.authType === 'deployKey' ? (app.deployKey ?? null) : null,
+  };
+}

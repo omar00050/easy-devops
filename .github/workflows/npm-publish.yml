@@ -28,6 +28,30 @@ jobs:
           registry-url: https://registry.npmjs.org/
       - run: npm install
       - run: npm ci
-      - run: npm publish
+
+      # Build the dashboard UI. The package ships the BUILT files (dist/ui),
+      # never the UI sources: package.json "files" includes dist/ui/ and
+      # excludes src/dashboard/ui/.
+      - name: Build the dashboard UI
+        run: npm run build:ui
+
+      # Stop here if the build is missing or the UI sources would be published.
+      - name: Check what will be published
+        run: |
+          test -f dist/ui/index.html || { echo "::error::dist/ui/index.html is missing - the UI was not built."; exit 1; }
+          npm pack --dry-run --json > pack.json
+          node -e "
+            const files = require('./pack.json')[0].files.map((f) => f.path);
+            const built = files.filter((p) => p.startsWith('dist/ui/'));
+            const sources = files.filter((p) => p.startsWith('src/dashboard/ui/'));
+            if (!files.includes('dist/ui/index.html')) { console.error('::error::dist/ui/index.html is not in the package.'); process.exit(1); }
+            if (sources.length) { console.error('::error::UI sources are in the package: ' + sources.slice(0, 5).join(', ')); process.exit(1); }
+            console.log('Package OK: ' + files.length + ' files, ' + built.length + ' of them the built UI, no UI sources.');
+          "
+          rm pack.json
+
+      # --ignore-scripts: the UI is already built above and the tests already
+      # ran in the build job, so prepublishOnly must not do both again.
+      - run: npm publish --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{secrets.npm_token}}

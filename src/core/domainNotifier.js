@@ -220,60 +220,126 @@ export function setNotificationState(domain, eventType, state) {
  * @property {string|null} reason - Why (e.g., 'state_changed', 'recovery', 'no_change')
  * @property {string} currentStatus - The new status ('up' or 'down')
  * @property {string|null} previousNotifiedFor - What we previously notified about
+ * @property {Object|null} nextState - The state to record once the send succeeds
  */
 
 /**
- * Determine if we should send a notification based on state changes.
- * Prevents spam by only sending when state changes.
- * Handles recovery notifications when transitioning from down → up.
+ * Decides whether a transition is worth notifying about.
+ *
+ * PURE: this records nothing. It used to write "notified" to the database
+ * before the notification was sent, which made a failed send invisible — the
+ * state already claimed it had gone out, so it was never retried.
+ *
+ * The caller now does: evaluate -> claim -> send -> commit, and releases the
+ * claim if the send fails. See core/notifications/claim.js and
+ * core/notifications/dispatch.js.
+ *
+ * nextState is what commitNotification() should persist. It is returned even
+ * when shouldNotify is false, because the first sighting of a domain still has
+ * to be recorded — it just must not produce a notification.
  *
  * @param {string|null} domain - null for global events
  * @param {string} eventType
  * @param {string} currentStatus - 'up' or 'down'
  * @returns {NotificationDecision}
  */
-export function shouldSendNotification(domain, eventType, currentStatus) {
+export function evaluateTransition(domain, eventType, currentStatus) {
   const previousState = getNotificationState(domain, eventType);
   const previousNotifiedFor = previousState.notifiedFor;
 
-  // Normalize status to 'up' or 'down'
   const status = currentStatus === 'up' || currentStatus === 'down' ? currentStatus : 'unknown';
 
-  console.log(`[domainNotifier] Checking notification: domain=${domain || 'global'}, event=${eventType}, status=${status}, prevNotifiedFor=${previousNotifiedFor}`);
-
-  // First time seeing this domain/event - don't notify, just record state
+  // First time seeing this domain/event: record it, never notify. Otherwise
+  // every restart would announce everything as newly down.
   if (previousNotifiedFor === null || previousState.status === 'unknown') {
-    console.log(`[domainNotifier] First check - recording state, no notification`);
-    setNotificationState(domain, eventType, { status, lastNotifiedAt: null, notifiedFor: status });
-    return { shouldNotify: false, reason: 'first_check', currentStatus: status, previousNotifiedFor: null };
+    return {
+      shouldNotify: false,
+      reason: 'first_check',
+      currentStatus: status,
+      previousNotifiedFor: null,
+      nextState: { status, lastNotifiedAt: null, notifiedFor: status },
+    };
   }
 
-  // Status unchanged from what we already notified about
   if (previousNotifiedFor === status) {
-    console.log(`[domainNotifier] No change - already notified for '${status}'`);
-    return { shouldNotify: false, reason: 'no_change', currentStatus: status, previousNotifiedFor };
+    return {
+      shouldNotify: false,
+      reason: 'no_change',
+      currentStatus: status,
+      previousNotifiedFor,
+      nextState: null,
+    };
   }
 
-  // Status changed!
   if (status === 'down' && previousNotifiedFor !== 'down') {
-    // Transition: up → down (or unknown → down)
-    console.log(`[domainNotifier] State changed: ${previousNotifiedFor} → down, will notify`);
-    setNotificationState(domain, eventType, { status: 'down', lastNotifiedAt: Date.now(), notifiedFor: 'down' });
-    return { shouldNotify: true, reason: 'state_changed', currentStatus: 'down', previousNotifiedFor };
+    return {
+      shouldNotify: true,
+      reason: 'state_changed',
+      currentStatus: 'down',
+      previousNotifiedFor,
+      nextState: { status: 'down', lastNotifiedAt: null, notifiedFor: 'down' },
+    };
   }
 
   if (status === 'up' && previousNotifiedFor === 'down') {
-    // Transition: down → up (recovery!)
-    console.log(`[domainNotifier] Recovery detected: down → up, will notify`);
-    setNotificationState(domain, eventType, { status: 'up', lastNotifiedAt: Date.now(), notifiedFor: 'up' });
-    return { shouldNotify: true, reason: 'recovery', currentStatus: 'up', previousNotifiedFor: 'down' };
+    return {
+      shouldNotify: true,
+      reason: 'recovery',
+      currentStatus: 'up',
+      previousNotifiedFor: 'down',
+      nextState: { status: 'up', lastNotifiedAt: null, notifiedFor: 'up' },
+    };
   }
 
-  // Edge case: up → up (but previousNotifiedFor was something else)
-  // This shouldn't happen, but handle gracefully
-  console.log(`[domainNotifier] Edge case: status=${status}, prevNotifiedFor=${previousNotifiedFor}`);
-  setNotificationState(domain, eventType, { status, lastNotifiedAt: Date.now(), notifiedFor: status });
-  return { shouldNotify: false, reason: 'edge_case', currentStatus: status, previousNotifiedFor };
+  // status is 'unknown', or an up->up with a stale notifiedFor. Record the
+  // status so the next real transition is judged against the truth, but say
+  // nothing: there is no event here a user would want to hear about.
+  return {
+    shouldNotify: false,
+    reason: 'edge_case',
+    currentStatus: status,
+    previousNotifiedFor,
+    nextState: { status, lastNotifiedAt: null, notifiedFor: status },
+  };
+}
+
+/**
+ * Records a decision as sent.
+ *
+ * Call this ONLY after the notification actually went out. The timestamp is
+ * stamped here rather than in evaluateTransition(), so lastNotifiedAt always
+ * means "when it was really delivered".
+ *
+ * @param {string|null} domain
+ * @param {string} eventType
+ * @param {NotificationDecision} decision
+ * @param {number} [sentAt]
+ */
+export function commitNotification(domain, eventType, decision, sentAt = Date.now()) {
+  if (!decision?.nextState) return;
+
+  setNotificationState(domain, eventType, {
+    ...decision.nextState,
+    lastNotifiedAt: decision.shouldNotify ? sentAt : decision.nextState.lastNotifiedAt,
+  });
+}
+
+/**
+ * Evaluate and record in one step, with no send in between.
+ *
+ * Retained for callers that only track state and never notify. It is NOT the
+ * path the monitors use: anything that sends must evaluate, claim, send and
+ * then commit, so a failed send is retried.
+ *
+ * @param {string|null} domain
+ * @param {string} eventType
+ * @param {string} currentStatus
+ * @returns {NotificationDecision}
+ */
+export function shouldSendNotification(domain, eventType, currentStatus) {
+  const decision = evaluateTransition(domain, eventType, currentStatus);
+  commitNotification(domain, eventType, decision);
+  return decision;
 }
 
 /**

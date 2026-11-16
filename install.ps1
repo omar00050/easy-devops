@@ -17,6 +17,15 @@
   Skip Node.js management entirely. Proceeds directly to dependency
   installation using whatever Node.js is currently active.
 
+.PARAMETER Service
+  Install the background service at the end without asking. On Windows Server
+  this installs a real Windows Service and relaunches elevated through UAC if
+  needed; otherwise it installs the logon launcher. No password is ever asked
+  for.
+
+.PARAMETER NoService
+  Do not install the background service, and do not ask.
+
 .EXAMPLE
   .\install.ps1                  # Interactive install
   .\install.ps1 -Version 20      # Install Node.js 20.x (latest patch via nvm)
@@ -25,7 +34,9 @@
 param(
   [switch]$Help,
   [string]$Version  = "",
-  [switch]$KeepNode
+  [switch]$KeepNode,
+  [switch]$Service,
+  [switch]$NoService
 )
 
 Set-StrictMode -Version Latest
@@ -760,3 +771,179 @@ if ($allOK) {
   Write-Host "    node src/cli/index.js" -ForegroundColor Cyan
 }
 Write-Host ""
+
+# ─── Offer to install the background service ─────────────────────────────────
+#
+# Asked LAST, after Node and the package are in place, because `ezz` has to be
+# runnable for the answer to mean anything.
+#
+# Two modes on Windows, and they are genuinely different:
+#
+#   Server   — a real Windows Service. Starts before anyone logs in. Needs an
+#              Administrator terminal once, so this script relaunches itself
+#              elevated through UAC if it is not already. NO PASSWORD is ever
+#              requested: the service runs as the virtual account
+#              NT SERVICE\EasyDevOps, which Windows manages itself.
+#   Personal — a launcher in the Startup folder. Starts at logon, needs no
+#              administrator rights at all.
+#
+# The default follows the edition: Server on Windows Server, ask otherwise.
+
+function Test-IsElevated {
+  try {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($id)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  } catch {
+    return $false
+  }
+}
+
+function Get-IsWindowsServer {
+  # InstallationType is 'Client', 'Server' or 'Server Core'. os.release() does
+  # not distinguish them, and the WMI route takes seconds to start its service
+  # on a cold machine; this is immediate.
+  try {
+    $key = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+    return ($key.InstallationType -like 'Server*')
+  } catch {
+    return $false
+  }
+}
+
+function Get-EzCommand {
+  foreach ($name in @('ezz', 'easy-devops')) {
+    $found = Get-Command $name -ErrorAction SilentlyContinue
+    if ($found) { return $name }
+  }
+  $local = Join-Path $scriptDir 'src\cli\index.js'
+  if (Test-Path $local) { return "node `"$local`"" }
+  return $null
+}
+
+function Invoke-ServiceInstall {
+  param([string]$Mode)
+
+  $ez = Get-EzCommand
+  if (-not $ez) {
+    Write-Host "  Could not find the ezz command, so the service was not installed." -ForegroundColor Yellow
+    Write-Host "  Open a new terminal and run: ezz service install" -ForegroundColor Cyan
+    return $false
+  }
+
+  # Server mode writes under ProgramData, registers a service and sets ACLs,
+  # all of which need elevation. If this session is not elevated, relaunch
+  # ONLY the service install through UAC rather than re-running the whole
+  # installer -- Node is already in place and repeating it would be wasteful
+  # and could prompt again.
+  if ($Mode -eq 'server' -and -not (Test-IsElevated)) {
+    Write-Host ""
+    Write-Host "  Server mode needs an Administrator terminal." -ForegroundColor Yellow
+    Write-Host "  Windows will ask for consent. You will NOT be asked for a password." -ForegroundColor Gray
+    Write-Host ""
+
+    try {
+      # -Verb RunAs is what raises the UAC prompt. The child keeps its window
+      # open on failure so the user can read the error; a window that vanishes
+      # is the usual complaint about elevated helpers.
+      $inner = "$ez service install; if (`$LASTEXITCODE -ne 0) { Read-Host 'Press Enter to close' }"
+      $proc = Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $inner `
+        -Verb RunAs -Wait -PassThru -ErrorAction Stop
+
+      if ($proc.ExitCode -eq 0) { return $true }
+
+      Write-Host "  The elevated install exited with code $($proc.ExitCode)." -ForegroundColor Yellow
+      return $false
+    } catch {
+      # The usual cause is the user declining the UAC prompt, which is a
+      # legitimate answer and not an error worth failing the installer over.
+      Write-Host "  Elevation was declined or failed, so the service was not installed." -ForegroundColor Yellow
+      Write-Host ""
+      Write-Host "  To do it yourself: open PowerShell as Administrator and run" -ForegroundColor Gray
+      Write-Host "    ezz service install" -ForegroundColor Cyan
+      return $false
+    }
+  }
+
+  # Personal mode, or already elevated: run it here so the prompts appear in
+  # this window.
+  try {
+    Invoke-Expression "$ez service install"
+    return ($LASTEXITCODE -eq 0 -or $null -eq $LASTEXITCODE)
+  } catch {
+    Write-Host "  The service install failed: $($_.Exception.Message)" -ForegroundColor Yellow
+    return $false
+  }
+}
+
+function Invoke-ServiceOffer {
+  if ($NoService) {
+    Write-Host ""
+    Write-Host "  Skipping the background service (-NoService)." -ForegroundColor Gray
+    Write-Host "  Install it later with: ezz service install" -ForegroundColor Cyan
+    Write-Host ""
+    return
+  }
+
+  $isServer = Get-IsWindowsServer
+  $mode = if ($isServer) { 'server' } else { 'personal' }
+
+  if (-not $Service) {
+    # Non-interactive host (a CI runner, or piped input): never guess on a
+    # question that may need elevation.
+    if ([Console]::IsInputRedirected) {
+      Write-Host ""
+      Write-Host "  No terminal available, so the background service was not installed." -ForegroundColor Gray
+      Write-Host "  Install it with:        ezz service install" -ForegroundColor Cyan
+      Write-Host "  Or non-interactively:   .\install.ps1 -Service" -ForegroundColor Cyan
+      Write-Host ""
+      return
+    }
+
+    Write-Host ""
+    Write-Host "  Easy DevOps can run a background service that keeps monitoring," -ForegroundColor White
+    Write-Host "  notifications and the Hub agent alive even with no dashboard open." -ForegroundColor White
+    Write-Host ""
+
+    if ($isServer) {
+      Write-Host "  This is Windows Server, so Server mode is recommended:" -ForegroundColor White
+      Write-Host "    a real Windows Service that starts before anyone logs in." -ForegroundColor Gray
+      Write-Host "    Needs Administrator consent once. No password, ever." -ForegroundColor Gray
+    } else {
+      Write-Host "  On this machine it would start when you log in (Personal mode)," -ForegroundColor White
+      Write-Host "    which needs no administrator rights." -ForegroundColor Gray
+    }
+
+    Write-Host ""
+    $answer = Read-Host "  Install the background service now? (recommended for servers) [Y/n]"
+
+    if ($answer -match '^(n|no)$') {
+      Write-Host ""
+      Write-Host "  Skipped. Install it later with: ezz service install" -ForegroundColor Gray
+      Write-Host ""
+      return
+    }
+  }
+
+  Write-Host ""
+  Write-Host "  Installing the background service..." -ForegroundColor Cyan
+  Write-Host ""
+
+  $ok = Invoke-ServiceInstall -Mode $mode
+
+  Write-Host ""
+  if ($ok) {
+    Write-Host "  Background service installed." -ForegroundColor Green
+    if ($mode -eq 'personal') {
+      Write-Host "  It starts the next time you log in." -ForegroundColor Gray
+      Write-Host "  To start it now without signing out: ezz daemon" -ForegroundColor Cyan
+    }
+  } else {
+    Write-Host "  The service was not installed. Nothing else was changed." -ForegroundColor Yellow
+    Write-Host "  You can retry with: ezz service install" -ForegroundColor Cyan
+  }
+  Write-Host ""
+}
+
+Invoke-ServiceOffer
