@@ -3,7 +3,8 @@
  *
  * `ezz daemon` — the long-running background process.
  *
- * Runs in the FOREGROUND and opens NO HTTP port. Both are deliberate:
+ * Runs in the FOREGROUND and, by default, opens NO HTTP port. Both are
+ * deliberate:
  *
  *  - Foreground, because every service manager this project targets (Windows
  *    Services via WinSW, systemd, and the Startup-folder supervisor) wants a
@@ -13,6 +14,13 @@
  *    need its own bind policy, authentication and firewall story; the
  *    dashboard already has all three and is started on demand. Live events
  *    reach it over the local IPC channel instead (core/daemon/ipc.js).
+ *
+ *    The one exception is opt-in: the deploy hook (core/deploy/hookServer.js),
+ *    which a CI job calls to trigger a deployment and which therefore has to
+ *    be there when the dashboard is not. It is off until switched on, binds
+ *    to loopback unless told otherwise, serves only /.ez-deploy/, and carries
+ *    its own bind policy and per-app token — the "own story" the paragraph
+ *    above says a port needs. It is started with the jobs, not here.
  *
  * What it owns while it runs: the single-instance lock, the monitors, the
  * revision watcher, the hub agent, and the IPC server that feeds an open

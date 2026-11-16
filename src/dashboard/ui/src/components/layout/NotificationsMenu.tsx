@@ -4,6 +4,7 @@ import {
   Activity,
   Bell,
   BellOff,
+  Rocket,
   Server,
   ShieldAlert,
   Sparkles,
@@ -19,6 +20,7 @@ function iconFor(event: NotificationEvent): LucideIcon {
   if (event.type === 'nginx_down') return Server;
   if (event.type === 'cert_expiry') return ShieldAlert;
   if (event.type === 'domain_health') return Activity;
+  if (event.type === 'deploy') return Rocket;
   return Sparkles;
 }
 

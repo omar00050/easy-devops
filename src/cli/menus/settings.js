@@ -9,6 +9,10 @@ import {
 } from '../../core/passwords.js';
 import { dbGet } from '../../core/db.js';
 import { setupLinuxPermissions, checkPermissionsConfigured } from '../../core/permissions.js';
+import {
+  getAutoRenewSettings, normalizeAutoRenewDays, MIN_AUTO_RENEW_DAYS, MAX_AUTO_RENEW_DAYS,
+} from '../../core/cert-renewal.js';
+import { deployRoot, defaultDeployRoot, validateDeployDir } from '../../core/deploy/store.js';
 
 export default async function settingsMenu() {
   // T021: detect missing/corrupted config before loadConfig() creates defaults
@@ -31,6 +35,10 @@ export default async function settingsMenu() {
       ? `${config.dashboardBindAddress} (this machine only)`
       : `${config.dashboardBindAddress} (all interfaces)`;
     const emailDisplay = config.acmeEmail || '(not set)';
+    const autoRenew = getAutoRenewSettings(config);
+    const autoRenewDisplay = autoRenew.enabled
+      ? `on, ${autoRenew.days} day${autoRenew.days === 1 ? '' : 's'} before expiry`
+      : 'off';
 
     const isLinux = process.platform !== 'win32';
     const permsOk = isLinux ? await checkPermissionsConfigured() : true;
@@ -44,6 +52,8 @@ export default async function settingsMenu() {
     console.log(` Nginx Directory: ${chalk.cyan(config.nginxDir)}`);
     console.log(` SSL Directory: ${chalk.cyan(config.sslDir)}`);
     console.log(` ACME Email: ${chalk.cyan(emailDisplay)}`);
+    console.log(` SSL Auto-Renew: ${chalk.cyan(autoRenewDisplay)}`);
+    console.log(` Deployments Folder: ${chalk.cyan(deployRoot())}`);
     console.log();
 
     // T014: field selection
@@ -58,6 +68,8 @@ export default async function settingsMenu() {
         { name: `Nginx Directory (${config.nginxDir})`, value: 'nginxDir' },
         { name: `SSL Directory (${config.sslDir})`, value: 'sslDir' },
         { name: `ACME Email (${emailDisplay})`, value: 'acmeEmail' },
+        { name: `SSL Auto-Renew (${autoRenewDisplay})`, value: 'sslAutoRenew' },
+        { name: `Deployments Folder (${deployRoot()})`, value: 'deployDir' },
         ...(isLinux ? [{
           name: permsOk
             ? '🔓 Linux Permissions  ✅ configured'
@@ -210,6 +222,62 @@ export default async function settingsMenu() {
       }]);
       config.acmeEmail = value;
       saveConfig(config); // T016
+
+    } else if (field === 'deployDir') {
+      // Only NEW apps are created here. Existing apps keep the folder they
+      // were created in; moving one is done from the dashboard.
+      const { value } = await inquirer.prompt([{
+        type: 'input',
+        name: 'value',
+        message: `Folder for new deployed apps (empty = ${defaultDeployRoot()}):`,
+        default: config.deployDir || '',
+        validate(input) {
+          if (!input.trim()) return true;
+          const problem = validateDeployDir(input);
+          return problem ? chalk.red(problem) : true;
+        },
+      }]);
+      config.deployDir = value.trim() ? value.trim() : null;
+      saveConfig(config);
+      console.log(chalk.green(`\n  ✓ Saved. New apps will be created in ${deployRoot()}.`));
+      console.log(chalk.gray('    Existing apps stay where they are.\n'));
+
+    } else if (field === 'sslAutoRenew') {
+      // The background service renews HTTP-01 certificates on its own. DNS-01
+      // certificates (wildcards) need a TXT record added by hand, so they only
+      // ever get the expiry warning.
+      const { enabled } = await inquirer.prompt([{
+        type: 'list',
+        name: 'enabled',
+        message: 'Renew certificates automatically before they expire?',
+        default: autoRenew.enabled,
+        choices: [
+          { name: 'On — renew HTTP-validated certificates in the background', value: true },
+          { name: 'Off — only warn before expiry', value: false },
+        ],
+      }]);
+      config.sslAutoRenew = enabled;
+
+      if (enabled) {
+        const { days } = await inquirer.prompt([{
+          type: 'input',
+          name: 'days',
+          message: `Renew how many days before expiry? (${MIN_AUTO_RENEW_DAYS}-${MAX_AUTO_RENEW_DAYS})`,
+          default: String(autoRenew.days),
+          validate(input) {
+            return normalizeAutoRenewDays(input) !== null
+              || chalk.red(`Enter a whole number from ${MIN_AUTO_RENEW_DAYS} to ${MAX_AUTO_RENEW_DAYS}.`);
+          },
+        }]);
+        config.sslAutoRenewDays = normalizeAutoRenewDays(days);
+      }
+      saveConfig(config);
+
+      if (enabled && !config.acmeEmail) {
+        console.log(chalk.yellow('\n  ⚠ Set an ACME email too — renewal cannot run without one.\n'));
+      } else {
+        console.log(chalk.green('\n  ✓ Saved. The background service picks it up on its next check.\n'));
+      }
 
     } else {
       const { value } = await inquirer.prompt([{

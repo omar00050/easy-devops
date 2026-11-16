@@ -108,11 +108,28 @@ export interface DomainDeleteResult {
 
 export type CertStatus = 'valid' | 'expiring' | 'expired' | 'error';
 
+/**
+ * What the background job intends for a certificate.
+ *   auto   — renewed automatically once inside the window
+ *   manual — DNS-01 / wildcard: needs a TXT record, so warning only
+ *   unused — no enabled domain serves it, so it is left alone
+ *   off    — auto-renewal is switched off in Settings
+ */
+export type CertAutoRenew = 'auto' | 'manual' | 'unused' | 'off';
+
 export interface Certificate {
   domain: string;
   expiry: string | null;
   daysLeft: number | null;
   status: CertStatus;
+  /** Optional: absent on a backend older than contract 2.3.0. */
+  autoRenew?: CertAutoRenew;
+  autoRenewDays?: number;
+  lastAutoRenew?: {
+    at: number | null;
+    result: 'renewed' | 'failed' | null;
+    error: string | null;
+  } | null;
 }
 
 export interface IssuanceFailure {
@@ -341,6 +358,15 @@ export interface Settings {
   nginxDir: string;
   sslDir: string;
   acmeEmail: string;
+  /** Optional: absent on a backend older than contract 2.3.0. */
+  sslAutoRenew?: boolean;
+  sslAutoRenewDays?: number;
+  sslAutoRenewDaysMin?: number;
+  sslAutoRenewDaysMax?: number;
+  /** Folder new deployed apps are created in. Absent before contract 2.6.0. */
+  deployDir?: string;
+  deployDirDefault?: string;
+  deployDirIsDefault?: boolean;
   dashboardBindAddress: string;
   bindsToLoopbackOnly: boolean;
   dashboardAuth: AuthMode;
@@ -355,6 +381,10 @@ export interface SettingsUpdate {
   nginxDir?: string;
   sslDir?: string;
   acmeEmail?: string;
+  sslAutoRenew?: boolean;
+  sslAutoRenewDays?: number;
+  /** An absolute path, or '' to go back to the default. */
+  deployDir?: string;
   dashboardBindAddress?: string;
   dashboardAuth?: AuthMode;
 }
@@ -453,13 +483,13 @@ export interface HubPermissionsResponse {
 
 // ─── Realtime ────────────────────────────────────────────────────────────────
 
-export type NotificationType = 'nginx_down' | 'cert_expiry' | 'domain_health' | 'test' | string;
+export type NotificationType = 'nginx_down' | 'cert_expiry' | 'domain_health' | 'test' | string | 'deploy';
 export type NotificationSeverity = 'success' | 'warning' | 'danger' | 'info' | string;
 
 export interface NotificationEvent {
   id: string;
   type: NotificationType;
-  subtype?: 'down' | 'recovery';
+  subtype?: string;
   severity: NotificationSeverity;
   message: string;
   domain?: string;
@@ -494,6 +524,212 @@ export interface ServerEvents {
   connect: undefined;
   disconnect: undefined;
   connect_error: Error;
+}
+
+// ─── Deployments ─────────────────────────────────────────────────────────────
+
+export type DeployAuthType = 'none' | 'deployKey' | 'token';
+export type DeployRunStatus = 'running' | 'success' | 'failed' | 'rolled_back';
+export type DeployTrigger = 'manual' | 'webhook' | 'hub' | 'rollback';
+
+/** A command field: one command, several, or `false` to switch the step off. */
+export type DeployCommands = string | string[] | false;
+
+/** Per-app overrides. Absent means "use ez.json, then package.json". */
+export interface DeploySettings {
+  install?: DeployCommands;
+  build?: DeployCommands;
+  pre?: DeployCommands;
+  post?: DeployCommands;
+  start?: string;
+  port?: number;
+  healthPath?: string;
+  healthTimeout?: number;
+}
+
+export interface DeployRun {
+  id: string;
+  appId: string;
+  trigger: DeployTrigger;
+  actor: string | null;
+  ref: string | null;
+  sha: string | null;
+  releaseId: string;
+  status: DeployRunStatus;
+  step: string;
+  startedAt: number;
+  finishedAt: number | null;
+  error: string | null;
+  warnings: string[];
+  rolledBackTo: string | null;
+}
+
+export interface DeployRunDetail extends DeployRun {
+  log: string;
+  logTruncated: boolean;
+}
+
+export interface DeployRelease {
+  id: string;
+  sha: string | null;
+  ref: string | null;
+  startable: boolean;
+  current: boolean;
+  previous: boolean;
+}
+
+export interface DeployProcess {
+  status: string;
+  pid: number | null;
+  cpu: number | null;
+  memoryBytes: number | null;
+  uptimeMs: number | null;
+  restarts: number;
+}
+
+export interface DeployApp {
+  id: string;
+  pm2Name: string;
+  repoUrl: string;
+  branch: string;
+  authType: DeployAuthType;
+  hasToken: boolean;
+  deployKey: string | null;
+  settings: DeploySettings;
+  env: Record<string, string>;
+  keepReleases: number;
+  autoRollback: boolean;
+  notifyChannelIds: string[];
+  /** The folder the app lives in. Absent before contract 2.6.0. */
+  dir?: string;
+  /** The domain linked to the app, or null. */
+  domain?: string | null;
+  hook: { hasToken: boolean; tokenHint: string | null; createdAt: string | null };
+  createdAt: string | null;
+  updatedAt: string | null;
+  /** Present in the list and the detail response. */
+  currentRelease?: string | null;
+  previousRelease?: string | null;
+  deploying?: boolean;
+  activeRunId?: string | null;
+  lastRun?: DeployRun | null;
+  process?: DeployProcess | null;
+}
+
+export interface DeployAppDetail extends DeployApp {
+  runs: DeployRun[];
+  releases: DeployRelease[];
+}
+
+export interface DeployAppInput {
+  id?: string;
+  repoUrl?: string;
+  branch?: string;
+  authType?: DeployAuthType;
+  token?: string;
+  settings?: DeploySettings;
+  env?: Record<string, string>;
+  keepReleases?: number;
+  autoRollback?: boolean;
+  notifyChannelIds?: string[];
+}
+
+export type DeployHookMode = 'domain' | 'direct' | 'none';
+
+export interface DeployHook {
+  enabled: boolean;
+  port: number;
+  bind: string;
+  domain: string | null;
+  listening: boolean;
+  path: string;
+  urlExample?: string | null;
+  mode?: DeployHookMode;
+  secure?: boolean;
+  note?: string;
+  nginxReloaded?: boolean | null;
+  appliesWithinSeconds?: number;
+}
+
+export interface DeployHookUpdate {
+  enabled?: boolean;
+  port?: number;
+  bind?: string;
+  domain?: string | null;
+}
+
+export interface DeploymentsResponse {
+  apps: DeployApp[];
+  hook: DeployHook;
+  requirements: { git: boolean; gitVersion: string | null; pm2: boolean };
+  limits: { keepReleasesDefault: number; keepReleasesMin: number; keepReleasesMax: number };
+  ezFileLocations: string[];
+  /** Where a new app would be created. Absent before contract 2.6.0. */
+  deployDir?: string;
+  channels: Array<{ id: string; name: string; type: string }>;
+  domains: Array<{ name: string; enabled: boolean; ssl: boolean }>;
+}
+
+export interface DeployGithubSetup {
+  hookUrl: string | null;
+  hookMode: DeployHookMode;
+  hookSecure: boolean;
+  hookNote: string;
+  hasToken: boolean;
+  tokenHint: string | null;
+  workflowPath: string;
+  workflow: string;
+  secrets: Array<{ name: string; value: string | null }>;
+  deployKey: string | null;
+  /** The ways GitHub can reach this server. Absent before contract 2.5.0. */
+  targets?: DeployGithubTarget[];
+}
+
+export interface DeployGithubTarget {
+  id: 'hook' | 'hub';
+  label: string;
+  url: string | null;
+  secure: boolean;
+  note: string;
+  /** Hub target only: false until the server grants deploy.ci. */
+  ready?: boolean;
+}
+
+export interface DeployGithubApplyInput {
+  token?: string;
+  target?: 'hook' | 'hub';
+  secrets?: boolean;
+  workflow?: boolean;
+  deployKey?: boolean;
+}
+
+export interface DeployGithubApplyResult {
+  ok: boolean;
+  repo: string | null;
+  error: string | null;
+  target: 'hook' | 'hub' | null;
+  deployUrl: string | null;
+  steps: Array<{ id: 'secrets' | 'workflow' | 'deployKey'; ok: boolean; detail: string }>;
+}
+
+export interface DeployDomainLink {
+  domain: string;
+  created: boolean;
+  port: number;
+  nginxReloaded: boolean;
+  ssl: { ok: boolean; detail: string } | null;
+}
+
+export interface DeployMoveResult {
+  from: string;
+  to: string;
+  restarted: boolean;
+  warning: string | null;
+}
+
+export interface DeployStarted {
+  runId: string;
+  status: 'running';
 }
 
 // ─── Errors ──────────────────────────────────────────────────────────────────

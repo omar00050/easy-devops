@@ -19,6 +19,19 @@ import type {
   BackupFile,
   Certificate,
   ChannelInput,
+  DeployApp,
+  DeployAppDetail,
+  DeployAppInput,
+  DeployDomainLink,
+  DeployMoveResult,
+  DeployGithubApplyInput,
+  DeployGithubApplyResult,
+  DeployGithubSetup,
+  DeployHook,
+  DeployHookUpdate,
+  DeployRunDetail,
+  DeployStarted,
+  DeploymentsResponse,
   DnsChallengePending,
   Domain,
   DomainDeleteResult,
@@ -244,6 +257,60 @@ export const api = {
       request<ProcessActionResponse>(`/processes/${enc(name)}/${action}`, { method: 'POST' }),
     logs: (name: string, lines = 200, signal?: AbortSignal) =>
       request<ProcessLogs>(`/processes/${enc(name)}/logs`, { signal, query: { lines } }),
+  },
+
+  deployments: {
+    list: (signal?: AbortSignal) => request<DeploymentsResponse>('/deployments', { signal }),
+    get: (id: string, signal?: AbortSignal) =>
+      request<DeployAppDetail>(`/deployments/${enc(id)}`, { signal }),
+    create: (input: DeployAppInput) =>
+      request<DeployApp>('/deployments', { method: 'POST', body: input }),
+    update: (id: string, input: DeployAppInput) =>
+      request<DeployApp>(`/deployments/${enc(id)}`, { method: 'PUT', body: input }),
+    remove: (id: string, deleteDomain = false) =>
+      request<{ deleted: string; domainDeleted?: boolean; warning?: string | null }>(
+        `/deployments/${enc(id)}`,
+        { method: 'DELETE', query: deleteDomain ? { deleteDomain: 1 } : undefined }
+      ),
+    linkDomain: (id: string, domain: string, ssl = false) =>
+      request<DeployDomainLink>(`/deployments/${enc(id)}/domain`, {
+        method: 'PUT',
+        body: { domain, ssl },
+      }),
+    unlinkDomain: (id: string) =>
+      request<{ unlinked: true }>(`/deployments/${enc(id)}/domain`, { method: 'DELETE' }),
+    move: (id: string, path: string) =>
+      request<DeployMoveResult>(`/deployments/${enc(id)}/move`, { method: 'POST', body: { path } }),
+    deploy: (id: string, ref?: string) =>
+      request<DeployStarted>(`/deployments/${enc(id)}/deploy`, {
+        method: 'POST',
+        body: ref ? { ref } : {},
+      }),
+    rollback: (id: string, releaseId?: string) =>
+      request<DeployStarted>(`/deployments/${enc(id)}/rollback`, {
+        method: 'POST',
+        body: releaseId ? { releaseId } : {},
+      }),
+    run: (id: string, runId: string, signal?: AbortSignal) =>
+      request<DeployRunDetail>(`/deployments/${enc(id)}/runs/${enc(runId)}`, { signal }),
+    issueHookToken: (id: string) =>
+      request<{ token: string; tokenHint: string }>(`/deployments/${enc(id)}/hook-token`, {
+        method: 'POST',
+      }),
+    revokeHookToken: (id: string) =>
+      request<{ revoked: true }>(`/deployments/${enc(id)}/hook-token`, { method: 'DELETE' }),
+    generateDeployKey: (id: string) =>
+      request<{ publicKey: string }>(`/deployments/${enc(id)}/deploy-key`, { method: 'POST' }),
+    github: (id: string, signal?: AbortSignal) =>
+      request<DeployGithubSetup>(`/deployments/${enc(id)}/github`, { signal }),
+    applyGithub: (id: string, input: DeployGithubApplyInput) =>
+      request<DeployGithubApplyResult>(`/deployments/${enc(id)}/github/apply`, {
+        method: 'POST',
+        body: input,
+      }),
+    hook: (signal?: AbortSignal) => request<DeployHook>('/deployments/hook', { signal }),
+    updateHook: (input: DeployHookUpdate) =>
+      request<DeployHook>('/deployments/hook', { method: 'PUT', body: input }),
   },
 
   service: {

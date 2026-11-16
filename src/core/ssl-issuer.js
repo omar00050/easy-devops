@@ -44,6 +44,15 @@ import {
 } from './nginx-conf-generator.js';
 import { withChallengeServer, preflight, resolveProbeHosts } from './acme-challenge.js';
 
+/**
+ * Written next to fullchain.pem after every successful issuance. It records
+ * HOW the certificate was obtained, which the certificate itself cannot say:
+ * a single-name certificate validated over DNS-01 looks exactly like one
+ * validated over HTTP-01. core/cert-renewal.js reads it to decide whether a
+ * certificate can be renewed unattended.
+ */
+export const CERT_META_FILE = 'ez-cert.json';
+
 export const CHALLENGE_MODES = Object.freeze({
   AUTO: 'auto',
   PROXY: 'proxy',
@@ -342,6 +351,23 @@ export async function issueCertificate(domainName, options = {}) {
     const keyPath = path.join(certDir, 'privkey.pem');
     await fs.writeFile(keyPath, domainKey);
     await fs.writeFile(certPath, cert);
+
+    // Best effort: a certificate without this file still renews — the names
+    // are read back out of the certificate — so a failed write must never
+    // turn a successful issuance into a reported failure.
+    try {
+      await fs.writeFile(
+        path.join(certDir, CERT_META_FILE),
+        JSON.stringify({
+          domain: domainName,
+          altNames,
+          validationMethod: validationMethod === 'dns' ? 'dns' : 'http',
+          staging,
+          issuedAt: new Date().toISOString(),
+        }, null, 2),
+      );
+    } catch { /* non-fatal */ }
+
     return { certPath, keyPath };
   };
 

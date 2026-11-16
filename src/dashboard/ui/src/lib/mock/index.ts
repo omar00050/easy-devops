@@ -19,6 +19,7 @@
  */
 
 import { ApiError } from '../errors';
+import { handleDeployments } from './deployments';
 import {
   COMING_SOON_IDS,
   PERMISSION_TREE,
@@ -977,6 +978,23 @@ function handle(
       }
       next.acmeEmail = value;
     }
+    if (data.deployDir !== undefined) {
+      const value = String(data.deployDir ?? '').trim();
+      if (value && !/^(\/|[A-Za-z]:[\\/])/.test(value)) fail(400, 'Use an absolute path, such as /srv/ez_deploys or D:\\ez_deploys.');
+      next.deployDir = value || next.deployDirDefault;
+      next.deployDirIsDefault = !value;
+    }
+    if (data.sslAutoRenew !== undefined) {
+      if (typeof data.sslAutoRenew !== 'boolean') fail(400, 'sslAutoRenew must be true or false');
+      next.sslAutoRenew = data.sslAutoRenew;
+    }
+    if (data.sslAutoRenewDays !== undefined) {
+      const days = Number(data.sslAutoRenewDays);
+      if (!Number.isInteger(days) || days < 1 || days > 30) {
+        fail(400, 'Auto-renew days must be a whole number from 1 to 30');
+      }
+      next.sslAutoRenewDays = days;
+    }
 
     const nextAuth = next.dashboardAuth;
     const nextBind = next.dashboardBindAddress;
@@ -1155,6 +1173,11 @@ function handle(
     };
     persist();
     return { permissions, tree: PERMISSION_TREE, comingSoon: COMING_SOON_IDS };
+  }
+
+  // ── Deployments ───────────────────────────────────────────────────────────
+  if (path === '/deployments' || path.startsWith('/deployments/')) {
+    return handleDeployments(method, path, data);
   }
 
   throw new ApiError(404, { error: `Not found: ${method} ${path}` });

@@ -58,6 +58,7 @@ import {
 } from './owner.js';
 import { initHubAgent, stopHubAgent, reconcileHubAgent } from '../hub/agent.js';
 import { startMonitors } from './monitors.js';
+import { startDeployHookManager } from '../deploy/hookServer.js';
 import { startRevisionWatcher } from './revisionWatcher.js';
 
 /** How often a standby re-checks whether a daemon has appeared or gone. */
@@ -130,7 +131,7 @@ export function startJobs({
   }
 
   /** @type {{ monitors: Object|null, revisions: Object|null }} */
-  const handles = { monitors: null, revisions: null, ownerBeat: null };
+  const handles = { monitors: null, revisions: null, ownerBeat: null, deployHook: null };
   let running = false;
   let reason = 'starting';
   let stopped = false;
@@ -201,6 +202,16 @@ export function startJobs({
       }
     }
 
+    // The deploy hook follows ownership for the same reason the agent does:
+    // two processes cannot both bind its port, and a CI job must reach the one
+    // that is actually going to run the deployment. It listens on nothing
+    // unless `deployHook.enabled` is set — see core/deploy/hookServer.js.
+    try {
+      handles.deployHook = startDeployHookManager();
+    } catch (err) {
+      console.error('[jobs] deploy hook failed to start:', err.message);
+    }
+
     // The marker has to be refreshed or it goes stale in 20 seconds and
     // another process would be entitled to take the jobs from under us.
     handles.ownerBeat = setInterval(() => {
@@ -230,9 +241,14 @@ export function startJobs({
     handles.monitors?.stop();
     handles.revisions?.stop();
     if (handles.ownerBeat) clearInterval(handles.ownerBeat);
+    // Its port must be free before another process is told the jobs are
+    // available; the close is quick, and is not awaited because this path is
+    // synchronous — a successor that finds the port briefly busy retries.
+    handles.deployHook?.stop().catch(() => {});
     handles.monitors = null;
     handles.revisions = null;
     handles.ownerBeat = null;
+    handles.deployHook = null;
 
     if (hub) {
       try {

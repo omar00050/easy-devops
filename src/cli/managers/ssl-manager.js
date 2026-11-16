@@ -18,7 +18,8 @@ import fs from 'fs/promises';
 import path from 'path';
 import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
-import { issueCertificate, describeIssuance, prepareDomainForHttpChallenge } from '../../core/ssl-issuer.js';
+import { issueCertificate, describeIssuance } from '../../core/ssl-issuer.js';
+import { renewCertificate, describeRenewal, failureReason } from '../../core/cert-renewal.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -142,49 +143,36 @@ export async function issueCert(domainName, options = {}) {
 }
 
 /**
- * Renews a certificate by re-issuing it.
- * acme-client's auto() handles renewal transparently.
+ * Renews a certificate.
+ *
+ * Goes through core/cert-renewal.js, the one renewal path: it keeps the names
+ * the certificate already covers (a `www` certificate stays one), prepares the
+ * nginx config, and reloads nginx so the new certificate is the one served.
+ * A DNS-01 / wildcard certificate is refused with `skipped: 'manual'` rather
+ * than silently replaced by a single-name HTTP-01 certificate.
  */
 export async function renewCert(domainName, options = {}) {
-  return issueCert(domainName, options);
+  return renewCertificate(domainName, { email: options.email ?? null, mode: options.mode ?? null });
 }
 
 /**
  * Renews all certificates expiring within 30 days.
  */
-export async function renewExpiring(certs) {
+export async function renewExpiring(certs, options = {}) {
   const expiring = certs.filter(c => c.daysLeft !== null && c.daysLeft < 30);
   if (expiring.length === 0) return [];
 
-  const { findDomain } = await import('../../core/domains-db.js');
-
   const results = [];
   for (const cert of expiring) {
-    // Same prepare step as a single renew: regenerate a config that predates
-    // the ACME challenge location so this renewal can use proxy mode, instead
-    // of silently falling back to stopping nginx.
-    const record = findDomain(cert.domain);
-    let prepared = null;
-    if (record) {
-      prepared = await prepareDomainForHttpChallenge(record);
-      if (!prepared.ok) {
-        results.push({
-          domain: cert.domain,
-          success: false,
-          exitCode: 1,
-          error: prepared.error,
-        });
-        continue;
-      }
-    }
-
-    const result = await issueCert(cert.domain, { validationMethod: 'http' });
+    const result = await renewCert(cert.domain, options);
     results.push({
       domain: cert.domain,
       success: result.success,
       exitCode: result.success ? 0 : 1,
-      configRegenerated: Boolean(prepared?.regenerated),
-      summary: describeIssuance(result),
+      manual: result.skipped === 'manual',
+      configRegenerated: Boolean(result.configRegenerated),
+      error: result.success ? null : failureReason(result),
+      summary: describeRenewal(result),
     });
   }
   return results;
@@ -363,14 +351,18 @@ export async function showSslManager() {
 
         const config = loadConfig();
         const spinner = ora(`Renewing certificate for ${selectedDomain}…`).start();
-        const result = await renewCert(selectedDomain, {
-          validationMethod: 'http',
-          email: config.acmeEmail,
-        });
+        const result = await renewCert(selectedDomain, { email: config.acmeEmail });
         spinner.stop();
 
         if (result.success) {
-          console.log(chalk.green('\n ✓ Renewed successfully\n'));
+          console.log(chalk.green('\n ✓ Renewed successfully'));
+          const summary = describeRenewal(result);
+          if (summary) console.log(chalk.gray(`   ${summary}`));
+          console.log();
+        } else if (result.skipped === 'manual') {
+          console.log(chalk.yellow('\n ⚠ This certificate cannot be renewed over HTTP'));
+          console.log(chalk.yellow(` ${result.error.cause}`));
+          console.log(chalk.gray(' Use "Create new certificate" with the DNS challenge to renew it.\n'));
         } else {
           const e = result.error;
           console.log(chalk.red('\n ✗ Renewal failed'));
@@ -389,9 +381,11 @@ export async function showSslManager() {
           console.log();
           for (const r of results) {
             if (r.success) {
-              console.log(` ${chalk.green('✓ ' + r.domain)}`);
+              console.log(` ${chalk.green('✓ ' + r.domain)}${r.summary ? chalk.gray(`  ${r.summary}`) : ''}`);
+            } else if (r.manual) {
+              console.log(` ${chalk.yellow('⚠ ' + r.domain)}${chalk.gray('  DNS-validated — renew it manually')}`);
             } else {
-              console.log(` ${chalk.red('✗ ' + r.domain)}`);
+              console.log(` ${chalk.red('✗ ' + r.domain)}${r.error ? chalk.gray(`  ${r.error}`) : ''}`);
             }
           }
           console.log();

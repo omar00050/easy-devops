@@ -1,7 +1,15 @@
 import { listAllCerts } from '../../core/cert-reader.js';
-import { issueCert, renewCert } from '../../cli/managers/ssl-manager.js';
+import { issueCert } from '../../cli/managers/ssl-manager.js';
+import {
+  renewCertificate,
+  describeRenewal,
+  describeCertificate,
+  getAutoRenewSettings,
+  getAutoRenewState,
+  autoRenewPlan,
+} from '../../core/cert-renewal.js';
 import { describeIssuance, prepareDomainForHttpChallenge } from '../../core/ssl-issuer.js';
-import { findDomain } from '../../core/domains-db.js';
+import { findDomain, getDomains } from '../../core/domains-db.js';
 import { loadConfig } from '../../core/config.js';
 import { promises as dns } from 'dns';
 
@@ -272,7 +280,38 @@ class SslController {
   async list(req, res, next) {
     try {
       const certs = await listAllCerts();
-      res.json(certs);
+
+      // Additive: what the background job intends for each certificate, so the
+      // UI can show "auto-renews" / "manual renewal" instead of leaving the
+      // operator to guess. Computed by the same function the job uses.
+      const config = loadConfig();
+      const settings = getAutoRenewSettings(config);
+      const domains = getDomains();
+      const state = getAutoRenewState();
+
+      const withPlan = await Promise.all(certs.map(async (cert) => {
+        let plan = 'off';
+        try {
+          const info = await describeCertificate(cert.domain);
+          plan = autoRenewPlan({ certDomain: cert.domain, info, settings, domains, sslDir: config.sslDir });
+        } catch { /* unreadable certificate: report it as not handled */ }
+
+        const last = state[cert.domain] ?? null;
+        return {
+          ...cert,
+          autoRenew: plan,
+          autoRenewDays: settings.days,
+          lastAutoRenew: last
+            ? {
+              at: last.lastAttemptAt ?? null,
+              result: last.lastResult ?? null,
+              error: last.lastError ?? null,
+            }
+            : null,
+        };
+      }));
+
+      res.json(withPlan);
     } catch (error) {
       next(error);
     }
@@ -296,22 +335,11 @@ class SslController {
         return res.status(404).json({ error: `Domain '${domain}' not found` });
       }
 
-      // Flow 1: a config generated before the ACME challenge location existed
-      // cannot answer the challenge. Regenerate it (reload only) and say so.
-      const domainRecord = findDomain(domain);
-      let prepared = null;
-      if (domainRecord) {
-        prepared = await prepareDomainForHttpChallenge(domainRecord);
-        if (!prepared.ok) {
-          return res.status(500).json({
-            error: 'challenge_setup_failed',
-            detail: prepared.error,
-            hint: 'nginx could not be prepared to answer the ACME challenge.',
-          });
-        }
-      }
-
-      const result = await renewCert(domain, { validationMethod: 'http', email: config.acmeEmail });
+      // renewCertificate() is the one renewal path (core/cert-renewal.js): it
+      // regenerates a config that predates the ACME challenge location, keeps
+      // the names the certificate already covers, and reloads nginx so the new
+      // certificate is the one being served.
+      const result = await renewCertificate(domain, { email: config.acmeEmail });
 
       if (result.success) {
         // Tell the UI how the challenge ran: proxy (nginx stayed up), or a
@@ -324,11 +352,27 @@ class SslController {
           fellBack: result.fellBack,
           nginxDownMs: result.nginxDownMs,
           staging: result.staging,
-          summary: describeIssuance(result),
+          nginxReloaded: result.nginxReloaded,
+          summary: describeRenewal(result),
+        });
+      }
+
+      if (result.skipped === 'manual') {
+        return res.status(409).json({
+          error: 'manual_renewal_required',
+          detail: result.error.cause,
+          hint: 'Create the certificate again from the SSL page using the DNS method.',
         });
       }
 
       const { step } = result.error;
+      if (step === 'challenge setup') {
+        return res.status(500).json({
+          error: 'challenge_setup_failed',
+          detail: result.error.cause,
+          hint: 'nginx could not be prepared to answer the ACME challenge.',
+        });
+      }
       if (step === 'port 80 check') {
         return res.status(409).json({
           error: 'port_busy',
@@ -358,27 +402,32 @@ class SslController {
       const results = [];
 
       for (const cert of expiring) {
-        // Same prepare step as a single renew: regenerate a config that
-        // predates the ACME challenge location so this renewal can use proxy
-        // mode, instead of silently falling back to stopping nginx.
-        const record = findDomain(cert.domain);
-        let prepared = null;
-        if (record) {
-          prepared = await prepareDomainForHttpChallenge(record);
-          if (!prepared.ok) {
-            results.push({
-              domain: cert.domain,
-              success: false,
-              certPath: null,
-              keyPath: null,
-              error: 'challenge_setup_failed',
-              detail: prepared.error,
-            });
-            continue;
-          }
+        const result = await renewCertificate(cert.domain, { email: config.acmeEmail });
+
+        if (!result.success && result.error?.step === 'challenge setup') {
+          results.push({
+            domain: cert.domain,
+            success: false,
+            certPath: null,
+            keyPath: null,
+            error: 'challenge_setup_failed',
+            detail: result.error.cause,
+          });
+          continue;
         }
 
-        const result = await renewCert(cert.domain, { validationMethod: 'http', email: config.acmeEmail });
+        if (result.skipped === 'manual') {
+          results.push({
+            domain: cert.domain,
+            success: false,
+            certPath: null,
+            keyPath: null,
+            error: 'manual_renewal_required',
+            detail: result.error.cause,
+          });
+          continue;
+        }
+
         results.push({
           domain: cert.domain,
           success: result.success,
@@ -387,8 +436,9 @@ class SslController {
           mode: result.mode,
           fellBack: result.fellBack,
           nginxDownMs: result.nginxDownMs,
-          configRegenerated: Boolean(prepared?.regenerated),
-          summary: describeIssuance(result),
+          configRegenerated: Boolean(result.configRegenerated),
+          nginxReloaded: result.nginxReloaded,
+          summary: describeRenewal(result),
         });
       }
 

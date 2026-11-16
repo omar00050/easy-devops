@@ -35,7 +35,7 @@ import { HubPanel } from '../components/settings/HubPanel';
 import { Card, CardBody, CardFooter, CardHeader } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { Button, buttonClasses } from '../components/ui/Button';
-import { FormGrid, Select, TextInput } from '../components/ui/Field';
+import { FormGrid, Select, Switch, TextInput } from '../components/ui/Field';
 import {
   ErrorState,
   InlineAlert,
@@ -69,7 +69,13 @@ interface GeneralDraft {
   nginxDir: string;
   sslDir: string;
   acmeEmail: string;
+  autoRenew: boolean;
+  autoRenewDays: string;
+  deployDir: string;
 }
+
+/** Used only when the backend predates the setting and sends no limits. */
+const AUTO_RENEW_FALLBACK = { days: 7, min: 1, max: 30 };
 
 interface AccessDraft {
   bind: string;
@@ -84,6 +90,9 @@ function toGeneralDraft(settings: Settings): GeneralDraft {
     nginxDir: settings.nginxDir,
     sslDir: settings.sslDir,
     acmeEmail: settings.acmeEmail,
+    autoRenew: settings.sslAutoRenew ?? true,
+    autoRenewDays: String(settings.sslAutoRenewDays ?? AUTO_RENEW_FALLBACK.days),
+    deployDir: settings.deployDir ?? '',
   };
 }
 
@@ -184,13 +193,39 @@ export function SettingsPage() {
     general && !general.nginxDir.trim() ? 'This directory is required.' : null;
   const sslDirError = general && !general.sslDir.trim() ? 'This directory is required.' : null;
 
+  const deployDirSupported = settings.data?.deployDir !== undefined;
+  const deployDirChanged =
+    Boolean(general) && deployDirSupported && general!.deployDir.trim() !== (settings.data?.deployDir ?? '');
+
+  // A backend older than the setting does not send it; the control is hidden
+  // rather than shown as something that would silently not save.
+  const autoRenewSupported = settings.data?.sslAutoRenew !== undefined;
+  const autoRenewMin = settings.data?.sslAutoRenewDaysMin ?? AUTO_RENEW_FALLBACK.min;
+  const autoRenewMax = settings.data?.sslAutoRenewDaysMax ?? AUTO_RENEW_FALLBACK.max;
+  const autoRenewDaysNumber = general ? Number(general.autoRenewDays) : NaN;
+  const autoRenewDaysError =
+    general &&
+    autoRenewSupported &&
+    general.autoRenew &&
+    (!/^\d+$/.test(general.autoRenewDays.trim()) ||
+      autoRenewDaysNumber < autoRenewMin ||
+      autoRenewDaysNumber > autoRenewMax)
+      ? `Enter a whole number from ${autoRenewMin} to ${autoRenewMax}.`
+      : null;
+
   const generalDirty = Boolean(
     general &&
       settings.data &&
       (Number(general.port) !== settings.data.dashboardPort ||
         general.nginxDir !== settings.data.nginxDir ||
         general.sslDir !== settings.data.sslDir ||
-        general.acmeEmail !== settings.data.acmeEmail)
+        general.acmeEmail !== settings.data.acmeEmail ||
+        (deployDirSupported && general.deployDir.trim() !== (settings.data.deployDir ?? '')) ||
+        (autoRenewSupported &&
+          (general.autoRenew !== (settings.data.sslAutoRenew ?? true) ||
+            (general.autoRenew &&
+              autoRenewDaysNumber !==
+                (settings.data.sslAutoRenewDays ?? AUTO_RENEW_FALLBACK.days)))))
   );
 
   const accessDirty = Boolean(
@@ -204,7 +239,7 @@ export function SettingsPage() {
   const saveGeneral = async () => {
     if (!general || savingGeneral) return;
     setGeneralTouched(true);
-    if (portError || emailError || nginxDirError || sslDirError) return;
+    if (portError || emailError || nginxDirError || sslDirError || autoRenewDaysError) return;
     setSavingGeneral(true);
     try {
       const result = await api.settings.update({
@@ -212,6 +247,17 @@ export function SettingsPage() {
         nginxDir: general.nginxDir.trim(),
         sslDir: general.sslDir.trim(),
         acmeEmail: general.acmeEmail.trim(),
+        // Sent only when edited, so saving another field never re-validates
+        // (or re-creates) the folder. Empty goes back to the default.
+        ...(deployDirChanged ? { deployDir: general.deployDir.trim() } : {}),
+        ...(autoRenewSupported
+          ? {
+              sslAutoRenew: general.autoRenew,
+              // The window is only sent while the switch is on: turning
+              // renewal off must not require a valid number in a hidden field.
+              ...(general.autoRenew ? { sslAutoRenewDays: autoRenewDaysNumber } : {}),
+            }
+          : {}),
       });
       setNeedsRestart(result.needsRestart);
       toast.success(
@@ -508,7 +554,64 @@ export function SettingsPage() {
                 className="font-mono"
                 spellCheck={false}
               />
+              {deployDirSupported && (
+                <TextInput
+                  label="Deployments folder"
+                  value={general.deployDir}
+                  onChange={(event) =>
+                    setGeneral({ ...general, deployDir: event.target.value })
+                  }
+                  hint={
+                    <>
+                      Where <strong className="font-medium">new</strong> deployed apps are created.
+                      Apps that already exist stay where they are — move one from its “Domain &
+                      folder” tab. Leave empty for the default
+                      {settings.data.deployDirDefault ? ` (${settings.data.deployDirDefault})` : ''}.
+                    </>
+                  }
+                  placeholder={settings.data.deployDirDefault}
+                  className="font-mono"
+                  spellCheck={false}
+                />
+              )}
             </FormGrid>
+            {autoRenewSupported && (
+              <div className="space-y-4 border-t border-line pt-5">
+                <Switch
+                  checked={general.autoRenew}
+                  onChange={(checked) => setGeneral({ ...general, autoRenew: checked })}
+                  label="Renew certificates automatically"
+                  description={
+                    <>
+                      The background service renews HTTP-validated certificates before they
+                      expire, without stopping nginx. Wildcard and other DNS-validated
+                      certificates need a TXT record added by hand, so they only get a warning.
+                    </>
+                  }
+                />
+                {general.autoRenew && (
+                  <FormGrid>
+                    <TextInput
+                      label="Renew this many days before expiry"
+                      type="number"
+                      min={autoRenewMin}
+                      max={autoRenewMax}
+                      inputMode="numeric"
+                      value={general.autoRenewDays}
+                      onChange={(event) =>
+                        setGeneral({ ...general, autoRenewDays: event.target.value })
+                      }
+                      error={generalTouched ? autoRenewDaysError : null}
+                      hint={
+                        general.acmeEmail.trim()
+                          ? 'A failed attempt is retried on the next check, and you are notified either way.'
+                          : 'Set an ACME email above — renewal cannot run without one.'
+                      }
+                    />
+                  </FormGrid>
+                )}
+              </div>
+            )}
           </CardBody>
           <CardFooter>
             <span className="text-2xs text-faint">

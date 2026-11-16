@@ -9,9 +9,13 @@ import {
 import { isLoopbackAddress } from '../lib/localRequest.js';
 import { hashPassword, validateNewPassword } from '../../core/passwords.js';
 import { validatePort, validateEmail } from '../../core/validators.js';
+import {
+	getAutoRenewSettings, normalizeAutoRenewDays, MIN_AUTO_RENEW_DAYS, MAX_AUTO_RENEW_DAYS,
+} from '../../core/cert-renewal.js';
 import { run, runWithStdin } from '../../core/shell.js';
 import { checkPermissionsConfigured } from '../../core/permissions.js';
 import { dbGet, dbSet } from '../../core/db.js';
+import { deployRoot, defaultDeployRoot, validateDeployDir } from '../../core/deploy/store.js';
 import { saveDomains } from '../../core/domains-db.js';
 import { loadChannels, saveChannels, sendNotification } from '../../core/notifier.js';
 
@@ -21,12 +25,24 @@ class SettingsController {
 			const config = loadConfig();
 			const { dashboardPort, nginxDir, sslDir, acmeEmail, dashboardBindAddress } = config;
 			const hasPassword = Boolean(config.dashboardPasswordHash || config.dashboardPassword);
+			const autoRenew = getAutoRenewSettings(config);
 			// Neither the password nor its hash is ever returned.
 			res.json({
 				dashboardPort,
 				nginxDir,
 				sslDir,
 				acmeEmail,
+				// Background renewal of HTTP-01 certificates (core/cert-renewal.js).
+				// The limits are published so no client hard-codes them.
+				sslAutoRenew: autoRenew.enabled,
+				sslAutoRenewDays: autoRenew.days,
+				sslAutoRenewDaysMin: MIN_AUTO_RENEW_DAYS,
+				sslAutoRenewDaysMax: MAX_AUTO_RENEW_DAYS,
+				// Where NEW deployed apps are created. Existing apps stay where they
+				// were created; moving one is an action on the Deployments page.
+				deployDir: deployRoot(),
+				deployDirDefault: defaultDeployRoot(),
+				deployDirIsDefault: !config.deployDir,
 				dashboardBindAddress,
 				bindsToLoopbackOnly: isLoopbackBind(dashboardBindAddress),
 				dashboardAuth: effectiveAuthMode(config),
@@ -49,7 +65,7 @@ class SettingsController {
 		try {
 			const {
 				dashboardPort, dashboardPassword, nginxDir, sslDir, acmeEmail, dashboardBindAddress,
-				dashboardAuth, dashboardUi,
+				dashboardAuth, dashboardUi, sslAutoRenew, sslAutoRenewDays, deployDir,
 			} = req.body;
 
 			const current = loadConfig();
@@ -132,6 +148,27 @@ class SettingsController {
 				if (emailError) return res.status(400).json({ error: emailError });
 			}
 
+			if (sslAutoRenew !== undefined && typeof sslAutoRenew !== 'boolean') {
+				return res.status(400).json({ error: 'sslAutoRenew must be true or false' });
+			}
+			if (sslAutoRenewDays !== undefined && normalizeAutoRenewDays(sslAutoRenewDays) === null) {
+				return res.status(400).json({
+					error: `Auto-renew days must be a whole number from ${MIN_AUTO_RENEW_DAYS} to ${MAX_AUTO_RENEW_DAYS}`,
+				});
+			}
+
+			// An empty value means "back to the default".
+			const resetDeployDir = deployDir === null || (typeof deployDir === 'string' && deployDir.trim() === '');
+			if (deployDir !== undefined && !resetDeployDir) {
+				const dirError = validateDeployDir(deployDir);
+				if (dirError) return res.status(400).json({ error: dirError });
+				try {
+					await fs.mkdir(path.resolve(deployDir.trim()), { recursive: true });
+				} catch (err) {
+					return res.status(400).json({ error: `That folder cannot be created or written to: ${err.message}` });
+				}
+			}
+
 			const currentConfig = current;
 			const updates = {};
 
@@ -154,6 +191,9 @@ class SettingsController {
 			if (nginxDir !== undefined) updates.nginxDir = nginxDir.trim();
 			if (sslDir !== undefined) updates.sslDir = sslDir.trim();
 			if (acmeEmail !== undefined) updates.acmeEmail = acmeEmail.trim();
+			if (deployDir !== undefined) updates.deployDir = resetDeployDir ? null : path.resolve(deployDir.trim());
+			if (sslAutoRenew !== undefined) updates.sslAutoRenew = sslAutoRenew;
+			if (sslAutoRenewDays !== undefined) updates.sslAutoRenewDays = normalizeAutoRenewDays(sslAutoRenewDays);
 
 			saveConfig({ ...currentConfig, ...updates });
 

@@ -54,6 +54,51 @@ export function buildChallengeLocation(port = DEFAULT_ACME_CHALLENGE_PORT) {
   ].join('\n');
 }
 
+/** Path prefix the deploy hook answers on. Shared with core/deploy/hookServer.js. */
+export const DEPLOY_HOOK_PATH = '/.ez-deploy/';
+
+/**
+ * Builds the location block that exposes the deploy hook through a domain.
+ *
+ * The hook listener binds to loopback; this is what lets GitHub Actions reach
+ * it over the domain's own HTTPS without opening another port. Only this one
+ * prefix is forwarded — nothing else on the listener, and nothing at all on
+ * the dashboard, becomes reachable.
+ *
+ * `X-Forwarded-For` is overwritten with `$remote_addr`, not appended to: the
+ * hook rate-limits failed attempts per client, and an appended header would
+ * let a caller choose its own identity.
+ *
+ * @param {number} port Loopback port of the deploy hook listener
+ * @returns {string} Indented nginx location block
+ */
+export function buildDeployHookLocation(port) {
+  return [
+    ` # Easy DevOps deploy hook — lets CI trigger a deployment over this domain.`,
+    ` location ^~ ${DEPLOY_HOOK_PATH} {`,
+    ` proxy_pass http://127.0.0.1:${Number(port)};`,
+    ` proxy_set_header Host $host;`,
+    ` proxy_set_header X-Forwarded-For $remote_addr;`,
+    ` proxy_set_header X-Forwarded-Proto $scheme;`,
+    ` client_max_body_size 16k;`,
+    ` }`,
+  ].join('\n');
+}
+
+/**
+ * The deploy hook port to expose on `domainName`, or null.
+ *
+ * @param {string} domainName
+ * @param {Object} config Result of loadConfig()
+ * @returns {number|null}
+ */
+export function deployHookPortFor(domainName, config) {
+  const hook = config?.deployHook;
+  if (!hook?.enabled || !hook.domain || hook.domain !== domainName) return null;
+  const port = Number(hook.port);
+  return Number.isInteger(port) && port > 0 && port < 65536 ? port : null;
+}
+
 /**
  * True when a config already contains an ACME challenge location.
  * Used to detect configs generated before this feature existed.
@@ -453,6 +498,14 @@ ${challengeLocation}
     mainBlock.push(` access_log ${logDir}/${name}.access.log;`);
   }
 
+  // The deploy hook, when this domain is the one chosen to expose it. It goes
+  // in the block that actually serves the site (443 with SSL on, 80 without),
+  // so the hook is reached over HTTPS whenever the domain has a certificate.
+  if (options.deployHookPort) {
+    mainBlock.push(``);
+    mainBlock.push(buildDeployHookLocation(options.deployHookPort));
+  }
+
   // ─── Location Block ─────────────────────────────────────────────────────────
   mainBlock.push(``);
   mainBlock.push(` location / {`);
@@ -540,11 +593,13 @@ ${challengeLocation}
  * @returns {Promise<string>} Path to the generated conf file
  */
 export async function generateConf(domain, options = {}) {
-  const { nginxDir, sslDir, acmeChallengePort } = loadConfig();
+  const config = loadConfig();
+  const { nginxDir, sslDir, acmeChallengePort } = config;
   const confDir = getConfDDir(nginxDir);
   const confPath = path.join(confDir, `${domain.name}.conf`);
   const confContent = buildConf(domain, nginxDir, sslDir, {
     acmeChallengePort,
+    deployHookPort: deployHookPortFor(domain.name, config),
     ...options,
   });
 

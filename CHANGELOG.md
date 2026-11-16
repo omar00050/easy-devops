@@ -9,6 +9,198 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### Deployments: domains, a configurable folder, moving an app, and an ez.json guide
+- **Link an app to a domain.** From the app's "Domain & folder" tab: a new name
+  is created, an existing domain is re-pointed at the app's port. It goes
+  through the same domain path as everything else (`handleHubDomainCommand`),
+  so nginx is tested and the previous config restored if it is rejected. A
+  certificate can be requested in the same step; if it cannot be issued the
+  link stands over HTTP and the answer says why. **A deployment that changes
+  the app's port moves the linked domain with it** — otherwise nginx would keep
+  proxying to a port nothing listens on.
+- **Deleting an app asks about its domain.** Unticked by default: the domain is
+  kept unless you say otherwise. If the domain cannot be removed the app is
+  still deleted, with a warning.
+- **The deployments folder is a setting** — `deployDir`, default
+  `<data dir>/ez_deploys`, in the dashboard and the CLI. **Changing it never
+  moves an existing app.** Each app records the folder it was created in and
+  keeps using it; apps created before this release stay in
+  `<data dir>/deploy/<id>` and are found there.
+- **Move an app.** Give a folder: the PM2 process is stopped (on Windows a
+  folder in use cannot be moved at all), the folder is moved to
+  `<folder>/<app>` — a rename, or a copy across disks — the new location is
+  recorded, each release's PM2 config is pointed at its new path, and the live
+  release is started again. If the move itself fails nothing has changed and
+  the process is started where it was. A destination that already has files in
+  it is refused.
+- **An ez.json tab** on every app: the file written out from what that app
+  deploys with today (copy or download), where to put it, what each field
+  means and what happens without it, and a non-Node example. The GitHub tab
+  gains a short "how it works".
+- All of it from the Hub too (`linkDomain`, `unlinkDomain`, `move`, `delete`
+  with `deleteDomain`), under `deploy.manage` — plus `domains.create` /
+  `domains.edit` to link and `domains.delete` to remove a domain, because
+  managing apps does not imply managing domains. No certificate is requested
+  from the Hub's link action; that stays `ssl.issue`.
+
+Contract 2.6.0.
+
+#### Deployments from the Hub, CI through the Hub, and automatic GitHub setup
+The second half of Deployments: everything the local dashboard can do, from the
+Hub, under permissions the server's owner sets — and two ways to stop copying
+things into GitHub by hand.
+
+- **A Deployments section on the Hub's server page.** The app list, deploy, roll
+  back, deployment logs, create/edit/delete an app, edit environment variables,
+  and the GitHub setup. Every action is a `hub:manageDeploy` command checked on
+  the server.
+- **Six new permissions, all off by default** (Settings → Hub): `deploy.run`,
+  `deploy.rollback`, `deploy.logs`, `deploy.manage`, `deploy.env`, `deploy.ci`.
+  Environment values are their own permission on purpose — "may create an app"
+  does not include "may read its secrets" — and creating or editing an app from
+  the Hub ignores `env` entirely.
+- **What the Hub is sent.** The app list is monitoring, like the process list,
+  and is the *public* view: names of environment variables, never values, and no
+  credentials. Values leave the server only through `getEnv`, to the person who
+  asked, and are not stored by the Hub. A deploy key cannot be generated from
+  the Hub at all: its private half never leaves the server.
+- **CI through the Hub ("option B").** A GitHub Action can call the Hub instead
+  of the server; the Hub forwards the request down the agent connection the
+  server already holds open, so the server needs **no inbound port and no public
+  domain**. The credential is the app's own deploy token and **the server
+  verifies it** — the Hub stores no token and cannot mint one. The workflow file
+  is identical to the direct one; only the `EZ_DEPLOY_URL` secret differs. The
+  dashboard's GitHub tab offers both and says which are usable.
+- **"Do it for me" on GitHub.** For a github.com repository the dashboard stores
+  both secrets, commits the workflow file and adds the deploy key read-only,
+  given a GitHub token with write access. Each step is reported on its own, so
+  a token that may write secrets but not workflows still gets the secrets in
+  place and the answer names the step that is left. The deploy token is issued
+  for the occasion, goes straight into the repository's secrets and is never
+  shown. The manual steps remain underneath.
+
+**Two new dependencies, by explicit decision:** `tweetnacl` and `blakejs`.
+GitHub only accepts a secret encrypted as a libsodium sealed box (X25519 +
+XSalsa20-Poly1305 with a BLAKE2b-derived nonce), which Node's crypto cannot
+produce. Both are small, pure JavaScript and dependency-free, and are used in
+`core/deploy/githubApi.js` only.
+
+Contract 2.5.0. In `hub_backend`: `routes/api/v1/hooks.ts`, `requestAgent()`
+and the `deploy:apps` relay in `agentServer.ts`.
+
+#### Deployments — put a project on the server and keep it deployed
+A new **Deployments** section in the dashboard. Give it a git repository; it is
+fetched and built on the server, run under PM2, and the previous release is
+kept one step away. All of it is `core/deploy/`, so the Hub can reach the same
+behaviour later without going through HTTP.
+
+- **One deployment:** fetch into `releases/<id>` → settings → `pre` hook →
+  install → build → stop the old process, start the new one (`ez-<name>`) →
+  health check → `post` hook → prune. **Nothing before the switch touches what
+  is running**, so a broken build costs nothing.
+- **Automatic rollback.** A release that starts but fails its health check is
+  replaced by the previous release — the same files that were running, not a
+  rebuild. Per app, on by default. A manual rollback to any release still on
+  disk is one click.
+- **`ez.json`, optional.** `install`, `build`, `start`, `port`, `health`,
+  `hooks.pre` / `hooks.post`, at `ez.json`, `deploy/ez.json` or
+  `.deploy/ez.json`. Without one, a Node project is deployed from
+  `package.json` (the lockfile picks npm, yarn or pnpm). With one, the commands
+  run exactly as written — **any language**. Values set on the app override it.
+  A mistake in the file stops the deployment before anything is touched.
+- **Private repositories:** a per-app SSH deploy key generated in-process (no
+  `ssh-keygen` needed; the private half is never returned by any endpoint), or
+  an access token passed to git as a per-command header so it is never written
+  into a checkout or a log.
+- **Environment variables** per app, stored on the server only.
+- **GitHub Actions.** The dashboard generates the workflow file and lists the
+  two secrets it needs. The workflow waits for the outcome, so a failed
+  deployment is a red check on the commit. It uses no third-party actions.
+- **The deploy hook** that the workflow calls is a separate, opt-in listener
+  (`core/deploy/hookServer.js`) that runs with the background jobs — the
+  dashboard is on demand, and a deployment trigger cannot be. It is **off by
+  default**, binds to loopback, and serves only `/.ez-deploy/`. Expose it
+  through one of your domains (one nginx location, HTTPS when the domain has a
+  certificate) or directly on its own port (plain HTTP, and the UI says so).
+  Each app has its own token — 256 random bits, stored as a hash, shown once —
+  that can start a deployment of that app from its configured repository and
+  nothing else. Failed attempts are rate-limited per client, and an unknown app
+  is indistinguishable from a wrong token.
+- One deployment per app at a time, enforced by a lock file, because the
+  dashboard and the background service are different processes.
+- Contract 2.4.0 (`/api/deployments/*`), `e2e/deploy.test.mjs`.
+
+**This reverses one earlier decision, deliberately:** the daemon used to open no
+port at all. It still opens none unless the deploy hook is switched on.
+
+**Not in this release:** zero-downtime switching (the switch is a restart),
+static sites served straight from nginx, creating the GitHub secrets through
+GitHub's API (it needs libsodium sealed boxes — a new dependency, so a
+decision), and triggering deployments from the Hub.
+
+`core/shell.js` gained `runCommandLine()` for commands a user wrote (it runs
+them in the platform's default shell, where `&&` works on Windows too), and
+`run()` accepts `env` and `onData`. `core/runner.js` gained `startConfig()`.
+
+#### Automatic certificate renewal
+A certificate used to be renewed only when someone pressed a button. The daemon
+watched expiry and warned about it — twice a day, from 30 days out — but did
+nothing, so an unattended server still served an expired certificate.
+
+- **HTTP-01 certificates are now renewed in the background, 7 days before they
+  expire.** `sslAutoRenew` (default on) and `sslAutoRenewDays` (default 7, 1–30)
+  are in Settings in the dashboard and the CLI, and need no restart. An install
+  that predates the setting reads as on.
+- **An unattended renewal never stops nginx.** `sslChallengeMode: auto` may fall
+  back to standalone mode, which is fine when someone is watching and not fine
+  at an arbitrary hour on every site the server hosts. On a running nginx the
+  job is pinned to proxy mode: if the local preflight fails, the attempt fails
+  and a notification says why. An explicit `standalone` setting is still
+  respected.
+- **DNS-01 certificates — every wildcard — are not renewed automatically.** They
+  need a TXT record a person adds. They keep the expiry warning, which now says
+  they must be renewed manually.
+- **A certificate no enabled domain serves is left alone.** Leftovers in the
+  certificate directory usually no longer point here, and retrying them would
+  spend Let's Encrypt's failed-validation budget on certificates nobody uses.
+- **Attempts are spaced at least 6 hours apart, and the attempt is written down
+  before issuance starts.** The job also runs at every daemon start; without
+  this a crash-looping service would retry a failing domain on every restart.
+- **You are told either way.** "Renewed" and "renewal failed: <reason>" go to
+  the channels already configured for that domain's `cert_expiry` event.
+- **The expiry warning stops repeating for certificates that are covered.** One
+  that will be auto-renewed is not warned about until it is inside its window
+  and still not renewed. Unused, DNS-01 and (with the setting off) all
+  certificates are warned about exactly as before.
+- `GET /api/ssl` reports each certificate's plan (`autoRenew`: `auto` | `manual`
+  | `unused` | `off`) and last attempt; the SSL page shows it. Contract 2.3.0.
+
+All of it is `core/cert-renewal.js`, with `e2e/cert-renewal.test.mjs` covering
+the decisions against real certificates and injected issuance.
+
+### Fixed
+
+- **A renewal dropped `www`.** Every renew path — dashboard, CLI, Hub —
+  re-issued for the bare domain, so a certificate issued with `www` came back
+  without `www.example.com`. The names are now read from the certificate being
+  replaced.
+- **nginx kept serving the old certificate after a renewal.** Proxy mode never
+  stops nginx, and nothing reloaded it either. It is reloaded now, and the
+  result reports `nginxReloaded`.
+- **"Renew" on a wildcard replaced it with a single-name certificate.** It is
+  refused with `manual_renewal_required` instead.
+- **The Hub showed every enabled domain as healthy.** The agent sent the
+  `enabled` flag as the health result. It now sends the real probe result from
+  the monitors, with `enabled` as its own field; the Hub no longer infers one
+  from the other (it still does for an older agent, which has no other way to
+  say it).
+- **`Metric.nginxStatus` was always `unknown`** in the Hub. It records the last
+  state the agent reported on that connection.
+- `core/cert-operations.js` no longer imports from `cli/` — it calls
+  `core/ssl-issuer.js` and `core/cert-renewal.js` directly.
+
+### Added (earlier in this cycle)
+
 #### `ezz runtime update` — move the service onto a newer Node, safely
 The service is pinned to one Node binary on purpose, so upgrading Node never
 reached it: it kept running the old binary until something re-pointed it by
@@ -435,6 +627,45 @@ DevOps manages PM2 on your behalf and never implements its own daemon.
   so `ezz service install` can be dispatched.
 
 ### Fixed
+
+- **`GET /api/service` took about 20 seconds on Windows.** Nothing in it was
+  slow by itself; it was the spawn count. Measured on the machine that reported
+  it: one `run()` through PowerShell costs **0.9–1.4 s**, `where.exe pm2` 2.0 s,
+  `pm2 --version` 4.0 s, `schtasks /Query` 1.7 s — and the endpoint made about
+  six of them, one after another (the service manager's status, the pinned
+  runtime's `--version`, the legacy PM2 scan, which itself detects PM2 and lists
+  its apps, and PM2 detection again for the Processes panel).
+
+  Three changes, in order of how much each is worth:
+
+  - **The expensive probes are cached and refreshed in the background**
+    (`core/probeCache.js`). A request is answered from the cache, even a stale
+    answer, and the refresh happens behind it; only a probe that has never run
+    can make a request wait, and then only until a deadline. These probes
+    describe things that change when the user runs a command — whether PM2 is
+    installed, which Node the service is pinned to — never on their own.
+  - **The probes that do run, run in parallel.** Five spawns sequentially cost
+    ~6 s on that machine; the same five together cost ~1.7 s. This also speeds
+    up `ezz service status` in the terminal, which deliberately does **not**
+    use the cache: 7.5 s to about 2 s.
+  - **The cheap state is served immediately.** The daemon lock, its heartbeat
+    age, whether a stop was requested and what install recorded cost
+    microseconds, and they are the facts that change on their own. They are
+    read fresh on every request and never cached.
+
+  Measured after the change: a warm call **3 ms**, the first call after start
+  **1.6 s** — and the dashboard warms the probes when it starts, so in practice
+  the first page load is warm too. The cache is dropped whenever the answer
+  could have changed: the three lifecycle endpoints, `ezz service install`,
+  `uninstall` and `repair`, a runtime update, and `service:changed`, which
+  covers a start or stop made in another process. A per-probe TTL is the
+  backstop for a change made outside Easy DevOps, such as `sc stop`.
+
+  `GET /api/service` gained a `probes` object (`ageMs`, `fresh`, `pending`,
+  `refreshing`) so a client can tell a measured answer from one still being
+  measured. While `pending` is true only the measured fields are absent —
+  `state`, `enabledOnBoot`, `restarts`, `crashLooping`, `runtime` — and
+  everything the banner needs is already real. Contract 2.2.0.
 
 - **`install.sh` could not find its own modules, from a clone or from
   `curl | bash`.** It looked for them at `lib/installer`, which exists neither in

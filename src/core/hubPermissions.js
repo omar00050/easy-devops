@@ -81,6 +81,19 @@ export const PERMISSION_TREE = Object.freeze([
     ],
   },
   {
+    id: 'deploy',
+    label: 'Deployments',
+    description: 'Deploy the apps on this server from the Hub. Fetching code and running its commands happens here, with this server’s own settings.',
+    children: [
+      { id: 'deploy.run', label: 'Deploy', description: 'Start a deployment of an existing app from its configured repository.' },
+      { id: 'deploy.rollback', label: 'Roll back', description: 'Switch an app back to an earlier release that is still on this server.' },
+      { id: 'deploy.logs', label: 'View deployment logs', description: 'Read the output of a deployment. Build output can contain whatever the build prints.' },
+      { id: 'deploy.manage', label: 'Create, edit and delete apps', description: 'Add an app from a repository, change its settings, issue its deploy token, or remove it. This decides which code runs here.' },
+      { id: 'deploy.env', label: 'Read and edit environment variables', description: 'See and change an app’s environment values. They pass through the Hub while being edited and are not stored there.' },
+      { id: 'deploy.ci', label: 'Deploy from CI through the Hub', description: 'Let a GitHub Action trigger a deployment by calling the Hub with the app’s own deploy token, so this server needs no inbound port.' },
+    ],
+  },
+  {
     id: 'process',
     label: 'Processes',
     description: 'Control the PM2 processes on this server, including the Easy DevOps service itself.',
@@ -344,6 +357,35 @@ export function permissionForCommand(command, payload = {}) {
       };
       return map[payload?.action] ?? undefined;
     }
+
+    case 'hub:manageDeploy': {
+      const map = {
+        // Listing the apps and their status is monitoring, like the process
+        // list: a paired server is a monitored server. No secrets are in it.
+        list: null,
+        detail: null,
+        github: null,
+        deploy: 'deploy.run',
+        rollback: 'deploy.rollback',
+        run: 'deploy.logs',
+        create: 'deploy.manage',
+        update: 'deploy.manage',
+        delete: 'deploy.manage',
+        issueToken: 'deploy.manage',
+        linkDomain: 'deploy.manage',
+        unlinkDomain: 'deploy.manage',
+        move: 'deploy.manage',
+        getEnv: 'deploy.env',
+        setEnv: 'deploy.env',
+      };
+      const action = payload?.action;
+      return Object.prototype.hasOwnProperty.call(map, action) ? map[action] : undefined;
+    }
+
+    // Not dispatchable by a Hub user: only the Hub's CI endpoint sends it, and
+    // the app's own deploy token is verified here, on the server.
+    case 'hub:deployHook':
+      return 'deploy.ci';
 
     case 'hub:getConfigs':
       return 'nginx.config.view';

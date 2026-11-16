@@ -327,6 +327,29 @@ export function SslPage() {
                                     : `${cert.daysLeft}d`
                                   : formatDaysLeft(cert.daysLeft)}
                               </span>
+                              {cert.autoRenew && cert.autoRenew !== 'off' && (
+                                <>
+                                  <span className="text-faint" aria-hidden="true">
+                                    ·
+                                  </span>
+                                  <span
+                                    title={
+                                      cert.autoRenew === 'auto'
+                                        ? 'The background service renews this certificate on its own.'
+                                        : cert.autoRenew === 'manual'
+                                          ? 'DNS-validated (wildcard) certificates need a TXT record added by hand, so they are not renewed automatically.'
+                                          : 'No enabled domain serves this certificate, so it is not renewed automatically.'
+                                    }
+                                    className={cert.autoRenew === 'manual' ? 'text-warn' : undefined}
+                                  >
+                                    {cert.autoRenew === 'auto'
+                                      ? `Auto-renews ${cert.autoRenewDays ?? 7}d before expiry`
+                                      : cert.autoRenew === 'manual'
+                                        ? 'Manual renewal (DNS)'
+                                        : 'Not in use'}
+                                  </span>
+                                </>
+                              )}
                             </>
                           )}
                         </div>

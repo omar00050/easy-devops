@@ -2,7 +2,8 @@
  * core/jobs/monitors.js
  *
  * The background monitoring that used to live inside the dashboard's socket
- * layer: nginx status, per-domain backend health and certificate expiry.
+ * layer: nginx status, per-domain backend health, certificate expiry — and,
+ * since it has to run where no browser is open, automatic certificate renewal.
  *
  * Moved here so it can run in the daemon with no HTTP server anywhere near it.
  * The behaviour is the same, with two deliberate changes:
@@ -22,6 +23,14 @@ import http from 'http';
 import { getStatus } from '../nginx-service.js';
 import { listAllCerts } from '../cert-reader.js';
 import { dbGet } from '../db.js';
+import { loadConfig } from '../config.js';
+import { getDomains } from '../domains-db.js';
+import {
+  runAutoRenewal,
+  describeCertificate,
+  getAutoRenewSettings,
+  autoRenewPlan,
+} from '../cert-renewal.js';
 import {
   createNginxDownEvent,
   createNginxRecoveredEvent,
@@ -109,16 +118,17 @@ export function probeBackend(host, port) {
 }
 
 /**
- * Probes every configured domain, publishes the list, and notifies on each
- * domain's transitions.
+ * Probes a list of domains and returns the results. Pure measurement: nothing
+ * is published and nobody is notified, so a caller that only wants the answer
+ * (the Hub agent, before the first scheduled sweep) can ask without side
+ * effects.
  *
+ * @param {Array<Object>} domains
  * @returns {Promise<Array<{ name: string, up: boolean|null, port?: number, host?: string }>>}
  */
-export async function checkDomainHealth() {
-  const domains = dbGet('domains') || [];
-
-  const results = await Promise.all(
-    domains.map(async (d) => {
+export function probeDomains(domains) {
+  return Promise.all(
+    (domains ?? []).map(async (d) => {
       const host = d.backendHost || '127.0.0.1';
       const port = d.port || 80;
 
@@ -130,6 +140,35 @@ export async function checkDomainHealth() {
       return { name: d.name, up, port, host };
     }),
   );
+}
+
+/**
+ * The most recent sweep, kept so the Hub agent can report REAL health.
+ *
+ * The agent used to send `up: d.enabled` — the enabled flag dressed up as a
+ * health result — so the Hub showed every enabled domain as healthy whether
+ * its backend answered or not. It runs in the same process as these monitors
+ * (core/jobs/index.js starts both), so it reads the sweep rather than probing
+ * every backend a second time.
+ */
+let lastDomainHealth = null;
+
+/** @returns {{ at: number, results: Array<Object> }|null} */
+export function getLastDomainHealth() {
+  return lastDomainHealth;
+}
+
+/**
+ * Probes every configured domain, publishes the list, and notifies on each
+ * domain's transitions.
+ *
+ * @returns {Promise<Array<{ name: string, up: boolean|null, port?: number, host?: string }>>}
+ */
+export async function checkDomainHealth() {
+  const domains = dbGet('domains') || [];
+
+  const results = await probeDomains(domains);
+  lastDomainHealth = { at: Date.now(), results };
 
   publish('domain:health', results);
 
@@ -177,14 +216,38 @@ export async function checkCertExpiry() {
     return events;
   }
 
+  const config = loadConfig();
+  const settings = getAutoRenewSettings(config);
+  // Migrated records, the same ones the renewal job reads, so the two cannot
+  // reach different conclusions about whether a certificate is in use.
+  const domains = getDomains();
+
   for (const cert of certs) {
     if (cert.daysLeft === null || cert.daysLeft >= CERT_WARN_DAYS) continue;
+
+    // What auto-renewal intends for this certificate decides what the warning
+    // should say, and whether it is worth sending yet.
+    let plan = 'off';
+    try {
+      const info = await describeCertificate(cert.domain);
+      plan = autoRenewPlan({ certDomain: cert.domain, info, settings, domains, sslDir: config.sslDir });
+    } catch { /* unreadable: warn as before */ }
+
+    // A certificate that WILL be renewed in the background, and has not
+    // reached its renewal window yet, is not a problem to report: warning
+    // twice a day for three weeks about something that is already handled
+    // only teaches people to ignore the channel. Once it is inside the window
+    // and still not renewed, the renewal has failed and the warning returns
+    // alongside the failure notification.
+    if (plan === 'auto' && cert.daysLeft > settings.days) continue;
 
     // The socket layer built this event inline, duplicating a factory that
     // already existed in core/events.js with the identical shape. Using the
     // factory keeps the payload in one place, next to the others the contract
     // documents.
-    const event = createCertExpiryEvent(cert.domain, cert.daysLeft);
+    const event = createCertExpiryEvent(cert.domain, cert.daysLeft, {
+      manualRenewal: plan === 'manual',
+    });
 
     publish('notification:new', event);
     events.push(event);
@@ -197,6 +260,28 @@ export async function checkCertExpiry() {
   }
 
   return events;
+}
+
+// ─── certificate renewal ──────────────────────────────────────────────────────
+
+/**
+ * Renews HTTP-01 certificates that are inside the configured window
+ * (`sslAutoRenew`, `sslAutoRenewDays` — 7 days by default).
+ *
+ * The decisions live in core/cert-renewal.js; this only gives the job a place
+ * in the schedule and routes its notifications the same way the expiry warning
+ * is routed, so a domain's `cert_expiry` channels receive "renewed" and
+ * "renewal failed" without any new configuration.
+ *
+ * @returns {Promise<Object>} runAutoRenewal()'s summary
+ */
+export async function checkCertRenewal() {
+  return runAutoRenewal({
+    onEvent: async (event, domain) => {
+      publish('notification:new', event);
+      await sendNotification(event, getEffectiveChannelIds(domain, 'cert_expiry'));
+    },
+  });
 }
 
 // ─── lifecycle ────────────────────────────────────────────────────────────────
@@ -242,7 +327,17 @@ export function startMonitors({ runImmediately = true, intervals = {} } = {}) {
 
   const runNginx = guarded('nginx status', checkNginx);
   const runDomains = guarded('domain health', checkDomainHealth);
-  const runCerts = guarded('cert expiry', checkCertExpiry);
+  // Renewal first, then the expiry check: a certificate that was just renewed
+  // must not also be warned about in the same pass. Each half is isolated so a
+  // failure in renewal can never silence the warning it would have prevented.
+  const runCerts = guarded('certificates', async () => {
+    try {
+      await checkCertRenewal();
+    } catch (err) {
+      console.error('[jobs/monitors] cert renewal failed:', err.message);
+    }
+    await checkCertExpiry();
+  });
 
   timers.push(setInterval(runNginx, every.nginx));
   timers.push(setInterval(runDomains, every.domains));

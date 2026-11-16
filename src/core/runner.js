@@ -244,6 +244,23 @@ export async function start({ script, name, args = [], cwd, run = defaultRun, pm
   return { ok: r.success, output: combine(r) };
 }
 
+/**
+ * Starts the app(s) described by a PM2 config file.
+ *
+ * This is how a deployed project is started (core/deploy/engine.js): a config
+ * file carries the working directory, the arguments and the environment, none
+ * of which survive being squeezed onto a command line on both platforms. PM2
+ * recognises the file as a config by its `.json` extension.
+ *
+ * @param {string} file Absolute path to the config file
+ * @param {{ run?: Function, pm2Path?: string }} [deps]
+ * @returns {Promise<{ ok: boolean, output: string }>}
+ */
+export async function startConfig(file, { run = defaultRun, pm2Path = 'pm2' } = {}) {
+  const r = await run(`${quoteExe(pm2Path)} start "${file}"`, { timeout: PM2_TIMEOUT_MS });
+  return { ok: r.success, output: combine(r) };
+}
+
 /** @returns {Promise<{ ok: boolean, output: string }>} */
 export async function stop(name, { run = defaultRun, pm2Path = 'pm2' } = {}) {
   return simple('stop', name, run, pm2Path);

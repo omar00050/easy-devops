@@ -16,6 +16,7 @@ import { loadConfig } from '../config.js';
 import { run } from '../shell.js';
 import { getStatus, start as nginxStart, stop as nginxStop, restart as nginxRestart, test as nginxTest, reload as nginxReload, listConfigs, getConfig, saveConfig, getLogs } from '../nginx-service.js';
 import { publish } from '../jobs/bus.js';
+import { getLastDomainHealth, probeDomains, DOMAIN_HEALTH_POLL_MS } from '../jobs/monitors.js';
 import { isWindows, platformName, isDevDataDir } from '../platform.js';
 import { listAllCerts } from '../cert-reader.js';
 import { backgroundServiceState } from '../service/index.js';
@@ -123,7 +124,21 @@ async function pushDomainHealth() {
   if (!socket?.connected) return;
   try {
     const domains = dbGet('domains') || [];
-    socket.emit('domain:health', domains.map(d => ({ name: d.name, up: d.enabled ?? true })));
+
+    // Real probe results, not the enabled flag. The monitors sweep every
+    // minute in this same process; reuse that sweep while it is fresh, and
+    // probe directly only when there is none yet (first push after a start).
+    const last = getLastDomainHealth();
+    const fresh = last && Date.now() - last.at < 3 * DOMAIN_HEALTH_POLL_MS;
+    const results = fresh ? last.results : await probeDomains(domains.filter(d => d.enabled !== false));
+    const upByName = new Map(results.map(r => [r.name, r.up]));
+
+    // `enabled` travels separately so the Hub never has to infer it from
+    // health. A disabled domain has no health to report: `up: null`.
+    socket.emit('domain:health', domains.map(d => {
+      const enabled = d.enabled !== false;
+      return { name: d.name, enabled, up: enabled ? (upByName.get(d.name) ?? null) : null };
+    }));
   } catch { /* non-fatal */ }
 }
 
@@ -427,6 +442,45 @@ async function handleManageSSL(payload) {
   });
 }
 
+/**
+ * Reports the deployed apps and where each one stands.
+ *
+ * Monitoring, like the process list: a paired server is a monitored server.
+ * publicApp() is what makes that safe — environment variable NAMES, never
+ * values, and no credentials of any kind.
+ */
+async function pushDeployApps() {
+  if (!socket?.connected) return;
+  try {
+    const { describeApps } = await import('../deploy/status.js');
+    const { publicApp } = await import('../deploy/apps.js');
+    socket.emit('deploy:apps', await describeApps({ view: publicApp }));
+  } catch { /* non-fatal */ }
+}
+
+async function handleManageDeploy(payload) {
+  return runCommand('hub:manageDeploy', payload, async (p) => {
+    const { handleHubDeployCommand } = await import('../deploy/hubCommands.js');
+    try {
+      return await handleHubDeployCommand(p, { onFinished: () => { pushDeployApps(); } });
+    } finally {
+      // Whatever the action was, the list is the thing that may have changed.
+      if (!['list', 'detail', 'run', 'github', 'getEnv'].includes(p?.action)) pushDeployApps();
+      // Linking or deleting with a domain changes the domain list too.
+      if (['linkDomain', 'delete'].includes(p?.action)) { pushDomainConfigs(); pushDomainHealth(); notifyLocalDashboard('domains'); }
+    }
+  });
+}
+
+async function handleDeployHook(payload) {
+  return runCommand('hub:deployHook', payload, async (p) => {
+    const { handleHubDeployHook } = await import('../deploy/hubCommands.js');
+    const result = await handleHubDeployHook(p, { onFinished: () => { pushDeployApps(); } });
+    if (result?.started) pushDeployApps();
+    return result;
+  });
+}
+
 // ─── Permission + revision sync ───────────────────────────────────────────────
 
 /**
@@ -507,6 +561,9 @@ function startHeartbeats() {
   // Both of these shell out to PM2, so they are deliberately infrequent.
   intervals.push(setInterval(pushServiceState, 5 * 60_000));
   intervals.push(setInterval(pushProcesses, 60_000));
+  // A deployment can be started from the dashboard or by CI, in another
+  // process, so the Hub learns about it from this rather than from an event.
+  intervals.push(setInterval(pushDeployApps, 20_000));
   // Cheap shared signal so CLI-side changes reach the Hub in seconds.
   intervals.push(setInterval(checkRevision, REVISION_POLL_MS));
   // Push immediately on connect
@@ -519,6 +576,7 @@ function startHeartbeats() {
   pushPermissions();
   pushServiceState();
   pushProcesses();
+  pushDeployApps();
 }
 
 function stopHeartbeats() {
@@ -669,6 +727,8 @@ export function initHubAgent() {
   self.on('hub:getConfigs', handleGetConfigs);
   self.on('hub:saveConfig', handleSaveConfig);
   self.on('hub:getLogs', handleGetLogs);
+  self.on('hub:manageDeploy', handleManageDeploy);
+  self.on('hub:deployHook', handleDeployHook);
 }
 
 /**

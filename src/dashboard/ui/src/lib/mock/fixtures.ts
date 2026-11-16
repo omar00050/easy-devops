@@ -159,8 +159,8 @@ export function seedDomains(): Domain[] {
 
 export function seedCertificates(): Certificate[] {
   return [
-    { domain: 'app.example.com', expiry: isoDaysFromNow(95), daysLeft: 95, status: 'valid' },
-    { domain: 'api.example.com', expiry: isoDaysFromNow(12), daysLeft: 12, status: 'expiring' },
+    { domain: 'app.example.com', expiry: isoDaysFromNow(95), daysLeft: 95, status: 'valid', autoRenew: 'auto', autoRenewDays: 7 },
+    { domain: 'api.example.com', expiry: isoDaysFromNow(12), daysLeft: 12, status: 'expiring', autoRenew: 'manual', autoRenewDays: 7 },
     { domain: 'legacy.example.com', expiry: isoDaysFromNow(-3), daysLeft: -3, status: 'expired' },
     { domain: 'broken.example.com', expiry: null, daysLeft: null, status: 'error' },
   ];
@@ -433,6 +433,13 @@ export function seedSettings(): Settings {
     nginxDir: '/etc/nginx',
     sslDir: '/etc/easy-devops/ssl',
     acmeEmail: 'ops@example.com',
+    sslAutoRenew: true,
+    sslAutoRenewDays: 7,
+    sslAutoRenewDaysMin: 1,
+    sslAutoRenewDaysMax: 30,
+    deployDir: '/home/ops/.config/easy-devops/ez_deploys',
+    deployDirDefault: '/home/ops/.config/easy-devops/ez_deploys',
+    deployDirIsDefault: true,
     dashboardBindAddress: '127.0.0.1',
     bindsToLoopbackOnly: true,
     dashboardAuth: 'password',
@@ -486,6 +493,20 @@ export const PERMISSION_TREE: PermissionGroup[] = [
           'Wildcard certificates need a DNS TXT record you add by hand, so they cannot be driven from the Hub yet.',
         comingSoon: true,
       },
+    ],
+  },
+  {
+    id: 'deploy',
+    label: 'Deployments',
+    description:
+      'Deploy the apps on this server from the Hub. Fetching code and running its commands happens here, with this server’s own settings.',
+    children: [
+      { id: 'deploy.run', label: 'Deploy', description: 'Start a deployment of an existing app from its configured repository.' },
+      { id: 'deploy.rollback', label: 'Roll back', description: 'Switch an app back to an earlier release that is still on this server.' },
+      { id: 'deploy.logs', label: 'View deployment logs', description: 'Read the output of a deployment. Build output can contain whatever the build prints.' },
+      { id: 'deploy.manage', label: 'Create, edit and delete apps', description: 'Add an app from a repository, change its settings, issue its deploy token, or remove it. This decides which code runs here.' },
+      { id: 'deploy.env', label: 'Read and edit environment variables', description: 'See and change an app’s environment values. They pass through the Hub while being edited and are not stored there.' },
+      { id: 'deploy.ci', label: 'Deploy from CI through the Hub', description: 'Let a GitHub Action trigger a deployment by calling the Hub with the app’s own deploy token, so this server needs no inbound port.' },
     ],
   },
   {

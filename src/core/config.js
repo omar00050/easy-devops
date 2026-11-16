@@ -83,6 +83,15 @@ const DEFAULTS = {
     acmeChallengePort: 8089,
     sslChallengeMode: 'auto',
     acmeStaging: false,
+    // Renew HTTP-01 certificates in the background once they are this close
+    // to expiry. See core/cert-renewal.js.
+    sslAutoRenew: true,
+    sslAutoRenewDays: 7,
+    // The deploy hook: a small listener GitHub Actions can call to trigger a
+    // deployment. Off until the user turns it on. See core/deploy/hookServer.js.
+    deployHook: { enabled: false, port: 6445, bind: BIND_LOOPBACK, domain: null },
+    // Folder NEW deployed apps are created in. null = <data dir>/ez_deploys.
+    deployDir: null,
     os: 'linux',
   },
   win32: {
@@ -102,6 +111,13 @@ const DEFAULTS = {
     acmeChallengePort: 8089,
     sslChallengeMode: 'auto',
     acmeStaging: false,
+    sslAutoRenew: true,
+    sslAutoRenewDays: 7,
+    // The deploy hook: a small listener GitHub Actions can call to trigger a
+    // deployment. Off until the user turns it on. See core/deploy/hookServer.js.
+    deployHook: { enabled: false, port: 6445, bind: BIND_LOOPBACK, domain: null },
+    // Folder NEW deployed apps are created in. null = <data dir>/ez_deploys.
+    deployDir: null,
     os: 'win32',
   },
 };

@@ -12,17 +12,11 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { loadConfig } from './config.js';
-import { describeIssuance, prepareDomainForHttpChallenge } from './ssl-issuer.js';
+import { describeIssuance, issueCertificate, prepareDomainForHttpChallenge } from './ssl-issuer.js';
+import { renewCertificate, describeRenewal, failureReason } from './cert-renewal.js';
 import { bumpHubRevision } from './hubLink.js';
 import { listAllCerts } from './cert-reader.js';
 import { getDomains, findDomain } from './domains-db.js';
-
-let sslManager = null;
-
-async function getSslManager() {
-  if (!sslManager) sslManager = await import('../../cli/managers/ssl-manager.js');
-  return sslManager;
-}
 
 /** Shape shared by every SSL result so the Hub can render it uniformly. */
 function issuanceResult(domain, result) {
@@ -35,6 +29,21 @@ function issuanceResult(domain, result) {
     nginxDownMs: result?.nginxDownMs ?? 0,
     staging: Boolean(result?.staging),
     summary: describeIssuance(result),
+  };
+}
+
+/**
+ * The same shape for a renewal, which additionally reports whether nginx was
+ * reloaded onto the new certificate and whether the renewal was refused
+ * because the certificate needs a manual DNS-01 renewal.
+ */
+function renewalResult(domain, result) {
+  return {
+    ...issuanceResult(domain, result),
+    error: result?.success ? null : failureReason(result),
+    summary: describeRenewal(result),
+    nginxReloaded: result?.nginxReloaded ?? null,
+    manual: result?.skipped === 'manual',
   };
 }
 
@@ -67,12 +76,11 @@ export async function handleHubSslCommand(payload) {
       if (!domain) return { ok: false, error: 'domain is required' };
       if (!config.acmeEmail) return { ok: false, error: 'No acmeEmail configured on this server.' };
 
-      const prep = await prepare(domain);
-      if (!prep.ok) return { ok: false, error: `Challenge setup failed: ${prep.error}` };
-
-      const { renewCert } = await getSslManager();
-      const result = await renewCert(domain, { validationMethod: 'http', email: config.acmeEmail });
-      const out = issuanceResult(domain, result);
+      // renewCertificate() keeps the names the certificate already covers
+      // (a `www` certificate stays a `www` certificate), prepares the nginx
+      // config, and reloads nginx afterwards.
+      const result = await renewCertificate(domain, { email: config.acmeEmail });
+      const out = renewalResult(domain, result);
       if (out.ok) bumpHubRevision();
       console.log('[hubAgent] ssl renew:', domain, out.ok ? 'OK' : 'FAILED', '—', out.summary || out.error);
       return out;
@@ -86,17 +94,11 @@ export async function handleHubSslCommand(payload) {
       const expiring = certs.filter((c) => c.daysLeft !== null && c.daysLeft < 30);
       if (expiring.length === 0) return { ok: true, renewed: [], message: 'Nothing is expiring within 30 days.' };
 
-      const { renewCert } = await getSslManager();
       const renewed = [];
 
       for (const cert of expiring) {
-        const prep = await prepare(cert.domain);
-        if (!prep.ok) {
-          renewed.push({ ok: false, domain: cert.domain, error: `Challenge setup failed: ${prep.error}` });
-          continue;
-        }
-        const result = await renewCert(cert.domain, { validationMethod: 'http', email: config.acmeEmail });
-        renewed.push(issuanceResult(cert.domain, result));
+        const result = await renewCertificate(cert.domain, { email: config.acmeEmail });
+        renewed.push(renewalResult(cert.domain, result));
       }
 
       bumpHubRevision();
@@ -125,8 +127,7 @@ export async function handleHubSslCommand(payload) {
       const prep = await prepare(domain);
       if (!prep.ok) return { ok: false, error: `Challenge setup failed: ${prep.error}` };
 
-      const { issueCert } = await getSslManager();
-      const result = await issueCert(domain, {
+      const result = await issueCertificate(domain, {
         www: Boolean(payload?.www),
         validationMethod: 'http',
         email: config.acmeEmail,
