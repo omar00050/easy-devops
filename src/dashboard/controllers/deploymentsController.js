@@ -144,9 +144,17 @@ class DeploymentsController {
     try {
       const deleteDomain = req.query?.deleteDomain === '1' || req.query?.deleteDomain === 'true'
         || req.body?.deleteDomain === true;
-      const result = await removeApp(req.params.id, { deleteDomain });
+      const purgeData = req.query?.purgeData === '1' || req.query?.purgeData === 'true'
+        || req.body?.purgeData === true;
+      const result = await removeApp(req.params.id, { deleteDomain, purgeData });
       if (!result.ok) return res.status(result.status).json({ error: result.error });
-      return res.json({ deleted: req.params.id, domainDeleted: result.domainDeleted, warning: result.warning ?? null });
+      return res.json({
+        deleted: req.params.id,
+        domainDeleted: result.domainDeleted,
+        warning: result.warning ?? null,
+        sharedKept: result.sharedKept,
+        sharedPath: result.sharedPath,
+      });
     } catch (error) {
       return next(error);
     }

@@ -557,6 +557,8 @@ export interface DeploySettings {
   port?: number;
   healthPath?: string;
   healthTimeout?: number;
+  /** Project-relative folders that survive deployments: ["data", "uploads"]. */
+  persist?: string | string[];
 }
 
 export interface DeployRun {
@@ -614,6 +616,10 @@ export interface DeployApp {
   notifyChannelIds: string[];
   /** The folder the app lives in. Absent before contract 2.6.0. */
   dir?: string;
+  /** Where folders listed in `settings.persist` are kept between deployments. */
+  sharedDir?: string;
+  /** True when that folder holds anything, so deleting the app would leave data behind. */
+  hasSharedData?: boolean;
   /** The domain linked to the app, or null. */
   domain?: string | null;
   hook: { hasToken: boolean; tokenHint: string | null; createdAt: string | null };

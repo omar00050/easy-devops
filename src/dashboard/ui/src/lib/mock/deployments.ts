@@ -91,6 +91,8 @@ function baseApp(appId: string, overrides: Partial<MockApp>): MockApp {
     autoRollback: true,
     notifyChannelIds: [],
     dir: `/home/ops/.config/easy-devops/ez_deploys/${appId}`,
+    sharedDir: `/home/ops/.config/easy-devops/ez_deploys/${appId}/shared`,
+    hasSharedData: false,
     domain: null,
     hook: { hasToken: false, tokenHint: null, createdAt: null },
     createdAt: new Date(Date.now() - 20 * 86_400_000).toISOString(),
@@ -125,7 +127,8 @@ function seed(): { apps: MockApp[]; hook: DeployHook } {
         repoUrl: 'git@github.com:acme/storefront-api.git',
         authType: 'deployKey',
         deployKey: 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC7mockmockmockmockmockmockmockmock easy-devops-deploy-storefront-api',
-        settings: { port: 3000, healthPath: '/healthz' },
+        settings: { port: 3000, healthPath: '/healthz', persist: ['uploads', 'data'] },
+        hasSharedData: true,
         domain: 'api.example.com',
         env: { DATABASE_URL: 'postgres://app:secret@127.0.0.1:5432/store', NODE_ENV: 'production' },
         hook: { hasToken: true, tokenHint: 'x9Qz', createdAt: new Date(Date.now() - 12 * 86_400_000).toISOString() },
@@ -374,8 +377,20 @@ export function handleDeployments(method: HttpMethod, path: string, body: Record
   }
 
   if (sub === '' && method === 'DELETE') {
+    const kept = Boolean(
+      app.hasSharedData ||
+        (Array.isArray(app.settings.persist)
+          ? app.settings.persist.length > 0
+          : app.settings.persist)
+    );
     s.apps = s.apps.filter((a) => a.id !== app.id);
-    return { deleted: app.id, domainDeleted: false, warning: null };
+    return {
+      deleted: app.id,
+      domainDeleted: false,
+      warning: null,
+      sharedKept: kept,
+      sharedPath: kept ? app.sharedDir : undefined,
+    };
   }
 
   if (sub === 'domain' && method === 'PUT') {

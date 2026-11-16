@@ -7,6 +7,7 @@
  *     releases/<releaseId>/     one checkout per deployment, built in place
  *     runs/<runId>.json         the record of one deployment attempt
  *     logs/<runId>.log          its output
+ *     shared/                   data that outlives a release, linked into each one
  *     state.json                which release is live, and the one before it
  *     deploy.lock               held while a deployment is running
  *     id_deploy                 the app's private deploy key, when it has one
@@ -127,6 +128,7 @@ export function pathsIn(root) {
     releases: path.join(root, 'releases'),
     runs: path.join(root, 'runs'),
     logs: path.join(root, 'logs'),
+    shared: path.join(root, 'shared'),
     state: path.join(root, 'state.json'),
     lock: path.join(root, 'deploy.lock'),
     deployKey: path.join(root, 'id_deploy'),
@@ -392,7 +394,31 @@ export function lockHolder(appId, dataDir) {
   return { pid: held.pid, runId: held.runId ?? null, at: held.at ?? null };
 }
 
-/** Removes everything on disk for an app. */
-export function removeAppFiles(appId, dataDir) {
-  fs.rmSync(appPaths(appId, dataDir).root, { recursive: true, force: true });
+/**
+ * Removes an app's folder — or everything in it except `shared/`.
+ *
+ * Persistent data is the one thing a delete does not destroy silently: the
+ * default keeps it, and removing it is an explicit choice. A `shared/` that
+ * holds nothing is removed with the rest, so an app that never used it leaves
+ * no trace.
+ *
+ * @returns {{ keptShared: boolean, sharedPath: string }}
+ */
+export function removeAppFiles(appId, { keepShared = false, dataDir } = {}) {
+  const p = appPaths(appId, dataDir);
+
+  let hasShared = false;
+  if (keepShared) {
+    try { hasShared = fs.readdirSync(p.shared).length > 0; } catch { /* no shared folder */ }
+  }
+  if (!hasShared) {
+    fs.rmSync(p.root, { recursive: true, force: true });
+    return { keptShared: false, sharedPath: p.shared };
+  }
+
+  for (const entry of fs.readdirSync(p.root)) {
+    if (entry === 'shared') continue;
+    fs.rmSync(path.join(p.root, entry), { recursive: true, force: true });
+  }
+  return { keptShared: true, sharedPath: p.shared };
 }

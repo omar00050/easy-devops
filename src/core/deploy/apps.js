@@ -332,15 +332,20 @@ function patchApp(id, patch) {
 /**
  * Removes an app from the registry and deletes its files.
  * Stopping its PM2 process is the caller's job (core/deploy/engine.js).
- * @returns {boolean} Whether an app was removed
+ *
+ * Persistent data is kept unless `purgeData` says otherwise: a delete removes
+ * a deployment, not the database and uploads it was serving.
+ *
+ * @returns {{ keptShared: boolean, sharedPath: string } | null} null when there was no such app
  */
-export function deleteApp(id) {
+export function deleteApp(id, { purgeData = false } = {}) {
   const apps = listApps();
-  if (!apps.some((a) => a.id === id)) return false;
+  if (!apps.some((a) => a.id === id)) return null;
   // Files first: once the record is gone, nothing remembers which folder was its.
-  try { removeAppFiles(id); } catch { /* files in use: the registry entry is removed regardless */ }
+  let files = { keptShared: false, sharedPath: appPaths(id).shared };
+  try { files = removeAppFiles(id, { keepShared: !purgeData }); } catch { /* files in use: the registry entry is removed regardless */ }
   saveApps(apps.filter((a) => a.id !== id));
-  return true;
+  return files;
 }
 
 // ─── The deploy-hook token ────────────────────────────────────────────────────
@@ -454,6 +459,9 @@ export function deployKeyPath(id) {
  */
 export function dashboardApp(app) {
   if (!app) return null;
+  const paths = appPaths(app.id);
+  let hasSharedData = false;
+  try { hasSharedData = fs.readdirSync(paths.shared).length > 0; } catch { /* nothing persistent */ }
   return {
     id: app.id,
     pm2Name: pm2Name(app.id),
@@ -467,7 +475,10 @@ export function dashboardApp(app) {
     keepReleases: app.keepReleases ?? DEFAULT_KEEP_RELEASES,
     autoRollback: app.autoRollback !== false,
     notifyChannelIds: app.notifyChannelIds ?? [],
-    dir: appPaths(app.id).root,
+    dir: paths.root,
+    /** Where the folders listed in `settings.persist` live. */
+    sharedDir: paths.shared,
+    hasSharedData,
     domain: app.domain ?? null,
     hook: {
       hasToken: Boolean(app.hook?.tokenHash),

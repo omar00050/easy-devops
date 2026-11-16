@@ -27,6 +27,7 @@
  *     "port":    3000,                      the port the app listens on
  *     "health":  "/healthz",                string, or { "path": "/healthz", "timeout": 60 }
  *     "hooks":   { "pre": "...", "post": "..." }    string | string[]
+ *     "persist": ["data", "uploads"],       folders that survive deployments
  *   }
  *
  * `false` (or an empty string) switches a step off — "this project has no
@@ -41,8 +42,11 @@ export const DEFAULT_HEALTH_TIMEOUT_S = 60;
 export const MAX_HEALTH_TIMEOUT_S = 600;
 
 const COMMAND_FIELDS = Object.freeze(['install', 'build']);
-const KNOWN_KEYS = Object.freeze(['$schema', 'name', 'install', 'build', 'start', 'port', 'health', 'hooks']);
+const KNOWN_KEYS = Object.freeze(['$schema', 'name', 'install', 'build', 'start', 'port', 'health', 'hooks', 'persist']);
 const MAX_COMMAND_LENGTH = 2000;
+
+export const MAX_PERSIST_PATHS = 20;
+const MAX_PERSIST_PATH_LENGTH = 200;
 
 /** @returns {boolean} */
 function isPlainObject(v) {
@@ -92,6 +96,69 @@ export function normalizeHealthPath(value) {
   const p = value.trim();
   if (!p.startsWith('/') || p.length > 500 || /[\s\0]/.test(p)) return null;
   return p;
+}
+
+/**
+ * A `persist` path must stay inside the project and name a whole folder.
+ *
+ * Directories only, deliberately: a file is the wrong unit. SQLite writes
+ * `-wal` and `-shm` next to its database, and an uploads folder gains new
+ * names every day — a persisted file would take neither with it.
+ *
+ * @returns {string|null} What is wrong with it, or null when it is usable
+ */
+function persistPathProblem(p) {
+  if (p.length > MAX_PERSIST_PATH_LENGTH) return `is longer than ${MAX_PERSIST_PATH_LENGTH} characters`;
+  if (/[\0\r\n]/.test(p)) return 'must be a single line';
+  if (p.startsWith('/') || /^[A-Za-z]:/.test(p)) return 'must be relative to the project folder, not an absolute path';
+  for (const segment of p.split('/')) {
+    if (segment === '' || segment === '.' || segment === '..') return 'must be a relative path without "." or ".."';
+    if (segment === '.git') return 'cannot be ".git" — the deployment manages it';
+    if (segment === 'node_modules') return 'cannot be "node_modules" — dependencies are installed fresh for each release';
+    if (/[<>:"|?*]/.test(segment)) return 'contains characters that are not allowed in a folder name';
+  }
+  return null;
+}
+
+/**
+ * Normalises a `persist` field to a list of project-relative folders.
+ *
+ * Paths are written with "/" on both platforms; the engine turns them into
+ * platform paths. Overlapping folders are refused rather than merged, because
+ * two links to the same data would look independent and then diverge.
+ *
+ * @param {*} value string | string[] | false | null | undefined
+ * @returns {{ paths: string[]|null, error: string|null }}
+ *   `paths: null` means "not specified here"; `[]` means "nothing persistent".
+ */
+export function normalizePersistPaths(value) {
+  if (value === undefined || value === null) return { paths: null, error: null };
+  if (value === false) return { paths: [], error: null };
+
+  const list = Array.isArray(value) ? value : [value];
+  if (list.length > MAX_PERSIST_PATHS) return { paths: null, error: `has more than ${MAX_PERSIST_PATHS} folders` };
+
+  const out = [];
+  for (const item of list) {
+    if (typeof item !== 'string') return { paths: null, error: 'must be folder paths, as a string or a list of strings' };
+    const p = item.trim().replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, '');
+    if (!p) continue;
+    const problem = persistPathProblem(p);
+    if (problem) return { paths: null, error: `"${item.trim()}" ${problem}` };
+    if (!out.includes(p)) out.push(p);
+  }
+
+  // Windows and macOS treat these as the same folder; one path cannot be
+  // linked twice there, so the pair is refused everywhere.
+  for (const a of out) {
+    for (const b of out) {
+      if (a !== b && b.toLowerCase().startsWith(`${a.toLowerCase()}/`)) {
+        return { paths: null, error: `"${a}" and "${b}" overlap — keep only "${a}"` };
+      }
+    }
+  }
+
+  return { paths: out, error: null };
 }
 
 /**
@@ -181,6 +248,12 @@ export function parseEzFile(text) {
     }
   }
 
+  if (raw.persist !== undefined && raw.persist !== null) {
+    const n = normalizePersistPaths(raw.persist);
+    if (n.error) errors.push(`ez.json: "persist" ${n.error}`);
+    else if (n.paths !== null) value.persist = n.paths;
+  }
+
   return { ok: errors.length === 0, value: errors.length === 0 ? value : null, errors, warnings };
 }
 
@@ -221,9 +294,10 @@ export function defaultsFromPackageJson(pkg, files = {}) {
  * Validates the per-app overrides set in the dashboard or the Hub.
  *
  * Same shape as a parsed ez.json (`install`, `build`, `start`, `port`,
- * `healthPath`, `healthTimeout`, `pre`, `post`). An absent, null or empty
- * field means "do not override", so a form with untouched inputs overrides
- * nothing. `false` for install/build/pre/post switches that step off.
+ * `healthPath`, `healthTimeout`, `pre`, `post`, `persist`). An absent, null or
+ * empty field means "do not override", so a form with untouched inputs
+ * overrides nothing. `false` for install/build/pre/post switches that step off;
+ * `[]` or `false` for persist means "nothing persistent", overriding ez.json.
  *
  * @param {*} input
  * @returns {{ ok: boolean, value: Object, errors: string[] }}
@@ -270,6 +344,12 @@ export function normalizeOverrides(input) {
     }
   }
 
+  if (input.persist !== undefined && input.persist !== null && input.persist !== '') {
+    const n = normalizePersistPaths(input.persist);
+    if (n.error) errors.push(`persist ${n.error}`);
+    else if (n.paths !== null) value.persist = n.paths;
+  }
+
   return { ok: errors.length === 0, value, errors };
 }
 
@@ -288,7 +368,8 @@ export function normalizeOverrides(input) {
  * @returns {{
  *   ok: boolean, error: string|null,
  *   settings: { install: string[], build: string[], start: string|null, port: number|null,
- *               healthPath: string, healthTimeout: number, pre: string[], post: string[] },
+ *               healthPath: string, healthTimeout: number, pre: string[], post: string[],
+ *               persist: string[] },
  *   sources: Object<string, 'override'|'ez.json'|'package.json'|'default'>
  * }}
  */
@@ -321,6 +402,7 @@ export function resolveSettings({ ez = null, pkg = null, files = {}, overrides =
     healthTimeout: pick('healthTimeout', DEFAULT_HEALTH_TIMEOUT_S),
     pre: pick('pre', []),
     post: pick('post', []),
+    persist: pick('persist', []),
   };
 
   if (!settings.start) {

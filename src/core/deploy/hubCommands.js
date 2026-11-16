@@ -152,9 +152,13 @@ export async function handleHubDeployCommand(payload, { onFinished = null } = {}
       if (deleteDomain && getHubPermissions()['domains.delete'] !== true) {
         throw refuse("Deleting the linked domain needs 'domains.delete', which this server has switched off. Delete the app without its domain, or enable it in Settings → Hub.");
       }
-      const result = await removeApp(id, { deleteDomain });
+      // Persistent data is kept unless asked for, exactly as on the dashboard.
+      const result = await removeApp(id, { deleteDomain, purgeData: payload.purgeData === true });
       if (!result.ok) throw refuse(result.error);
-      return { deleted: id, domainDeleted: result.domainDeleted, warning: result.warning ?? null };
+      return {
+        deleted: id, domainDeleted: result.domainDeleted, warning: result.warning ?? null,
+        sharedKept: result.sharedKept, sharedPath: result.sharedPath,
+      };
     }
 
     case 'linkDomain': {

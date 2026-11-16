@@ -12,6 +12,7 @@ import {
   fromSettingsDraft,
   isSshUrl,
   parseEnvText,
+  parsePersistText,
   toSettingsDraft,
   validateAppId,
   type SettingsDraft,
@@ -118,6 +119,7 @@ export function AppFormModal({
   const repoUrl = draft.repoUrl.trim();
   const ssh = isSshUrl(repoUrl);
   const parsedEnv = parseEnvText(draft.envText);
+  const parsedPersist = parsePersistText(draft.settings.persist);
   const keep = Number(draft.keepReleases);
 
   const errors = {
@@ -139,6 +141,7 @@ export function AppFormModal({
         ? 'Must start with "/".'
         : null,
     env: parsedEnv.error,
+    persist: parsedPersist.error,
     keepReleases:
       !Number.isInteger(keep) ||
       keep < meta.limits.keepReleasesMin ||
@@ -425,6 +428,41 @@ export function AppFormModal({
               />
             </div>
           </FormGrid>
+        </section>
+
+        <section className="space-y-4 border-t border-line pt-5">
+          <div>
+            <h3 className="text-sm font-semibold text-ink">Persistent data</h3>
+            <p className="mt-0.5 text-xs text-muted">
+              Each deployment runs from a fresh copy of your code. Folders written to at runtime are
+              lost on the next deploy — and on rollback. Folders listed here live in a shared
+              location that every deployment and every rollback reuses.
+            </p>
+          </div>
+          <TextArea
+            label="Folders to keep"
+            optional
+            rows={3}
+            value={draft.settings.persist}
+            onChange={(event) => setSettings({ persist: event.target.value })}
+            error={show('persist')}
+            hint="One per line. Add folders your app writes to: uploads, SQLite data, logs. The folder itself, not a file — SQLite creates -wal and -shm files next to the database."
+            placeholder="No persistent folders. Apps that use an external database or S3 don't need any."
+            className="font-mono"
+            spellCheck={false}
+          />
+          <div className="space-y-1 text-2xs text-faint">
+            <p>
+              The first deployment copies the folder’s current contents into the shared location;
+              after that, the shared copy is what counts — changes to it in the repository are
+              ignored. Left empty, the list is read from <code className="font-mono">ez.json</code>.
+            </p>
+            {editing && app?.sharedDir && (
+              <p className="break-all">
+                Kept in <span className="font-mono">{app.sharedDir}</span>
+              </p>
+            )}
+          </div>
         </section>
 
         <section className="space-y-4 border-t border-line pt-5">

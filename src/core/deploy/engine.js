@@ -241,6 +241,226 @@ export function loadProjectSettings(dir, overrides = {}) {
   return { ...resolved, warnings, ezLocation };
 }
 
+// ─── Persistent folders ──────────────────────────────────────────────────────
+
+/** The link path for one project-relative persistent folder. */
+function persistLink(dir, rel) {
+  return path.join(dir, ...rel.split('/'));
+}
+
+/**
+ * Refuses a link placed under a symbolic link that came from the repository.
+ * Following one would put the app's writes outside the release — and outside
+ * anything the deployment can clean up.
+ */
+function assertRealParents(dir, rel) {
+  let at = dir;
+  for (const part of rel.split('/').slice(0, -1)) {
+    at = path.join(at, part);
+    let st;
+    try { st = fs.lstatSync(at); } catch { return; } // nothing below it exists yet
+    if (st.isSymbolicLink()) {
+      throw new StepError('settings', `"${rel}" is under a symbolic link in the repository, which persistent folders do not allow.`);
+    }
+    if (!st.isDirectory()) {
+      throw new StepError('settings', `"${rel}" is inside "${path.relative(dir, at)}", which is a file in the repository.`);
+    }
+  }
+}
+
+/**
+ * Creates a directory link, relative where possible.
+ *
+ * A relative link survives the app's folder being moved. On Windows a
+ * non-elevated account cannot create symlinks; a junction needs no privilege
+ * but stores an absolute path, which is why moveApp() recreates these links.
+ */
+function createDirLink(targetDir, linkAt) {
+  fs.mkdirSync(path.dirname(linkAt), { recursive: true });
+  const relative = path.relative(path.dirname(linkAt), targetDir) || '.';
+  try {
+    fs.symlinkSync(relative, linkAt, 'dir');
+  } catch (err) {
+    if (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'EACCES')) {
+      fs.symlinkSync(targetDir, linkAt, 'junction');
+      return;
+    }
+    throw err;
+  }
+}
+
+function removeAt(target) {
+  let st = null;
+  try { st = fs.lstatSync(target); } catch { return; }
+  if (st) fs.rmSync(target, { recursive: true, force: true });
+}
+
+/** Copies the contents of a folder, leaving symlinks out: their targets are not part of this project. */
+function copyInto(from, to, log, rel, { overwrite = false } = {}) {
+  for (const entry of fs.readdirSync(from)) {
+    const src = path.join(from, entry);
+    const st = fs.lstatSync(src);
+    if (st.isSymbolicLink()) {
+      log.line(`  warning: skipped the symbolic link ${rel}/${entry} while seeding persistent data`);
+      continue;
+    }
+    fs.cpSync(src, path.join(to, entry), {
+      recursive: true, preserveTimestamps: true, force: overwrite, errorOnExist: !overwrite,
+    });
+  }
+}
+
+/**
+ * Gives every persistent folder one home outside the releases and links it in.
+ *
+ * A deployment starts from a fresh checkout, and old releases are deleted —
+ * that is what makes a rollback clean, and why runtime data disappears with
+ * it. A persistent folder lives once, under `<app folder>/shared/`, and every
+ * release gets a link to it, so a deploy, a rollback and a prune all see the
+ * same files.
+ *
+ * The first deployment seeds the shared copy from the repository, so a
+ * committed empty uploads/ or a SQLite file is not lost. When the app was
+ * already running, the live release is seeded after the repository and wins:
+ * its folder is the one holding the data written until now. After that the
+ * shared copy wins — editing the folder in the repository changes nothing,
+ * which is what "persistent" has to mean.
+ *
+ * @param {string|null} [inheritDir] The release that is live now, if any
+ */
+function linkPersistentDirs(appId, dir, paths, log, inheritDir = null) {
+  if (!paths || paths.length === 0) return;
+  const shared = appPaths(appId).shared;
+  fs.mkdirSync(shared, { recursive: true });
+
+  for (const rel of paths) {
+    const linkAt = persistLink(dir, rel);
+    const sharedAt = path.join(shared, ...rel.split('/'));
+    if (!isInside(linkAt, dir) || !isInside(sharedAt, shared)) {
+      throw new StepError('settings', `"${rel}" is not inside the project.`);
+    }
+    assertRealParents(dir, rel);
+
+    let inShared = null;
+    try { inShared = fs.lstatSync(sharedAt); } catch { /* first deployment for this folder */ }
+    if (inShared && !inShared.isDirectory()) {
+      throw new StepError('settings', `"${rel}" is not a folder in the app's shared data (${shared}).`);
+    }
+
+    let seededFrom = null;
+    if (!inShared) {
+      const sources = [];
+
+      let inRelease = null;
+      try { inRelease = fs.lstatSync(linkAt); } catch { /* the repository has nothing there */ }
+      if (inRelease && (!inRelease.isDirectory() || inRelease.isSymbolicLink())) {
+        throw new StepError('settings', `"${rel}" is a file in the repository. Persist the folder that contains it instead.`);
+      }
+      fs.mkdirSync(sharedAt, { recursive: true });
+      if (inRelease) {
+        copyInto(linkAt, sharedAt, log, rel);
+        sources.push('the repository');
+      }
+
+      if (inheritDir && path.resolve(inheritDir) !== path.resolve(dir)) {
+        const previousAt = persistLink(inheritDir, rel);
+        let previous = null;
+        try { previous = fs.lstatSync(previousAt); } catch { /* that release has nothing there */ }
+        if (previous && previous.isDirectory() && !previous.isSymbolicLink()) {
+          copyInto(previousAt, sharedAt, log, rel, { overwrite: true });
+          sources.push('the live release');
+        }
+      }
+      if (sources.length > 0) seededFrom = sources.join(' and ');
+    }
+
+    // Whatever was at this path is replaced by the link: the shared copy is
+    // the one that persists.
+    removeAt(linkAt);
+    createDirLink(sharedAt, linkAt);
+    log.line(`  persist    ${rel}${seededFrom ? ` (seeded from ${seededFrom})` : ''}`);
+  }
+}
+
+/**
+ * Checks the links again after the build. A build that deletes or recreates a
+ * persistent folder would put data back inside the release — where the next
+ * deployment loses it — so that is a failure, not something to fix silently.
+ */
+function verifyPersistentLinks(appId, dir, paths) {
+  if (!paths || paths.length === 0) return;
+  const shared = appPaths(appId).shared;
+
+  for (const rel of paths) {
+    const linkAt = persistLink(dir, rel);
+    const sharedAt = path.join(shared, ...rel.split('/'));
+    let st = null;
+    try { st = fs.lstatSync(linkAt); } catch { /* the build removed it */ }
+
+    let pointsAtShared = false;
+    if (st && st.isSymbolicLink()) {
+      try {
+        const a = fs.realpathSync(linkAt);
+        const b = fs.realpathSync(sharedAt);
+        pointsAtShared = process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+      } catch { pointsAtShared = false; }
+    }
+    if (pointsAtShared) continue;
+
+    if (!st) {
+      fs.mkdirSync(sharedAt, { recursive: true });
+      createDirLink(sharedAt, linkAt);
+      continue;
+    }
+    throw new StepError('build', `The build replaced the persistent folder "${rel}" with a real file or folder, so anything written there would be lost on the next deployment. Do not delete or recreate "${rel}" in the build.`);
+  }
+}
+
+/** Every persistent link in every release of an app. */
+function persistentLinks(appId) {
+  const out = [];
+  for (const id of listReleases(appId)) {
+    const dir = releaseDir(appId, id);
+    for (const rel of releaseHealth(dir).persist) out.push({ dir, rel });
+  }
+  return out;
+}
+
+/**
+ * Removes the links before the app's folder is moved, and recreates them after
+ * — against the new shared folder. A relative link would survive on its own;
+ * a Windows junction holds an absolute path and would point at a folder that
+ * no longer exists. Detaching first also keeps a cross-device copy from
+ * reading through the links.
+ */
+function detachPersistentLinks(appId) {
+  for (const { dir, rel } of persistentLinks(appId)) {
+    const linkAt = persistLink(dir, rel);
+    try {
+      if (fs.lstatSync(linkAt).isSymbolicLink()) fs.rmSync(linkAt, { force: true });
+    } catch { /* gone already */ }
+  }
+}
+
+/** @returns {string[]} One message per folder that could not be linked again */
+function attachPersistentLinks(appId) {
+  const shared = appPaths(appId).shared;
+  const failures = [];
+  for (const { dir, rel } of persistentLinks(appId)) {
+    const linkAt = persistLink(dir, rel);
+    try {
+      if (!fs.existsSync(linkAt)) {
+        const sharedAt = path.join(shared, ...rel.split('/'));
+        fs.mkdirSync(sharedAt, { recursive: true });
+        createDirLink(sharedAt, linkAt);
+      }
+    } catch (err) {
+      failures.push(`${rel}: ${err.message}`);
+    }
+  }
+  return failures;
+}
+
 /** The environment a deployed app (and its build) runs with. */
 function appEnvironment(app, settings, releaseId) {
   const env = { ...(app.env ?? {}) };
@@ -249,6 +469,9 @@ function appEnvironment(app, settings, releaseId) {
   if (settings.port && env.PORT === undefined) env.PORT = String(settings.port);
   env.EZ_APP = app.id;
   env.EZ_RELEASE = releaseId;
+  // One stable place for data, for an app that would rather build a path than
+  // rely on the folder links: `${EZ_SHARED_DIR}/uploads`.
+  if (settings.persist?.length) env.EZ_SHARED_DIR = appPaths(app.id).shared;
   return env;
 }
 
@@ -291,9 +514,10 @@ function releaseHealth(dir) {
       strict: Boolean(meta.strict),
       sha: typeof meta.sha === 'string' ? meta.sha : null,
       ref: typeof meta.ref === 'string' ? meta.ref : null,
+      persist: Array.isArray(meta.persist) ? meta.persist.filter((p) => typeof p === 'string') : [],
     };
   } catch {
-    return { port: null, healthPath: '/', strict: false, sha: null, ref: null };
+    return { port: null, healthPath: '/', strict: false, sha: null, ref: null, persist: [] };
   }
 }
 
@@ -541,6 +765,15 @@ async function executeDeployment(app, run, d) {
       const value = Array.isArray(settings[field]) ? (settings[field].join(' && ') || '(none)') : (settings[field] ?? '(none)');
       log.line(`  ${field.padEnd(10)} ${value}   [${sources[field]}]`);
     }
+    if (settings.persist.length > 0) {
+      log.line(`  persist    ${settings.persist.join(', ')}   [${sources.persist}]`);
+    }
+
+    // Before the hooks: a pre-deploy script that writes to the database must
+    // write to the shared copy, not to this disposable release. The live
+    // release is where the data written up to now is, so it seeds a folder
+    // that is being made persistent for the first time.
+    linkPersistentDirs(app.id, dir, settings.persist, log, before.current ? releaseDir(app.id, before.current) : null);
 
     const env = appEnvironment(app, settings, run.releaseId);
     const strict = sources.healthPath !== 'default';
@@ -549,6 +782,7 @@ async function executeDeployment(app, run, d) {
     await userCommands('pre', 'Pre-deploy hook', settings.pre, env);
     await userCommands('install', 'Install', settings.install, env);
     await userCommands('build', 'Build', settings.build, env);
+    verifyPersistentLinks(app.id, dir, settings.persist);
 
     // ── 4. switch ───────────────────────────────────────────────────────────
     setStep('start', 'Starting the new release');
@@ -562,6 +796,7 @@ async function executeDeployment(app, run, d) {
     writePm2Config(dir, app, settings, env);
     fs.writeFileSync(path.join(dir, 'ez.release.json'), JSON.stringify({
       sha: run.sha, ref: run.ref, port: settings.port, healthPath: settings.healthPath, strict,
+      persist: settings.persist,
       deployedAt: new Date(d.now()).toISOString(),
     }, null, 2));
 
@@ -794,9 +1029,11 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
  * @param {string} appId
  * @param {Object} [opts]
  * @param {boolean} [opts.deleteDomain] Also remove the domain linked to it
- * @returns {Promise<{ ok: boolean, status: number, error: string|null, domainDeleted?: boolean, warning?: string|null }>}
+ * @param {boolean} [opts.purgeData] Also delete the persistent folders, not just the app
+ * @returns {Promise<{ ok: boolean, status: number, error: string|null, domainDeleted?: boolean,
+ *   warning?: string|null, sharedKept?: boolean, sharedPath?: string }>}
  */
-export async function removeApp(appId, { deleteDomain = false, deps = {} } = {}) {
+export async function removeApp(appId, { deleteDomain = false, purgeData = false, deps = {} } = {}) {
   const app = getApp(appId);
   if (!app) return { ok: false, status: 404, error: `No app named "${appId}".` };
 
@@ -820,8 +1057,13 @@ export async function removeApp(appId, { deleteDomain = false, deps = {} } = {})
     if (!removed.ok) warning = `The app was deleted, but the domain ${app.domain} was not: ${removed.error}`;
   }
 
-  deleteApp(appId);
-  return { ok: true, status: 200, error: null, domainDeleted, warning };
+  // Resolved before the record goes: afterwards nothing knows this app's folder.
+  const sharedPath = appPaths(appId).shared;
+  const files = deleteApp(appId, { purgeData }) ?? { keptShared: false };
+  return {
+    ok: true, status: 200, error: null, domainDeleted, warning,
+    sharedKept: Boolean(files.keptShared), sharedPath,
+  };
 }
 
 /**
@@ -928,16 +1170,22 @@ export async function moveApp(appId, targetDir, { deps = {} } = {}) {
     // An empty folder left by an earlier attempt would make the rename fail.
     if (fs.existsSync(to)) fs.rmdirSync(to);
 
+    // Detached first: a junction holds an absolute path into the old folder,
+    // and a cross-device copy must not read through the links.
+    detachPersistentLinks(appId);
+
     try {
       if (fs.existsSync(from)) moveDirectory(from, to);
       else fs.mkdirSync(to, { recursive: true });
     } catch (err) {
       // Nothing was recorded, so the app is still where it was. Put it back up.
+      attachPersistentLinks(appId);
       if (wasRunning) await startCurrent();
       return { ok: false, status: 500, error: `The folder could not be moved: ${err.message}` };
     }
 
     setAppDir(appId, to);
+    const relinkFailures = attachPersistentLinks(appId);
 
     // The lock file travelled with the folder; it is ours, and the old path it
     // was taken at no longer exists for release() to clean up.
@@ -959,6 +1207,10 @@ export async function moveApp(appId, targetDir, { deps = {} } = {}) {
     if (wasRunning) {
       restarted = await startCurrent();
       if (!restarted) warning = 'The app was moved, but PM2 could not start it again. Deploy it, or start it from the Processes page.';
+    }
+    if (relinkFailures.length > 0) {
+      const note = `These persistent folders could not be linked again: ${relinkFailures.join('; ')}. Deploy the app to restore them.`;
+      warning = warning ? `${warning} ${note}` : `The app was moved, but ${note}`;
     }
 
     return { ok: true, status: 200, error: null, from, to, restarted, warning };

@@ -18,9 +18,10 @@ function errorText(error: unknown, fallback: string): string {
 // ─── Delete ───────────────────────────────────────────────────────────────────
 
 /**
- * Deleting an app, with the one question that has no safe default: what about
- * its domain. The box starts unticked — a domain may be serving something
- * else by now, and removing it is the choice that cannot be undone.
+ * Deleting an app, with the two questions that have no safe default: what
+ * about its domain, and what about the folders it writes to. Both boxes start
+ * unticked — a domain may be serving something else by now, and persistent
+ * data is the part of an app that cannot be created again.
  */
 export function DeleteAppModal({
   app,
@@ -33,19 +34,44 @@ export function DeleteAppModal({
 }) {
   const toast = useToast();
   const [deleteDomain, setDeleteDomain] = useState(false);
+  const [purgeData, setPurgeData] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    if (app) setDeleteDomain(false);
+    if (app) {
+      setDeleteDomain(false);
+      setPurgeData(false);
+    }
   }, [app]);
+
+  const keepsData = Boolean(
+    app &&
+      (app.hasSharedData ||
+        (Array.isArray(app.settings.persist)
+          ? app.settings.persist.length > 0
+          : Boolean(app.settings.persist)))
+  );
 
   const remove = async () => {
     if (!app || busy) return;
     setBusy(true);
     try {
-      const result = await api.deployments.remove(app.id, deleteDomain && Boolean(app.domain));
-      if (result.warning) toast.warning(`${app.id} deleted`, result.warning);
-      else toast.success(`${app.id} deleted`, result.domainDeleted ? `${app.domain} was removed too.` : undefined);
+      const result = await api.deployments.remove(app.id, {
+        deleteDomain: deleteDomain && Boolean(app.domain),
+        purgeData,
+      });
+      const kept =
+        result.sharedKept && result.sharedPath
+          ? `Persistent data was kept in ${result.sharedPath}.`
+          : '';
+      if (result.warning) toast.warning(`${app.id} deleted`, `${result.warning} ${kept}`.trim());
+      else
+        toast.success(
+          `${app.id} deleted`,
+          [result.domainDeleted ? `${app.domain} was removed too.` : '', kept]
+            .filter(Boolean)
+            .join(' ') || undefined
+        );
       onDeleted();
     } catch (error) {
       toast.error(`Could not delete ${app.id}`, errorText(error, 'Nothing was changed.'));
@@ -78,6 +104,24 @@ export function DeleteAppModal({
           are deleted from this server. The repository is not touched.
         </p>
         {app?.dir && <p className="break-all font-mono text-2xs text-faint">{app.dir}</p>}
+        {keepsData && app && (
+          <div className="space-y-2 rounded-md border border-line bg-inset/40 p-3">
+            <div className="text-xs font-medium text-ink">Persistent data</div>
+            <p className="text-xs">
+              Folders this app writes to are kept by default, so a later app with the same name
+              can pick up its database and uploads.
+            </p>
+            {app.sharedDir && (
+              <p className="break-all font-mono text-2xs text-faint">{app.sharedDir}</p>
+            )}
+            <Checkbox
+              label="Also delete the persistent data"
+              hint="The shared folders are deleted too and cannot be recovered."
+              checked={purgeData}
+              onChange={setPurgeData}
+            />
+          </div>
+        )}
         {app?.domain && (
           <Checkbox
             label={

@@ -72,6 +72,7 @@ export interface SettingsDraft {
   start: string;
   port: string;
   healthPath: string;
+  persist: string;
   skipInstall: boolean;
   skipBuild: boolean;
 }
@@ -83,9 +84,50 @@ export function toSettingsDraft(settings: DeploySettings): SettingsDraft {
     start: settings.start ?? '',
     port: settings.port ? String(settings.port) : '',
     healthPath: settings.healthPath ?? '',
+    persist: Array.isArray(settings.persist) ? settings.persist.join('\n') : (settings.persist ?? ''),
     skipInstall: settings.install === false || (Array.isArray(settings.install) && settings.install.length === 0),
     skipBuild: settings.build === false || (Array.isArray(settings.build) && settings.build.length === 0),
   };
+}
+
+/**
+ * Persistent folders, one per line or comma-separated.
+ *
+ * The same rules the server enforces (core/deploy/ezfile.js), checked here so
+ * a typo is answered before the form is sent: folders only, inside the project.
+ */
+export function parsePersistText(text: string): { paths: string[]; error: string | null } {
+  const paths: string[] = [];
+
+  for (const item of text.split(/[\n,]/)) {
+    const raw = item.trim();
+    if (!raw) continue;
+    const p = raw.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, '');
+    if (!p) return { paths, error: `"${raw}" is not a folder path.` };
+    if (p.length > 200) return { paths, error: `"${raw}" is longer than 200 characters.` };
+    if (p.startsWith('/') || /^[A-Za-z]:/.test(p)) {
+      return { paths, error: `"${raw}" must be relative to the project folder.` };
+    }
+    const parts = p.split('/');
+    if (parts.some((s) => s === '' || s === '.' || s === '..')) {
+      return { paths, error: `"${raw}" must be a relative path without "." or "..".` };
+    }
+    if (parts.includes('.git')) return { paths, error: `"${raw}" cannot be ".git".` };
+    if (parts.includes('node_modules')) return { paths, error: `"${raw}" cannot include node_modules.` };
+    if (/[<>:"|?*]/.test(p)) return { paths, error: `"${raw}" contains characters that are not allowed.` };
+    if (!paths.includes(p)) paths.push(p);
+  }
+
+  if (paths.length > 20) return { paths, error: 'Use at most 20 folders.' };
+  const lower = paths.map((p) => p.toLowerCase());
+  for (let i = 0; i < paths.length; i++) {
+    for (let j = 0; j < paths.length; j++) {
+      if (i !== j && lower[j].startsWith(`${lower[i]}/`)) {
+        return { paths, error: `"${paths[i]}" and "${paths[j]}" overlap — keep only "${paths[i]}".` };
+      }
+    }
+  }
+  return { paths, error: null };
 }
 
 /** Builds the `settings` override object: empty fields override nothing. */
@@ -98,6 +140,8 @@ export function fromSettingsDraft(draft: SettingsDraft): DeploySettings {
   if (draft.start.trim()) settings.start = draft.start.trim();
   if (draft.port.trim()) settings.port = Number(draft.port);
   if (draft.healthPath.trim()) settings.healthPath = draft.healthPath.trim();
+  const persist = parsePersistText(draft.persist);
+  if (persist.paths.length > 0) settings.persist = persist.paths;
   return settings;
 }
 
@@ -174,6 +218,13 @@ export function buildEzJson(settings: DeploySettings): string {
     health: settings.healthPath?.trim() || '/',
   };
 
+  const persist = Array.isArray(settings.persist)
+    ? settings.persist
+    : settings.persist?.trim()
+      ? [settings.persist.trim()]
+      : [];
+  if (persist.length > 0) file.persist = persist;
+
   const pre = one(settings.pre, '');
   const post = one(settings.post, '');
   if ((pre && pre !== '') || (post && post !== '')) {
@@ -205,6 +256,7 @@ export const EZ_JSON_FIELDS: Array<{ name: string; meaning: string; without: str
   { name: 'start', meaning: 'The long-running process. One command, any language.', without: 'the "start" script, else node <main>' },
   { name: 'port', meaning: 'The port the app listens on. Passed to it as PORT and used for the health check.', without: 'no HTTP check; the process only has to stay up' },
   { name: 'health', meaning: 'A path that must answer before the deployment counts: "/healthz", or { "path": "/healthz", "timeout": 60 }.', without: '"/" with a 60-second limit' },
+  { name: 'persist', meaning: 'Folders your app writes to and you need to keep: uploaded files, SQLite data, logs. List folders, not files — SQLite creates -wal and -shm files next to its database.', without: 'nothing is kept; each deployment starts from the repository' },
   { name: 'hooks.pre', meaning: 'Run before install — check the environment, fetch something.', without: 'nothing' },
   { name: 'hooks.post', meaning: 'Run once the new release is live — warm a cache, notify someone. A failure is a warning; the release stays.', without: 'nothing' },
 ];

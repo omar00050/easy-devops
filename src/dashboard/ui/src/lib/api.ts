@@ -270,11 +270,20 @@ export const api = {
       request<DeployApp>('/deployments', { method: 'POST', body: input }),
     update: (id: string, input: DeployAppInput) =>
       request<DeployApp>(`/deployments/${enc(id)}`, { method: 'PUT', body: input }),
-    remove: (id: string, deleteDomain = false) =>
-      request<{ deleted: string; domainDeleted?: boolean; warning?: string | null }>(
-        `/deployments/${enc(id)}`,
-        { method: 'DELETE', query: deleteDomain ? { deleteDomain: 1 } : undefined }
-      ),
+    remove: (id: string, options: { deleteDomain?: boolean; purgeData?: boolean } = {}) =>
+      request<{
+        deleted: string;
+        domainDeleted?: boolean;
+        warning?: string | null;
+        sharedKept?: boolean;
+        sharedPath?: string;
+      }>(`/deployments/${enc(id)}`, {
+        method: 'DELETE',
+        query: {
+          deleteDomain: options.deleteDomain ? 1 : undefined,
+          purgeData: options.purgeData ? 1 : undefined,
+        },
+      }),
     linkDomain: (id: string, domain: string, ssl = false) =>
       request<DeployDomainLink>(`/deployments/${enc(id)}/domain`, {
         method: 'PUT',
