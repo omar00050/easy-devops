@@ -50,7 +50,7 @@
     "dev": "node src/cli/index.js --dev",
     "build:ui": "npm --prefix src/dashboard/ui install && npm --prefix src/dashboard/ui run build",
     "prepublishOnly": "npm run build:ui && npm test",
-    "test": "node e2e/run.mjs",
+    "testold": "node e2e/run.mjs",
     "test:e2e": "node e2e/run.mjs",
     "test:e2e:check": "node e2e/run.mjs --check",
     "dashboard": "node src/dashboard/server.js",
