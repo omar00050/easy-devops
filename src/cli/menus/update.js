@@ -23,6 +23,25 @@ import ora from 'ora';
 import { dbGet, dbSet } from '../../core/db.js';
 import { loadConfig } from '../../core/config.js';
 import { getDashboardStatus, startDashboard, stopDashboard } from './dashboard.js';
+import { run } from '../../core/shell.js';
+
+
+// ─── Version helpers ──────────────────────────────────────────────────────────
+
+async function fetchLatestVersion() {
+  const result = await run('npm view easy-devops version', { timeout: 20000 });
+  if (result.success && result.stdout.trim()) return result.stdout.trim();
+  return null;
+}
+
+function isNewer(latest, current) {
+  const parse = v => v.replace(/^v/, '').split('.').map(Number);
+  const [la, lb, lc] = parse(latest);
+  const [ca, cb, cc] = parse(current);
+  if (la !== ca) return la > ca;
+  if (lb !== cb) return lb > cb;
+  return lc > cc;
+}
 
 // ─── Recover interrupted update ───────────────────────────────────────────────
 // If a previous update crashed after stopping the dashboard but before restarting
