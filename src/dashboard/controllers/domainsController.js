@@ -4,6 +4,7 @@ import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../../core/domains-db.js';
 import { writeConfWithTest } from '../../core/nginx-apply.js';
+import { getDefaultCertPaths } from '../../core/nginx-conf-generator.js';
 import { getCertExpiry } from '../../core/cert-reader.js';
 import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk, hasBackslashPath } from '../../core/platform.js';
 import {
@@ -26,6 +27,39 @@ function applyErrorResponse(applied) {
     };
   }
   return { error: 'nginx config test failed', details: applied.error, output };
+}
+
+/**
+ * Resolves the paths nginx will load and reports them when either file is
+ * missing. Blank fields use the same `${sslDir}/${name}` fallback as the
+ * config generator, so this check matches the generated config.
+ * @param {{ name: string, ssl?: { enabled?: boolean, certPath?: string, keyPath?: string } }} domain
+ * @returns {Promise<{ certPath: string, keyPath: string } | null>}
+ */
+async function missingCertFiles(domain) {
+  if (!domain.ssl?.enabled) return null;
+
+  const { sslDir } = loadConfig();
+  const defaults = getDefaultCertPaths(domain.name, process.platform, sslDir);
+  const certPath = domain.ssl.certPath || defaults.certPath;
+  const keyPath = domain.ssl.keyPath || defaults.keyPath;
+
+  try {
+    await fs.access(certPath, fs.constants.F_OK);
+    await fs.access(keyPath, fs.constants.F_OK);
+    return null;
+  } catch {
+    return { certPath, keyPath };
+  }
+}
+
+function certMissingBody({ certPath, keyPath }) {
+  return {
+    error: 'cert_missing',
+    certPath,
+    keyPath,
+    hint: 'The SSL certificate files do not exist at the configured paths. Create the certificate first, or disable SSL.',
+  };
 }
 
 class DomainsController {
@@ -128,17 +162,9 @@ class DomainsController {
       });
 
       // Cert existence check (FR-001): prevent saving a config that references non-existent cert files
-      if (domain.ssl.enabled && domain.ssl.certPath) {
-        try {
-          await fs.access(domain.ssl.certPath, fs.constants.F_OK);
-        } catch {
-          return res.status(422).json({
-            error: 'cert_missing',
-            certPath: domain.ssl.certPath,
-            keyPath: domain.ssl.keyPath,
-            hint: 'The SSL certificate files do not exist at the configured paths. Create the certificate first, or disable SSL.',
-          });
-        }
+      const missingCert = await missingCertFiles(domain);
+      if (missingCert) {
+        return res.status(422).json(certMissingBody(missingCert));
       }
 
       // Shared core apply: writes, tests via isNginxTestOk(), and on Windows
@@ -207,6 +233,12 @@ class DomainsController {
         wildcard: updates.wildcard ?? existing.wildcard ?? false,
         updatedAt: new Date().toISOString(),
       };
+
+      // An update must not point nginx at certificate files that are not on disk.
+      const missingCert = await missingCertFiles(updatedDomain);
+      if (missingCert) {
+        return res.status(422).json(certMissingBody(missingCert));
+      }
 
       // Shared core apply — snapshots the current file and restores it exactly
       // if every attempt fails, so no .bak juggling is needed here.

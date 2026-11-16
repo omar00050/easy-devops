@@ -22,6 +22,7 @@ import {
 import { api, ApiError } from '../../lib/api';
 import { cn } from '../../lib/cn';
 import type {
+  Certificate,
   DnsChallengePending,
   Domain,
   DomainAdvanced,
@@ -350,6 +351,171 @@ function ChannelChip({
 
 const numeric = (value: number): number | '' => (Number.isFinite(value) && value !== 0 ? value : '');
 
+function CertificateIssuance({
+  wildcard,
+  certMethod,
+  onMethodChange,
+  certFailure,
+  dnsPending,
+  certAction,
+  onCreate,
+  onConfirmDns,
+  onCancelDns,
+  disabledReason,
+  extraActions,
+}: {
+  wildcard: boolean;
+  certMethod: 'http' | 'dns';
+  onMethodChange: (method: 'http' | 'dns') => void;
+  certFailure: CertFailure | null;
+  dnsPending: DnsChallengePending | null;
+  certAction: 'issue' | 'confirm' | null;
+  onCreate: () => void;
+  onConfirmDns: () => void;
+  onCancelDns: () => void;
+  disabledReason?: string | null;
+  extraActions?: ReactNode;
+}) {
+  const busy = certAction !== null;
+
+  return (
+    <div className="space-y-3">
+      {certFailure && (
+        <InlineAlert tone="danger" title={certFailure.message}>
+          {certFailure.hint && <div>{certFailure.hint}</div>}
+          {certFailure.detail && (
+            <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-2xs">
+              {certFailure.detail}
+            </pre>
+          )}
+        </InlineAlert>
+      )}
+
+      {dnsPending ? (
+        <div className="space-y-3">
+          <div>
+            <div className="text-sm font-medium text-ink">
+              Add this DNS TXT record, then continue
+            </div>
+            <p className="mt-0.5 text-xs text-muted">
+              {dnsPending.hint ??
+                'The certificate authority checks this record before issuing the certificate.'}
+            </p>
+          </div>
+          <div className="space-y-2 rounded-md border border-line bg-canvas p-3 font-mono text-2xs">
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="font-sans text-2xs uppercase tracking-wider text-faint">Name</div>
+                <div className="mt-0.5 break-all text-ink">{dnsPending.txtName}</div>
+              </div>
+              <CopyButton value={dnsPending.txtName} label="Copy record name" />
+            </div>
+            <div className="flex items-center justify-between gap-2 border-t border-line pt-2">
+              <div className="min-w-0">
+                <div className="font-sans text-2xs uppercase tracking-wider text-faint">Value</div>
+                <div className="mt-0.5 break-all text-ink">{dnsPending.txtValue}</div>
+              </div>
+              <CopyButton value={dnsPending.txtValue} label="Copy record value" />
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              loading={certAction === 'confirm'}
+              onClick={onConfirmDns}
+            >
+              I added the record, continue
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={onCancelDns}
+              disabled={busy}
+            >
+              Cancel issuance
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <fieldset>
+            <legend className="mb-2 text-xs font-medium text-muted">Validation method</legend>
+            <div className="flex flex-wrap gap-2">
+              <label
+                className={cn(
+                  'flex cursor-pointer items-start gap-2 rounded-md border px-3 py-2 text-xs',
+                  certMethod === 'http'
+                    ? 'border-accent/50 bg-accent-soft/40'
+                    : 'border-line hover:border-line-strong',
+                  wildcard && 'cursor-not-allowed opacity-50'
+                )}
+              >
+                <input
+                  type="radio"
+                  name="cert-method"
+                  value="http"
+                  checked={certMethod === 'http'}
+                  disabled={wildcard || busy}
+                  onChange={() => onMethodChange('http')}
+                  className="mt-0.5 accent-[var(--ez-accent)]"
+                />
+                <span>
+                  <span className="block font-medium text-ink">HTTP challenge</span>
+                  <span className="block text-2xs text-faint">DNS already points here</span>
+                </span>
+              </label>
+              <label
+                className={cn(
+                  'flex cursor-pointer items-start gap-2 rounded-md border px-3 py-2 text-xs',
+                  certMethod === 'dns'
+                    ? 'border-accent/50 bg-accent-soft/40'
+                    : 'border-line hover:border-line-strong'
+                )}
+              >
+                <input
+                  type="radio"
+                  name="cert-method"
+                  value="dns"
+                  checked={certMethod === 'dns'}
+                  disabled={busy}
+                  onChange={() => onMethodChange('dns')}
+                  className="mt-0.5 accent-[var(--ez-accent)]"
+                />
+                <span>
+                  <span className="block font-medium text-ink">DNS challenge</span>
+                  <span className="block text-2xs text-faint">Add a TXT record</span>
+                </span>
+              </label>
+            </div>
+            {wildcard && (
+              <p className="mt-2 text-2xs text-warn">
+                Wildcard certificates require the DNS challenge.
+              </p>
+            )}
+          </fieldset>
+
+          {disabledReason && <p className="text-2xs text-warn">{disabledReason}</p>}
+
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              loading={certAction === 'issue'}
+              onClick={onCreate}
+              disabled={Boolean(disabledReason)}
+              icon={<ShieldCheck className="size-3.5" aria-hidden="true" />}
+            >
+              Create certificate
+            </Button>
+            {extraActions}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function DomainFormModal({
   editor,
   onClose,
@@ -357,7 +523,7 @@ export function DomainFormModal({
 }: {
   editor: DomainEditor;
   onClose: () => void;
-  onSaved: (domain: Domain) => void;
+  onSaved: () => void;
 }) {
   const editing = editor.mode === 'edit' ? editor.domain : null;
   const toast = useToast();
@@ -406,6 +572,11 @@ export function DomainFormModal({
     [],
     { enabled: Boolean(editing) }
   );
+  const certificates = useResource<Certificate[]>(
+    (signal) => api.ssl.list(signal),
+    [],
+    { enabled: form.ssl.enabled }
+  );
 
   useEffect(() => {
     if (!dirty) return;
@@ -422,6 +593,17 @@ export function DomainFormModal({
   }, [certMissing, form.wildcard]);
 
   const backendIsUrl = /^https?:\/\//i.test(form.backendHost.trim());
+  const domainName = editing ? editing.name : normalizeName(form.name);
+  const domainNameError = validateDomainName(domainName);
+  const pathsUnset = form.ssl.certPath.trim() === '' && form.ssl.keyPath.trim() === '';
+  const hasCertificate =
+    certificates.data?.some((certificate) => certificate.domain === domainName) ?? false;
+  const offerCertificate =
+    form.ssl.enabled &&
+    pathsUnset &&
+    !certificates.loading &&
+    !hasCertificate &&
+    !certMissing;
 
   function update<K extends keyof DomainInput>(key: K, value: DomainInput[K]) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -475,53 +657,67 @@ export function DomainFormModal({
   const expandSection = (id: string) =>
     setSections((current) => ({ ...current, [id]: true }));
 
-  const submit = async (overrides?: Partial<DomainInput>) => {
-    const payload: DomainInput = {
-      ...form,
-      ...overrides,
-      ssl: { ...form.ssl, ...(overrides?.ssl ?? {}) },
-      name: editing ? editing.name : normalizeName(form.name),
-    };
+  const buildPayload = (overrides?: Partial<DomainInput>): DomainInput => ({
+    ...form,
+    ...overrides,
+    ssl: { ...form.ssl, ...(overrides?.ssl ?? {}) },
+    name: editing ? editing.name : normalizeName(form.name),
+  });
 
+  const validatePayload = (payload: DomainInput): boolean => {
     const errors = validateForm(payload, !editing);
-    if (Object.keys(errors).length > 0) {
-      setFieldErrors(errors);
-      setSaveError({ message: 'Check the highlighted fields before saving.' });
-      if (errors['domain-name'] || errors['backend-host'] || errors['backend-port']) {
-        expandSection('basic');
-      }
-      if (errors['max-body'] || errors['read-timeout'] || errors['connect-timeout']) {
-        expandSection('performance');
-      }
-      if (errors['rate-limit-rate'] || errors['rate-limit-burst']) {
-        expandSection('security');
-      }
-      if (errors['hsts-max-age']) expandSection('ssl');
-      const firstId = Object.keys(errors)[0];
-      queueMicrotask(() => document.getElementById(firstId)?.focus());
-      return;
+    if (Object.keys(errors).length === 0) return true;
+
+    setFieldErrors(errors);
+    setSaveError({ message: 'Check the highlighted fields before saving.' });
+    if (errors['domain-name'] || errors['backend-host'] || errors['backend-port']) {
+      expandSection('basic');
     }
+    if (errors['max-body'] || errors['read-timeout'] || errors['connect-timeout']) {
+      expandSection('performance');
+    }
+    if (errors['rate-limit-rate'] || errors['rate-limit-burst']) {
+      expandSection('security');
+    }
+    if (errors['hsts-max-age']) expandSection('ssl');
+    const firstId = Object.keys(errors)[0];
+    queueMicrotask(() => document.getElementById(firstId)?.focus());
+    return false;
+  };
+
+  const submit = async (overrides?: Partial<DomainInput>) => {
+    const payload = buildPayload(overrides);
+    if (!validatePayload(payload)) return;
+    const savedName = editing?.name ?? payload.name;
 
     setFieldErrors({});
     setSaveError(null);
     setSaving(true);
+
+    let saved: Domain;
     try {
-      const saved = editing
+      saved = editing
         ? await api.domains.update(editing.name, payload)
         : await api.domains.create(payload);
-      setCertMissing(null);
-      setDnsPending(null);
-      setCertFailure(null);
-      toast.success(
-        editing ? 'Domain saved' : 'Domain created',
-        editing
-          ? `${saved.name} was updated and its nginx config regenerated.`
-          : `${saved.name} is configured; nginx will start serving it on the next reload.`
-      );
-      onSaved(saved);
     } catch (error) {
       const apiError = error instanceof ApiError ? error : null;
-      if (apiError?.status === 422 && apiError.code === 'cert_missing') {
+
+      if (!apiError) {
+        // The request went out but its reply could not be read (a truncated
+        // body, a crash page). The server may well have saved it, so do not
+        // claim a failure: close and reload, and let the list show the truth.
+        setCertMissing(null);
+        setDnsPending(null);
+        setCertFailure(null);
+        toast.warning(
+          'The dashboard’s reply could not be read',
+          'The domain list was reloaded. Check that the change is there before saving again.'
+        );
+        onSaved();
+        return;
+      }
+
+      if (apiError.status === 422 && apiError.code === 'cert_missing') {
         setCertMissing({
           certPath:
             typeof apiError.payload.certPath === 'string' ? apiError.payload.certPath : '',
@@ -536,44 +732,77 @@ export function DomainFormModal({
         setSaveError(null);
         setCertMethod(form.wildcard ? 'dns' : 'http');
         expandSection('ssl');
+      } else if (apiError.status === 0) {
+        // The connection dropped in flight. The write may have completed
+        // before the reply was lost, so say so instead of asserting failure.
+        setSaveError({
+          message: 'The dashboard did not answer.',
+          detail: apiError.message,
+          hint: 'Saving may still have worked: check the domain list before trying again.',
+        });
+        toast.error('The dashboard did not answer', 'The change may already have been saved.');
       } else {
         setSaveError({
-          message: apiError?.message ?? 'The domain could not be saved.',
+          message: apiError.message ?? 'The domain could not be saved.',
           detail:
-            typeof apiError?.payload.detail === 'string'
+            typeof apiError.payload.detail === 'string'
               ? apiError.payload.detail
-              : typeof apiError?.payload.output === 'string'
+              : typeof apiError.payload.output === 'string'
                 ? apiError.payload.output
                 : undefined,
           hint:
-            typeof apiError?.payload.hint === 'string' ? apiError.payload.hint : undefined,
+            typeof apiError.payload.hint === 'string' ? apiError.payload.hint : undefined,
         });
-        toast.error('Could not save the domain', apiError?.message ?? undefined);
+        toast.error('Could not save the domain', apiError.message ?? undefined);
       }
+      return;
     } finally {
       setSaving(false);
     }
+
+    // Success handling stays outside the try above: a toast or a parent
+    // callback that throws must never turn a saved domain into an error.
+    setCertMissing(null);
+    setDnsPending(null);
+    setCertFailure(null);
+    toast.success(
+      editing ? 'Domain saved' : 'Domain created',
+      editing
+        ? `${saved?.name ?? savedName} was updated and its nginx config regenerated.`
+        : `${saved?.name ?? savedName} is configured; nginx will start serving it on the next reload.`
+    );
+    onSaved();
   };
 
   const createCertificate = async () => {
+    // A certificate can be issued before the domain is saved, but only once
+    // the form is complete enough to save itself afterwards.
+    if (!validatePayload(buildPayload({ ssl: { ...form.ssl, enabled: true } }))) return;
+
     setCertAction('issue');
     setCertFailure(null);
     try {
-      const domainName = editing ? editing.name : normalizeName(form.name);
       const result = await api.ssl.create({
         domain: domainName,
         www: form.www,
-        validationMethod: certMethod,
+        // The HTTP radio is disabled for wildcards, so honour the rule even if
+        // it was the last selected method.
+        validationMethod: form.wildcard ? 'dns' : certMethod,
       });
       if (isDnsPending(result)) {
         setDnsPending(result);
         return;
       }
+      const ssl = {
+        ...form.ssl,
+        enabled: true,
+        certPath: result.certPath,
+        keyPath: result.keyPath,
+      };
+      setForm((current) => ({ ...current, ssl }));
       setCertMissing(null);
       setDnsPending(null);
-      await submit({
-        ssl: { ...form.ssl, enabled: true, certPath: result.certPath, keyPath: result.keyPath },
-      });
+      await submit({ ssl });
     } catch (error) {
       setCertFailure(describeCertFailure(error));
     } finally {
@@ -587,11 +816,16 @@ export function DomainFormModal({
     setCertFailure(null);
     try {
       const result = await api.ssl.confirmDns(dnsPending.domain);
+      const ssl = {
+        ...form.ssl,
+        enabled: true,
+        certPath: result.certPath,
+        keyPath: result.keyPath,
+      };
+      setForm((current) => ({ ...current, ssl }));
       setDnsPending(null);
       setCertMissing(null);
-      await submit({
-        ssl: { ...form.ssl, enabled: true, certPath: result.certPath, keyPath: result.keyPath },
-      });
+      await submit({ ssl });
     } catch (error) {
       setCertFailure(describeCertFailure(error));
       setDnsPending(null);
@@ -736,150 +970,27 @@ export function DomainFormModal({
               </InlineAlert>
 
               <div className="rounded-md border border-line bg-raised/40 p-3">
-                {dnsPending ? (
-                  <div className="space-y-3">
-                    <div>
-                      <div className="text-sm font-medium text-ink">
-                        Add this DNS TXT record, then continue
-                      </div>
-                      <p className="mt-0.5 text-xs text-muted">
-                        {dnsPending.hint ??
-                          'The certificate authority checks this record before issuing the certificate.'}
-                      </p>
-                    </div>
-                    <div className="space-y-2 rounded-md border border-line bg-canvas p-3 font-mono text-2xs">
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="min-w-0">
-                          <div className="font-sans text-2xs uppercase tracking-wider text-faint">
-                            Name
-                          </div>
-                          <div className="mt-0.5 break-all text-ink">{dnsPending.txtName}</div>
-                        </div>
-                        <CopyButton value={dnsPending.txtName} label="Copy record name" />
-                      </div>
-                      <div className="flex items-center justify-between gap-2 border-t border-line pt-2">
-                        <div className="min-w-0">
-                          <div className="font-sans text-2xs uppercase tracking-wider text-faint">
-                            Value
-                          </div>
-                          <div className="mt-0.5 break-all text-ink">{dnsPending.txtValue}</div>
-                        </div>
-                        <CopyButton value={dnsPending.txtValue} label="Copy record value" />
-                      </div>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      <Button
-                        variant="primary"
-                        size="sm"
-                        loading={certAction === 'confirm'}
-                        onClick={confirmDns}
-                      >
-                        I added the record, continue
-                      </Button>
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        onClick={cancelDns}
-                        disabled={certAction !== null}
-                      >
-                        Cancel issuance
-                      </Button>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="space-y-3">
-                    {certFailure && (
-                      <InlineAlert tone="danger" title={certFailure.message}>
-                        {certFailure.hint && <div>{certFailure.hint}</div>}
-                        {certFailure.detail && (
-                          <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-2xs">
-                            {certFailure.detail}
-                          </pre>
-                        )}
-                      </InlineAlert>
-                    )}
-
-                    <fieldset>
-                      <legend className="mb-2 text-xs font-medium text-muted">
-                        Validation method
-                      </legend>
-                      <div className="flex flex-wrap gap-2">
-                        <label
-                          className={cn(
-                            'flex cursor-pointer items-start gap-2 rounded-md border px-3 py-2 text-xs',
-                            certMethod === 'http'
-                              ? 'border-accent/50 bg-accent-soft/40'
-                              : 'border-line hover:border-line-strong',
-                            form.wildcard && 'cursor-not-allowed opacity-50'
-                          )}
-                        >
-                          <input
-                            type="radio"
-                            name="cert-method"
-                            value="http"
-                            checked={certMethod === 'http'}
-                            disabled={form.wildcard || busy}
-                            onChange={() => setCertMethod('http')}
-                            className="mt-0.5 accent-[var(--ez-accent)]"
-                          />
-                          <span>
-                            <span className="block font-medium text-ink">HTTP challenge</span>
-                            <span className="block text-2xs text-faint">
-                              DNS already points here
-                            </span>
-                          </span>
-                        </label>
-                        <label
-                          className={cn(
-                            'flex cursor-pointer items-start gap-2 rounded-md border px-3 py-2 text-xs',
-                            certMethod === 'dns'
-                              ? 'border-accent/50 bg-accent-soft/40'
-                              : 'border-line hover:border-line-strong'
-                          )}
-                        >
-                          <input
-                            type="radio"
-                            name="cert-method"
-                            value="dns"
-                            checked={certMethod === 'dns'}
-                            disabled={busy}
-                            onChange={() => setCertMethod('dns')}
-                            className="mt-0.5 accent-[var(--ez-accent)]"
-                          />
-                          <span>
-                            <span className="block font-medium text-ink">DNS challenge</span>
-                            <span className="block text-2xs text-faint">Add a TXT record</span>
-                          </span>
-                        </label>
-                      </div>
-                      {form.wildcard && (
-                        <p className="mt-2 text-2xs text-warn">
-                          Wildcard certificates require the DNS challenge.
-                        </p>
-                      )}
-                    </fieldset>
-
-                    <div className="flex flex-wrap gap-2">
-                      <Button
-                        variant="primary"
-                        size="sm"
-                        loading={certAction === 'issue'}
-                        onClick={createCertificate}
-                        icon={<ShieldCheck className="size-3.5" aria-hidden="true" />}
-                      >
-                        Create certificate
-                      </Button>
-                      <Button
-                        variant="dangerGhost"
-                        size="sm"
-                        onClick={disableSsl}
-                        disabled={certAction !== null}
-                      >
-                        Disable SSL and save
-                      </Button>
-                    </div>
-                  </div>
-                )}
+                <CertificateIssuance
+                  wildcard={form.wildcard}
+                  certMethod={certMethod}
+                  onMethodChange={setCertMethod}
+                  certFailure={certFailure}
+                  dnsPending={dnsPending}
+                  certAction={certAction}
+                  onCreate={createCertificate}
+                  onConfirmDns={confirmDns}
+                  onCancelDns={cancelDns}
+                  extraActions={
+                    <Button
+                      variant="dangerGhost"
+                      size="sm"
+                      onClick={disableSsl}
+                      disabled={certAction !== null}
+                    >
+                      Disable SSL and save
+                    </Button>
+                  }
+                />
               </div>
             </>
           )}
@@ -1021,6 +1132,35 @@ export function DomainFormModal({
                     className="font-mono"
                   />
                 </div>
+
+                {offerCertificate && (
+                  <div className="space-y-3 rounded-md border border-line bg-raised/30 p-3.5">
+                    <div>
+                      <div className="text-sm font-medium text-ink">No certificate paths set</div>
+                      <p className="mt-0.5 text-xs text-muted">
+                        Create a certificate for {domainName || 'this domain'} now. On success, the
+                        certificate and key paths are filled in automatically.
+                      </p>
+                    </div>
+                    <CertificateIssuance
+                      wildcard={form.wildcard}
+                      certMethod={certMethod}
+                      onMethodChange={setCertMethod}
+                      certFailure={certFailure}
+                      dnsPending={dnsPending}
+                      certAction={certAction}
+                      onCreate={createCertificate}
+                      onConfirmDns={confirmDns}
+                      onCancelDns={cancelDns}
+                      disabledReason={
+                        !domainName
+                          ? 'Enter the domain name above to create a certificate.'
+                          : domainNameError ?? null
+                      }
+                    />
+                  </div>
+                )}
+
                 <div className="space-y-3 rounded-md border border-line bg-raised/30 p-3.5">
                   <Switch
                     checked={form.ssl.redirect}

@@ -11,7 +11,16 @@ import {
 import { describeIssuance, prepareDomainForHttpChallenge } from '../../core/ssl-issuer.js';
 import { findDomain, getDomains } from '../../core/domains-db.js';
 import { loadConfig } from '../../core/config.js';
+import { isWindows } from '../../core/platform.js';
 import { promises as dns } from 'dns';
+import fs from 'fs/promises';
+import path from 'path';
+
+// nginx writes its logs and scratch files here; those can grow large and never
+// contain certificate paths.
+const NGINX_SKIP_DIRS = new Set([
+  'logs', 'temp', 'client_body_temp', 'proxy_temp', 'fastcgi_temp', 'uwsgi_temp', 'scgi_temp',
+]);
 
 // In-memory DNS challenge state
 // Keyed by domain name. Entries are cleaned up when the ACME process exits
@@ -44,6 +53,72 @@ export function stopSslController() {
     } catch { /* already settled */ }
     pendingDnsChallenges.delete(domain);
   }
+}
+
+/**
+ * Flattens a path so nginx configs written with forward slashes, Windows
+ * backslashes or doubled separators all compare equal.
+ */
+function comparablePath(value) {
+  const slashed = String(value ?? '').replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+  return isWindows ? slashed.toLowerCase() : slashed;
+}
+
+/**
+ * Collects every nginx configuration file under `dir` — the main nginx.conf,
+ * domain configs, and the `.conf.disabled` copies a disabled domain leaves.
+ */
+async function collectConfigFiles(dir, found = []) {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return found;
+  }
+
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (!NGINX_SKIP_DIRS.has(entry.name.toLowerCase())) {
+        await collectConfigFiles(full, found);
+      }
+      continue;
+    }
+    if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+    const name = entry.name.toLowerCase();
+    if (name.endsWith('.conf') || name.endsWith('.conf.disabled')) found.push(full);
+  }
+
+  return found;
+}
+
+/**
+ * Finds every nginx config line that points at a file inside the certificate's
+ * directory, so deletion cannot leave nginx referencing missing files.
+ *
+ * @returns {Promise<Array<{ file: string, line: number, text: string }>>}
+ */
+async function findCertReferences(domain, config) {
+  const target = `${comparablePath(path.join(config.sslDir, domain)).replace(/\/+$/, '')}/`;
+  const files = await collectConfigFiles(config.nginxDir);
+  const references = [];
+
+  for (const file of files) {
+    let content;
+    try {
+      content = await fs.readFile(file, 'utf8');
+    } catch {
+      continue;
+    }
+
+    content.split(/\r?\n/).forEach((text, index) => {
+      if (comparablePath(text).includes(target)) {
+        references.push({ file, line: index + 1, text: text.trim() });
+      }
+    });
+  }
+
+  return references;
 }
 
 class SslController {
@@ -312,6 +387,48 @@ class SslController {
       }));
 
       res.json(withPlan);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async remove(req, res, next) {
+    try {
+      const domain = req.params.domain;
+      const config = loadConfig();
+      const certs = await listAllCerts();
+      const cert = certs.find(entry => entry.domain === domain);
+
+      // listAllCerts() only returns direct children of sslDir, so taking the
+      // domain from it — not from the URL — also rules out path traversal.
+      if (!cert) {
+        return res.status(404).json({ error: `Certificate '${domain}' not found` });
+      }
+
+      const directory = path.join(config.sslDir, cert.domain);
+      const references = await findCertReferences(cert.domain, config);
+
+      if (references.length > 0) {
+        return res.status(409).json({
+          error: 'cert_in_use',
+          directory,
+          references,
+          hint:
+            'At least one nginx config still points at this certificate. ' +
+            'Disable SSL on those domains (or remove the lines) before deleting it.',
+        });
+      }
+
+      try {
+        await fs.rm(directory, { recursive: true, force: true });
+      } catch (error) {
+        return res.status(500).json({
+          error: 'delete_failed',
+          detail: `Could not delete ${directory}: ${error.message}`,
+        });
+      }
+
+      res.json({ deleted: cert.domain, directory });
     } catch (error) {
       next(error);
     }

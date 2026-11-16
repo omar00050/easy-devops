@@ -5,11 +5,13 @@ import {
   Plus,
   RefreshCw,
   ShieldCheck,
+  Trash2,
   XCircle,
 } from 'lucide-react';
 import { api, ApiError } from '../lib/api';
 import type {
   Certificate,
+  CertConfigReference,
   CertStatus,
   Domain,
   RenewAllResult,
@@ -94,11 +96,17 @@ export function SslPage() {
   });
 
   const [renewing, setRenewing] = useState<string | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
   const [renewFailure, setRenewFailure] = useState<{
     domain: string | null;
     error: unknown;
   } | null>(null);
   const [renewAllResults, setRenewAllResults] = useState<RenewAllResult[] | null>(null);
+  const [blockedDelete, setBlockedDelete] = useState<{
+    domain: string;
+    directory: string | null;
+    references: CertConfigReference[];
+  } | null>(null);
 
   useRefreshOnVisible(resource.reload);
   useLocalChange(['ssl', 'domains'], resource.reload);
@@ -131,7 +139,7 @@ export function SslPage() {
   const openIssue = () => setParams({ new: '1' });
 
   const renewOne = async (cert: Certificate) => {
-    if (renewing) return;
+    if (renewing || removing) return;
     setRenewing(cert.domain);
     try {
       const result = await api.ssl.renew(cert.domain);
@@ -144,8 +152,44 @@ export function SslPage() {
     }
   };
 
+  const removeOne = async (cert: Certificate) => {
+    if (renewing || removing) return;
+    const ok = await confirm({
+      title: `Delete the certificate for ${cert.domain}?`,
+      body: 'Its files are removed from disk and this cannot be undone. The deletion is refused if any nginx configuration still references the certificate.',
+      confirmLabel: 'Delete certificate',
+      tone: 'danger',
+    });
+    if (!ok) return;
+
+    setRemoving(cert.domain);
+    try {
+      const result = await api.ssl.remove(cert.domain);
+      toast.success(`${cert.domain} deleted`, `Removed ${result.directory}.`);
+      resource.reload();
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'cert_in_use') {
+        setBlockedDelete({
+          domain: cert.domain,
+          directory: typeof error.payload.directory === 'string' ? error.payload.directory : null,
+          references: Array.isArray(error.payload.references) ? error.payload.references : [],
+        });
+      } else {
+        const detail =
+          error instanceof ApiError && typeof error.payload.detail === 'string'
+            ? error.payload.detail
+            : error instanceof Error
+              ? error.message
+              : undefined;
+        toast.error(`Could not delete ${cert.domain}`, detail);
+      }
+    } finally {
+      setRemoving(null);
+    }
+  };
+
   const renewAll = async () => {
-    if (renewing || renewable.length === 0) return;
+    if (renewing || removing || renewable.length === 0) return;
     const ok = await confirm({
       title: `Renew ${pluralize(renewable.length, 'certificate')}?`,
       body: 'Every certificate expiring within 30 days is renewed one at a time. nginx keeps running unless a challenge has to fall back to standalone mode, which stops it briefly.',
@@ -209,7 +253,7 @@ export function SslPage() {
             <Button
               variant="secondary"
               size="sm"
-              disabled={renewable.length === 0 || renewing !== null}
+              disabled={renewable.length === 0 || renewing !== null || removing !== null}
               loading={renewing === 'all'}
               onClick={renewAll}
             >
@@ -362,16 +406,28 @@ export function SslPage() {
                       </Badge>
                     </div>
 
-                    <div className="flex shrink-0 items-center justify-end pl-7 sm:w-24 sm:pl-0">
+                    <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5 pl-7 sm:pl-0">
                       <Button
                         variant="secondary"
                         size="sm"
                         loading={busyHere}
-                        disabled={renewing !== null && !busyHere}
+                        disabled={renewing !== null || removing !== null}
                         onClick={() => renewOne(cert)}
                       >
                         Renew
                       </Button>
+                      {cert.status === 'error' && (
+                        <Button
+                          variant="dangerGhost"
+                          size="sm"
+                          icon={<Trash2 className="size-3.5" aria-hidden="true" />}
+                          loading={removing === cert.domain}
+                          disabled={renewing !== null || removing !== null}
+                          onClick={() => removeOne(cert)}
+                        >
+                          Delete
+                        </Button>
+                      )}
                     </div>
                   </li>
                 );
@@ -487,6 +543,54 @@ export function SslPage() {
               </li>
             ))}
           </ul>
+        )}
+      </Modal>
+
+      <Modal
+        open={blockedDelete !== null}
+        onClose={() => setBlockedDelete(null)}
+        title={
+          blockedDelete
+            ? `${blockedDelete.domain} is still referenced`
+            : 'Certificate is still referenced'
+        }
+        description="Nothing was deleted. At least one nginx configuration file still points at this certificate."
+        size="md"
+        footer={
+          <Button variant="secondary" onClick={() => setBlockedDelete(null)}>
+            Close
+          </Button>
+        }
+      >
+        {blockedDelete && (
+          <div className="space-y-3">
+            <p className="text-xs text-muted">
+              Disable SSL on the domain that uses this certificate — or remove the matching
+              lines — then try deleting it again.
+            </p>
+            {blockedDelete.directory && (
+              <p className="break-all font-mono text-2xs text-faint">
+                {blockedDelete.directory}
+              </p>
+            )}
+            {blockedDelete.references.length > 0 && (
+              <ul className="space-y-2">
+                {blockedDelete.references.map((reference) => (
+                  <li
+                    key={`${reference.file}:${reference.line}`}
+                    className="rounded-md border border-line bg-raised/30 px-3 py-2"
+                  >
+                    <div className="break-all font-mono text-2xs font-medium text-ink">
+                      {reference.file}:{reference.line}
+                    </div>
+                    <pre className="mt-1 whitespace-pre-wrap break-all font-mono text-2xs text-muted">
+                      {reference.text}
+                    </pre>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         )}
       </Modal>
     </>

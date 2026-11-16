@@ -132,6 +132,18 @@ export interface Certificate {
   } | null;
 }
 
+/** One nginx config line that points into a certificate's directory. */
+export interface CertConfigReference {
+  file: string;
+  line: number;
+  text: string;
+}
+
+export interface CertificateDeleteResult {
+  deleted: string;
+  directory: string;
+}
+
 export interface IssuanceFailure {
   step?: string;
   cause?: string;
@@ -750,6 +762,9 @@ export interface ApiErrorPayload {
   found?: string[];
   certPath?: string;
   keyPath?: string;
+  /** DELETE /api/ssl/:domain: certificate still referenced by nginx configs. */
+  directory?: string;
+  references?: CertConfigReference[];
   retryAfterSeconds?: number;
   needsSetup?: boolean;
   authMode?: AuthMode;

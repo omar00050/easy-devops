@@ -201,27 +201,30 @@ export function DomainFolderTab({
         ) : null}
 
         <div className="space-y-2.5">
-          <div className="flex flex-wrap items-end gap-2">
-            <TextInput
-              label={app.domain ? 'Link a different domain' : 'Domain name'}
-              value={domain}
-              onChange={(event) => setDomain(event.target.value)}
-              placeholder="app.example.com"
-              list="deploy-domain-options"
-              hint={
-                !name
-                  ? 'Type a new name, or pick one of your domains.'
-                  : existing
-                    ? 'This domain exists. It will be re-pointed at this app.'
-                    : 'This domain will be created.'
-              }
-              className="min-w-56 flex-1 font-mono"
-              spellCheck={false}
-              autoComplete="off"
-            />
-            <Button variant="primary" onClick={() => void link()} loading={linking} disabled={!name}>
-              Link domain
-            </Button>
+          <div>
+            <div className="flex flex-wrap items-end gap-2">
+              <TextInput
+                label={app.domain ? 'Link a different domain' : 'Domain name'}
+                value={domain}
+                onChange={(event) => setDomain(event.target.value)}
+                placeholder="app.example.com"
+                list="deploy-domain-options"
+                aria-describedby="deploy-domain-hint"
+                className="min-w-56 flex-1 font-mono"
+                spellCheck={false}
+                autoComplete="off"
+              />
+              <Button variant="primary" onClick={() => void link()} loading={linking} disabled={!name}>
+                Link domain
+              </Button>
+            </div>
+            <p id="deploy-domain-hint" className="mt-1.5 text-xs text-faint">
+              {!name
+                ? 'Type a new name, or pick one of your domains.'
+                : existing
+                  ? 'This domain exists. It will be re-pointed at this app.'
+                  : 'This domain will be created.'}
+            </p>
           </div>
           <datalist id="deploy-domain-options">
             {meta.domains.map((d) => (
@@ -258,28 +261,31 @@ export function DomainFolderTab({
             <p className="mt-1.5 break-all font-mono text-2xs text-ink">{app.dir ?? '—'}</p>
           </div>
         </div>
-        <div className="flex flex-wrap items-end gap-2">
-          <TextInput
-            label="Move to"
-            value={target}
-            onChange={(event) => setTarget(event.target.value)}
-            placeholder={meta.deployDir ?? '/srv/ez_deploys'}
-            hint={
-              target.trim()
-                ? `The app will be in ${target.trim().replace(/[\\/]+$/, '')}/${app.id}`
-                : 'A folder on this server. The app goes into a subfolder named after it.'
-            }
-            className="min-w-56 flex-1 font-mono"
-            spellCheck={false}
-            autoComplete="off"
-          />
-          <Button
-            onClick={() => void move()}
-            loading={moving}
-            disabled={!target.trim() || Boolean(app.deploying)}
-          >
-            Move app
-          </Button>
+        <div>
+          <div className="flex flex-wrap items-end gap-2">
+            <TextInput
+              label="Move to"
+              value={target}
+              onChange={(event) => setTarget(event.target.value)}
+              placeholder={meta.deployDir ?? '/srv/ez_deploys'}
+              aria-describedby="deploy-move-hint"
+              className="min-w-56 flex-1 font-mono"
+              spellCheck={false}
+              autoComplete="off"
+            />
+            <Button
+              onClick={() => void move()}
+              loading={moving}
+              disabled={!target.trim() || Boolean(app.deploying)}
+            >
+              Move app
+            </Button>
+          </div>
+          <p id="deploy-move-hint" className="mt-1.5 text-xs text-faint">
+            {target.trim()
+              ? `The app will be in ${target.trim().replace(/[\\/]+$/, '')}/${app.id}`
+              : 'A folder on this server. The app goes into a subfolder named after it.'}
+          </p>
         </div>
         <p className="text-2xs text-faint">
           The app is stopped, its folder is moved, and it is started again from the new place. To

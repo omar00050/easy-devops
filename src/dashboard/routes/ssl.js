@@ -19,5 +19,6 @@ router.post('/create-cancel', (req, res, next) => controller.createCancel(req, r
 router.get('/', (req, res, next) => controller.list(req, res, next));
 router.post('/renew/:domain', (req, res, next) => controller.renew(req, res, next));
 router.post('/renew-all', (req, res, next) => controller.renewAll(req, res, next));
+router.delete('/:domain', (req, res, next) => controller.remove(req, res, next));
 
 export default router;

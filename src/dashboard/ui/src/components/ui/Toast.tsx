@@ -51,6 +51,14 @@ const TONE_STYLES: Record<ToastTone, { icon: LucideIcon; iconClass: string }> = 
 
 const DEFAULT_DURATION = 6000;
 
+// crypto.randomUUID() is missing outside secure contexts, which includes the
+// plain-HTTP LAN addresses this dashboard is commonly opened on.
+let toastSequence = 0;
+function toastId(): string {
+  toastSequence += 1;
+  return `toast-${Date.now().toString(36)}-${toastSequence}`;
+}
+
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([]);
   const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
@@ -63,7 +71,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   };
 
   const push = (options: ToastOptions): string => {
-    const id = crypto.randomUUID();
+    const id = toastId();
     const item: ToastItem = {
       id,
       title: options.title,

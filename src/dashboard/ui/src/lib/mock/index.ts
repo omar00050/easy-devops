@@ -41,6 +41,7 @@ import {
 } from './fixtures';
 import type {
   BackgroundServiceEvent,
+  CertConfigReference,
   Certificate,
   ChannelInput,
   Domain,
@@ -444,19 +445,52 @@ function emptyDomain(input: Record<string, unknown>): Domain {
   };
 }
 
+/** Mirrors the server's scan of nginx configs for lines pointing at a certificate. */
+function certConfigReferences(s: MockState, domain: string): CertConfigReference[] {
+  const base = s.settings.sslDir
+    .replace(/\\/g, '/')
+    .replace(/\/{2,}/g, '/')
+    .replace(/\/+$/, '');
+  const needle = `${base}/${domain}/`;
+  const references: CertConfigReference[] = [];
+
+  for (const [file, content] of Object.entries(s.configs)) {
+    content.split(/\r?\n/).forEach((text, index) => {
+      const normalized = text.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+      if (normalized.includes(needle)) {
+        references.push({
+          file: `/etc/nginx/conf.d/${file}`,
+          line: index + 1,
+          text: text.trim(),
+        });
+      }
+    });
+  }
+
+  return references;
+}
+
 function sslShapeCheck(s: MockState, domain: Domain): void {
-  if (domain.ssl.enabled && domain.ssl.certPath) {
-    const known =
-      s.certs.some((c) => c.domain === domain.name) ||
-      s.domains.some((d) => d.ssl.certPath === domain.ssl.certPath && d.name !== domain.name);
-    if (!known) {
-      throw new ApiError(422, {
-        error: 'cert_missing',
-        certPath: domain.ssl.certPath,
-        keyPath: domain.ssl.keyPath,
-        hint: 'The SSL certificate files do not exist at the configured paths. Create the certificate first, or disable SSL.',
-      });
-    }
+  if (!domain.ssl.enabled) return;
+
+  const base = s.settings.sslDir
+    .replace(/\\/g, '/')
+    .replace(/\/{2,}/g, '/')
+    .replace(/\/+$/, '');
+  const certPath = domain.ssl.certPath || `${base}/${domain.name}/fullchain.pem`;
+  const keyPath = domain.ssl.keyPath || `${base}/${domain.name}/privkey.pem`;
+  const known =
+    s.certs.some((c) => c.domain === domain.name) ||
+    (Boolean(domain.ssl.certPath) &&
+      s.domains.some((d) => d.name !== domain.name && d.ssl.certPath === domain.ssl.certPath));
+
+  if (!known) {
+    throw new ApiError(422, {
+      error: 'cert_missing',
+      certPath,
+      keyPath,
+      hint: 'The SSL certificate files do not exist at the configured paths. Create the certificate first, or disable SSL.',
+    });
   }
 }
 
@@ -564,7 +598,14 @@ function handle(
   requireAuth(s);
 
   // ── Domains ───────────────────────────────────────────────────────────────
-  if (path === '/domains' && method === 'GET') return s.domains;
+  // The real API derives expiry from the certificate files on every list call,
+  // so a newly issued certificate shows its days left without a domain save.
+  if (path === '/domains' && method === 'GET') {
+    return s.domains.map((domain) => {
+      const cert = s.certs.find((candidate) => candidate.domain === domain.name);
+      return cert ? { ...domain, certExpiry: cert.expiry, daysLeft: cert.daysLeft } : domain;
+    });
+  }
 
   if (path === '/domains' && method === 'POST') {
     const name = String(data.name ?? '').trim();
@@ -754,6 +795,34 @@ function handle(
     });
     persist();
     return results;
+  }
+
+  const deleteSslMatch = /^\/ssl\/([^/]+)$/.exec(path);
+  if (deleteSslMatch && method === 'DELETE') {
+    const name = decodeURIComponent(deleteSslMatch[1]);
+    if (!s.certs.some((c) => c.domain === name)) fail(404, `Certificate '${name}' not found`);
+
+    const base = s.settings.sslDir
+      .replace(/\\/g, '/')
+      .replace(/\/{2,}/g, '/')
+      .replace(/\/+$/, '');
+    const directory = `${base}/${name}`;
+    const references = certConfigReferences(s, name);
+
+    if (references.length > 0) {
+      fail(409, 'certificate is still referenced by nginx', {
+        error: 'cert_in_use',
+        directory,
+        references,
+        hint:
+          'At least one nginx config still points at this certificate. ' +
+          'Disable SSL on those domains (or remove the lines) before deleting it.',
+      });
+    }
+
+    s.certs = s.certs.filter((c) => c.domain !== name);
+    persist();
+    return { deleted: name, directory };
   }
 
   // ── Nginx ─────────────────────────────────────────────────────────────────
@@ -1066,7 +1135,7 @@ function handle(
       fail(400, 'Telegram channels require a botToken and a chatId.');
     }
     const channel: NotificationChannel = {
-      id: `ch-${crypto.randomUUID()}`,
+      id: `ch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       name: input.name.trim(),
       type: input.type,
       ...(input.type === 'discord'

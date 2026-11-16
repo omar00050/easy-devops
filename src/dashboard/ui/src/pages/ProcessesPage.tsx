@@ -1,11 +1,14 @@
 import { useState } from 'react';
 import {
+  List,
+  Loader2,
   Play,
   RefreshCw,
   RotateCw,
   ScrollText,
   ServerCog,
   Square,
+  Table2,
   X,
 } from 'lucide-react';
 import { api, ApiError } from '../lib/api';
@@ -348,6 +351,189 @@ function ProcessRow({
   );
 }
 
+type ProcessView = 'list' | 'table';
+
+const PROCESS_VIEW_KEY = 'ez.processes.view';
+
+function readStoredView(): ProcessView {
+  try {
+    return localStorage.getItem(PROCESS_VIEW_KEY) === 'table' ? 'table' : 'list';
+  } catch {
+    return 'list';
+  }
+}
+
+function ViewToggle({ view, onChange }: { view: ProcessView; onChange: (view: ProcessView) => void }) {
+  const options = [
+    { id: 'list' as const, label: 'List view', icon: List },
+    { id: 'table' as const, label: 'Table view', icon: Table2 },
+  ];
+
+  return (
+    <div
+      role="group"
+      aria-label="Process layout"
+      className="inline-flex items-center gap-0.5 rounded-md border border-line bg-raised p-0.5"
+    >
+      {options.map(({ id, label, icon: Icon }) => (
+        <button
+          key={id}
+          type="button"
+          aria-pressed={view === id}
+          title={label}
+          onClick={() => onChange(id)}
+          className={cn(
+            'inline-flex size-7 items-center justify-center rounded-sm transition-colors duration-[var(--ez-motion-fast)]',
+            view === id ? 'bg-surface text-ink shadow-sm' : 'text-faint hover:text-ink'
+          )}
+        >
+          <Icon className="size-3.5" aria-hidden="true" />
+          <span className="sr-only">{label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function RestartCell({ app }: { app: ProcessApp }) {
+  return app.unstableRestarts > 0
+    ? `${app.restarts} · ${app.unstableRestarts} unstable`
+    : String(app.restarts);
+}
+
+function ProcessTable({
+  apps,
+  isModule,
+  busy,
+  currentUser,
+  onAction,
+  onLogs,
+}: {
+  apps: ProcessApp[];
+  isModule: boolean;
+  busy: { name: string; action: ProcessAction } | null;
+  currentUser: string | null;
+  onAction: (app: ProcessApp, action: ProcessAction, isModule: boolean) => void;
+  onLogs: (app: ProcessApp) => void;
+}) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[42rem] text-left text-sm">
+        <thead>
+          <tr className="border-b border-line text-2xs uppercase tracking-wider text-faint">
+            <th scope="col" className="px-4 py-2 font-medium sm:px-5">
+              Process
+            </th>
+            <th scope="col" className="px-3 py-2 font-medium">
+              Status
+            </th>
+            <th scope="col" className="px-3 py-2 text-right font-medium">
+              CPU
+            </th>
+            <th scope="col" className="px-3 py-2 text-right font-medium">
+              Memory
+            </th>
+            <th scope="col" className="px-3 py-2 font-medium">
+              Uptime
+            </th>
+            <th scope="col" className="px-3 py-2 text-right font-medium">
+              Restarts
+            </th>
+            <th scope="col" className="px-4 py-2 text-right font-medium sm:px-5">
+              <span className="sr-only">Actions</span>
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {apps.map((app) => {
+            const isBusy = busy?.name === app.name;
+            const otherUser = Boolean(app.user && currentUser && app.user !== currentUser);
+
+            return (
+              <tr key={`${app.name}-${app.pmId ?? 'x'}`} className="border-b border-line/70 last:border-0">
+                <td className="px-4 py-2 sm:px-5">
+                  <div className="flex items-center gap-2">
+                    <StatusDot tone={statusTone(app.status)} pulse={app.status === 'online'} />
+                    <span className="truncate text-sm font-medium text-ink">{app.name}</span>
+                    {isModule && <Badge tone="info">module</Badge>}
+                    {otherUser && <Badge tone="warn">{app.user}</Badge>}
+                  </div>
+                </td>
+                <td className="whitespace-nowrap px-3 py-2">
+                  <Badge tone={statusTone(app.status)}>{app.status}</Badge>
+                </td>
+                <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-muted">
+                  {metricPercent(app.cpu)}
+                </td>
+                <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-muted">
+                  {metricBytes(app.memoryBytes)}
+                </td>
+                <td className="whitespace-nowrap px-3 py-2 tabular-nums text-muted">
+                  {formatUptime(app.uptimeMs)}
+                </td>
+                <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-muted">
+                  <RestartCell app={app} />
+                </td>
+                <td className="px-4 py-2 sm:px-5">
+                  <div className="flex items-center justify-end gap-1">
+                    {app.status === 'online' ? (
+                      <IconButton
+                        label={`Stop ${app.name}`}
+                        size="sm"
+                        disabled={isBusy || otherUser}
+                        onClick={() => onAction(app, 'stop', isModule)}
+                      >
+                        {isBusy && busy?.action === 'stop' ? (
+                          <Loader2 className="spin size-3.5" aria-hidden="true" />
+                        ) : (
+                          <Square className="size-3" aria-hidden="true" />
+                        )}
+                      </IconButton>
+                    ) : (
+                      <IconButton
+                        label={`Start ${app.name}`}
+                        size="sm"
+                        disabled={isBusy || otherUser}
+                        onClick={() => onAction(app, 'start', isModule)}
+                      >
+                        {isBusy && busy?.action === 'start' ? (
+                          <Loader2 className="spin size-3.5" aria-hidden="true" />
+                        ) : (
+                          <Play className="size-3" aria-hidden="true" />
+                        )}
+                      </IconButton>
+                    )}
+                    <IconButton
+                      label={`Restart ${app.name}`}
+                      size="sm"
+                      disabled={isBusy || otherUser}
+                      onClick={() => onAction(app, 'restart', isModule)}
+                    >
+                      {isBusy && busy?.action === 'restart' ? (
+                        <Loader2 className="spin size-3.5" aria-hidden="true" />
+                      ) : (
+                        <RotateCw className="size-3.5" aria-hidden="true" />
+                      )}
+                    </IconButton>
+                    <IconButton
+                      label={`View logs for ${app.name}`}
+                      size="sm"
+                      disabled={isBusy}
+                      onClick={() => onLogs(app)}
+                    >
+                      <ScrollText className="size-3.5" aria-hidden="true" />
+                    </IconButton>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export function ProcessesPage() {
   useDocumentTitle('Processes');
   const toast = useToast();
@@ -366,6 +552,16 @@ export function ProcessesPage() {
   const [logsFor, setLogsFor] = useState<ProcessApp | null>(null);
   const [serviceBusy, setServiceBusy] = useState<ServiceAction | null>(null);
   const [serviceGuidance, setServiceGuidance] = useState<ServiceGuidance | null>(null);
+  const [view, setView] = useState<ProcessView>(readStoredView);
+
+  const changeView = (next: ProcessView) => {
+    setView(next);
+    try {
+      localStorage.setItem(PROCESS_VIEW_KEY, next);
+    } catch {
+      // Storage can be unavailable (private mode); the choice just will not stick.
+    }
+  };
 
   const reloadAll = () => {
     processes.reload();
@@ -827,6 +1023,11 @@ export function ProcessesPage() {
                   ? `Apps PM2 is supervising for ${currentUser}. Easy DevOps itself is not one of them.`
                   : 'Apps PM2 is supervising for you. Easy DevOps itself is not one of them.'
               }
+              actions={
+                userApps.length > 0 || modules.length > 0 ? (
+                  <ViewToggle view={view} onChange={changeView} />
+                ) : undefined
+              }
             />
 
             {processes.data.pm2.installed && processes.data.hint && (
@@ -861,19 +1062,32 @@ export function ProcessesPage() {
                 description="Start an app with PM2 and it will appear here. Easy DevOps does not run itself under PM2."
               />
             ) : (
-              <ul className="divide-y divide-line/70">
-                {userApps.map((app) => (
-                  <ProcessRow
-                    key={`${app.name}-${app.pmId ?? 'x'}`}
-                    app={app}
+              <div key={view} className="panel-enter">
+                {view === 'table' ? (
+                  <ProcessTable
+                    apps={userApps}
                     isModule={false}
                     busy={busy}
                     currentUser={currentUser}
                     onAction={runAction}
                     onLogs={setLogsFor}
                   />
-                ))}
-              </ul>
+                ) : (
+                  <ul className="divide-y divide-line/70">
+                    {userApps.map((app) => (
+                      <ProcessRow
+                        key={`${app.name}-${app.pmId ?? 'x'}`}
+                        app={app}
+                        isModule={false}
+                        busy={busy}
+                        currentUser={currentUser}
+                        onAction={runAction}
+                        onLogs={setLogsFor}
+                      />
+                    ))}
+                  </ul>
+                )}
+              </div>
             )}
           </Card>
 
@@ -888,19 +1102,32 @@ export function ProcessesPage() {
                 }
                 description="Modules extend PM2 itself and are not your apps. Stopping pm2-logrotate lets PM2 logs grow without limit."
               />
-              <ul className="divide-y divide-line/70">
-                {modules.map((app) => (
-                  <ProcessRow
-                    key={`${app.name}-${app.pmId ?? 'x'}`}
-                    app={app}
+              <div key={view} className="panel-enter">
+                {view === 'table' ? (
+                  <ProcessTable
+                    apps={modules}
                     isModule={true}
                     busy={busy}
                     currentUser={currentUser}
                     onAction={runAction}
                     onLogs={setLogsFor}
                   />
-                ))}
-              </ul>
+                ) : (
+                  <ul className="divide-y divide-line/70">
+                    {modules.map((app) => (
+                      <ProcessRow
+                        key={`${app.name}-${app.pmId ?? 'x'}`}
+                        app={app}
+                        isModule={true}
+                        busy={busy}
+                        currentUser={currentUser}
+                        onAction={runAction}
+                        onLogs={setLogsFor}
+                      />
+                    ))}
+                  </ul>
+                )}
+              </div>
             </Card>
           )}
         </div>

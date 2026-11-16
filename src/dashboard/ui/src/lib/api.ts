@@ -18,6 +18,7 @@ import type {
   AuthStatus,
   BackupFile,
   Certificate,
+  CertificateDeleteResult,
   ChannelInput,
   DeployApp,
   DeployAppDetail,
@@ -231,6 +232,8 @@ export const api = {
     renew: (domain: string) =>
       request<IssuanceSuccess>(`/ssl/renew/${enc(domain)}`, { method: 'POST' }),
     renewAll: () => request<RenewAllResult[]>('/ssl/renew-all', { method: 'POST' }),
+    remove: (domain: string) =>
+      request<CertificateDeleteResult>(`/ssl/${enc(domain)}`, { method: 'DELETE' }),
   },
 
   nginx: {
