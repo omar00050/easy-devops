@@ -130,7 +130,11 @@ export async function probe(key, producer, {
 
   const settled = entries.get(key);
 
-  if (raced === 'done' && settled?.at !== null) {
+  // `settled` can be gone: invalidate() deletes the entry while the producer
+  // is in flight, and this read was already waiting on that producer. The
+  // promise still resolves, but its answer no longer belongs to any cache
+  // entry — treat it as "no answer yet" instead of dereferencing undefined.
+  if (raced === 'done' && settled && settled.at !== null) {
     return {
       value: settled.value,
       ageMs: Date.now() - settled.at,
