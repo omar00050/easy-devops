@@ -448,8 +448,8 @@ export function AppFormModal({
               return { value: result.path, error: result.error };
             }}
             max={20}
-            hint="Add folders your app writes to: uploads, SQLite data, logs — or one file, such as prisma/hub.db. Press Enter after each path."
-            placeholder="data, uploads, prisma/hub.db"
+            hint="Add folders your app writes to: uploads, SQLite data, logs — or one file, such as prisma/app.db. Press Enter after each path."
+            placeholder="data, uploads, prisma/app.db"
           />
           <div className="space-y-1 text-2xs text-faint">
             <p>
