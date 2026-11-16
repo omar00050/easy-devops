@@ -10,11 +10,15 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import { loadConfig } from '../../core/config.js';
 import { dbGet, dbSet } from '../../core/db.js';
+import { getDataDir } from '../../core/platform.js';
 import { run } from '../../core/shell.js';
 
 const __dirname  = path.dirname(fileURLToPath(import.meta.url));
 const isWindows  = process.platform === 'win32';
-const LOG_PATH   = path.resolve(__dirname, '../../../data/dashboard.log');
+// Principle IV: logs live in the user's data directory, never inside the
+// package — a package-relative path is wiped by `npm update`. Follows
+// EASY_DEVOPS_DATA_DIR in dev mode like the database and sessions do.
+const LOG_PATH   = path.join(getDataDir(), 'logs', 'dashboard.log');
 const SERVER_PATH = path.resolve(__dirname, '../../dashboard/server.js');
 
 // ─── Port helpers ─────────────────────────────────────────────────────────────
@@ -159,12 +163,89 @@ function showUsageInfo() {
   console.log();
 }
 
+// ─── `ezz dashboard <action>` ─────────────────────────────────────────────────
+
+const DASHBOARD_ACTIONS = ['setup-code'];
+
+/**
+ * Issues a new first-run setup code and prints it.
+ *
+ * CLI-only, deliberately: the code's whole purpose is to prove that whoever is
+ * setting the first password can read this machine's terminal or its service
+ * log. An endpoint that handed it out would defeat it, so there is none — and
+ * this is also the only way back once a code has expired or been invalidated
+ * by too many wrong guesses.
+ *
+ * @returns {Promise<number>} Process exit code
+ */
+async function issueSetupCode() {
+  const { loadConfig } = await import('../../core/config.js');
+  const setupCode = await import('../../core/setupCode.js');
+
+  const config = loadConfig();
+
+  if (!setupCode.setupPending(config)) {
+    console.log();
+    console.log('  ' + chalk.white('The dashboard is already set up.'));
+    console.log('  ' + chalk.gray('A setup code only applies before the first password is set.'));
+    console.log('  ' + chalk.gray('Change the password in the dashboard under Settings.'));
+    console.log();
+    // Any leftover code is removed rather than left outstanding.
+    if (setupCode.clear()) {
+      console.log('  ' + chalk.gray('An outstanding code was cleared.'));
+      console.log();
+    }
+    return 0;
+  }
+
+  const issued = await setupCode.issue();
+
+  for (const line of setupCode.describe({ code: issued.code, expiresAt: issued.expiresAt })) {
+    console.log(line);
+  }
+  console.log('  ' + chalk.gray('This replaces any code issued earlier.'));
+  console.log();
+
+  return 0;
+}
+
+/**
+ * Entry point for the `dashboard` command.
+ *
+ * @param {string} action
+ * @returns {Promise<number>} Process exit code
+ */
+export async function dashboardCommand(action) {
+  if (!DASHBOARD_ACTIONS.includes(action)) {
+    process.stderr.write(
+      `Unknown dashboard action: ${action}\n` +
+      `Available: ${DASHBOARD_ACTIONS.join(', ')}\n`
+    );
+    return 1;
+  }
+
+  switch (action) {
+    case 'setup-code': return issueSetupCode();
+    default: return 1;
+  }
+}
+
 // ─── Menu ─────────────────────────────────────────────────────────────────────
 
 export default async function dashboardMenu() {
   while (true) {
     const spinner = ora('Checking dashboard status...').start();
     const status = await getDashboardStatus();
+
+    // The background SERVICE no longer runs the dashboard — it runs the daemon,
+    // which serves no UI. So this menu always owns starting and stopping the
+    // dashboard; what the service state changes is only what to tell the user
+    // about monitoring.
+    let background = null;
+    try {
+      const { backgroundServiceState } = await import('../../core/service/index.js');
+      background = backgroundServiceState();
+    } catch { /* unreadable state: the dashboard lines below still apply */ }
     spinner.stop();
 
     const url = `http://localhost:${status.port}`;
@@ -176,6 +257,16 @@ export default async function dashboardMenu() {
       console.log(`  ${chalk.green('✅ Running')}  |  ${chalk.cyan(url)}  |  PID ${status.pid}`);
     } else {
       console.log(`  ${chalk.red('❌ Stopped')}  |  port ${status.configPort}`);
+    }
+
+    // Whether monitoring survives closing the dashboard is a separate fact,
+    // and the one users were surprised by.
+    if (background?.running) {
+      console.log(chalk.gray(`  Background service running (pid ${background.pid}) — monitoring continues without this page.`));
+    } else if (background?.installed) {
+      console.log(chalk.yellow('  Background service installed but not running') + chalk.gray(' — `ezz service start`'));
+    } else {
+      console.log(chalk.gray('  No background service — monitoring runs only while the dashboard is open.'));
     }
     console.log();
 

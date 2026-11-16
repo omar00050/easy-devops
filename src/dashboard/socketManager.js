@@ -1,203 +1,151 @@
-import http from 'http';
+/**
+ * dashboard/socketManager.js
+ *
+ * The browser-facing Socket.io layer. It no longer DOES any monitoring.
+ *
+ * It used to: nginx polling, domain health probes, certificate checks and the
+ * notification decisions all lived here, driven by intervals that only ran
+ * while a browser was connected. That is why none of it worked without an open
+ * dashboard, and why it could not move into a service.
+ *
+ * All of it now lives in core/jobs/, runs in whichever process owns the jobs,
+ * and arrives here as events on core/jobs/bus.js — published either by the
+ * monitors in this process, or by the daemon over IPC and republished onto the
+ * bus by dashboard/lib/daemonBridge.js. This module's whole job is to forward
+ * them to connected browsers unchanged, which is why the bus uses the names
+ * and payloads from docs/api-contract.md.
+ *
+ * What is still genuinely socket work and stays here: the session and
+ * local-request guards on the handshake, and the live log tails — a tail exists
+ * only for a client that is watching it, and dies with that client.
+ */
+
 import { spawn } from 'child_process';
-import path from 'path';
 import { Server as SocketIO } from 'socket.io';
 
-import { getStatus } from './lib/nginx-service.js';
-import { listAllCerts } from './lib/cert-reader.js';
+import { socketRequireAuth } from './lib/requireAuth.js';
+import { socketRequireLocalRequest } from './lib/localRequest.js';
 import { loadConfig } from '../core/config.js';
-import { dbGet } from '../core/db.js';
-import {
-  createNginxDownEvent,
-  createNginxRecoveredEvent,
-  createDomainDownEvent,
-  createDomainRecoveredEvent,
-} from '../core/events.js';
-import { sendNotification } from '../core/notifier.js';
-import {
-  getEffectiveChannelIds,
-  getAllDomainChannelIds,
-  shouldSendNotification,
-} from '../core/domainNotifier.js';
+import { nginxLogPath } from '../core/platform.js';
+import { publish, subscribeAll } from '../core/jobs/bus.js';
 
 let connectedClients = 0;
 const activeTails = new Map();
 
+let ioServer = null;
+let unsubscribeBus = null;
+
 /**
- * Emit nginx status and handle notification state transitions.
- * Uses state tracking to prevent spam and support recovery notifications.
+ * The most recent payload for each replayable event.
+ *
+ * A newly opened tab has to show something immediately. The monitors publish
+ * on their own schedule — domain health every 60 seconds — so without this a
+ * tab opened just after a poll would sit empty until the next one. Previously
+ * the fix was to run a fresh poll per connection; that does not work when the
+ * polling happens in another process, and it meant every opened tab triggered
+ * real work.
+ *
+ * `service:changed` is cached for the same reason, and matters more: a tab
+ * that opens while the daemon is already running must render the banner right
+ * away rather than waiting for the next hand-over to tell it anything.
+ *
+ * Only the state-like events are cached. `notification:new` is not: it is a
+ * discrete thing that happened, and replaying old notifications into each new
+ * tab would announce outages that are long over.
  */
-async function emitNginxStatus(target) {
-  try {
-    const status = await getStatus();
-    target.emit('nginx:status', status);
+const REPLAYABLE = ['nginx:status', 'domain:health', 'service:changed'];
+const lastKnown = new Map();
 
-    const currentStatus = status.running ? 'up' : 'down';
-    const decision = shouldSendNotification(null, 'nginx_down', currentStatus);
+/**
+ * Initialize the Socket.IO server.
+ *
+ * @param {import('http').Server} httpServer
+ * @param {Function} sessionMiddleware Shared with Express so sockets see the same session
+ * @param {Function} getBinding Returns the current { port, bindAddress }
+ * @returns {import('socket.io').Server}
+ */
+function initSocket(httpServer, sessionMiddleware, getBinding) {
+  const io = new SocketIO(httpServer);
+  ioServer = io;
 
-    if (decision.shouldNotify) {
-      let event;
-      if (decision.reason === 'recovery') {
-        event = createNginxRecoveredEvent();
-      } else {
-        event = createNginxDownEvent();
-      }
-
-      console.log(`[socketManager] Sending nginx notification: ${decision.reason}`);
-      target.emit('notification:new', event);
-
-      // External channel routing (fire-and-forget, isolated)
-      try {
-        const channels = getAllDomainChannelIds('nginx_down');
-        await sendNotification(event, channels);
-      } catch (err) {
-        console.error('[socketManager] sendNotification failed:', err.message);
-      }
-    }
-  } catch (err) {
-    target.emit('nginx:status', { running: false, version: null, pid: null, error: err.message });
+  // The socket stream is not a lesser surface than the REST API: it carries
+  // nginx status, domain health and live log tails. It gets the same session
+  // check.
+  //
+  // `io.engine.use` runs the express-session middleware on the handshake
+  // request, which is what puts `socket.request.session` in place for
+  // socketRequireAuth to read. Without the middleware there is no session
+  // object at all, and the guard then refuses every connection — which is the
+  // correct direction to fail, but would break the dashboard, so it is worth
+  // noticing rather than shipping.
+  if (typeof sessionMiddleware === 'function') {
+    io.engine.use(sessionMiddleware);
+  } else {
+    console.error('[socketManager] no session middleware supplied — refusing all socket connections');
   }
-}
 
-/**
- * Emit cert expiry notifications.
- * Note: Cert expiry doesn't use state tracking because it's a time-based event,
- * not a state transition. We notify whenever a cert is expiring, regardless of
- * whether we notified before.
- */
-async function emitCertNotifications(target) {
-  try {
-    const certs = await listAllCerts();
-    for (const cert of certs) {
-      if (cert.daysLeft !== null && cert.daysLeft < 30) {
-        const event = {
-          id: `cert-expiry-${cert.domain}-${Date.now()}`,
-          type: 'cert_expiry',
-          severity: cert.daysLeft < 10 ? 'danger' : 'warning',
-          message: `🔒 SSL cert for ${cert.domain} expires in ${cert.daysLeft} day${cert.daysLeft === 1 ? '' : 's'}`,
-          domain: cert.domain,
-          timestamp: Date.now(),
-        };
-        target.emit('notification:new', event);
-
-        // External channel routing (fire-and-forget, isolated)
-        try {
-          const channels = getEffectiveChannelIds(cert.domain, 'cert_expiry');
-          await sendNotification(event, channels);
-        } catch (err) {
-          console.error('[socketManager] sendNotification failed:', err.message);
-        }
-      }
-    }
-  } catch {
-    /* non-fatal */
+  // Host / Origin / X-EZ-Request, before the session check — the handshake is
+  // as reachable from a hostile page as any POST is, and a socket has no
+  // "safe method", so the custom header is required unconditionally.
+  //
+  // This is why the browser client must NOT force transports: ['websocket']:
+  // browsers cannot set headers on a WebSocket upgrade. socket.io's default
+  // starts with HTTP polling, where extraHeaders does apply, and the
+  // handshake is authenticated there before any upgrade happens.
+  if (typeof getBinding === 'function') {
+    io.use(socketRequireLocalRequest(getBinding));
+  } else {
+    console.error('[socketManager] no binding supplied — refusing all socket connections');
+    io.use((socket, next) => next(new Error('FORBIDDEN')));
   }
-}
 
-/**
- * Check if a domain backend is responding.
- */
-function checkDomainHealth(host, port) {
-  return new Promise((resolve) => {
-    const req = http.request(
-      {
-        host,
-        port: Number(port),
-        path: '/',
-        method: 'HEAD',
-        timeout: 5000,
-      },
-      (res) => {
-        resolve({ up: true, status: res.statusCode });
-        res.resume();
-      }
-    );
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ up: false });
-    });
-    req.on('error', () => resolve({ up: false }));
-    req.end();
+  io.use(socketRequireAuth);
+
+  // One subscription for the whole server, not one per client: these events are
+  // broadcasts, and subscribing per socket would deliver each one as many times
+  // as there are tabs open.
+  unsubscribeBus = subscribeAll((event, payload) => {
+    if (REPLAYABLE.includes(event)) lastKnown.set(event, payload);
+    if (connectedClients > 0) io.emit(event, payload);
   });
-}
 
-/**
- * Emit domain health status and handle notification state transitions.
- * Uses state tracking to:
- * 1. Prevent spam (don't re-notify if already down)
- * 2. Send recovery notifications when domain comes back up
- */
-async function emitDomainHealth(target) {
-  try {
-    const domains = dbGet('domains') || [];
-    const results = await Promise.all(
-      domains.map(async (d) => {
-        const host = d.backendHost || '127.0.0.1';
-        const port = d.port || 80;
+  io.on('connection', (socket) => {
+    connectedClients++;
 
-        // Skip external URL backends
-        if (typeof host === 'string' && host.startsWith('http')) return { name: d.name, up: null };
-
-        const { up } = await checkDomainHealth(host, port);
-        return { name: d.name, up, port, host };
-      })
-    );
-
-    target.emit('domain:health', results);
-
-    // Process state transitions for each domain
-    for (const result of results) {
-      if (result.up === null) continue; // Skip external URL backends
-
-      const currentStatus = result.up ? 'up' : 'down';
-      const decision = shouldSendNotification(result.name, 'domain_health', currentStatus);
-
-      if (decision.shouldNotify) {
-        let event;
-        if (decision.reason === 'recovery') {
-          event = createDomainRecoveredEvent(result.name, result.port);
-        } else {
-          event = createDomainDownEvent(result.name, result.port);
-        }
-
-        console.log(`[socketManager] Sending domain health notification for ${result.name}: ${decision.reason}`);
-        target.emit('notification:new', event);
-
-        try {
-          const channelIds = getEffectiveChannelIds(result.name, 'domain_health');
-          await sendNotification(event, channelIds);
-        } catch (err) {
-          console.error('[socketManager] domain health sendNotification failed:', err.message);
-        }
-      }
+    // Whatever we last heard, so the UI renders immediately instead of waiting
+    // for the next poll in whichever process owns the jobs.
+    for (const event of REPLAYABLE) {
+      if (lastKnown.has(event)) socket.emit(event, lastKnown.get(event));
     }
-  } catch (err) {
-    console.error('[socketManager] emitDomainHealth error:', err.message);
-  }
+
+    socket.on('logs:subscribe', ({ logFile } = {}) => startTail(socket, logFile || 'error'));
+    socket.on('logs:unsubscribe', () => stopTail(socket.id));
+
+    socket.on('disconnect', () => {
+      connectedClients--;
+      stopTail(socket.id);
+    });
+  });
+
+  return io;
 }
 
-/**
- * Get the path to a log file.
- */
-function getLogPath(logFile) {
-  const { nginxDir } = loadConfig();
-  const file = logFile === 'access' ? 'access.log' : 'error.log';
-
-  // Linux standard path first, fall back to nginxDir/logs/
-  if (process.platform !== 'win32') {
-    return `/var/log/nginx/${file}`;
-  }
-  return path.join(nginxDir, 'logs', file);
-}
+// ─── Live log tails ───────────────────────────────────────────────────────────
 
 /**
- * Start tailing a log file for a socket.
+ * Starts tailing a log file for one socket.
+ *
+ * `-n 50` / `-Tail 50` is what satisfies the contract's promise that a
+ * subscribe replays the last 50 lines before streaming: the tail command does
+ * both in one call, so there is no window between the replay and the live
+ * stream in which a line could be missed.
  */
 function startTail(socket, logFile) {
-  // Kill any existing tail for this socket
   stopTail(socket.id);
 
-  const logPath = getLogPath(logFile);
+  const { nginxDir } = loadConfig();
+  const logPath = nginxLogPath(nginxDir, logFile === 'access' ? 'access' : 'error');
+
   const args = process.platform === 'win32'
     ? ['Get-Content', '-Path', logPath, '-Wait', '-Tail', '50']
     : ['-n', '50', '-f', logPath];
@@ -212,7 +160,7 @@ function startTail(socket, logFile) {
   child.stdout.on('data', (chunk) => {
     buf += chunk.toString();
     const lines = buf.split('\n');
-    buf = lines.pop(); // keep incomplete line in buffer
+    buf = lines.pop(); // keep the incomplete line in the buffer
     for (const line of lines) {
       if (line.trim()) socket.emit('logs:line', { line: line.trim(), logFile });
     }
@@ -226,9 +174,7 @@ function startTail(socket, logFile) {
   activeTails.set(socket.id, { process: child, logFile });
 }
 
-/**
- * Stop tailing a log file for a socket.
- */
+/** Stops the tail belonging to one socket. */
 function stopTail(socketId) {
   const entry = activeTails.get(socketId);
   if (entry) {
@@ -239,44 +185,62 @@ function stopTail(socketId) {
   }
 }
 
+// ─── Outbound helper ──────────────────────────────────────────────────────────
+
 /**
- * Initialize the Socket.IO server.
+ * Tells every open dashboard tab that a section changed, so the UI can refresh
+ * just that part instead of reloading the page.
+ *
+ * Used when a change did NOT originate in this browser — most importantly when
+ * the Hub applies a command through core/hub/agent.js, or when another process
+ * moves the revision counter.
+ *
+ * It publishes to the job bus rather than emitting at the socket server
+ * directly, so the same call works in the daemon, which has no socket server,
+ * and still reaches browsers through IPC. Safe to call before initSocket().
+ *
+ * @param {'domains'|'ssl'|'nginx'|'settings'} section
+ * @param {Object} [detail] Optional extra context for the client
  */
-function initSocket(httpServer) {
-  const io = new SocketIO(httpServer);
-
-  io.on('connection', (socket) => {
-    connectedClients++;
-
-    emitNginxStatus(socket);
-    emitCertNotifications(socket);
-
-    socket.on('logs:subscribe', ({ logFile }) => startTail(socket, logFile || 'error'));
-    socket.on('logs:unsubscribe', () => stopTail(socket.id));
-
-    // Send initial domain health on connect
-    emitDomainHealth(socket);
-
-    socket.on('disconnect', () => {
-      connectedClients--;
-      stopTail(socket.id);
-    });
-  });
-
-  // Poll domain health every 60 seconds
-  setInterval(() => {
-    if (connectedClients > 0) emitDomainHealth(io);
-  }, 60_000);
-
-  // Broadcast nginx status to all clients every 5 seconds
-  setInterval(() => {
-    if (connectedClients > 0) emitNginxStatus(io);
-  }, 5000);
-
-  // Check cert expiry every 12 hours
-  setInterval(() => {
-    if (connectedClients > 0) emitCertNotifications(io);
-  }, 12 * 60 * 60 * 1000);
+function emitLocalChange(section, detail = {}) {
+  publish('local:changed', { section, source: 'hub', at: Date.now(), ...detail });
 }
 
-export { initSocket };
+/**
+ * Stops everything initSocket() started: the bus subscription, every active
+ * log tail (each is a spawned child process), and the Socket.io server itself.
+ * Safe to call more than once.
+ *
+ * It does NOT stop the background jobs — server.js owns those, because their
+ * lifetime is the process's, not the socket server's.
+ *
+ * @returns {Promise<void>} Resolves once the Socket.io server has closed
+ */
+async function stopSocket() {
+  if (unsubscribeBus) {
+    unsubscribeBus();
+    unsubscribeBus = null;
+  }
+
+  // Kill the tail/Get-Content children; stopTail() removes each map entry.
+  for (const socketId of [...activeTails.keys()]) stopTail(socketId);
+
+  connectedClients = 0;
+  lastKnown.clear();
+
+  const io = ioServer;
+  ioServer = null;
+  if (!io) return;
+
+  await new Promise((resolve) => {
+    // close() disconnects clients and stops accepting new ones. It is given a
+    // short grace period so a wedged client cannot block shutdown.
+    const done = setTimeout(resolve, 2000);
+    io.close(() => {
+      clearTimeout(done);
+      resolve();
+    });
+  });
+}
+
+export { initSocket, stopSocket, emitLocalChange };

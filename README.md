@@ -17,10 +17,11 @@ No external ACME binaries required — SSL certificates are issued via [`acme-cl
 ## Features
 
 - **🖥️ Interactive CLI** — Arrow-key menus with real-time status indicators
-- **📊 Web Dashboard** — Modern Vue 3 interface with dark/light themes (`#161616` / `#d64a29` palette)
+- **📊 Web Dashboard** — React interface with dark/light themes (`#161616` / `#d64a29` palette), shipped prebuilt — nothing is loaded from a CDN
 - **🌐 Nginx Management** — Start/stop/reload, config editor, error logs, install
-- **🔒 SSL Certificate Management** — Let's Encrypt via `acme-client` (no certbot), HTTP-01 and DNS-01 challenges, wildcard certs, expiry tracking
+- **🔒 SSL Certificate Management** — Let's Encrypt via `acme-client` (no certbot), HTTP-01 and DNS-01 challenges, wildcard certs, expiry tracking, **automatic renewal** in the background
 - **🔗 Domain Management** — Reverse proxy configs with SSL, external URL backends, enable/disable, wildcard domains, WebSocket, gzip, rate limiting
+- **🚀 Deployments** — Put a project from a git repository on the server: built there, run under PM2, health-checked, rolled back automatically, with earlier releases kept. Trigger from the dashboard or from GitHub Actions; an optional `ez.json` keeps the commands with the code
 - **📦 Node.js Manager** — Version switching via nvm / nvm-windows, global package management
 - **🔄 Real-time Updates** — Socket.io powered status updates in dashboard
 - **💿 SQLite Storage** — Persistent configuration via `good.db`
@@ -110,7 +111,7 @@ npx easy-devops
 ### CLI Overview
 
 ```
-  ███████╗███████╗     Easy DevOps  v1.2.1
+  ███████╗███████╗     Easy DevOps  v2.0.0
   ██╔════╝╚════██╗     ─────────────────────
   █████╗      ██╔╝     CLI & Web Dashboard
   ██╔══╝     ██╔╝      Nginx · SSL · Domains · Node.js
@@ -199,10 +200,23 @@ Issue and renew Let's Encrypt SSL certificates via `acme-client` — no certbot 
 
 | Method | How it works |
 |--------|-------------|
-| **HTTP-01** | Easy DevOps stops nginx, binds port 80, serves the ACME token, then restarts nginx |
+| **HTTP-01** | nginx keeps running and proxies the ACME challenge to Easy DevOps (proxy mode). Only when nginx is not running, or not serving port 80, does it fall back to binding port 80 itself (standalone mode) |
 | **DNS-01** | You add a `_acme-challenge` TXT record to your DNS; Easy DevOps waits for confirmation |
 
 > **Wildcard certificates** (`*.example.com`) require DNS-01 — HTTP-01 is automatically disabled for wildcard domains.
+
+#### Automatic renewal
+
+The background service (`ezz service install`) renews certificates on its own, so nothing has to be open:
+
+- **HTTP-01 certificates are renewed 7 days before they expire.** Change the window, or switch it off, in **Settings** (dashboard or CLI): `sslAutoRenew`, `sslAutoRenewDays` (1–30).
+- **nginx is never stopped by an unattended renewal.** With the default challenge mode it uses proxy mode only, then reloads nginx so the new certificate is the one being served.
+- **A renewal keeps the certificate's names** — one issued with `www` is renewed with `www`.
+- **DNS-01 certificates (every wildcard) are not renewed automatically**: they need a TXT record you add at your DNS provider. They keep getting the expiry warning, which says a manual renewal is needed.
+- **Certificates no enabled domain uses are left alone**, so a leftover cannot spend Let's Encrypt's failure budget.
+- **You are notified either way** — "renewed" or "renewal failed, and why" — on the channels configured for that domain's certificate-expiry event. A failed attempt is retried on the next check (every 12 hours).
+
+Without the background service the same job runs while the dashboard is open.
 
 #### Certificate Storage
 
@@ -217,6 +231,77 @@ Certificates are stored under `sslDir` (configured in Settings):
 Default paths:
 - Linux: `/etc/easy-devops/ssl/`
 - Windows: `C:\easy-devops\ssl\`
+
+---
+
+### Deployments
+
+Put a project from a git repository on the server and keep it deployed. From the dashboard: **Deployments → New app**, give it a repository, press **Deploy**.
+
+One deployment: fetch into a new release folder → read settings → `pre` hook → install → build → stop the old process and start the new one under PM2 (`ez-<name>`) → health check → `post` hook. Nothing before the switch touches what is running, so a broken build costs nothing; if the new release starts but is not healthy, **the previous release is started again automatically**.
+
+> The switch is a restart, not a zero-downtime handover: the app is down for as long as it takes to start.
+
+**Requirements:** `git` and PM2 (`npm install -g pm2`) on the server.
+
+#### ez.json (optional)
+
+Keeps the commands with the code. Looked for at `ez.json`, `deploy/ez.json`, then `.deploy/ez.json`.
+
+```json
+{
+  "install": "npm ci",
+  "build": "npm run build",
+  "start": "node dist/server.js",
+  "port": 3000,
+  "health": "/healthz",
+  "hooks": { "pre": "node scripts/check-env.js", "post": "node scripts/warm-cache.js" }
+}
+```
+
+- Without it, a Node project is deployed from `package.json`: `npm ci` (yarn and pnpm are detected from the lockfile), the `build` script if there is one, and the `start` script.
+- With it, the commands run **exactly as written, whatever the language** — `"start": "python app.py"` works.
+- `install` / `build` take a command, a list, or `false` to skip. `port` is passed to the app as `PORT` and used for the health check.
+- Anything set on the app in the dashboard overrides `ez.json`.
+
+#### A domain for the app
+
+In the app's **Domain & folder** tab, type a domain name. A new name is created; an existing domain is re-pointed at the app. nginx proxies it to the app's port, and a deployment that changes the port takes the domain with it. Tick *Request an SSL certificate* to issue one over HTTP-01 at the same time — if it cannot be issued (the DNS does not point here yet) the domain still works over HTTP.
+
+Deleting an app asks what to do with its domain; the default is to keep it.
+
+#### Where apps live
+
+New apps are created in the **deployments folder** — `ez_deploys` inside the Easy DevOps data directory by default, changeable in Settings (dashboard or CLI). **Changing the setting never moves an existing app**: each app records the folder it was created in and keeps using it.
+
+To move one, use **Move app** in its Domain & folder tab and give a folder: the app is stopped in PM2, its folder is moved to `<folder>/<app name>`, and it is started again from there.
+
+#### Repository access
+
+| | URL | |
+|---|---|---|
+| Public | `https://…` | No credentials |
+| Deploy key | `git@github.com:owner/repo.git` | An SSH key generated per app; add its public half to the repository, read-only |
+| Access token | `https://…` | A personal access token stored on the server |
+
+#### Deploying from GitHub Actions
+
+Switch on the **deploy hook** (off by default), create the app's deploy token, add the two repository secrets the dashboard lists (`EZ_DEPLOY_URL`, `EZ_DEPLOY_TOKEN`) and commit the workflow file it generates. Every push then deploys that commit, and the check on GitHub is red if the deployment fails.
+
+- **Through one of your domains (recommended):** one path, `/.ez-deploy/`, is added to that domain's nginx config, so the token travels over the domain's HTTPS. Nothing of the dashboard becomes reachable.
+- **Directly, on its own port (6445):** plain HTTP — the token is sent unencrypted. For private networks.
+
+- **Through the Hub (paired servers):** the Action calls the Hub, which forwards the request down the connection the server already holds open — no inbound port, no public domain. The server still verifies the token itself; the Hub stores nothing. Enable “Deploy from CI through the Hub” in Settings → Hub.
+
+The workflow file is the same whichever way you choose; only the value of `EZ_DEPLOY_URL` differs.
+
+**Do it for me:** on a github.com repository the dashboard can store both secrets, commit the workflow file and add the deploy key itself, given a GitHub token that may write the repository's secrets, contents and workflows. A token typed for this is used once and not stored.
+
+A deploy token can start a deployment of its own app from that app's configured repository, and nothing else. Only its hash is stored.
+
+#### Deploying from the Hub
+
+A paired server's apps appear on its Hub page. What the Hub may do is decided on the server (Settings → Hub), one switch per action: deploy, roll back, read deployment logs, create/edit/delete apps, read and edit environment variables, and deploy from CI. All are off until you turn them on. The Hub is never sent environment values except while someone with that permission is editing them.
 
 ---
 
@@ -299,10 +384,13 @@ All configuration is stored in a persistent user directory (never inside the npm
 | Field | Default (Linux) | Default (Windows) | Description |
 |-------|-----------------|-------------------|-------------|
 | `dashboardPort` | `6443` | `6443` | Dashboard HTTP port |
-| `dashboardPassword` | `admin` | `admin` | Dashboard login password |
+| `dashboardPasswordHash` | _(none)_ | _(none)_ | Set on first run with a one-time setup code; stored scrypt-hashed, never in plain text |
 | `nginxDir` | `/etc/nginx` | `C:\nginx` | Nginx installation directory |
 | `sslDir` | `/etc/easy-devops/ssl` | `C:\easy-devops\ssl` | SSL certificate storage root |
 | `acmeEmail` | _(empty)_ | _(empty)_ | Email for Let's Encrypt account (**required** for cert issuance) |
+| `sslAutoRenew` | `true` | `true` | Renew HTTP-01 certificates in the background |
+| `sslAutoRenewDays` | `7` | `7` | How many days before expiry to renew (1–30) |
+| `deployDir` | `<data dir>/ez_deploys` | `<data dir>\ez_deploys` | Folder new deployed apps are created in |
 
 ---
 
@@ -317,6 +405,8 @@ easy-devops/
 │   │   └── menus/            # Thin menu dispatcher wrappers
 │   ├── core/
 │   │   ├── config.js         # Configuration load/save
+│   │   ├── cert-renewal.js   # Certificate renewal: manual and automatic
+│   │   ├── deploy/           # Deployments: ez.json, app registry, engine, deploy hook
 │   │   ├── db.js             # SQLite helpers (good.db)
 │   │   ├── detector.js       # System environment detection
 │   │   ├── nginx-conf-generator.js  # Nginx conf builder (shared)
@@ -328,7 +418,8 @@ easy-devops/
 │   │   ├── routes/           # auth, domains, nginx, settings, ssl
 │   │   ├── lib/              # cert-reader, domains-db, nginx-service
 │   │   ├── views/            # EJS templates + partials
-│   │   └── public/           # Static assets (Vue 3 app)
+│   │   ├── ui/               # React dashboard sources (Vite) → built into dist/ui
+│   │   └── public/           # Static assets for the classic EJS fallback
 │   └── lib/
 │       └── installer/        # Bash helper modules for install.sh
 ├── data/

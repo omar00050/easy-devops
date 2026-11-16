@@ -2,15 +2,31 @@ import fs from 'fs/promises';
 import path from 'path';
 import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
-import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../lib/domains-db.js';
-import { generateConf } from '../lib/nginx-conf-generator.js';
-import { getCertExpiry } from '../lib/cert-reader.js';
-import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk } from '../../core/platform.js';
+import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../../core/domains-db.js';
+import { writeConfWithTest } from '../../core/nginx-apply.js';
+import { getCertExpiry } from '../../core/cert-reader.js';
+import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk, hasBackslashPath } from '../../core/platform.js';
 import {
   validateDomainName, validatePort, validateUpstreamType,
   validateMaxBodySize,
 } from '../../core/validators.js';
 import { getDomainNotifConfig, saveDomainNotifConfig } from '../../core/domainNotifier.js';
+
+/**
+ * Maps a failed writeConfWithTest() result to an API error body, preserving
+ * the Linux permissions hint that the old inline checks surfaced.
+ * @param {{ error: string|null, output: string }} applied
+ */
+function applyErrorResponse(applied) {
+  const output = applied.output || '';
+  if (!isWindows && output.includes('password is required')) {
+    return {
+      error: 'Linux permissions not configured. Open Settings → Setup Linux Permissions.',
+      output,
+    };
+  }
+  return { error: 'nginx config test failed', details: applied.error, output };
+}
 
 class DomainsController {
   async list(req, res, next) {
@@ -20,7 +36,15 @@ class DomainsController {
         domains.map(async (domain) => {
           const { expiry, daysLeft } = await getCertExpiry(domain.name);
           const notifications = getDomainNotifConfig(domain.name);
-          return { ...domain, certExpiry: expiry, daysLeft, notifications };
+          // Report-only: existing configs are never rewritten automatically.
+          // Saving the domain regenerates it through the shared apply, which
+          // writes forward-slash paths and clears the warning.
+          const sslPathWarning = Boolean(
+            isWindows &&
+              domain.ssl?.enabled &&
+              (hasBackslashPath(domain.ssl.certPath) || hasBackslashPath(domain.ssl.keyPath))
+          );
+          return { ...domain, certExpiry: expiry, daysLeft, notifications, sslPathWarning };
         })
       );
       res.json(result);
@@ -117,23 +141,11 @@ class DomainsController {
         }
       }
 
-      const { nginxDir } = loadConfig();
-
-      try {
-        await generateConf(domain);
-      } catch (err) {
-        return res.status(500).json({ error: 'Failed to write nginx conf', details: err.message });
-      }
-
-      const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
-      const testResult = await run(testCmd, { cwd: nginxDir });
-      if (!isNginxTestOk(testResult)) {
-        try { await fs.unlink(domain.configFile); } catch { /* ignore */ }
-        const output = testResult.stderr || testResult.stdout;
-        const error = !isWindows && output.includes('password is required')
-          ? 'Linux permissions not configured. Open Settings → Setup Linux Permissions.'
-          : 'nginx config test failed';
-        return res.status(500).json({ error, output });
+      // Shared core apply: writes, tests via isNginxTestOk(), and on Windows
+      // retries once with escaped backslash cert paths before rolling back.
+      const applied = await writeConfWithTest(domain);
+      if (!applied.ok) {
+        return res.status(500).json(applyErrorResponse(applied));
       }
 
       const domains = getDomains();
@@ -196,36 +208,11 @@ class DomainsController {
         updatedAt: new Date().toISOString(),
       };
 
-      const { nginxDir } = loadConfig();
-      const bakPath = existing.configFile ? `${existing.configFile}.bak` : null;
-
-      // Backup existing conf
-      if (bakPath && existing.configFile) {
-        try {
-          await fs.copyFile(existing.configFile, bakPath);
-        } catch { /* file absent — skip backup */ }
-      }
-
-      try {
-        await generateConf(updatedDomain);
-      } catch (err) {
-        if (bakPath) {
-          try { await fs.copyFile(bakPath, existing.configFile); } catch { /* ignore restore failure */ }
-        }
-        return res.status(500).json({ error: 'Failed to write nginx conf', details: err.message });
-      }
-
-      const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
-      const testResult = await run(testCmd, { cwd: nginxDir });
-      if (!isNginxTestOk(testResult)) {
-        if (bakPath) {
-          try { await fs.rename(bakPath, existing.configFile); } catch { /* ignore */ }
-        }
-        const output = testResult.stderr || testResult.stdout;
-        const error = !isWindows && output.includes('password is required')
-          ? 'Linux permissions not configured. Open Settings → Setup Linux Permissions.'
-          : 'nginx config test failed';
-        return res.status(500).json({ error, output });
+      // Shared core apply — snapshots the current file and restores it exactly
+      // if every attempt fails, so no .bak juggling is needed here.
+      const applied = await writeConfWithTest(updatedDomain);
+      if (!applied.ok) {
+        return res.status(500).json(applyErrorResponse(applied));
       }
 
       const domains = getDomains();

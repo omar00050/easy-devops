@@ -1,9 +1,9 @@
 import fs from 'fs/promises';
 import path from 'path';
-import { run } from '../../core/shell.js';
-import { loadConfig } from '../../core/config.js';
-import { ensureNginxInclude, getConfDDir } from '../../core/nginx-conf-generator.js';
-import { isWindows, getNginxExe, nginxTestCmd, combineOutput, isNginxTestOk } from '../../core/platform.js';
+import { run } from './shell.js';
+import { loadConfig } from './config.js';
+import { ensureNginxInclude, getConfDDir } from './nginx-conf-generator.js';
+import { isWindows, getNginxExe, nginxTestCmd, combineOutput, isNginxTestOk, nginxLogPath } from './platform.js';
 
 // ─── Error Types ──────────────────────────────────────────────────────────────
 
@@ -197,9 +197,7 @@ export async function start() {
   }
 
   // Didn't start — surface error log
-  const logPath = isWindows
-    ? path.join(nginxDir, 'logs', 'error.log')
-    : '/var/log/nginx/error.log';
+  const logPath = nginxLogPath(nginxDir, 'error');
   const logCmd = isWindows
     ? `Get-Content -Tail 20 "${logPath}" -ErrorAction SilentlyContinue`
     : `tail -n 20 "${logPath}" 2>/dev/null`;
@@ -306,9 +304,20 @@ export async function saveConfig(filename, content) {
 
 // ─── US5: Logs ────────────────────────────────────────────────────────────────
 
-export async function getLogs(lines = 100) {
+/**
+ * Reads the tail of an nginx log.
+ *
+ * `which` is additive: the previous signature took only a line count and
+ * always read the error log, so every existing caller keeps working. The
+ * access log was unreachable before, which is what the UI needed.
+ *
+ * @param {number} [lines]
+ * @param {'error'|'access'} [which]
+ * @returns {Promise<{ lines: string[] }>}
+ */
+export async function getLogs(lines = 100, which = 'error') {
   const nginxDir = getNginxDir();
-  const logPath = path.join(nginxDir, 'logs', 'error.log');
+  const logPath = nginxLogPath(nginxDir, which === 'access' ? 'access' : 'error');
   let content;
   try {
     content = await fs.readFile(logPath, 'utf8');

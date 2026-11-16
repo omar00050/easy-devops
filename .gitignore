@@ -1,10 +1,18 @@
+# Dev data mode (--dev / npm run dev) — isolated SQLite, sessions and logs
+.dev-data/
+
 # Database — created at runtime, not committed
 data/easy-devops.sqlite
 data/easy-devops.sqlite-shm
 data/easy-devops.sqlite-wal
 
-# Dependencies
+# Dependencies — the dashboard UI is a separate package with its own tree
 node_modules/
+src/dashboard/ui/node_modules/
+
+# New dashboard UI build output — produced by npm run build:ui, shipped in the
+# published package, never committed
+dist/ui/
 
 # Logs
 *.log

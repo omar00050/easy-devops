@@ -91,7 +91,10 @@ graph TD
 | `cleanup.js` | The reclaimable-file inventory. Scans; deletes only what it is handed |
 | `purge.js` | `ezz uninstall --purge`: back up first, then remove the service, runtime and data |
 | `setupCode.js` | The one-time first-run setup code. Printed locally, stored hashed, never transmitted |
+<<<<<<< HEAD
 | `probeCache.js` | Cache with background refresh for probes that cost a subprocess. One PowerShell spawn is ~1 s on Windows |
+=======
+>>>>>>> 9238df86221d4ee97559a959817f3f21827fb07c
 | `service/runtimeUpdate.js` | Moving the service onto another Node: smoke test, swap, verify, roll back |
 | `validators.js`, `detector.js`, `permissions.js` | Input validation, system detection, Linux sudoers setup |
 

@@ -8,6 +8,8 @@
 #   --help, -h           Print this help and exit 0
 #   --version VERSION    Skip picker; use the specified Node.js version
 #   --keep-node          Skip Node.js management; proceed to dependency install
+#   --service            Install the background service without asking
+#   --no-service         Skip the background service without asking
 #
 # Exit codes:
 #   0  Installation completed successfully
@@ -18,47 +20,146 @@ set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Resolve script and project directory
+#
+# BASH_SOURCE[0] is empty when the script arrives on stdin — `curl | bash`, or
+# `bash -s`. In that case the directory this resolves to is just the user's
+# current directory and has nothing to do with Easy DevOps, so it must not be
+# used to decide anything. PIPED records that distinction once, here, rather
+# than letting each later test guess.
 # ---------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-EASYDEVOPS_DIR="${EASYDEVOPS_DIR:-$SCRIPT_DIR}"
+_SELF="${BASH_SOURCE[0]:-}"
+case "$_SELF" in
+  ''|/dev/stdin|/dev/fd/*|/proc/self/fd/*|bash|sh|-) PIPED=true ;;
+  *) PIPED=false ;;
+esac
 
-# ---------------------------------------------------------------------------
-# Source lib modules (auto-download if running standalone)
-# ---------------------------------------------------------------------------
-LIB_DIR="$SCRIPT_DIR/lib/installer"
-_LIB_BASE="https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/lib/installer"
-_LIB_MODULES="progress.sh detect.sh node-versions.sh picker.sh nvm-bootstrap.sh"
-
-if [ ! -f "$LIB_DIR/progress.sh" ]; then
-  printf 'Lib modules not found locally — downloading from GitHub...\n'
-  mkdir -p "$LIB_DIR"
-  _dl_ok=true
-  for _module in $_LIB_MODULES; do
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsSL "$_LIB_BASE/$_module" -o "$LIB_DIR/$_module" 2>/dev/null || _dl_ok=false
-    elif command -v wget >/dev/null 2>&1; then
-      wget -q "$_LIB_BASE/$_module" -O "$LIB_DIR/$_module" 2>/dev/null || _dl_ok=false
-    else
-      printf 'Error: curl or wget is required to download installer modules.\n' >&2
-      exit 1
-    fi
-  done
-  if [ "$_dl_ok" = "false" ]; then
-    printf 'Error: Failed to download one or more installer modules from GitHub.\n' >&2
-    printf 'Check your internet connection and try again.\n' >&2
-    exit 1
-  fi
-  printf 'Modules downloaded.\n\n'
+if [ "$PIPED" = "true" ]; then
+  # Deliberately not the current directory: see above.
+  SCRIPT_DIR=""
+else
+  SCRIPT_DIR="$(cd "$(dirname "$_SELF")" && pwd)"
 fi
 
-for _module in $_LIB_MODULES; do
-  if [ ! -f "$LIB_DIR/$_module" ]; then
-    printf 'Error: Required module not found: %s/%s\n' "$LIB_DIR" "$_module" >&2
-    exit 1
+EASYDEVOPS_DIR="${EASYDEVOPS_DIR:-${SCRIPT_DIR:-$PWD}}"
+
+# ---------------------------------------------------------------------------
+# Lib modules
+#
+# The modules live at src/lib/installer in the repository and in the published
+# npm package (package.json ships `src/`). They used to be looked for at
+# lib/installer, which exists in neither — so a clone failed, and the fallback
+# then `mkdir -p`'d an empty lib/installer into whatever directory the user
+# happened to be in. Both halves of that are fixed here: every real layout is
+# searched, and a download goes to a temporary directory that is cleaned up.
+#
+# Defined as functions and called AFTER the flags are parsed, so `--help` costs
+# no network request and writes nothing.
+# ---------------------------------------------------------------------------
+_LIB_BASE="https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/src/lib/installer"
+_LIB_MODULES="progress.sh detect.sh node-versions.sh picker.sh nvm-bootstrap.sh"
+LIB_DIR=""
+_LIB_TMP=""
+
+# Set EZ_INSTALL_NO_DOWNLOAD=1 to require the modules locally. The installer
+# tests use it to prove the failure is a clear message rather than a stray
+# directory.
+_lib_download_allowed() {
+  [ "${EZ_INSTALL_NO_DOWNLOAD:-0}" != "1" ]
+}
+
+_lib_dir_complete() {
+  local dir="$1" _m
+  [ -n "$dir" ] || return 1
+  for _m in $_LIB_MODULES; do
+    [ -f "$dir/$_m" ] || return 1
+  done
+  return 0
+}
+
+# Every layout the modules can legitimately be in: a clone or the published
+# package (src/lib/installer), an older checkout (lib/installer), and the
+# parent of a copied script.
+resolve_lib_dir() {
+  local candidate
+  for candidate in \
+    "${EASYDEVOPS_DIR:+$EASYDEVOPS_DIR/src/lib/installer}" \
+    "${SCRIPT_DIR:+$SCRIPT_DIR/src/lib/installer}" \
+    "${SCRIPT_DIR:+$SCRIPT_DIR/lib/installer}" \
+    "${SCRIPT_DIR:+$SCRIPT_DIR/../src/lib/installer}" \
+    "${EZ_INSTALL_LIB_DIR:-}"
+  do
+    if _lib_dir_complete "$candidate"; then
+      LIB_DIR="$(cd "$candidate" && pwd)"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_cleanup_lib_tmp() {
+  [ -n "$_LIB_TMP" ] && [ -d "$_LIB_TMP" ] && rm -rf "$_LIB_TMP"
+}
+
+download_lib_dir() {
+  local downloader=""
+  if command -v curl >/dev/null 2>&1; then downloader="curl"
+  elif command -v wget >/dev/null 2>&1; then downloader="wget"
+  else
+    printf 'Error: the installer modules are not present and neither curl nor wget is available.\n' >&2
+    printf 'Clone the repository and run it from there:\n' >&2
+    printf '  git clone https://github.com/omar00050/Easy-DevOps.git\n' >&2
+    printf '  bash Easy-DevOps/install.sh\n' >&2
+    return 1
   fi
-  # shellcheck source=/dev/null
-  . "$LIB_DIR/$_module"
-done
+
+  # A temporary directory, never the current one: this used to create
+  # ./lib/installer wherever it was run.
+  _LIB_TMP="$(mktemp -d 2>/dev/null || mktemp -d -t ezinstall)" || {
+    printf 'Error: could not create a temporary directory for the installer modules.\n' >&2
+    return 1
+  }
+  trap _cleanup_lib_tmp EXIT
+
+  printf 'Installer modules not found locally — downloading...\n'
+  local _module
+  for _module in $_LIB_MODULES; do
+    if [ "$downloader" = "curl" ]; then
+      curl -fsSL "$_LIB_BASE/$_module" -o "$_LIB_TMP/$_module" 2>/dev/null || true
+    else
+      wget -q "$_LIB_BASE/$_module" -O "$_LIB_TMP/$_module" 2>/dev/null || true
+    fi
+  done
+
+  if ! _lib_dir_complete "$_LIB_TMP"; then
+    printf 'Error: could not download the installer modules from GitHub.\n' >&2
+    printf '  %s\n' "$_LIB_BASE" >&2
+    printf 'Check your internet connection, or clone the repository and run install.sh from it.\n' >&2
+    return 1
+  fi
+
+  LIB_DIR="$_LIB_TMP"
+  printf 'Modules downloaded.\n\n'
+  return 0
+}
+
+source_lib_modules() {
+  if ! resolve_lib_dir; then
+    if ! _lib_download_allowed; then
+      printf 'Error: the installer modules were not found and downloading is disabled.\n' >&2
+      printf 'Expected them at:\n' >&2
+      printf '  %s/src/lib/installer\n' "${EASYDEVOPS_DIR:-$PWD}" >&2
+      printf 'Clone the repository and run install.sh from it, or allow the download.\n' >&2
+      exit 1
+    fi
+    download_lib_dir || exit 1
+  fi
+
+  local _module
+  for _module in $_LIB_MODULES; do
+    # shellcheck source=/dev/null
+    . "$LIB_DIR/$_module"
+  done
+}
 
 # ---------------------------------------------------------------------------
 # Result tracking (mirrors install.ps1 summary table)
@@ -121,6 +222,8 @@ Options:
                        version directly (e.g., --version 20.11.1)
   --keep-node          Skip Node.js management entirely; proceed straight to
                        dependency installation with whatever Node.js is active
+  --service            Install the background service without asking
+  --no-service         Do not install the background service, and do not ask
 
 Exit codes:
   0  Installation completed successfully
@@ -131,6 +234,8 @@ Examples:
   bash install.sh                   # Interactive install
   bash install.sh --version 20      # Install Node.js 20.x (latest patch)
   bash install.sh --keep-node       # Skip Node.js management
+  bash install.sh --service         # Unattended, with the background service
+  bash install.sh --no-service      # Unattended, without it
 EOF
 }
 
@@ -139,6 +244,8 @@ EOF
 # ---------------------------------------------------------------------------
 FORCED_VERSION=""
 KEEP_NODE=false
+# ask | yes | no — whether to install the background service at the end.
+SERVICE_CHOICE="ask"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -162,6 +269,14 @@ while [ "$#" -gt 0 ]; do
       KEEP_NODE=true
       shift
       ;;
+    --service)
+      SERVICE_CHOICE="yes"
+      shift
+      ;;
+    --no-service)
+      SERVICE_CHOICE="no"
+      shift
+      ;;
     *)
       printf 'Unknown option: %s\n' "$1" >&2
       printf 'Run "bash install.sh --help" for usage.\n' >&2
@@ -170,22 +285,29 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# Only now: --help above costs no network request and writes nothing.
+source_lib_modules
+
 # ---------------------------------------------------------------------------
 # Install mode detection (mirrors install.ps1 3-mode logic)
 #
-#   source  : package.json with name=easy-devops found in script dir
+#   source  : package.json with name=easy-devops found beside this script
 #             -> npm install + npm link
 #   update  : easy-devops already on PATH
 #             -> skip install steps
 #   npm     : standalone download, not in project dir
 #             -> npm install -g easy-devops
+#
+# Piped execution is never source mode: with `curl | bash` there is no script
+# directory, and the current directory's package.json belongs to whatever the
+# user happened to be standing in.
 # ---------------------------------------------------------------------------
 SOURCE_MODE=false
 ALREADY_INSTALLED=false
 EXISTING_CMD=""
 
 # Source mode: script is running from the project directory
-if [ -f "$SCRIPT_DIR/package.json" ]; then
+if [ "$PIPED" = "false" ] && [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/package.json" ]; then
   if command -v node >/dev/null 2>&1; then
     _pkg_name="$(node -e "try{process.stdout.write(require('$SCRIPT_DIR/package.json').name)}catch(e){}" 2>/dev/null || true)"
   else
@@ -517,5 +639,108 @@ if [ "$NODE_ACTION" != "keep" ]; then
     . "$HOME/.zshrc" 2>/dev/null || true
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# Offer to install the background service
+#
+# Asked LAST, after Node and the package are in place, because `ezz` has to be
+# runnable for the answer to mean anything.
+#
+# Reading from /dev/tty rather than stdin is what makes this work under
+#   curl -fsSL .../install.sh | bash
+# where stdin is the pipe carrying the script itself. A plain `read` there
+# consumes script text, or sees EOF and silently takes the default — and this
+# is the one question whose default decides whether the user's server is
+# monitored at all. If there is no terminal (a CI run, a Dockerfile), the
+# prompt is skipped and the command is printed instead.
+# ---------------------------------------------------------------------------
+maybe_install_service() {
+  # An explicit flag means do not ask.
+  if [ "$SERVICE_CHOICE" = "no" ]; then
+    printf '  Skipping the background service (--no-service).\n'
+    printf '  Install it later with: ezz service install\n\n'
+    return 0
+  fi
+
+  # Open the terminal on fd 3 ONCE, and let the open itself decide whether
+  # there is one. A "[ -r /dev/tty ]" test is not enough: it can pass while the
+  # open then fails with "No such device or address" on a process that has no
+  # controlling terminal -- measured, not assumed. That leaked an error to the
+  # user and then fell through to the default, and the default here is yes.
+  # Guessing yes on a question that runs sudo is the wrong direction.
+  # The braces matter: "exec 3</dev/tty 2>/dev/null" still lets the SHELL print
+  # its own "No such device or address" before the redirection takes effect.
+  # Grouping puts the shell's own diagnostic inside the redirect too.
+  _has_tty=false
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    _has_tty=true
+  fi
+
+  if [ "$SERVICE_CHOICE" != "yes" ]; then
+    if [ "$_has_tty" != "true" ]; then
+      # Unattended: never guess on a question that needs sudo.
+      printf '  No terminal available, so the background service was not installed.\n'
+      printf '  Install it with:   ezz service install\n'
+      printf '  Or non-interactively: bash install.sh --service\n\n'
+      return 0
+    fi
+
+    printf '\n'
+    printf '  Easy DevOps can run a background service that keeps monitoring,\n'
+    printf '  notifications and the Hub agent alive even with no dashboard open.\n'
+    printf '  It installs a systemd unit running as your user. sudo will ask for\n'
+    printf '  your password itself; nothing here stores or sees it.\n'
+    printf '\n'
+    printf '  Install the background service now? (recommended for servers) [Y/n] '
+
+    _answer=""
+    IFS= read -r _answer <&3 || _answer=""
+
+    case "$_answer" in
+      [Nn]|[Nn][Oo])
+        printf '\n  Skipped. Install it later with: ezz service install\n\n'
+        exec 3<&-
+        return 0
+        ;;
+    esac
+  fi
+
+  printf '\n  Installing the background service...\n\n'
+
+  # Resolve the CLI the same way a user would, then fall back to the checkout.
+  _ez=""
+  if command -v ezz >/dev/null 2>&1; then
+    _ez="ezz"
+  elif command -v easy-devops >/dev/null 2>&1; then
+    _ez="easy-devops"
+  elif [ -f "$EASYDEVOPS_DIR/src/cli/index.js" ]; then
+    _ez="node \"$EASYDEVOPS_DIR/src/cli/index.js\""
+  else
+    printf '  Could not find the ezz command, so the service was not installed.\n'
+    printf '  Open a new terminal and run: ezz service install\n\n'
+    if [ "$_has_tty" = "true" ]; then exec 3<&-; fi
+    return 0
+  fi
+
+  # stdin comes from the terminal for the same reason as the prompt above:
+  # "ezz service install" runs sudo, and sudo must be able to ask.
+  _installed=false
+  if [ "$_has_tty" = "true" ]; then
+    if eval "$_ez service install" <&3; then _installed=true; fi
+    exec 3<&-
+  elif eval "$_ez service install"; then
+    _installed=true
+  fi
+
+  if [ "$_installed" = "true" ]; then
+    return 0
+  fi
+
+  printf '\n  The service was not installed. Nothing else was changed.\n'
+  printf '  You can retry with: ezz service install\n\n'
+  return 0
+}
+
+maybe_install_service
 
 exit 0
