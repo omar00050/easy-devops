@@ -557,7 +557,7 @@ export interface DeploySettings {
   port?: number;
   healthPath?: string;
   healthTimeout?: number;
-  /** Project-relative folders that survive deployments: ["data", "uploads"]. */
+  /** Project-relative paths that survive deployments — folders or one file: ["data", "prisma/hub.db"]. */
   persist?: string | string[];
 }
 
@@ -616,7 +616,7 @@ export interface DeployApp {
   notifyChannelIds: string[];
   /** The folder the app lives in. Absent before contract 2.6.0. */
   dir?: string;
-  /** Where folders listed in `settings.persist` are kept between deployments. */
+  /** Where paths listed in `settings.persist` are kept between deployments. */
   sharedDir?: string;
   /** True when that folder holds anything, so deleting the app would leave data behind. */
   hasSharedData?: boolean;

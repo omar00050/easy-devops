@@ -8,11 +8,11 @@ import type {
   DeploymentsResponse,
 } from '../../lib/types';
 import {
+  checkPersistAddition,
   envToText,
   fromSettingsDraft,
   isSshUrl,
   parseEnvText,
-  parsePersistText,
   toSettingsDraft,
   validateAppId,
   type SettingsDraft,
@@ -20,7 +20,7 @@ import {
 import { validatePort } from '../../lib/validation';
 import { Button } from '../ui/Button';
 import { CopyButton } from '../ui/CopyButton';
-import { Checkbox, FormGrid, Select, Switch, TextArea, TextInput } from '../ui/Field';
+import { Checkbox, FormGrid, Select, Switch, TagInput, TextArea, TextInput } from '../ui/Field';
 import { Modal } from '../ui/Modal';
 import { InlineAlert } from '../ui/States';
 import { useToast } from '../ui/Toast';
@@ -119,7 +119,6 @@ export function AppFormModal({
   const repoUrl = draft.repoUrl.trim();
   const ssh = isSshUrl(repoUrl);
   const parsedEnv = parseEnvText(draft.envText);
-  const parsedPersist = parsePersistText(draft.settings.persist);
   const keep = Number(draft.keepReleases);
 
   const errors = {
@@ -141,7 +140,6 @@ export function AppFormModal({
         ? 'Must start with "/".'
         : null,
     env: parsedEnv.error,
-    persist: parsedPersist.error,
     keepReleases:
       !Number.isInteger(keep) ||
       keep < meta.limits.keepReleasesMin ||
@@ -434,28 +432,32 @@ export function AppFormModal({
           <div>
             <h3 className="text-sm font-semibold text-ink">Persistent data</h3>
             <p className="mt-0.5 text-xs text-muted">
-              Each deployment runs from a fresh copy of your code. Folders written to at runtime are
-              lost on the next deploy — and on rollback. Folders listed here live in a shared
-              location that every deployment and every rollback reuses.
+              Each deployment runs from a fresh copy of your code. Files written to at runtime are
+              lost on the next deploy — and on rollback. Every path listed here, a folder or a
+              single file, lives in a shared location that every deployment and every rollback
+              reuses.
             </p>
           </div>
-          <TextArea
-            label="Folders to keep"
+          <TagInput
+            label="Folders and files to keep"
             optional
-            rows={3}
             value={draft.settings.persist}
-            onChange={(event) => setSettings({ persist: event.target.value })}
-            error={show('persist')}
-            hint="One per line. Add folders your app writes to: uploads, SQLite data, logs. The folder itself, not a file — SQLite creates -wal and -shm files next to the database."
-            placeholder="No persistent folders. Apps that use an external database or S3 don't need any."
-            className="font-mono"
-            spellCheck={false}
+            onChange={(persist) => setSettings({ persist })}
+            normalize={(raw, current) => {
+              const result = checkPersistAddition(raw, current);
+              return { value: result.path, error: result.error };
+            }}
+            max={20}
+            hint="Add folders your app writes to: uploads, SQLite data, logs — or one file, such as prisma/hub.db. Press Enter after each path."
+            placeholder="data, uploads, prisma/hub.db"
           />
           <div className="space-y-1 text-2xs text-faint">
             <p>
-              The first deployment copies the folder’s current contents into the shared location;
-              after that, the shared copy is what counts — changes to it in the repository are
-              ignored. Left empty, the list is read from <code className="font-mono">ez.json</code>.
+              The first deployment copies the current contents into the shared location; after
+              that, the shared copy is what counts — changes to it in the repository are ignored.
+              A folder is usually the safer unit: SQLite creates <code className="font-mono">-wal</code> and{' '}
+              <code className="font-mono">-shm</code> files next to its database. Left empty, the
+              list is read from <code className="font-mono">ez.json</code>.
             </p>
             {editing && app?.sharedDir && (
               <p className="break-all">

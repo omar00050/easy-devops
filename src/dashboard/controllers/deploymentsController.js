@@ -33,7 +33,7 @@ import {
   rotateHookToken, revokeHookToken, generateDeployKey,
   DEFAULT_KEEP_RELEASES, MIN_KEEP_RELEASES, MAX_KEEP_RELEASES,
 } from '../../core/deploy/apps.js';
-import { startDeployment, startRollback, removeApp, moveApp } from '../../core/deploy/engine.js';
+import { startDeployment, startRollback, removeRelease, removeApp, moveApp } from '../../core/deploy/engine.js';
 import { readRun, readLogTail, isId, deployRoot } from '../../core/deploy/store.js';
 import { linkDomain, unlinkDomain } from '../../core/deploy/domainLink.js';
 import { describeApps, describeAppDetail } from '../../core/deploy/status.js';
@@ -232,6 +232,17 @@ class DeploymentsController {
       const started = startRollback(req.params.id, { releaseId, actor: 'dashboard' });
       if (!started.ok) return res.status(started.status).json({ error: started.error, runId: started.runId ?? null });
       return res.status(202).json({ runId: started.runId, status: 'running' });
+    } catch (error) {
+      return next(error);
+    }
+  }
+
+  /** DELETE /api/deployments/:id/releases/:releaseId — delete an old release's files. */
+  removeRelease(req, res, next) {
+    try {
+      const result = removeRelease(req.params.id, req.params.releaseId);
+      if (!result.ok) return res.status(result.status).json({ error: result.error });
+      return res.json({ deleted: result.deleted });
     } catch (error) {
       return next(error);
     }

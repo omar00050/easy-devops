@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { CheckCircle2, History, KeyRound, RotateCcw, ShieldAlert, Wand2, XCircle } from 'lucide-react';
+import { CheckCircle2, History, KeyRound, RotateCcw, ShieldAlert, Trash2, Wand2, XCircle } from 'lucide-react';
 import { api, ApiError } from '../../lib/api';
 import type {
   DeployAppDetail,
@@ -167,10 +167,15 @@ function ActivityTab({ app, initialRunId }: { app: DeployAppDetail; initialRunId
 function ReleasesTab({
   app,
   onRollback,
+  onDelete,
+  deleting,
   busy,
 }: {
   app: DeployAppDetail;
   onRollback: (release: DeployRelease) => void;
+  onDelete: (release: DeployRelease) => void;
+  /** The release being deleted right now, if any. */
+  deleting: string | null;
   busy: boolean;
 }) {
   if (app.releases.length === 0) {
@@ -203,15 +208,32 @@ function ReleasesTab({
               </div>
             </div>
             {!release.current && (
-              <Button
-                size="sm"
-                icon={<RotateCcw className="size-3.5" aria-hidden="true" />}
-                onClick={() => onRollback(release)}
-                disabled={busy || !release.startable}
-                title={release.startable ? undefined : 'This release never got as far as starting.'}
-              >
-                Roll back to this
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  icon={<RotateCcw className="size-3.5" aria-hidden="true" />}
+                  onClick={() => onRollback(release)}
+                  disabled={busy || !release.startable}
+                  title={release.startable ? undefined : 'This release never got as far as starting.'}
+                >
+                  Roll back to this
+                </Button>
+                <Button
+                  variant="dangerGhost"
+                  size="sm"
+                  icon={<Trash2 className="size-3.5" aria-hidden="true" />}
+                  onClick={() => onDelete(release)}
+                  loading={deleting === release.id}
+                  disabled={busy || release.previous}
+                  title={
+                    release.previous
+                      ? 'An automatic rollback would return to this release. Delete it after the next deployment.'
+                      : `Delete the files of release ${release.id}`
+                  }
+                >
+                  Delete
+                </Button>
+              </div>
             )}
           </li>
         ))}
@@ -643,6 +665,7 @@ export function AppDetailModal({
   const open = appId !== null;
   const [tab, setTab] = useState<string>(initialTab);
   const [acting, setActing] = useState(false);
+  const [deletingRelease, setDeletingRelease] = useState<string | null>(null);
 
   const detail = useResource<DeployAppDetail>(
     (signal) => api.deployments.get(appId ?? '', signal),
@@ -655,8 +678,11 @@ export function AppDetailModal({
     if (open) setTab(initialTab);
   }, [open, appId, initialTab]);
 
-  // While a deployment runs, the run list (step, status) is changing.
+  // While a deployment runs, the run list (step, status) is changing. When
+  // none is running, keep a slower watch: a deploy started elsewhere — a
+  // GitHub Action, the Hub, the CLI — must appear here too.
   usePolling(detail.reload, 2000, open && Boolean(app?.deploying));
+  usePolling(detail.reload, 8000, open && Boolean(app) && !app?.deploying);
 
   const rollback = async (release: DeployRelease) => {
     if (!app || acting) return;
@@ -679,6 +705,29 @@ export function AppDetailModal({
       toast.error('Could not roll back', errorText(error, 'Nothing was changed.'));
     } finally {
       setActing(false);
+    }
+  };
+
+  const removeRelease = async (release: DeployRelease) => {
+    if (!app || acting || deletingRelease) return;
+    const ok = await confirm({
+      title: `Delete release ${release.id}?`,
+      body: `Its files (${shortSha(release.sha)}) are removed from this server. The deployment log stays. The live release and the one an automatic rollback would return to cannot be deleted.`,
+      confirmLabel: 'Delete release',
+      tone: 'danger',
+    });
+    if (!ok) return;
+
+    setDeletingRelease(release.id);
+    try {
+      await api.deployments.removeRelease(app.id, release.id);
+      toast.success('Release deleted');
+      detail.reload();
+      onChanged();
+    } catch (error) {
+      toast.error('Could not delete the release', errorText(error, 'Nothing was changed.'));
+    } finally {
+      setDeletingRelease(null);
     }
   };
 
@@ -723,7 +772,13 @@ export function AppDetailModal({
             <ActivityTab app={app} initialRunId={app.activeRunId ?? null} />
           </TabPanel>
           <TabPanel id="releases" value={tab}>
-            <ReleasesTab app={app} onRollback={(r) => void rollback(r)} busy={acting || Boolean(app.deploying)} />
+            <ReleasesTab
+              app={app}
+              onRollback={(r) => void rollback(r)}
+              onDelete={(r) => void removeRelease(r)}
+              deleting={deletingRelease}
+              busy={acting || Boolean(app.deploying)}
+            />
           </TabPanel>
           <TabPanel id="setup" value={tab}>
             <DomainFolderTab

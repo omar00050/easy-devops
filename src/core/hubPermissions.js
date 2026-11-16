@@ -371,6 +371,7 @@ export function permissionForCommand(command, payload = {}) {
         create: 'deploy.manage',
         update: 'deploy.manage',
         delete: 'deploy.manage',
+        deleteRelease: 'deploy.manage',
         issueToken: 'deploy.manage',
         linkDomain: 'deploy.manage',
         unlinkDomain: 'deploy.manage',

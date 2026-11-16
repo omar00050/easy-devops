@@ -24,7 +24,7 @@ import { getHubLink, getHubPermissions, resolveHubOrigin } from '../hubLink.js';
 import {
   getApp, createApp, updateApp, publicApp, normalizeEnv, rotateHookToken, verifyHookToken, validateAppId,
 } from './apps.js';
-import { startDeployment, startRollback, removeApp, moveApp } from './engine.js';
+import { startDeployment, startRollback, removeRelease, removeApp, moveApp } from './engine.js';
 import { linkDomain, unlinkDomain } from './domainLink.js';
 import { findDomain } from '../domains-db.js';
 import { describeGithubSetup } from './github.js';
@@ -129,6 +129,14 @@ export async function handleHubDeployCommand(payload, { onFinished = null } = {}
       if (!started.ok) throw refuse(started.error);
       watch(started);
       return { runId: started.runId, status: 'running' };
+    }
+
+    case 'deleteRelease': {
+      const app = requireApp(id);
+      if (!isId(payload.releaseId)) throw refuse('Invalid release id.');
+      const result = removeRelease(app.id, payload.releaseId);
+      if (!result.ok) throw refuse(result.error);
+      return { deleted: result.deleted };
     }
 
     case 'create': {

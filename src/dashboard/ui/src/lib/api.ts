@@ -303,6 +303,10 @@ export const api = {
         method: 'POST',
         body: releaseId ? { releaseId } : {},
       }),
+    removeRelease: (id: string, releaseId: string) =>
+      request<{ deleted: string }>(`/deployments/${enc(id)}/releases/${enc(releaseId)}`, {
+        method: 'DELETE',
+      }),
     run: (id: string, runId: string, signal?: AbortSignal) =>
       request<DeployRunDetail>(`/deployments/${enc(id)}/runs/${enc(runId)}`, { signal }),
     issueHookToken: (id: string) =>

@@ -241,7 +241,7 @@ export function DeploymentsPage() {
   useRefreshOnVisible(resource.reload);
   // Fast while something is building, slow otherwise — process status and a
   // deployment started by CI both show up without a manual refresh.
-  usePolling(resource.reload, anyDeploying ? 2000 : 15000);
+  usePolling(resource.reload, anyDeploying ? 2000 : 10000);
 
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<DeployApp | null>(null);

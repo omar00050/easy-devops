@@ -27,8 +27,10 @@
  *     "port":    3000,                      the port the app listens on
  *     "health":  "/healthz",                string, or { "path": "/healthz", "timeout": 60 }
  *     "hooks":   { "pre": "...", "post": "..." }    string | string[]
- *     "persist": ["data", "uploads"],       folders that survive deployments
+ *     "persist": ["data", "upload"],        paths that survive deployments
  *   }
+ *
+ * A persistent path is a folder or a single file.
  *
  * `false` (or an empty string) switches a step off — "this project has no
  * build" is a real answer, and different from "work it out for me".
@@ -99,11 +101,12 @@ export function normalizeHealthPath(value) {
 }
 
 /**
- * A `persist` path must stay inside the project and name a whole folder.
+ * A `persist` path must stay inside the project and name a folder or a file.
  *
- * Directories only, deliberately: a file is the wrong unit. SQLite writes
- * `-wal` and `-shm` next to its database, and an uploads folder gains new
- * names every day — a persisted file would take neither with it.
+ * A folder is usually the right unit: SQLite writes `-wal` and `-shm` next to
+ * its database, and an uploads folder gains new names every day. A single file
+ * is supported for the case where that really is all there is — one database
+ * file beside code that is replaced on every deploy.
  *
  * @returns {string|null} What is wrong with it, or null when it is usable
  */
@@ -115,16 +118,16 @@ function persistPathProblem(p) {
     if (segment === '' || segment === '.' || segment === '..') return 'must be a relative path without "." or ".."';
     if (segment === '.git') return 'cannot be ".git" — the deployment manages it';
     if (segment === 'node_modules') return 'cannot be "node_modules" — dependencies are installed fresh for each release';
-    if (/[<>:"|?*]/.test(segment)) return 'contains characters that are not allowed in a folder name';
+    if (/[<>:"|?*]/.test(segment)) return 'contains characters that are not allowed in a path name';
   }
   return null;
 }
 
 /**
- * Normalises a `persist` field to a list of project-relative folders.
+ * Normalises a `persist` field to a list of project-relative paths.
  *
  * Paths are written with "/" on both platforms; the engine turns them into
- * platform paths. Overlapping folders are refused rather than merged, because
+ * platform paths. Overlapping paths are refused rather than merged, because
  * two links to the same data would look independent and then diverge.
  *
  * @param {*} value string | string[] | false | null | undefined
@@ -136,11 +139,11 @@ export function normalizePersistPaths(value) {
   if (value === false) return { paths: [], error: null };
 
   const list = Array.isArray(value) ? value : [value];
-  if (list.length > MAX_PERSIST_PATHS) return { paths: null, error: `has more than ${MAX_PERSIST_PATHS} folders` };
+  if (list.length > MAX_PERSIST_PATHS) return { paths: null, error: `has more than ${MAX_PERSIST_PATHS} paths` };
 
   const out = [];
   for (const item of list) {
-    if (typeof item !== 'string') return { paths: null, error: 'must be folder paths, as a string or a list of strings' };
+    if (typeof item !== 'string') return { paths: null, error: 'must be project paths (folders or files), as a string or a list of strings' };
     const p = item.trim().replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, '');
     if (!p) continue;
     const problem = persistPathProblem(p);

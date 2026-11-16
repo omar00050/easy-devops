@@ -136,6 +136,7 @@ function seed(): { apps: MockApp[]; hook: DeployHook } {
         releases: [
           { id: apiRuns[0].releaseId, sha: apiRuns[0].sha, ref: 'main', startable: true, current: true, previous: false },
           { id: apiRuns[1].releaseId, sha: apiRuns[1].sha, ref: 'main', startable: true, current: false, previous: true },
+          { id: apiRuns[2].releaseId, sha: apiRuns[2].sha, ref: 'main', startable: false, current: false, previous: false },
         ],
       }),
       baseApp('mail-worker', {
@@ -430,6 +431,17 @@ export function handleDeployments(method: HttpMethod, path: string, body: Record
     if (!releaseId) fail(409, 'There is no earlier release to roll back to.');
     const run = startRun(app, 'rollback', releaseId);
     return { runId: run.id, status: 'running' };
+  }
+
+  const releaseMatch = /^releases\/(.+)$/.exec(sub);
+  if (releaseMatch && method === 'DELETE') {
+    const releaseId = decodeURIComponent(releaseMatch[1]);
+    const release = app.releases.find((r) => r.id === releaseId);
+    if (!release) fail(404, 'No such release.');
+    if (release.current) fail(409, 'That release is live. Roll back to another release before deleting it.');
+    if (release.previous) fail(409, 'That release is the one an automatic rollback would return to. Delete it after the next deployment.');
+    app.releases = app.releases.filter((r) => r.id !== releaseId);
+    return { deleted: releaseId };
   }
 
   const runMatch = /^runs\/(.+)$/.exec(sub);

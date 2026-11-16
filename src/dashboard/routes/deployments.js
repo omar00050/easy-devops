@@ -35,6 +35,7 @@ router.post('/:id/move', (req, res, next) => controller.move(req, res, next));
 
 router.post('/:id/deploy', (req, res, next) => controller.deploy(req, res, next));
 router.post('/:id/rollback', (req, res, next) => controller.rollback(req, res, next));
+router.delete('/:id/releases/:releaseId', (req, res, next) => controller.removeRelease(req, res, next));
 router.get('/:id/runs/:runId', (req, res, next) => controller.run(req, res, next));
 
 router.post('/:id/hook-token', (req, res, next) => controller.hookToken(req, res, next));

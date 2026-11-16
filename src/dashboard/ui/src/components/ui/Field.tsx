@@ -1,10 +1,12 @@
 import {
   useId,
+  useState,
   type InputHTMLAttributes,
   type ReactNode,
   type SelectHTMLAttributes,
   type TextareaHTMLAttributes,
 } from 'react';
+import { Plus, X } from 'lucide-react';
 import { cn } from '../../lib/cn';
 
 const CONTROL =
@@ -16,16 +18,21 @@ export function LabelText({
   htmlFor,
   children,
   optional,
+  trailing,
 }: {
   htmlFor?: string;
   children: ReactNode;
   optional?: boolean;
+  trailing?: ReactNode;
 }) {
   return (
-    <label htmlFor={htmlFor} className="mb-1.5 flex items-baseline gap-2 text-xs font-medium text-muted">
-      <span>{children}</span>
-      {optional && <span className="text-2xs font-normal text-faint">Optional</span>}
-    </label>
+    <div className="mb-1.5 flex items-baseline justify-between gap-2">
+      <label htmlFor={htmlFor} className="flex items-baseline gap-2 text-xs font-medium text-muted">
+        <span>{children}</span>
+        {optional && <span className="text-2xs font-normal text-faint">Optional</span>}
+      </label>
+      {trailing}
+    </div>
   );
 }
 
@@ -160,6 +167,143 @@ export function Select({
         {children}
       </select>
       {error ? <FieldError id={errorId}>{error}</FieldError> : hint ? <FieldHint id={hintId}>{hint}</FieldHint> : null}
+    </div>
+  );
+}
+
+export interface TagInputProps {
+  label?: string;
+  hint?: ReactNode;
+  error?: string | null;
+  optional?: boolean;
+  value: string[];
+  onChange: (value: string[]) => void;
+  /** Normalises one entry; returns the value to store, or why it cannot be added. */
+  normalize: (raw: string, current: string[]) => { value: string | null; error: string | null };
+  max?: number;
+  placeholder?: string;
+  className?: string;
+  id?: string;
+}
+
+/**
+ * A multi-value field: every entry becomes a chip with its own remove button.
+ * Enter (or a comma) adds the typed entry; the same normalization the server
+ * applies runs first, so a typo stays in the box with the reason beside it.
+ */
+export function TagInput({
+  label,
+  hint,
+  error,
+  optional,
+  value,
+  onChange,
+  normalize,
+  max,
+  placeholder,
+  className,
+  id: idProp,
+}: TagInputProps) {
+  const autoId = useId();
+  const id = idProp ?? autoId;
+  const [draft, setDraft] = useState('');
+  const [localError, setLocalError] = useState<string | null>(null);
+  const errorId = `${id}-error`;
+  const hintId = `${id}-hint`;
+  const shownError = localError ?? error ?? null;
+
+  const commit = () => {
+    const raw = draft.trim();
+    if (!raw) return;
+
+    // A pasted "data, uploads" adds both, in order.
+    let next = value;
+    for (const piece of raw.split(/[\n,]/)) {
+      if (!piece.trim()) continue;
+      const result = normalize(piece, next);
+      if (result.error || !result.value) {
+        setLocalError(result.error ?? 'This path cannot be added.');
+        setDraft(piece.trim());
+        return;
+      }
+      if (!next.includes(result.value)) next = [...next, result.value];
+    }
+    onChange(next);
+    setDraft('');
+    setLocalError(null);
+  };
+
+  return (
+    <div className={className}>
+      {label && (
+        <LabelText
+          htmlFor={id}
+          optional={optional}
+          trailing={max ? <span className="text-2xs font-normal text-faint">{value.length}/{max}</span> : undefined}
+        >
+          {label}
+        </LabelText>
+      )}
+      <div
+        className={cn(
+          'flex min-h-9 w-full flex-wrap items-center gap-1.5 rounded-md border bg-canvas px-2 py-1.5 transition-colors duration-[var(--ez-motion-fast)]',
+          shownError
+            ? BAD
+            : 'border-line hover:border-line-strong focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/25'
+        )}
+      >
+        {value.map((tag) => (
+          <span
+            key={tag}
+            className="inline-flex max-w-full items-center gap-1 rounded-sm border border-line bg-inset py-0.5 pl-2 pr-1 font-mono text-xs text-ink"
+          >
+            <span className="truncate">{tag}</span>
+            <button
+              type="button"
+              onClick={() => {
+                onChange(value.filter((item) => item !== tag));
+                setLocalError(null);
+              }}
+              className="shrink-0 rounded-sm p-0.5 text-faint transition-colors hover:bg-canvas hover:text-bad focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/50"
+              aria-label={`Remove ${tag}`}
+            >
+              <X className="size-3" aria-hidden="true" />
+            </button>
+          </span>
+        ))}
+        <input
+          id={id}
+          value={draft}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            if (localError) setLocalError(null);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' || event.key === ',') {
+              event.preventDefault();
+              commit();
+            }
+            if (event.key === 'Backspace' && !draft && value.length > 0) onChange(value.slice(0, -1));
+          }}
+          onBlur={commit}
+          placeholder={value.length === 0 ? placeholder : undefined}
+          aria-invalid={shownError ? true : undefined}
+          aria-describedby={shownError ? errorId : hint ? hintId : undefined}
+          className="h-6 min-w-24 flex-1 bg-transparent font-mono text-sm text-ink placeholder:text-faint focus:outline-none"
+          spellCheck={false}
+          autoComplete="off"
+        />
+        <button
+          type="button"
+          onClick={commit}
+          disabled={!draft.trim()}
+          className="shrink-0 rounded-sm p-1 text-faint transition-colors hover:bg-inset hover:text-ink focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/50 disabled:pointer-events-none disabled:opacity-40"
+          aria-label="Add path"
+        >
+          <Plus className="size-3.5" aria-hidden="true" />
+        </button>
+      </div>
+      {shownError ? <FieldError id={errorId}>{shownError}</FieldError> : hint ? <FieldHint id={hintId}>{hint}</FieldHint> : null}
     </div>
   );
 }
