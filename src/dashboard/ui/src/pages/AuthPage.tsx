@@ -18,6 +18,7 @@ import { ApiError } from '../lib/errors';
 import type { AuthStatus } from '../lib/types';
 import { useDocumentTitle } from '../hooks/useResource';
 import { cn } from '../lib/cn';
+import { currentYear } from '../lib/format';
 import { Button, IconButton } from '../components/ui/Button';
 import { TextInput } from '../components/ui/Field';
 import { InlineAlert } from '../components/ui/States';
@@ -58,13 +59,13 @@ function AuthLayout({ children }: { children: ReactNode }) {
   const { theme, toggleTheme } = useTheme();
 
   return (
-    <div className="relative flex min-h-full items-center justify-center overflow-hidden bg-canvas px-4 py-8 sm:py-12">
+    <div className="relative flex min-h-full flex-col overflow-hidden bg-canvas px-4 py-8 sm:py-12">
       <div className="pointer-events-none absolute inset-0" aria-hidden="true">
         <div className="absolute -top-48 left-1/2 h-[420px] w-[760px] -translate-x-1/2 rounded-full bg-accent-soft blur-3xl" />
         <div className="absolute -bottom-56 right-[-120px] h-[380px] w-[520px] rounded-full bg-info-soft blur-3xl" />
       </div>
 
-      <div className="relative grid w-full max-w-4xl overflow-hidden rounded-xl border border-line bg-surface shadow-card lg:grid-cols-[1.02fr_1fr]">
+      <div className="relative my-auto grid w-full max-w-4xl self-center overflow-hidden rounded-xl border border-line bg-surface shadow-card lg:grid-cols-[1.02fr_1fr]">
         <aside className="hidden flex-col justify-between gap-8 border-r border-line bg-raised/40 p-8 lg:flex">
           <AuthBrand />
 
@@ -110,6 +111,18 @@ function AuthLayout({ children }: { children: ReactNode }) {
           {children}
         </section>
       </div>
+
+      <footer className="relative py-4 text-center text-2xs text-faint">
+        © {currentYear()} Easy DevOps · provided by{' '}
+        <a
+          href="https://devxor.team"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-muted underline-offset-2 transition-colors hover:text-ink hover:underline"
+        >
+          DevXor Team
+        </a>
+      </footer>
     </div>
   );
 }

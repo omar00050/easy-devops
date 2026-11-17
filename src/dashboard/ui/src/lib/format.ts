@@ -38,6 +38,11 @@ export function timeAgo(timestamp: number): string {
   return `${days}d ago`;
 }
 
+/** Current calendar year, for copyright lines. */
+export function currentYear(): number {
+  return new Date().getFullYear();
+}
+
 export function formatBytes(bytes: number | null): string {
   if (bytes === null || bytes === undefined) return '—';
   if (bytes < 1024) return `${bytes} B`;

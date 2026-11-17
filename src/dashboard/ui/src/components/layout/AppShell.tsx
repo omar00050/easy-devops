@@ -6,6 +6,7 @@ import { ServiceBanner } from './ServiceBanner';
 import { BlockedBanner } from './BlockedBanner';
 import { ErrorBoundary } from '../ErrorBoundary';
 import { findNavItem } from '../../lib/navigation';
+import { currentYear } from '../../lib/format';
 
 export function AppShell() {
   const [navOpen, setNavOpen] = useState(false);
@@ -60,6 +61,17 @@ export function AppShell() {
             </div>
           </div>
         </main>
+        <footer className="shrink-0 border-t border-line bg-canvas px-3 py-1.5 text-center text-[10px] text-faint sm:px-5">
+          © {currentYear()} Easy DevOps · provided by{' '}
+          <a
+            href="https://devxor.team"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-muted underline-offset-2 transition-colors hover:text-ink hover:underline"
+          >
+            DevXor Team
+          </a>
+        </footer>
       </div>
     </div>
   );
