@@ -186,9 +186,39 @@ if (servingNewUi) {
   // handled by the static index. A real path (/domains/example.com) gets the
   // same index.html so the app can resolve it. Static files above win first,
   // and /api and /socket.io never reach this point with a routed request.
+  //
+  // `root` is load-bearing: with an absolute path, send() walks every segment
+  // of it as a potential dotfile and answers 404 for any that starts with a
+  // dot — a global Bun install lives under ~/.bun, so the built UI would
+  // never be served there. Root-relative parts contain no dot segments.
+  //
+  // A build that disappears after startup would otherwise reach Express's
+  // default error handler, which prints a stack trace in the browser. Fall
+  // back to the classic page instead, and report it once, not per request.
+  let indexErrorReported = false;
   app.use((req, res, next) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') return next();
-    res.sendFile(uiIndexFile, { headers: { 'Cache-Control': 'no-cache' } });
+    res.sendFile('index.html', {
+      root: uiDistDir,
+      headers: { 'Cache-Control': 'no-cache' },
+    }, (err) => {
+      if (!err) return;
+      // Client gone, or the body already started: nothing left to render.
+      if (res.headersSent || err.code === 'ECONNABORTED' || err.syscall === 'write') return;
+      if (!indexErrorReported) {
+        indexErrorReported = true;
+        process.stderr.write(
+          '\nThe dashboard UI could not be served:\n' +
+          `  ${uiIndexFile}\n` +
+          `  ${err.message}\n` +
+          '  Serving the classic dashboard until it can.\n\n'
+        );
+      }
+      res.render('index', (renderErr, html) => {
+        if (renderErr) return next(renderErr);
+        res.send(html);
+      });
+    });
   });
 } else {
   // Render EJS template for all other routes
