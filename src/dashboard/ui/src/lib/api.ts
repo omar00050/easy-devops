@@ -60,6 +60,9 @@ import type {
   SettingsUpdateResult,
   SslCreateInput,
   ApiErrorPayload,
+  UpdateCheck,
+  UpdateStartResponse,
+  UpdateStatusResponse,
 } from './types';
 import { ApiError } from './errors';
 
@@ -379,5 +382,13 @@ export const api = {
     unlink: () => request<{ ok: true }>('/hub/link', { method: 'DELETE' }),
     updatePermissions: (permissions: Record<string, boolean>) =>
       request<HubPermissionsResponse>('/hub/permissions', { method: 'PUT', body: permissions }),
+  },
+
+  update: {
+    check: (signal?: AbortSignal) => request<UpdateCheck>('/update', { signal }),
+    status: (signal?: AbortSignal) =>
+      request<UpdateStatusResponse>('/update/status', { signal }),
+    start: (version: string) =>
+      request<UpdateStartResponse>('/update', { method: 'POST', body: { version } }),
   },
 };

@@ -513,11 +513,11 @@ export const PERMISSION_TREE: PermissionGroup[] = [
     id: 'process',
     label: 'Processes',
     description:
-      'Control the PM2 processes on this server, including the Easy DevOps service itself.',
+      'Control the PM2 processes on this server. Easy DevOps itself runs as a background service, not a PM2 app, so it cannot be controlled from here.',
     children: [
-      { id: 'process.start', label: 'Start', description: 'Start a stopped PM2 process from the Hub.', comingSoon: true },
-      { id: 'process.stop', label: 'Stop', description: 'Stop a running PM2 process from the Hub. Stopping the dashboard would cut the Hub off from this server.', comingSoon: true },
-      { id: 'process.restart', label: 'Restart', description: 'Restart a PM2 process from the Hub.', comingSoon: true },
+      { id: 'process.start', label: 'Start', description: 'Start a stopped PM2 process from the Hub.' },
+      { id: 'process.stop', label: 'Stop', description: 'Stop a running PM2 process from the Hub.' },
+      { id: 'process.restart', label: 'Restart', description: 'Restart a PM2 process from the Hub.' },
     ],
   },
   {
@@ -568,6 +568,8 @@ export function seedHub(permissions: Record<string, boolean>): HubStatus {
     status: 'connected',
     lastError: null,
     attempts: 0,
+    agentOwner: 'dashboard',
+    agentReported: true,
     dataDir: '/var/lib/easy-devops',
     devDataDir: false,
   };

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   Activity,
+  ArrowUpRight,
   Boxes,
   CheckCircle2,
   ChevronRight,
@@ -70,6 +71,15 @@ const TONE_TEXT: Record<Tone, string> = {
   info: 'text-info',
 };
 
+const TONE_TILE: Record<Tone, string> = {
+  neutral: 'border-line/70 bg-inset text-muted group-hover:text-ink',
+  accent: 'border-accent/25 bg-accent-soft text-accent-text',
+  ok: 'border-ok/25 bg-ok-soft text-ok',
+  warn: 'border-warn/25 bg-warn-soft text-warn',
+  bad: 'border-bad/25 bg-bad-soft text-bad',
+  info: 'border-info/25 bg-info-soft text-info',
+};
+
 function StatCard({
   label,
   value,
@@ -89,14 +99,14 @@ function StatCard({
 }) {
   return (
     <Link to={to} className="group block rounded-lg">
-      <Card className="h-full px-4 py-3.5 transition-colors duration-[var(--ez-motion-fast)] group-hover:border-line-strong">
+      <Card className="stat-card h-full px-4 py-3.5">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <div className="text-2xs font-semibold uppercase tracking-[0.12em] text-faint">
               {label}
             </div>
             <div className="mt-1.5 flex items-center gap-2">
-              <span className={cn('text-xl font-semibold tracking-tight', TONE_TEXT[tone])}>
+              <span className={cn('text-2xl font-semibold tracking-tight', TONE_TEXT[tone])}>
                 {value}
               </span>
               {(tone === 'ok' || tone === 'bad' || tone === 'warn') && (
@@ -104,11 +114,22 @@ function StatCard({
               )}
             </div>
           </div>
-          <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-inset text-muted transition-colors group-hover:text-ink">
+          <div
+            className={cn(
+              'flex size-9 shrink-0 items-center justify-center rounded-lg border transition-transform duration-[var(--ez-motion-base)] group-hover:scale-105',
+              TONE_TILE[tone]
+            )}
+          >
             <Icon className="size-4" aria-hidden="true" />
           </div>
         </div>
-        <div className="mt-2 truncate text-2xs text-muted">{hint}</div>
+        <div className="mt-2.5 flex items-center justify-between gap-2">
+          <div className="truncate text-2xs text-muted">{hint}</div>
+          <span className="inline-flex shrink-0 items-center gap-0.5 text-2xs font-medium text-faint opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
+            Open
+            <ArrowUpRight className="size-3" aria-hidden="true" />
+          </span>
+        </div>
       </Card>
     </Link>
   );
@@ -201,6 +222,24 @@ function HealthBadge({ entry }: { entry: DomainHealthEntry | undefined }) {
     <Badge tone="bad" dot>
       Down
     </Badge>
+  );
+}
+
+function CertMeter({ days }: { days: number }) {
+  const tone = days <= 0 ? 'bg-bad' : days < 30 ? 'bg-warn' : 'bg-ok';
+  const width = days <= 0 ? 100 : Math.max(8, (Math.min(days, 90) / 90) * 100);
+  return (
+    <span className="flex items-center gap-2">
+      <span className={cn('text-2xs tabular-nums', days < 30 ? 'text-warn' : 'text-muted')}>
+        {formatDaysLeft(days)}
+      </span>
+      <span className="h-1 w-10 shrink-0 overflow-hidden rounded-full bg-inset" aria-hidden="true">
+        <span
+          className={cn('block h-full rounded-full', tone)}
+          style={{ width: `${width}%` }}
+        />
+      </span>
+    </span>
   );
 }
 
@@ -330,7 +369,7 @@ export function OverviewPage() {
               <div className="flex items-start gap-4">
                 <div
                   className={cn(
-                    'relative mt-0.5 flex size-11 shrink-0 items-center justify-center rounded-full border',
+                    'relative isolate mt-0.5 flex size-11 shrink-0 items-center justify-center rounded-full border',
                     critical > 0
                       ? 'border-bad/30 bg-bad-soft text-bad'
                       : issues.length > 0
@@ -338,6 +377,13 @@ export function OverviewPage() {
                         : 'border-ok/30 bg-ok-soft text-ok'
                   )}
                 >
+                  <span
+                    className={cn(
+                      'pointer-events-none absolute -inset-3 -z-10 rounded-full blur-lg',
+                      critical > 0 ? 'bg-bad/25' : issues.length > 0 ? 'bg-warn/25' : 'bg-ok/25'
+                    )}
+                    aria-hidden="true"
+                  />
                   {critical > 0 || issues.length > 0 ? (
                     <TriangleAlert className="size-5" aria-hidden="true" />
                   ) : (
@@ -543,17 +589,11 @@ export function OverviewPage() {
                             </td>
                             <td className="hidden px-3 py-2.5 text-2xs md:table-cell">
                               {domain.ssl.enabled ? (
-                                <span
-                                  className={cn(
-                                    domain.daysLeft !== null && domain.daysLeft < 30
-                                      ? 'text-warn'
-                                      : 'text-muted'
-                                  )}
-                                >
-                                  {domain.daysLeft !== null
-                                    ? formatDaysLeft(domain.daysLeft)
-                                    : 'Unknown'}
-                                </span>
+                                domain.daysLeft !== null ? (
+                                  <CertMeter days={domain.daysLeft} />
+                                ) : (
+                                  <span className="text-muted">Unknown</span>
+                                )
                               ) : (
                                 <span className="text-faint">Not enabled</span>
                               )}
@@ -622,7 +662,7 @@ export function OverviewPage() {
                     health appear here live.
                   </div>
                 ) : (
-                  <div>
+                  <div className="event-timeline">
                     {notifications.slice(0, 6).map((event) => {
                       const { icon: Icon, tone } = eventIcon(event);
                       return (
@@ -630,7 +670,9 @@ export function OverviewPage() {
                           key={event.id}
                           className="flex items-start gap-2.5 border-b border-line/60 px-4 py-2.5 last:border-0"
                         >
-                          <Icon className={cn('mt-0.5 size-3.5 shrink-0', tone)} aria-hidden="true" />
+                          <span className="relative z-10 mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full border border-line bg-raised">
+                            <Icon className={cn('size-3', tone)} aria-hidden="true" />
+                          </span>
                           <div className="min-w-0 flex-1">
                             <div className="text-xs leading-snug text-ink">{event.message}</div>
                             <div className="mt-0.5 text-2xs text-faint">{timeAgo(event.timestamp)}</div>

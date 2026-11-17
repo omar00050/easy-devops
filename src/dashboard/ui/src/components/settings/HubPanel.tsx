@@ -28,7 +28,7 @@ import { useToast } from '../ui/Toast';
 const STATUS_LABEL: Record<string, string> = {
   not_linked: 'Not linked',
   connecting: 'Connecting…',
-  connected: 'Online',
+  connected: 'Connected',
   rejected: 'Rejected by the Hub',
   unreachable: 'Hub unreachable',
 };
@@ -99,14 +99,16 @@ export function HubPanel() {
 
   const status = hub.data?.status ?? 'not_linked';
 
-  // Keep asking while the outcome can still change on its own. 'rejected'
-  // and 'not_linked' need the user, so polling stops there.
+  // Keep asking while the outcome can still change on its own — including when
+  // the connection is healthy, because the agent may live in the background
+  // service and restart without this page knowing. The refresh is SILENT: the
+  // status line must not flash a loading bar on every poll.
   useEffect(() => {
-    const delay = status === 'connecting' ? 2_000 : status === 'unreachable' ? 15_000 : 0;
-    if (!delay) return;
-    const id = window.setTimeout(hub.reload, delay);
+    if (!hub.data?.linked) return;
+    const delay = status === 'connecting' ? 2_000 : status === 'unreachable' ? 5_000 : 15_000;
+    const id = window.setTimeout(hub.reloadSilent, delay);
     return () => window.clearTimeout(id);
-  }, [hub.data, hub.reload, status]);
+  }, [hub.data, hub.reloadSilent, status]);
 
   const connect = async () => {
     if (connecting) return;
@@ -292,6 +294,19 @@ export function HubPanel() {
           {data.serverId && (
             <span className="text-2xs text-faint">
               Server ID <code className="font-mono text-muted">{data.serverId}</code>
+            </span>
+          )}
+          {data.linked && (
+            <span className="text-2xs text-faint" title={
+              data.agentOwner === 'daemon'
+                ? 'The Hub connection is held by the background service, which keeps it alive with no browser open.'
+                : 'The Hub connection is held by this dashboard and stops when it closes.'
+            }>
+              {data.agentOwner === 'daemon' && !data.agentReported
+                ? 'waiting for the background service…'
+                : data.agentOwner === 'daemon'
+                  ? 'via the background service'
+                  : 'via this dashboard'}
             </span>
           )}
           {data.status === 'unreachable' && data.attempts > 0 && (

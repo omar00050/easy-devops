@@ -51,7 +51,8 @@ export function AppShell() {
           tabIndex={-1}
           className="min-h-0 flex-1 overflow-y-auto outline-none"
         >
-          <div className="mx-auto w-full max-w-[var(--ez-content-max)] px-3 py-4 sm:px-5 sm:py-5 lg:px-7 lg:py-6">
+          <div className="relative isolate mx-auto w-full max-w-[var(--ez-content-max)] px-3 py-4 sm:px-5 sm:py-5 lg:px-7 lg:py-6">
+            <div className="dashboard-ambient -z-10" aria-hidden="true" />
             <ServiceBanner />
             <BlockedBanner />
             <div key={pathname} className="page-enter">

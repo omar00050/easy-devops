@@ -6,6 +6,13 @@ export interface Resource<T> {
   error: ApiError | null;
   loading: boolean;
   reload: () => void;
+  /**
+   * Re-fetches without flipping `loading`, so a background poll never shows a
+   * refresh indicator. For states that legitimately poll for a while (an agent
+   * mid-handshake) this is the difference between a live status and a bar that
+   * flashes every two seconds.
+   */
+  reloadSilent: () => void;
   setData: (updater: T | ((current: T | null) => T | null)) => void;
 }
 
@@ -29,6 +36,7 @@ export function useResource<T>(
   loaderRef.current = loader;
 
   const [nonce, setNonce] = useState(0);
+  const silentNext = useRef(false);
   const [state, setState] = useState<{
     data: T | null;
     error: ApiError | null;
@@ -37,11 +45,16 @@ export function useResource<T>(
 
   useEffect(() => {
     if (!enabled) {
+      silentNext.current = false;
       setState({ data: null, error: null, loading: false });
       return;
     }
     const controller = new AbortController();
-    setState((current) => ({ ...current, loading: true, error: null }));
+    const silent = silentNext.current;
+    silentNext.current = false;
+    if (!silent) {
+      setState((current) => ({ ...current, loading: true, error: null }));
+    }
 
     loaderRef
       .current(controller.signal)
@@ -61,6 +74,10 @@ export function useResource<T>(
   }, [...deps, enabled, nonce]);
 
   const reload = useCallback(() => setNonce((value) => value + 1), []);
+  const reloadSilent = useCallback(() => {
+    silentNext.current = true;
+    setNonce((value) => value + 1);
+  }, []);
 
   const setData = useCallback(
     (updater: T | ((current: T | null) => T | null)) => {
@@ -75,7 +92,7 @@ export function useResource<T>(
     []
   );
 
-  return { data: state.data, error: state.error, loading: state.loading, reload, setData };
+  return { data: state.data, error: state.error, loading: state.loading, reload, reloadSilent, setData };
 }
 
 /** Runs `callback` on an interval while enabled, without resetting on re-renders. */

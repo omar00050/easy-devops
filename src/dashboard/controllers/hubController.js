@@ -17,6 +17,7 @@ import { PERMISSION_TREE, COMING_SOON_PERMISSION_IDS } from '../../core/hubPermi
 import { getDataDir, isDevDataDir, isDefaultDataDir } from '../../core/platform.js';
 import { inspect } from '../../core/daemon/lock.js';
 import { stopHubAgent, initHubAgent, getHubAgentStatus, pushPermissions } from '../../core/hub/agent.js';
+import { daemonStatus, daemonHubState } from '../lib/daemonBridge.js';
 
 // POST /api/hub/connect
 // Body: { connectionString: 'ezops://hubUrl|serverId|secret' }
@@ -101,10 +102,18 @@ export function updatePermissions(req, res) {
 /**
  * Builds the status response. Deliberately omits the secret — it is only ever
  * shown once by the hub, and is never echoed back by this API.
+ *
+ * The agent lives in whichever process owns the background jobs. When a daemon
+ * is running, this process's own agent is not started at all, so asking it
+ * would report "connecting" for ever — it has no socket and never will. The
+ * answer therefore comes from the daemon (through the bridge), and `agentOwner`
+ * says which side reported it.
  */
 function hubStatusPayload() {
   const link = getLinkStatus();
-  const agent = getHubAgentStatus();
+  const daemon = inspect();
+  const agentOwner = daemon.running ? 'daemon' : 'dashboard';
+  const agent = agentOwner === 'daemon' ? daemonAgentStatus(link.linked) : getHubAgentStatus();
 
   return {
     linked: link.linked,
@@ -118,6 +127,12 @@ function hubStatusPayload() {
     status: agent.status,
     lastError: agent.lastError,
     attempts: agent.attempts,
+    // 'daemon' means the background service owns the Hub connection; the state
+    // above describes ITS agent, not this process's (which is not running).
+    agentOwner,
+    // False while the daemon is running but its event channel has not told us
+    // its state yet. The UI must say "waiting" rather than invent a status.
+    agentReported: agent.reported,
     // Which database this dashboard — and therefore this agent — is actually
     // using. A non-default directory means a CLI and a dashboard can be editing
     // two separate domain lists with no visible sign of it, so the path is
@@ -131,5 +146,49 @@ function hubStatusPayload() {
     dataDir: getDataDir(),
     defaultDataDir: isDefaultDataDir(getDataDir()),
     devDataDir: isDevDataDir(),
+  };
+}
+
+/**
+ * The daemon's agent state, or an honest placeholder when it has not reported.
+ *
+ * `reported: false` is the important part: the daemon is running but its IPC
+ * channel is not up (or the hello frame has not arrived), so the real state is
+ * unknown. Claiming `connected` would be wrong and claiming `connecting` with
+ * no explanation looked like a stuck refresh — the UI renders the placeholder
+ * as "waiting for the background service".
+ */
+function daemonAgentStatus(dbLinked) {
+  const reported = daemonHubState();
+
+  if (!reported) {
+    return {
+      linked: dbLinked,
+      connected: false,
+      status: dbLinked ? 'connecting' : 'not_linked',
+      lastError: null,
+      attempts: 0,
+      reported: false,
+    };
+  }
+
+  const channelUp = daemonStatus().connected;
+
+  // A stale snapshot is only trusted while the channel that carried it is up.
+  // Once it drops, the bridge already clears its copy; this is the belt-and-
+  // braces case of a frame arriving mid-disconnect. A daemon that has not yet
+  // reconciled a link made a moment ago reports not_linked — the link is in
+  // the shared database, so that is a "starting up", not an "unlinked".
+  const linked = reported.linked || dbLinked;
+  let status = channelUp ? reported.status : 'connecting';
+  if (linked && status === 'not_linked') status = 'connecting';
+
+  return {
+    linked,
+    connected: Boolean(reported.connected) && channelUp,
+    status,
+    lastError: channelUp ? reported.lastError : null,
+    attempts: reported.attempts ?? 0,
+    reported: channelUp,
   };
 }

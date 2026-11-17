@@ -13,8 +13,10 @@
  * key that lets a crash mid-update still bring the dashboard back on the next
  * launch.
  *
- * Nothing here runs from the dashboard or the Hub, and `whyCliOnly()` in
+ * Nothing in this file runs from the Hub, and `whyCliOnly()` in
  * core/updater.js is what explains that to the user rather than a comment.
+ * The dashboard has its own entry point for the same flow —
+ * dashboard/updateWorker.js — which is why this file owns only the CLI side.
  */
 
 import chalk from 'chalk';
@@ -22,26 +24,8 @@ import inquirer from 'inquirer';
 import ora from 'ora';
 import { dbGet, dbSet } from '../../core/db.js';
 import { loadConfig } from '../../core/config.js';
-import { getDashboardStatus, startDashboard, stopDashboard } from './dashboard.js';
-import { run } from '../../core/shell.js';
+import { getDashboardStatus, startDashboard, stopDashboard } from '../../core/dashboardProcess.js';
 
-
-// ─── Version helpers ──────────────────────────────────────────────────────────
-
-async function fetchLatestVersion() {
-  const result = await run('npm view easy-devops version', { timeout: 20000 });
-  if (result.success && result.stdout.trim()) return result.stdout.trim();
-  return null;
-}
-
-function isNewer(latest, current) {
-  const parse = v => v.replace(/^v/, '').split('.').map(Number);
-  const [la, lb, lc] = parse(latest);
-  const [ca, cb, cc] = parse(current);
-  if (la !== ca) return la > ca;
-  if (lb !== cb) return lb > cb;
-  return lc > cc;
-}
 
 // ─── Recover interrupted update ───────────────────────────────────────────────
 // If a previous update crashed after stopping the dashboard but before restarting
@@ -79,36 +63,18 @@ async function recoverIfNeeded() {
   dbSet('update-pre-dashboard', null);
 }
 
-// ─── Perform update ───────────────────────────────────────────────────────────
+// ─── Detached dashboard ───────────────────────────────────────────────────────
 
 /**
- * The menu's update, which is the same operation `ezz update` performs.
+ * Persists the dashboard state, stops it, runs `fn`, and starts it again.
  *
- * The sequence itself — stop the service, replace the package, refresh the
- * Windows Server runtime copy, start, verify against the daemon's own
- * heartbeat, roll back if it did not come up — lives in core/updater.js.
- * Having had two copies of it was how the runtime copy came to be refreshed in
- * neither: a feature added to one path is invisible to the other.
- *
- * What stays here is the detached dashboard, which is a CLI concept, and the
- * recovery key that survives a crash mid-update.
+ * The state is written *before* the stop, so a crash in between leaves the
+ * `update-pre-dashboard` key behind and `recoverIfNeeded()` finishes the job on
+ * the next launch. Both entry points go through here — `ezz update`, and the
+ * menu, which now simply calls it — so neither can stop the dashboard and
+ * forget to bring it back.
  */
-async function performUpdate(latestVersion) {
-  const updater = await import('../../core/updater.js');
-  const { detectInstallSource, describeUnmanaged } = await import('../../core/installSource.js');
-
-  const source = detectInstallSource();
-  if (!source.npmUpdatable) {
-    console.log();
-    for (const line of describeUnmanaged(source, 'update')) console.log('  ' + chalk.gray(line));
-    return false;
-  }
-
-  for (const line of updater.whyCliOnly()) console.log('  ' + chalk.gray(line));
-  console.log();
-
-  // Step 1 — the dashboard's state, persisted so a crash mid-update can still
-  // bring it back on the next launch (recoverIfNeeded above).
+async function withDashboardStopped(fn) {
   const status = await getDashboardStatus();
   dbSet('update-pre-dashboard', {
     wasRunning: status.running,
@@ -118,44 +84,58 @@ async function performUpdate(latestVersion) {
   });
 
   if (status.running) {
-    const sp = ora('Stopping dashboard...').start();
+    const sp = ora('Stopping the dashboard...').start();
     await stopDashboard(status.pid);
     sp.succeed('Dashboard stopped');
   }
 
-  // Step 2 — the package and the service.
-  const result = await updater.performUpdate({
-    version: latestVersion,
-    log: (line) => console.log('  ' + chalk.gray(line)),
-  });
+  try {
+    return await fn();
+  } finally {
+    // Cleared before the restart: if the restart itself crashes, the next
+    // launch must not start a second dashboard on the same port.
+    const saved = dbGet('update-pre-dashboard');
+    dbSet('update-pre-dashboard', null);
 
-  // Step 3 — the dashboard, however it was before.
-  const saved = dbGet('update-pre-dashboard');
-  dbSet('update-pre-dashboard', null);
-
-  if (saved?.wasRunning) {
-    const port = saved.port || loadConfig().dashboardPort;
-    const sp = ora(`Restarting dashboard on port ${port}...`).start();
-    const back = await startDashboard(port);
-    back.success
-      ? sp.succeed(`Dashboard restarted on port ${port}`)
-      : sp.fail('Could not restart dashboard — use the Dashboard menu');
-  }
-
-  if (result.ok) {
-    console.log('  ' + chalk.green(`Updated to v${result.to}`));
-    if (result.serviceInstalled && result.runningVersion) {
-      console.log('  ' + chalk.gray(`The service reports v${result.runningVersion}.`));
+    if (saved?.wasRunning) {
+      const port = saved.port || loadConfig().dashboardPort;
+      const sp = ora(`Starting the dashboard on port ${port}...`).start();
+      const back = await startDashboard(port);
+      back.success
+        ? sp.succeed(`Dashboard running on port ${port}`)
+        : sp.fail('Could not start the dashboard - use the Dashboard menu');
     }
-    return true;
   }
+}
 
-  console.log('  ' + chalk.red(`Update failed (${result.step})`));
-  for (const line of String(result.reason ?? '').split('\n')) console.log('  ' + chalk.gray(line));
-  if (result.rolledBack) {
-    console.log('  ' + chalk.green(`Rolled back to v${result.from}.`));
-  }
-  return false;
+// ─── Post-update check ────────────────────────────────────────────────────────
+
+/**
+ * Says so when a daemon this command did not start is still on the old code.
+ *
+ * Replacing the files does not replace a running process: a daemon started
+ * from another terminal keeps the code it loaded until it is restarted. Telling
+ * the user is the whole fix — killing a process another terminal owns is not
+ * this command's call, and that pid may be an interactive session.
+ *
+ * @param {string} targetVersion The version the files on disk now carry
+ */
+async function warnStaleDaemon(targetVersion) {
+  const updater = await import('../../core/updater.js');
+  const { inspect } = await import('../../core/daemon/lock.js');
+
+  const state = inspect();
+  if (!state.running || !state.lock) return;
+
+  const running = state.lock.version;
+  if (running && updater.compareVersions(running, targetVersion) === 0) return;
+
+  console.log();
+  console.log('  ' + chalk.yellow(
+    `A daemon this command did not start is still running${running ? ` v${running}` : ''} (pid ${state.lock.pid}).`
+  ));
+  console.log('  ' + chalk.gray('The files on disk are now the new version, but a running process keeps the code it loaded.'));
+  console.log('  ' + chalk.gray('Restart it from the terminal that started it (stop it there, then run `ezz daemon`).'));
 }
 
 // ─── `ezz update` ─────────────────────────────────────────────────────────────
@@ -240,30 +220,16 @@ export async function updateCommand({ yes = false } = {}) {
   }
 
   // A detached dashboard runs the jobs while no service does, and it is
-  // running the code npm is about to replace. Stopped here and started again
-  // afterwards, which is exactly what the menu path does.
-  const dash = await getDashboardStatus();
-  if (dash.running) {
-    const sp = ora('Stopping the dashboard...').start();
-    await stopDashboard(dash.pid);
-    sp.succeed('Dashboard stopped');
-  }
-
+  // running the code npm is about to replace. Stopped and started again around
+  // the update, with the recovery key that covers a crash in between.
   console.log();
-  const result = await updater.performUpdate({
-    version: check.latest,
-    log: (line) => console.log('  ' + chalk.gray(line)),
-  });
+  const result = await withDashboardStopped(() =>
+    updater.performUpdate({
+      version: check.latest,
+      log: (line) => console.log('  ' + chalk.gray(line)),
+    })
+  );
   console.log();
-
-  if (dash.running) {
-    const port = dash.port || loadConfig().dashboardPort;
-    const sp = ora(`Starting the dashboard on port ${port}...`).start();
-    const back = await startDashboard(port);
-    back.success
-      ? sp.succeed(`Dashboard running on port ${port}`)
-      : sp.fail('Could not start the dashboard - use the Dashboard menu');
-  }
 
   if (result.ok) {
     console.log('  ' + chalk.green(`Updated v${result.from} -> v${result.to}.`));
@@ -277,6 +243,7 @@ export async function updateCommand({ yes = false } = {}) {
         console.log('  ' + chalk.gray('The ProgramData runtime copy was refreshed, so the service runs the new code.'));
       }
     }
+    await warnStaleDaemon(result.to);
     console.log();
     return 0;
   }
@@ -304,56 +271,29 @@ export async function updateCommand({ yes = false } = {}) {
 
 // ─── Menu ─────────────────────────────────────────────────────────────────────
 
+/**
+ * The menu's "Check for Updates".
+ *
+ * Deliberately a front for `updateCommand` and not a second implementation:
+ * the old version here kept calling helpers that no longer existed and threw a
+ * ReferenceError the moment the item was chosen. One flow, one place to fix.
+ */
 export default async function updateMenu() {
-  // Recover from a crashed previous update first
+  // A crashed previous update is finished before another one is offered.
   await recoverIfNeeded();
 
-  const spinner = ora('Checking for updates...').start();
-  const latestVersion = await fetchLatestVersion();
-  spinner.stop();
-
-  console.log(chalk.bold('\n  Check for Updates'));
-  console.log(chalk.gray('  ' + '─'.repeat(40)));
-  console.log(`  Current version : ${chalk.cyan('v' + currentVersion)}`);
-
-  if (!latestVersion) {
-    console.log(chalk.yellow('  Could not reach npm registry. Check your internet connection.\n'));
-    await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to go back...' }]);
-    return;
-  }
-
-  const updateAvailable = check.updateAvailable;
-
-  if (updateAvailable) {
-    console.log(`  Latest version  : ${chalk.green('v' + latestVersion)}  ${chalk.yellow('← update available')}\n`);
-  } else {
-    console.log(`  Latest version  : ${chalk.green('v' + latestVersion)}  ${chalk.gray('✓ up to date')}\n`);
-  }
-
-  const choices = updateAvailable
-    ? [`Update to v${latestVersion}`, new inquirer.Separator(), '← Back']
-    : ['← Back'];
-
-  let choice;
+  let code;
   try {
-    ({ choice } = await inquirer.prompt([{
-      type:    'list',
-      name:    'choice',
-      message: 'Select an option:',
-      choices,
-    }]));
+    code = await updateCommand();
   } catch (err) {
     if (err.name === 'ExitPromptError') return;
     throw err;
   }
 
-  if (choice === `Update to v${latestVersion}`) {
-    const success = await performUpdate(latestVersion);
-    if (success) {
-      console.log(chalk.gray('\n  Restart easy-devops to use the new version.\n'));
-    }
-    try {
-      await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
-    } catch { /* ExitPromptError */ }
-  }
+  // Dismissed at the confirmation prompt: nothing ran, nothing to read.
+  if (code === 2) return;
+
+  try {
+    await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
+  } catch { /* ExitPromptError on the pause */ }
 }

@@ -418,6 +418,67 @@ export interface BackupFile {
   domains: Domain[];
 }
 
+// ─── Updating Easy DevOps ────────────────────────────────────────────────────
+
+export type UpdatePhase =
+  | 'starting'
+  | 'stopping'
+  | 'updating'
+  | 'restarting'
+  | 'done'
+  | 'failed'
+  | 'interrupted';
+
+export interface UpdateSource {
+  kind: 'clone' | 'npm' | 'unknown';
+  reason: string;
+  /** False means the Update button is not offered at all. */
+  npmUpdatable: boolean;
+  howToUpdate: string[];
+}
+
+export interface UpdateRun {
+  id: string;
+  phase: UpdatePhase;
+  from: string;
+  to: string;
+  /** Which sub-step failed, on a failure. */
+  step: string | null;
+  reason: string | null;
+  logTail: string[];
+  startedAt: number;
+  updatedAt: number;
+  finishedAt?: number;
+  rolledBack?: boolean;
+  restored?: boolean | null;
+  runningVersion?: string | null;
+  versionConfirmed?: boolean;
+  serviceInstalled?: boolean;
+  refreshedCopy?: boolean;
+  dashboardRestarted?: boolean;
+  dashboardPort?: number;
+}
+
+export interface UpdateCheck {
+  current: string;
+  latest: string | null;
+  reachable: boolean;
+  updateAvailable: boolean;
+  source: UpdateSource;
+  /** The last run, so a page loaded after a restart can report its outcome. */
+  run: UpdateRun | null;
+}
+
+export interface UpdateStatusResponse {
+  current: string;
+  run: UpdateRun | null;
+}
+
+export interface UpdateStartResponse {
+  started: true;
+  run: UpdateRun;
+}
+
 // ─── Notification channels ───────────────────────────────────────────────────
 
 export type ChannelType = 'discord' | 'telegram';
@@ -478,6 +539,10 @@ export interface HubStatus {
   status: HubAgentState;
   lastError: string | null;
   attempts: number;
+  /** Which process owns the Hub connection: the background service or this dashboard. */
+  agentOwner: 'daemon' | 'dashboard';
+  /** False while the daemon is running but has not reported its agent state yet. */
+  agentReported: boolean;
   dataDir: string;
   devDataDir: boolean;
 }

@@ -136,7 +136,13 @@ export async function startDaemon({
   const handle = {
     ok: true,
     ipcPath: ipc?.path ?? null,
-    state: () => ({ ...jobs.state(), version, pid: process.pid, ipcPath: ipc?.path ?? null }),
+    state: () => ({
+      ...jobs.state(),
+      version,
+      pid: process.pid,
+      ipcPath: ipc?.path ?? null,
+      hub: getHubAgentStatus(),
+    }),
 
     /** Idempotent: a second signal while shutting down must not run it twice. */
     stop() {

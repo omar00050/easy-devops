@@ -56,6 +56,9 @@ import type {
   ServiceStatus,
   Settings,
   SslCreateInput,
+  UpdatePhase,
+  UpdateRun,
+  UpdateSource,
 } from '../types';
 import type { HttpMethod, QueryParams } from '../api';
 
@@ -83,8 +86,17 @@ const SCENARIOS: MockScenario[] = [
   'setupcode-expired',
   'none',
 ];
-const STORAGE_PREFIX = 'ez-mock-state-v4';
+const STORAGE_PREFIX = 'ez-mock-state-v5';
 const SCENARIO_KEY = 'ez-mock-scenario';
+
+interface MockUpdateState {
+  current: string;
+  latest: string;
+  reachable: boolean;
+  updateAvailable: boolean;
+  source: UpdateSource;
+  run: UpdateRun | null;
+}
 
 interface MockState {
   scenario: MockScenario;
@@ -103,6 +115,7 @@ interface MockState {
   service: ServiceStatus;
   settings: Settings;
   hub: HubStatus;
+  update: MockUpdateState;
   pendingDns: Record<string, { txtName: string; txtValue: string }>;
 }
 
@@ -272,6 +285,19 @@ function createState(scenario: MockScenario): MockState {
       canUseNoPassword: true,
     },
     hub: seedHub(permissions),
+    update: {
+      current: '1.3.4',
+      latest: '1.3.5',
+      reachable: true,
+      updateAvailable: true,
+      source: {
+        kind: 'npm',
+        reason: 'an npm-installed package at /usr/lib/node_modules/easy-devops',
+        npmUpdatable: true,
+        howToUpdate: [],
+      },
+      run: null,
+    },
     pendingDns: {},
   };
 }
@@ -527,6 +553,77 @@ function getAuthPayload(s: MockState) {
     setupCodeExpiresAt:
       codePending && s.scenario !== 'setupcode-expired' ? Date.now() + 24 * 60 * 60 * 1000 : null,
   };
+}
+
+// ─── Updating Easy DevOps (simulated) ────────────────────────────────────────
+
+/**
+ * A simulated run, so the Settings > Update panel can be exercised without
+ * installing anything. Phases advance with the wall clock from the moment the
+ * POST arrives; the log lines and the final record match what the detached
+ * worker writes in production.
+ *
+ * The real dashboard is dead between "stopping" and "restarting" — polling is
+ * expected to fail there — so `/update/status` throws the same status-0 error
+ * while the simulated run is stopping or updating. That exercises the "it is
+ * coming back" path instead of only the happy one; once the simulated process
+ * is back (phase "restarting") the endpoint answers again.
+ */
+const UPDATE_LIFECYCLE: Array<{ at: number; phase: UpdatePhase }> = [
+  { at: 0, phase: 'starting' },
+  { at: 1_600, phase: 'stopping' },
+  { at: 2_600, phase: 'updating' },
+  { at: 7_600, phase: 'restarting' },
+  { at: 10_500, phase: 'done' },
+];
+
+function isFinalPhase(phase: UpdatePhase): boolean {
+  return phase === 'done' || phase === 'failed' || phase === 'interrupted';
+}
+
+function updateLogLines(s: MockState, run: UpdateRun, elapsed: number): string[] {
+  const lines: Array<[number, string]> = [
+    [700, `Updating Easy DevOps v${run.from} -> v${run.to}`],
+    [1_600, 'Dashboard stopped'],
+    [2_600, 'Stopping the background service...'],
+    [4_200, `Installing easy-devops@${run.to}...`],
+    [7_600, 'Starting the service on the new version...'],
+    [9_000, `Dashboard restarted on port ${s.settings.dashboardPort}`],
+  ];
+  return lines.filter(([at]) => elapsed >= at).map(([, line]) => line);
+}
+
+function advanceUpdateRun(s: MockState): void {
+  const run = s.update.run;
+  if (!run || isFinalPhase(run.phase)) return;
+
+  const elapsed = Date.now() - run.startedAt;
+  let phase: UpdatePhase = 'starting';
+  for (const step of UPDATE_LIFECYCLE) if (elapsed >= step.at) phase = step.phase;
+
+  const logTail = updateLogLines(s, run, elapsed);
+  if (phase === run.phase && logTail.length === run.logTail.length) return;
+
+  if (phase === 'done') {
+    s.update.run = {
+      ...run,
+      phase,
+      logTail,
+      updatedAt: Date.now(),
+      finishedAt: Date.now(),
+      serviceInstalled: true,
+      runningVersion: run.to,
+      versionConfirmed: true,
+      dashboardRestarted: true,
+      dashboardPort: s.settings.dashboardPort,
+    };
+    // The process that comes back runs the new version.
+    s.update.current = run.to;
+    s.update.updateAvailable = false;
+  } else {
+    s.update.run = { ...run, phase, logTail, updatedAt: Date.now() };
+  }
+  persist();
 }
 
 // ─── Request router ──────────────────────────────────────────────────────────
@@ -1191,6 +1288,60 @@ function handle(
       persist();
       return { deleted: id };
     }
+  }
+
+  // ── Update ────────────────────────────────────────────────────────────────
+  if (path === '/update' && method === 'GET') {
+    advanceUpdateRun(s);
+    return {
+      current: s.update.current,
+      latest: s.update.latest,
+      reachable: s.update.reachable,
+      updateAvailable: s.update.updateAvailable,
+      source: s.update.source,
+      run: s.update.run,
+    };
+  }
+
+  if (path === '/update/status' && method === 'GET') {
+    advanceUpdateRun(s);
+    if (s.update.run?.phase === 'stopping' || s.update.run?.phase === 'updating') {
+      // This process has been stopped for the update; see UPDATE_LIFECYCLE.
+      throw new ApiError(0, { error: 'Cannot reach the dashboard.' });
+    }
+    return { current: s.update.current, run: s.update.run };
+  }
+
+  if (path === '/update' && method === 'POST') {
+    advanceUpdateRun(s);
+    if (!s.update.source.npmUpdatable) {
+      fail(409, `This copy is ${s.update.source.reason}, so npm cannot update it in place.`, {
+        source: s.update.source,
+      });
+    }
+    if (s.update.run && !isFinalPhase(s.update.run.phase)) {
+      fail(409, 'An update is already running.', { run: s.update.run });
+    }
+    const version = String(data.version ?? '').trim();
+    if (!/^\d+\.\d+\.\d+$/.test(version)) fail(400, 'A version is required.');
+    if (version === s.update.current) {
+      fail(409, `Easy DevOps is already up to date (v${s.update.current}).`);
+    }
+    const now = Date.now();
+    const run: UpdateRun = {
+      id: `upd-${now.toString(36)}`,
+      phase: 'starting',
+      from: s.update.current,
+      to: version,
+      step: null,
+      reason: null,
+      logTail: [],
+      startedAt: now,
+      updatedAt: now,
+    };
+    s.update = { ...s.update, run };
+    persist();
+    return { started: true, run };
   }
 
   // ── Hub ───────────────────────────────────────────────────────────────────

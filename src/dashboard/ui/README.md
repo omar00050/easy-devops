@@ -39,10 +39,16 @@ against the contract. Scenarios are selected with `?mock=`:
 | `/?mock=service-not-installed` | Personal mode, service never installed |
 | `/?mock=service-elevation` | Service running, but Start/Stop/Restart answer `403 elevation_required` |
 
-Mock state is kept in `sessionStorage` under `ez-mock-state-v4:<scenario>`.
+Mock state is kept in `sessionStorage` under `ez-mock-state-v5:<scenario>`.
 Reload the page after changing fixtures; destructive mock actions only change
 that state. Service lifecycle actions in mock mode update the card in place and
 emit `service:changed` on the mock socket, which is also replayed on connect.
+
+Settings → Update runs a simulated update against this state: the phases
+advance with the clock (about ten seconds in total), `/update/status` fails with
+a connection error while the simulated dashboard is "restarting" so the
+catching-up path is exercised, and the card ends on the result the detached
+worker would have written.
 
 ### Dev server against the real dashboard
 

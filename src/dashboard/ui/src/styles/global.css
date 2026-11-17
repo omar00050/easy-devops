@@ -254,6 +254,71 @@
   display: block;
 }
 
+/* ─── Analysis surfaces ───────────────────────────────────────────────────── */
+
+/* Faint aurora behind the top of every dashboard page. */
+.dashboard-ambient {
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 340px;
+  pointer-events: none;
+  background:
+    radial-gradient(42% 58% at 14% 0%, var(--ez-accent-soft), transparent 72%),
+    radial-gradient(36% 50% at 86% 0%, var(--ez-info-soft), transparent 74%);
+  opacity: 0.7;
+  -webkit-mask-image: linear-gradient(#000 30%, transparent);
+  mask-image: linear-gradient(#000 30%, transparent);
+}
+
+/* Stat cards: a soft lift plus an accent hairline that appears on hover. */
+.stat-card {
+  position: relative;
+  overflow: hidden;
+  transition:
+    transform var(--ez-motion-base) var(--ez-ease-out),
+    border-color var(--ez-motion-fast) var(--ez-ease-out),
+    box-shadow var(--ez-motion-base) var(--ez-ease-out);
+}
+.stat-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(
+    to right,
+    transparent,
+    color-mix(in srgb, var(--ez-accent) 55%, transparent),
+    transparent
+  );
+  opacity: 0;
+  transition: opacity var(--ez-motion-base) var(--ez-ease-out);
+}
+.stat-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--ez-line-strong);
+  box-shadow:
+    var(--ez-shadow-card),
+    0 14px 30px -20px color-mix(in srgb, var(--ez-accent) 45%, transparent);
+}
+.stat-card:hover::before {
+  opacity: 1;
+}
+
+/* Recent events rendered as a quiet timeline. */
+.event-timeline {
+  position: relative;
+}
+.event-timeline::before {
+  content: '';
+  position: absolute;
+  left: 27px;
+  top: 16px;
+  bottom: 16px;
+  width: 1px;
+  background: linear-gradient(to bottom, var(--ez-line-strong), transparent);
+  pointer-events: none;
+}
+
 /* ─── Reduced motion ──────────────────────────────────────────────────────── */
 
 @media (prefers-reduced-motion: reduce) {
@@ -269,5 +334,9 @@
   .skeleton {
     animation: none;
     background: var(--ez-inset);
+  }
+
+  .stat-card:hover {
+    transform: none;
   }
 }

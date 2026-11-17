@@ -63,8 +63,24 @@ let agentState = {
   attempts: 0,
 };
 
-function setState(status, lastError = null) {
-  agentState = { ...agentState, status, lastError };
+function setState(status, lastError = null, attempts = agentState.attempts) {
+  agentState = { ...agentState, status, lastError, attempts };
+  publishAgentState();
+}
+
+/**
+ * Puts the agent's state on the job bus, so a dashboard in another process can
+ * report it.
+ *
+ * The agent runs in the process that owns the jobs, which is often the daemon.
+ * The dashboard's status endpoint used to read its own (empty) agent state and
+ * sat on "Connecting…" for ever. Publishing on every transition means the
+ * daemon's IPC channel carries the answer, and the dashboard's view follows.
+ */
+function publishAgentState() {
+  try {
+    publish('hub:agentState', getHubAgentStatus());
+  } catch { /* a status listener must never break the connection */ }
 }
 
 // ─── CPU usage helper ──────────────────────────────────────────────────────────
@@ -203,8 +219,8 @@ async function pushServiceState() {
  * Reports the PM2 process list, as read-only telemetry.
  *
  * Monitoring is never gated in this project's permission catalog — a paired
- * server is a monitored server. Acting on a process from the Hub is a separate
- * matter and is still `comingSoon` in the tree (process.start/stop/restart).
+ * server is a monitored server. Acting on a process is a separate matter and
+ * needs process.start / process.stop / process.restart (hub:manageProcess).
  *
  * Skipped entirely when the PM2 daemon is not running, so that reporting never
  * starts one.
@@ -481,6 +497,60 @@ async function handleDeployHook(payload) {
   });
 }
 
+/**
+ * Starts, stops or restarts one PM2 process, mirroring the dashboard's own
+ * processes controller.
+ *
+ * The checks are the same ones, in the same order, and they are deliberately
+ * repeated here rather than trusted from the Hub: the Hub's copy of the
+ * permission map is a hint, and its process list is whatever the agent last
+ * pushed. The agent is the only place that sees the real PM2 state of this
+ * machine.
+ */
+const PROCESS_ACTIONS = {
+  // PM2 "start" for an app that exists is a restart.
+  start: runner.restart,
+  restart: runner.restart,
+  stop: runner.stop,
+};
+
+async function handleManageProcess(payload) {
+  return runCommand('hub:manageProcess', payload, async ({ action, name }) => {
+    const fn = PROCESS_ACTIONS[action];
+    if (!fn) throw new Error(`Unknown process action: ${action}`);
+    if (typeof name !== 'string' || !name.trim()) throw new Error('A process name is required');
+    if (name.length > 200) throw new Error('That process name is too long');
+
+    const pm2 = await runner.detect();
+    if (!pm2.installed) throw new Error('PM2 is not installed on this server');
+    const pm2Path = pm2.path ?? 'pm2';
+
+    // Only act on something PM2 actually knows, so a typo cannot be reported
+    // as a success.
+    const listed = await runner.list({ pm2Path });
+    if (!listed.ok) throw new Error(listed.error || 'Could not read the PM2 process list');
+    const app = listed.apps.find((a) => a.name === name);
+    if (!app) throw new Error(`PM2 has no process named "${name}"`);
+
+    // PM2 keeps one process list per OS user; another account's app may be
+    // visible but cannot be controlled from this process.
+    if (app.user && app.user !== runner.currentUser()) {
+      throw new Error(
+        `"${name}" belongs to OS user "${app.user}", not "${runner.currentUser()}". `
+        + 'PM2 keeps a separate process list per user. Sign in as that user to control it.',
+      );
+    }
+
+    const result = await fn(name, { pm2Path });
+    if (!result.ok) throw new Error(result.output || `pm2 ${action} failed`);
+
+    // The Hub's process table is fed by this push; without it the row would
+    // keep showing the old status until the next 60-second heartbeat.
+    pushProcesses();
+    return { name, action, managed: Boolean(app.managed), output: result.output ?? '' };
+  });
+}
+
 // ─── Permission + revision sync ───────────────────────────────────────────────
 
 /**
@@ -595,8 +665,7 @@ function cancelRejoin() {
 export function initHubAgent() {
   const link = getHubLink();
   if (!link) {
-    setState(HUB_AGENT_STATUS.NOT_LINKED);
-    agentState.attempts = 0;
+    setState(HUB_AGENT_STATUS.NOT_LINKED, null, 0);
     return;
   }
 
@@ -625,7 +694,7 @@ export function initHubAgent() {
   activeLink = linkSignature(link);
 
   cancelRejoin();
-  agentState = { status: HUB_AGENT_STATUS.CONNECTING, lastError: null, attempts: 0 };
+  setState(HUB_AGENT_STATUS.CONNECTING, null, 0);
 
   // Bind handlers to this specific instance. Re-pairing replaces `socket`, and
   // a late event from a discarded instance must not mutate the new one's state.
@@ -644,7 +713,7 @@ export function initHubAgent() {
     if (!isCurrent()) return;
     console.log('[hubAgent] Connected to hub');
     cancelRejoin();
-    agentState = { status: HUB_AGENT_STATUS.CONNECTED, lastError: null, attempts: 0 };
+    setState(HUB_AGENT_STATUS.CONNECTED, null, 0);
     // Push server metadata so the hub can tailor the domain form (SSL paths, etc.)
     const { sslDir } = loadConfig();
     self.emit('server:info', { platform: platformName, sslDir: sslDir ?? '' });
@@ -712,11 +781,11 @@ export function initHubAgent() {
     if (!self.active) scheduleRejoin();
 
     // Transport/network failure — socket.io keeps retrying with backoff.
-    agentState = {
-      status: HUB_AGENT_STATUS.UNREACHABLE,
-      lastError: `Cannot reach the hub (${message}). Retrying...`,
-      attempts: agentState.attempts + 1,
-    };
+    setState(
+      HUB_AGENT_STATUS.UNREACHABLE,
+      `Cannot reach the hub (${message}). Retrying...`,
+      agentState.attempts + 1,
+    );
     console.error('[hubAgent] Connection error:', message);
   });
 
@@ -729,6 +798,7 @@ export function initHubAgent() {
   self.on('hub:getLogs', handleGetLogs);
   self.on('hub:manageDeploy', handleManageDeploy);
   self.on('hub:deployHook', handleDeployHook);
+  self.on('hub:manageProcess', handleManageProcess);
 }
 
 /**
@@ -806,8 +876,7 @@ export function stopHubAgent() {
     socket.disconnect();
     socket = null;
   }
-  setState(HUB_AGENT_STATUS.NOT_LINKED);
-  agentState.attempts = 0;
+  setState(HUB_AGENT_STATUS.NOT_LINKED, null, 0);
 }
 
 /**

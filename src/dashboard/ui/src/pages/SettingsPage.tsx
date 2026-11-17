@@ -32,6 +32,7 @@ import {
 } from '../hooks/useResource';
 import { PageHeader } from '../components/layout/PageHeader';
 import { HubPanel } from '../components/settings/HubPanel';
+import { UpdatePanel } from '../components/settings/UpdatePanel';
 import { Card, CardBody, CardFooter, CardHeader } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { Button, buttonClasses } from '../components/ui/Button';
@@ -45,13 +46,14 @@ import {
 } from '../components/ui/States';
 import { useToast } from '../components/ui/Toast';
 
-type Tab = 'general' | 'access' | 'hub' | 'backup';
+type Tab = 'general' | 'access' | 'hub' | 'backup' | 'update';
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'general', label: 'General' },
   { id: 'access', label: 'Access' },
   { id: 'hub', label: 'Hub' },
   { id: 'backup', label: 'Backup' },
+  { id: 'update', label: 'Update' },
 ];
 
 const BIND_CHOICES: { value: string; label: string }[] = [
@@ -1057,7 +1059,7 @@ export function SettingsPage() {
         title="Settings"
         description="Configuration, access, Hub pairing and backups for this dashboard."
         actions={
-          tab !== 'hub' ? (
+          tab !== 'hub' && tab !== 'update' ? (
             <Button
               variant="secondary"
               size="sm"
@@ -1108,6 +1110,7 @@ export function SettingsPage() {
         {tab === 'access' && renderAccess()}
         {tab === 'hub' && <HubPanel />}
         {tab === 'backup' && renderBackup()}
+        {tab === 'update' && <UpdatePanel />}
       </div>
     </>
   );

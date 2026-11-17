@@ -96,25 +96,22 @@ export const PERMISSION_TREE = Object.freeze([
   {
     id: 'process',
     label: 'Processes',
-    description: 'Control the PM2 processes on this server, including the Easy DevOps service itself.',
+    description: 'Control the PM2 processes on this server. Easy DevOps itself runs as a background service, not a PM2 app, so it cannot be controlled from here.',
     children: [
       {
         id: 'process.start',
         label: 'Start',
         description: 'Start a stopped PM2 process from the Hub.',
-        comingSoon: true,
       },
       {
         id: 'process.stop',
         label: 'Stop',
-        description: 'Stop a running PM2 process from the Hub. Stopping the dashboard would cut the Hub off from this server.',
-        comingSoon: true,
+        description: 'Stop a running PM2 process from the Hub.',
       },
       {
         id: 'process.restart',
         label: 'Restart',
         description: 'Restart a PM2 process from the Hub.',
-        comingSoon: true,
       },
     ],
   },
@@ -310,6 +307,13 @@ export function migrateLegacyPermissions(stored) {
 
 // ─── Command → permission mapping ─────────────────────────────────────────────
 
+/** Own-key lookup: `map['constructor']` would otherwise hit the prototype. */
+function fromMap(map, action) {
+  return typeof action === 'string' && Object.prototype.hasOwnProperty.call(map, action)
+    ? map[action]
+    : undefined;
+}
+
 /**
  * Resolves the permission a hub command payload requires.
  *
@@ -334,7 +338,7 @@ export function permissionForCommand(command, payload = {}) {
         reload: 'nginx.reload',
         test: 'nginx.test',
       };
-      return map[payload?.action] ?? undefined;
+      return fromMap(map, payload?.action);
     }
 
     case 'hub:manageDomain': {
@@ -345,7 +349,7 @@ export function permissionForCommand(command, payload = {}) {
         delete: 'domains.delete',
         reload: 'nginx.reload',
       };
-      return map[payload?.action] ?? undefined;
+      return fromMap(map, payload?.action);
     }
 
     case 'hub:manageSSL': {
@@ -355,7 +359,18 @@ export function permissionForCommand(command, payload = {}) {
         issue: 'ssl.issue',
         delete: 'ssl.delete',
       };
-      return map[payload?.action] ?? undefined;
+      return fromMap(map, payload?.action);
+    }
+
+    case 'hub:manageProcess': {
+      const map = {
+        // PM2 "start" on an existing app is a restart, exactly as in the
+        // dashboard's own processes controller.
+        start: 'process.start',
+        stop: 'process.stop',
+        restart: 'process.restart',
+      };
+      return fromMap(map, payload?.action);
     }
 
     case 'hub:manageDeploy': {
@@ -380,7 +395,7 @@ export function permissionForCommand(command, payload = {}) {
         setEnv: 'deploy.env',
       };
       const action = payload?.action;
-      return Object.prototype.hasOwnProperty.call(map, action) ? map[action] : undefined;
+      return fromMap(map, action);
     }
 
     // Not dispatchable by a Hub user: only the Hub's CI endpoint sends it, and

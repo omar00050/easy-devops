@@ -17,6 +17,7 @@ import settingsRouter from './routes/settings.js';
 import hubRouter from './routes/hub.js';
 import processesRouter from './routes/processes.js';
 import deploymentsRouter from './routes/deployments.js';
+import updateRouter from './routes/update.js';
 import { ensureCode as ensureSetupCode, describe as describeSetupCode } from '../core/setupCode.js';
 import { warmProbes } from './controllers/processesController.js';
 import { stopSslController } from './controllers/sslController.js';
@@ -174,6 +175,7 @@ app.use('/api', settingsRouter);
 app.use('/api/hub', hubRouter);
 app.use('/api', processesRouter);
 app.use('/api/deployments', deploymentsRouter);
+app.use('/api', updateRouter);
 
 if (servingNewUi) {
   // Hashed Vite assets are immutable; index.html is served with no-cache

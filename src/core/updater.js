@@ -3,23 +3,25 @@
  *
  * Updating Easy DevOps itself.
  *
- * ── Why this is not a dashboard feature, and not a Hub command ─────────────
+ * ── Why the request cannot do the work ────────────────────────────────────
  *
- * The process that would perform the update is the process being replaced.
- * `npm install -g` overwrites the package directory the dashboard is running
- * from, and the background service has to be stopped so the files it holds
- * open can be replaced — on Windows an open handle makes the install fail
- * outright. A request that arrives over HTTP or over the Hub socket cannot
- * survive its own server being stopped, so it could report neither success nor
- * failure: the connection would simply end mid-update, and whatever happened
- * next would be invisible.
+ * npm replaces the files the caller is running from, and the background
+ * service has to be stopped so those files can be replaced — on Windows an
+ * open handle makes the install fail outright. A request that arrives over
+ * HTTP or over the Hub socket cannot survive its own server being stopped, so
+ * it could report neither success nor failure: the connection would simply
+ * end mid-update, and whatever happened next would be invisible.
  *
- * Doing it from a terminal means someone is watching, the output is visible,
- * and a failure can be rolled back while they are still there. That is not a
- * limitation to be engineered around; it is the correct shape for an operation
- * that replaces the running code. A later design could hand the work to a
- * short-lived detached helper that reports back afterwards — until then, the
- * CLI is the honest answer and the output says so.
+ * So the work is owned by a caller that outlives it:
+ *
+ *   - `ezz update` runs it in a terminal, where someone is watching and a
+ *     failure can be rolled back while they are still there;
+ *   - Settings > Update in the dashboard records the run and hands it to a
+ *     detached worker (dashboard/updateWorker.js) that survives the restart,
+ *     performs THIS flow, starts the dashboard again, and leaves the outcome
+ *     in core/updateStatus.js for the new dashboard to read.
+ *
+ * The Hub has neither, which is what whyCliOnly() explains.
  *
  * ── Why the install source is detected first ───────────────────────────────
  *
@@ -272,19 +274,20 @@ function trim(result) {
 }
 
 /**
- * The lines explaining why this is a terminal-only operation.
+ * The lines explaining why the Hub cannot run an update.
  *
- * Printed by `ezz update` on every run, successful or not: the question "why
- * can't I do this from the dashboard?" is asked once per user, and the answer
- * belongs where they are already looking.
+ * Printed by `ezz update` on every run: the question "why can't I do this from
+ * the Hub?" is asked once per user, and the answer belongs where they are
+ * already looking. The dashboard CAN do it (Settings > Update, via the
+ * detached worker), so the lines say so rather than claiming otherwise.
  *
  * @returns {string[]}
  */
 export function whyCliOnly() {
   return [
-    'Updating from the dashboard or the Hub is not possible yet:',
-    'the process that performs the update is the one being replaced and',
-    'stopped, so it could not report what happened. A terminal can.',
+    'The Hub cannot run this: the process performing the update is being',
+    'replaced and stopped, so it could not report back. Use Settings > Update',
+    'in the dashboard, or `ezz update` in a terminal - same flow either way.',
   ];
 }
 

@@ -32,6 +32,12 @@ let hello = null;
 let lockWatch = null;
 let lastAnnounced = null;
 
+// The daemon's view of the Hub agent, kept current from two sources: the
+// `hub` field of its hello frame (the state at connect time) and every
+// `hub:agentState` event it publishes afterwards. Reset when the channel
+// drops, because an unreachable daemon's last words are not its current state.
+let hubState = null;
+
 /**
  * Starts the bridge. Safe to call when no daemon exists: the client retries
  * quietly with backoff and connects if one appears later.
@@ -55,11 +61,13 @@ export function startDaemonBridge({ dataDir = getDataDir() } = {}) {
     onEvent(event, payload) {
       if (event === 'daemon:hello') {
         // Identity, not an event the browser needs: the banner reads it from
-        // status() instead.
+        // status() instead. The Hub agent state travels with it and is kept.
         hello = payload;
+        hubState = payload?.hub ?? null;
         announce(dataDir);
         return;
       }
+      if (event === 'hub:agentState') hubState = payload;
       publish(event, payload);
     },
     onStatus(connected, detail) {
@@ -67,6 +75,7 @@ export function startDaemonBridge({ dataDir = getDataDir() } = {}) {
         console.log('[daemonBridge] connected to the background service');
       } else {
         hello = null;
+        hubState = null;
         // A daemon that stopped is not the same as one we cannot reach, and
         // saying "no event channel" for both was misleading during an ordinary
         // restart. The lock tells us which this is.
@@ -133,7 +142,19 @@ export function stopDaemonBridge() {
   lockWatch?.close();
   lockWatch = null;
   hello = null;
+  hubState = null;
   lastAnnounced = null;
+}
+
+/**
+ * The Hub agent state as reported by the daemon, or null when this process has
+ * no live channel to it.
+ *
+ * A null does NOT mean "not connected": it means "the daemon has not told us".
+ * The caller must say so rather than guess.
+ */
+export function daemonHubState() {
+  return hubState;
 }
 
 /**

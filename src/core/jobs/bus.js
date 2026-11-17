@@ -47,6 +47,11 @@ export const JOB_EVENTS = Object.freeze([
   'notification:new',
   'local:changed',
   'service:changed',
+  // The Hub agent lives in whichever process owns the jobs. A dashboard in
+  // another process reads its state from the daemon's IPC channel, so every
+  // transition has to travel: without this event the dashboard only ever saw
+  // the hello snapshot and reported "Connecting…" for ever.
+  'hub:agentState',
 ]);
 
 /**
