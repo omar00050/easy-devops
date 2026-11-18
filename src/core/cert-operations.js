@@ -16,6 +16,7 @@ import { describeIssuance, issueCertificate, prepareDomainForHttpChallenge } fro
 import { renewCertificate, describeRenewal, failureReason } from './cert-renewal.js';
 import { bumpHubRevision } from './hubLink.js';
 import { listAllCerts } from './cert-reader.js';
+import { findCertificateForDomain } from './cert-suggest.js';
 import { getDomains, findDomain } from './domains-db.js';
 
 /** Shape shared by every SSL result so the Hub can render it uniformly. */
@@ -137,6 +138,15 @@ export async function handleHubSslCommand(payload) {
       if (out.ok) bumpHubRevision();
       console.log('[hubAgent] ssl issue:', domain, out.ok ? 'OK' : 'FAILED', '—', out.summary || out.error);
       return out;
+    }
+
+    // ── Suggest an existing certificate ──────────────────────────────────
+    // Read-only, like the server's own dashboard: it reports which
+    // certificate could serve the domain and the paths that hold it. The Hub
+    // fills them into the form and the operator still has to save.
+    case 'suggest': {
+      if (!domain) return { ok: false, error: 'domain is required' };
+      return { ok: true, ...(await findCertificateForDomain(domain)) };
     }
 
     // ── Delete a certificate ──────────────────────────────────────────────

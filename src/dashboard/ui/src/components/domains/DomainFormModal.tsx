@@ -17,6 +17,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   Settings2,
+  Sparkles,
   type LucideIcon,
 } from 'lucide-react';
 import { api, ApiError } from '../../lib/api';
@@ -34,6 +35,9 @@ import type {
   DomainSsl,
   IssuanceSuccess,
   NotificationChannel,
+  SslSuggestion,
+  SslSuggestionCertificate,
+  SslSuggestionMatch,
   UpstreamType,
 } from '../../lib/types';
 import {
@@ -516,6 +520,77 @@ function CertificateIssuance({
   );
 }
 
+function suggestionHeadline(
+  match: SslSuggestionMatch,
+  domainName: string,
+  certDomain: string
+): string {
+  if (match === 'exact') return `A certificate for ${domainName} already exists`;
+  if (match === 'wildcard') return `A wildcard certificate covers ${domainName}`;
+  return `The certificate in ${certDomain} covers ${domainName}`;
+}
+
+/**
+ * Offers an existing certificate for a domain that has none configured. The
+ * paths are shown before they are filled, and nothing changes until the
+ * operator presses the button — a certificate written onto the wrong site
+ * takes it down.
+ */
+function CertificateSuggestion({
+  domainName,
+  match,
+  certificate,
+  onAccept,
+}: {
+  domainName: string;
+  match: SslSuggestionMatch;
+  certificate: SslSuggestionCertificate;
+  onAccept: () => void;
+}) {
+  const days = certificate.daysLeft;
+  const expiryTone =
+    days === null ? 'text-muted' : days <= 0 ? 'text-bad' : days < 30 ? 'text-warn' : 'text-ok';
+  const expiryText =
+    days === null ? 'expiry unknown' : days <= 0 ? 'expired' : `${days} days left`;
+
+  return (
+    <div className="rounded-md border border-accent/40 bg-accent-soft/30 p-3.5">
+      <div className="flex flex-wrap items-start gap-x-3 gap-y-3">
+        <Sparkles className="mt-0.5 size-4 shrink-0 text-accent-text" aria-hidden="true" />
+        <div className="min-w-0 flex-1 basis-64">
+          <div className="text-sm font-medium text-ink">
+            {suggestionHeadline(match, domainName, certificate.domain)}
+          </div>
+          <p className="mt-0.5 text-xs text-muted">
+            {match === 'exact'
+              ? 'Turning SSL on will use this certificate.'
+              : `Stored in ${certificate.domain}, which lists this domain as a name. Turning SSL on will use it.`}
+          </p>
+          <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs">
+            <span className={cn('font-medium', expiryTone)}>{expiryText}</span>
+            {certificate.names.length > 1 && (
+              <span className="break-all text-muted">
+                covers {certificate.names.join(', ')}
+              </span>
+            )}
+          </div>
+          <div className="mt-2 space-y-0.5 font-mono text-2xs text-faint">
+            <div className="break-all">{certificate.certPath}</div>
+            <div className="break-all">{certificate.keyPath}</div>
+          </div>
+        </div>
+        <Button
+          size="sm"
+          onClick={onAccept}
+          icon={<ShieldCheck className="size-3.5" aria-hidden="true" />}
+        >
+          Use this certificate
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function DomainFormModal({
   editor,
   onClose,
@@ -577,6 +652,12 @@ export function DomainFormModal({
     [],
     { enabled: form.ssl.enabled }
   );
+  // Edit only: a domain being created has nothing to look up yet.
+  const sslSuggestion = useResource<SslSuggestion>(
+    (signal) => api.domains.sslSuggestion(editing?.name ?? '', signal),
+    [editing?.name],
+    { enabled: Boolean(editing) }
+  );
 
   useEffect(() => {
     if (!dirty) return;
@@ -598,18 +679,33 @@ export function DomainFormModal({
   const pathsUnset = form.ssl.certPath.trim() === '' && form.ssl.keyPath.trim() === '';
   const hasCertificate =
     certificates.data?.some((certificate) => certificate.domain === domainName) ?? false;
+  const sslSuggestionData = sslSuggestion.data?.found ? sslSuggestion.data : null;
+  const showSslSuggestion = pathsUnset && sslSuggestionData !== null;
   const offerCertificate =
     form.ssl.enabled &&
     pathsUnset &&
     !certificates.loading &&
     !hasCertificate &&
-    !certMissing;
+    !certMissing &&
+    !sslSuggestion.loading &&
+    sslSuggestionData === null;
 
   function update<K extends keyof DomainInput>(key: K, value: DomainInput[K]) {
     setForm((current) => ({ ...current, [key]: value }));
   }
   function updateSsl<K extends keyof DomainSsl>(key: K, value: DomainSsl[K]) {
     setForm((current) => ({ ...current, ssl: { ...current.ssl, [key]: value } }));
+  }
+  function acceptSslSuggestion(certificate: SslSuggestionCertificate) {
+    setForm((current) => ({
+      ...current,
+      ssl: {
+        ...current.ssl,
+        enabled: true,
+        certPath: certificate.certPath,
+        keyPath: certificate.keyPath,
+      },
+    }));
   }
   function updatePerformance<K extends keyof DomainPerformance>(
     key: K,
@@ -1108,6 +1204,15 @@ export function DomainFormModal({
           onToggle={() => setSections((c) => ({ ...c, ssl: !c.ssl }))}
         >
           <div className="space-y-4">
+            {showSslSuggestion && sslSuggestionData && (
+              <CertificateSuggestion
+                domainName={domainName}
+                match={sslSuggestionData.match}
+                certificate={sslSuggestionData.certificate}
+                onAccept={() => acceptSslSuggestion(sslSuggestionData.certificate)}
+              />
+            )}
+
             {form.ssl.enabled ? (
               <>
                 <div className="grid gap-4 sm:grid-cols-2">

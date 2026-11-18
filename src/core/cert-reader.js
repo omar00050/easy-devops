@@ -3,9 +3,8 @@ import path from 'path';
 import { run } from './shell.js';
 import { loadConfig } from './config.js';
 
-export async function listAllCerts() {
-  const { sslDir } = loadConfig();
-  const liveDir = sslDir;
+export async function listAllCerts({ sslDir } = {}) {
+  const liveDir = sslDir ?? loadConfig().sslDir;
   let entries;
   try {
     entries = await fs.readdir(liveDir, { withFileTypes: true });
@@ -16,7 +15,7 @@ export async function listAllCerts() {
   const dirs = entries.filter(e => e.isDirectory() && !e.name.startsWith('.'));
   const certs = [];
   for (const dir of dirs) {
-    const { expiry, daysLeft } = await getCertExpiry(dir.name);
+    const { expiry, daysLeft } = await getCertExpiry(dir.name, { sslDir: liveDir });
     let status;
     if (daysLeft === null) {
       status = 'error';
@@ -32,9 +31,8 @@ export async function listAllCerts() {
   return certs;
 }
 
-export async function getCertExpiry(name) {
-  const { sslDir } = loadConfig();
-  const certPath = path.join(sslDir, name, 'fullchain.pem');
+export async function getCertExpiry(name, { sslDir } = {}) {
+  const certPath = path.join(sslDir ?? loadConfig().sslDir, name, 'fullchain.pem');
 
   const result = await run(`openssl x509 -enddate -noout -in "${certPath}"`);
 

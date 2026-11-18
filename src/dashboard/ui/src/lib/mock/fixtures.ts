@@ -163,6 +163,9 @@ export function seedCertificates(): Certificate[] {
     { domain: 'api.example.com', expiry: isoDaysFromNow(12), daysLeft: 12, status: 'expiring', autoRenew: 'manual', autoRenewDays: 7 },
     { domain: 'legacy.example.com', expiry: isoDaysFromNow(-3), daysLeft: -3, status: 'expired' },
     { domain: 'broken.example.com', expiry: null, daysLeft: null, status: 'error' },
+    // Exists but no domain serves it yet — the "offer these paths" case for
+    // blog.example.com, which was added without SSL.
+    { domain: 'blog.example.com', expiry: isoDaysFromNow(64), daysLeft: 64, status: 'valid', autoRenew: 'unused', autoRenewDays: 7 },
   ];
 }
 

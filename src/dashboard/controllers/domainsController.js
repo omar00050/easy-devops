@@ -6,6 +6,7 @@ import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } fr
 import { writeConfWithTest } from '../../core/nginx-apply.js';
 import { getDefaultCertPaths } from '../../core/nginx-conf-generator.js';
 import { getCertExpiry } from '../../core/cert-reader.js';
+import { findCertificateForDomain } from '../../core/cert-suggest.js';
 import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk, hasBackslashPath } from '../../core/platform.js';
 import {
   validateDomainName, validatePort, validateUpstreamType,
@@ -414,6 +415,26 @@ class DomainsController {
     try {
       const config = getDomainNotifConfig(req.params.name);
       res.json(config);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Reports an existing certificate that could serve this domain, so the edit
+   * modal can offer to fill the cert/key paths in. Read-only: nothing is
+   * changed until the operator accepts and saves.
+   */
+  async sslSuggestion(req, res, next) {
+    try {
+      const { name } = req.params;
+      if (!name || !name.trim()) {
+        return res.status(400).json({ error: 'A domain name is required' });
+      }
+      if (!findDomain(name)) {
+        return res.status(404).json({ error: `Domain not found: ${name}` });
+      }
+      res.json(await findCertificateForDomain(name));
     } catch (error) {
       next(error);
     }

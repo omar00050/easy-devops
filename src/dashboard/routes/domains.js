@@ -19,6 +19,7 @@ router.put('/:name', (req, res, next) => controller.update(req, res, next));
 router.delete('/:name', (req, res, next) => controller.delete(req, res, next));
 router.put('/:name/toggle', (req, res, next) => controller.toggle(req, res, next));
 router.post('/:name/reload', (req, res, next) => controller.reload(req, res, next));
+router.get('/:name/ssl-suggestion', (req, res, next) => controller.sslSuggestion(req, res, next));
 router.get('/:name/notifications', (req, res, next) => controller.getNotifications(req, res, next));
 router.put('/:name/notifications', (req, res, next) => controller.updateNotifications(req, res, next));
 

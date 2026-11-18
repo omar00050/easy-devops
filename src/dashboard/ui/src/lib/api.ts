@@ -59,6 +59,7 @@ import type {
   SettingsUpdate,
   SettingsUpdateResult,
   SslCreateInput,
+  SslSuggestion,
   ApiErrorPayload,
   UpdateCheck,
   UpdateStartResponse,
@@ -222,6 +223,8 @@ export const api = {
         method: 'PUT',
         body: input,
       }),
+    sslSuggestion: (name: string, signal?: AbortSignal) =>
+      request<SslSuggestion>(`/domains/${enc(name)}/ssl-suggestion`, { signal }),
   },
 
   ssl: {

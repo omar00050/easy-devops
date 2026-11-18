@@ -144,6 +144,24 @@ export interface CertificateDeleteResult {
   directory: string;
 }
 
+export type SslSuggestionMatch = 'exact' | 'san' | 'wildcard';
+
+export interface SslSuggestionCertificate {
+  /** Certificate directory name. */
+  domain: string;
+  /** Every name the certificate covers. */
+  names: string[];
+  certPath: string;
+  keyPath: string;
+  expiry: string | null;
+  daysLeft: number | null;
+  status: CertStatus;
+}
+
+export type SslSuggestion =
+  | { found: false }
+  | { found: true; match: SslSuggestionMatch; certificate: SslSuggestionCertificate };
+
 export interface IssuanceFailure {
   step?: string;
   cause?: string;

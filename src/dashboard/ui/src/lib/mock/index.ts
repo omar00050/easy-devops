@@ -718,6 +718,35 @@ function handle(
     return created;
   }
 
+  const suggestionMatch = /^\/domains\/([^/]+)\/ssl-suggestion$/.exec(path);
+  if (suggestionMatch && method === 'GET') {
+    const name = decodeURIComponent(suggestionMatch[1]);
+    if (!s.domains.some((d) => d.name === name)) fail(404, `Domain not found: ${name}`);
+
+    // Mirrors the server's rule: an unreadable certificate is never offered,
+    // and the mock has no SAN metadata, so only the exact folder name matches.
+    const cert = s.certs.find((candidate) => candidate.domain === name && candidate.status !== 'error');
+    if (!cert) return { found: false };
+
+    const base = s.settings.sslDir
+      .replace(/\\/g, '/')
+      .replace(/\/{2,}/g, '/')
+      .replace(/\/+$/, '');
+    return {
+      found: true,
+      match: 'exact',
+      certificate: {
+        domain: cert.domain,
+        names: [cert.domain],
+        certPath: `${base}/${cert.domain}/fullchain.pem`,
+        keyPath: `${base}/${cert.domain}/privkey.pem`,
+        expiry: cert.expiry,
+        daysLeft: cert.daysLeft,
+        status: cert.status,
+      },
+    };
+  }
+
   const domainMatch = /^\/domains\/([^/]+)(\/[a-z]+)?$/.exec(path);
   if (domainMatch) {
     const name = decodeURIComponent(domainMatch[1]);

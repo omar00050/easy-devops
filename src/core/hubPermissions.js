@@ -357,6 +357,9 @@ export function permissionForCommand(command, payload = {}) {
         renew: 'ssl.renew',
         renewAll: 'ssl.renewAll',
         issue: 'ssl.issue',
+        // Read-only lookup: it changes nothing, and a paired server is a
+        // monitored server.
+        suggest: null,
         delete: 'ssl.delete',
       };
       return fromMap(map, payload?.action);
