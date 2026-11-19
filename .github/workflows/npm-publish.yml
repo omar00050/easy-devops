@@ -1,18 +1,14 @@
-# This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
-# For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
+# Publishes easy-devops to npm. Manual: Actions > Node.js Package > Run workflow.
+# The e2e suites are run locally before publishing (npm test); they are not run here
+# because several depend on the developer machine (Windows paths, hub_backend checkout).
 
 name: Node.js Package
 
 on: workflow_dispatch
 
-
 jobs:
-  # Publishing is gated on CI. This workflow only runs on workflow_dispatch
-  # (see "on:" above), so a workflow_run trigger on ci.yml would never fire a
-  # manual run here; the same checks are reused as a job instead and
-  # publish-npm waits for it with needs:.
-  ci:
-    name: CI
+  ui-checks:
+    name: Dashboard UI checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,9 +16,6 @@ jobs:
         with:
           node-version: 20
           cache: npm
-      - run: npm ci
-      - name: Run tests
-        run: npm test
       - name: Install dashboard UI dependencies
         run: npm --prefix src/dashboard/ui install
       - name: Typecheck the dashboard UI
@@ -33,7 +26,7 @@ jobs:
         run: npm --prefix src/dashboard/ui run build
 
   publish-npm:
-    needs: ci
+    needs: ui-checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,16 +34,12 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org/
-      - run: npm install
       - run: npm ci
 
-      # Build the dashboard UI. The package ships the BUILT files (dist/ui),
-      # never the UI sources: package.json "files" includes dist/ui/ and
-      # excludes src/dashboard/ui/.
+      # The package ships the BUILT UI (dist/ui), never its sources.
       - name: Build the dashboard UI
         run: npm run build:ui
 
-      # Stop here if the build is missing or the UI sources would be published.
       - name: Check what will be published
         run: |
           test -f dist/ui/index.html || { echo "::error::dist/ui/index.html is missing - the UI was not built."; exit 1; }
@@ -65,8 +54,8 @@ jobs:
           "
           rm pack.json
 
-      # prepublishOnly (npm run build:ui && npm test) runs as part of publish;
-      # it is what gates the published tarball on a working build and tests.
-      - run: npm publish
+      # --ignore-scripts skips prepublishOnly (build:ui + npm test): the UI was built
+      # above and the tests are run locally before publishing.
+      - run: npm publish --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{secrets.npm_token}}

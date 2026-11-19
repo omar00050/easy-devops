@@ -31,11 +31,13 @@ servers from one place is what the optional Hub does — see [The Hub](#the-hub-
 src/
   core/        shared logic — the single source of truth
   cli/         interactive terminal app (inquirer menus)
-  dashboard/   Express + Socket.io web app (classic EJS UI, plus the React
-               dashboard source in dashboard/ui/)
+  dashboard/   Express + Socket.io web app. The default UI is the React app in
+               dashboard/ui/, built to dist/ui; the classic EJS page is a
+               temporary fallback
   lib/         installer shell scripts
 dist/ui/       built React dashboard — npm run build:ui, not committed
 e2e/           plain Node test scripts (no framework)
+scripts/       maintenance scripts that talk to the network (Cloudflare ranges)
 ```
 
 ### Why everything shared lives in `core/`
@@ -74,29 +76,34 @@ graph TD
 | `db.js` | SQLite access (`good.db`), key/value only. Reads are uncached — see below |
 | `config.js` | The `config` record, merged over platform defaults |
 | `nginx-conf-generator.js` | Builds nginx config text. Pure — only `generateConf()` writes a file |
+| `cloudflare-ips.js` | The published Cloudflare IPv4/IPv6 ranges, their CIDR validation, and the fetch the refresh script uses. Data, not logic |
 | `nginx-apply.js` | Writes a config, tests it, rolls back on failure |
 | `runner.js` | **Every** PM2 invocation. Detect, install, list, start/stop/restart, save, startup |
 | `ssl-issuer.js` | Issues and renews certificates |
-| `acme-challenge.js` | The temporary HTTP-01 challenge listener and its preflight |
+| `ssl/preflight.js` | The pre-issuance checks: DNS, IPv6, the public HTTP challenge path and Cloudflare, each with a one-line fix |
+| `ssl/progress.js` | The one stage vocabulary (`preflight` … `https verified`) and its throttled, sanitized event payload, shared by the dashboard, CLI and Hub |
+| `acme-challenge.js` | The temporary HTTP-01 challenge listener and its local preflight |
 | `notifier.js`, `domainNotifier.js`, `events.js`, `channels/` | Notifications |
 | `notifications/claim.js`, `notifications/dispatch.js` | The one safe send path: evaluate → claim → send → commit |
-| `jobs/` | The background work (monitors, revision watcher), the owner election, and `owner.js` — the exclusive jobs-ownership marker |
+| `jobs/` | The background work (monitors, revision watcher) and the owner election — `index.js` starts jobs in the process that wins, `owner.js` is the exclusive jobs-ownership marker |
 | `daemon/` | The single-instance lock (and its `fs.watch` watcher), the local IPC channel, and `ezz daemon` |
 | `nginx-service.js`, `cert-reader.js` | nginx service control and certificate reading. Moved here from `dashboard/lib/` when the daemon needed them |
 | `domains-db.js`, `cert-operations.js` | The domain store, and the certificate actions the Hub can request. Also moved from `dashboard/lib/` |
 | `hub/agent.js` | The outbound Hub agent. Background work, so it follows job ownership |
+| `hub/deployProgress.js` | The agent's live deployment feed: watches the deploy lock, run record and log across processes, and sends redacted `deploy:progress` (≤1/s, 200 lines / 32 KiB) when the Hub has `deploy.logs` |
+| `hubConnect.js` | `ezz hub connect`: turns a one-time Hub link — or a pasted `ezops://` string — into a saved pairing. https only (loopback may use http), no redirects, 15 s timeout, 16 KiB cap, and no message ever contains the token |
 | `hubLink.js` | Pairing state for the optional Hub |
 | `installSource.js` | npm install, git clone or loose copy — and therefore how this copy is updated |
+| `deploy/` | Deployments: `apps.js` (the app registry and its validation), `deployKey.js` (the ed25519 key, its file and the host-key-pinned connection test), `store.js` (folders, runs, releases, the deploy lock), `ezfile.js` (settings precedence and persistent paths), `engine.js` (one deployment, with rollback), `domainLink.js`, `hookServer.js`, `hubCommands.js`, `github.js`, `githubApi.js`, `status.js`, `launcher.js` |
 | `updater.js` | `ezz update`: stop, replace, refresh the Server-mode copy, start, verify, roll back |
-| `cleanup.js` | The reclaimable-file inventory. Scans; deletes only what it is handed |
+| `updateStatus.js` | The one record of an update the dashboard asked for: `update-status.json`, atomic writes, phases, and the stale-heartbeat rule that turns an abandoned run into `interrupted` |
+| `cleanup.js` | The reclaimable-file inventory. Scans; deletes only what it is handed, and only inside the directories it scanned |
 | `purge.js` | `ezz uninstall --purge`: back up first, then remove the service, runtime and data |
 | `setupCode.js` | The one-time first-run setup code. Printed locally, stored hashed, never transmitted |
-<<<<<<< HEAD
 | `probeCache.js` | Cache with background refresh for probes that cost a subprocess. One PowerShell spawn is ~1 s on Windows |
-=======
->>>>>>> 9238df86221d4ee97559a959817f3f21827fb07c
 | `service/runtimeUpdate.js` | Moving the service onto another Node: smoke test, swap, verify, roll back |
-| `validators.js`, `detector.js`, `permissions.js` | Input validation, system detection, Linux sudoers setup |
+| `validators.js`, `detector.js` | Input validation, system detection |
+| `permissions.js` | Linux sudoers, and its only source: exactly five `systemctl … nginx` commands, plus the setup script that creates and hands over the runtime directories. It never accepts a password |
 
 Two constraints worth knowing before you add code:
 
@@ -142,10 +149,28 @@ point. That ordering matters — see the next section.
 
 | Command | Why not the dashboard or the Hub |
 |---|---|
-| `ezz update` | It replaces the running package and stops the service, so the process serving the request is the one being replaced. `whyCliOnly()` in `core/updater.js` is what tells the user that |
 | `ezz runtime update` | Installing a Node version takes minutes of streamed output, and a Windows Server swap needs an Administrator terminal the dashboard cannot obtain |
 | `ezz uninstall --purge` | It deletes the database the dashboard reads |
 | `ezz dashboard setup-code` | The code's purpose is to prove the caller can read this machine's terminal. An endpoint that handed it out would defeat it |
+
+`ezz update` used to be on that list. Settings → Update now offers it through a
+detached worker (see "Updating Easy DevOps from the dashboard" above), because
+the update can outlive the request that starts it; the Hub still cannot run it,
+and `whyCliOnly()` in `core/updater.js` is what explains that.
+
+### Pages, and pairing from the terminal
+
+Every menu screen is drawn by `src/cli/ui/page.js`: it prints an
+`Easy DevOps > SSL > Issue` breadcrumb, clears the screen where that is safe,
+and exports the one `BACK` / `EXIT` label pair. Clearing is `ESC[2J ESC[3J
+ESC[H` and happens only on a real TTY, outside `CI`, and outside an `EZ_TEST`
+run that is capturing output — a pipe or CI log keeps every line and gets no
+escape bytes. `pause()` holds a finished operation's result until Enter and
+returns at once when nobody can press it, so `ezz service start | tee log`
+still works. `src/cli/menus/hub.js` is the Hub menu; it is also the
+non-interactive `ezz hub connect <link>`, `ezz hub status` and
+`ezz hub unlink [--yes]`. `core/hubConnect.js` fetches a one-time link once and
+never prints the token or the connection string.
 
 ---
 
@@ -186,6 +211,15 @@ running against a scratch directory would otherwise consume the real installatio
 | `domain_notification_config` | Per-domain event routing |
 | `notification_state` | Deduplication and recovery state |
 | `hub-link`, `hub-permissions` | Hub pairing (see below) |
+| `deployApps` | The deployed-app registry: repository, branch, auth, settings, env, linked domain |
+| `service-state` | Recorded service mode, mechanism, install time and the runtime pin |
+| `dashboard-pid`, `dashboard-port` | The dashboard last started by the CLI menu or the update worker. A pid is verified against its command line before it is signalled |
+| `setup-code` | The hashed one-time first-run code, its expiry and failure count |
+| `sslAutoRenewState` | Per-certificate last automatic-renewal attempt |
+
+Files beside these keys, because they are written by more than one process: the
+daemon lock (`daemon.lock`), the jobs marker (`jobs.owner`), the update run
+(`update-status.json`) and the deploy hook settings.
 
 ---
 
@@ -213,6 +247,32 @@ cannot leave a broken config behind in one of them and not the others.
 **Validity is checked with `isNginxTestOk()`, never a raw exit code.** Without root, nginx exits 1
 after printing `syntax is ok`, because it cannot write its PID file. Checking the exit code alone
 reports a valid config as broken.
+
+### WebSocket proxying, and domains behind Cloudflare
+
+Every proxied domain is WebSocket-ready. Its headers send
+`proxy_http_version 1.1`, `Upgrade $http_upgrade` and
+`Connection $ezz_connection_upgrade`; the `/socket.io/` location adds
+`proxy_buffering off` and one-hour read/send timeouts, while ordinary HTTP keeps
+the domain's own read timeout.
+
+`$ezz_connection_upgrade` is the one thing that cannot live in a domain config.
+The `map` may be defined only once in the `http` context, and a second definition
+fails `nginx -t`, so it is written to a single file — `00-easy-devops-websocket.conf`
+in `conf.d` — and every domain references it. `'' ''` (not `'' close`) keeps
+upstream keep-alive for a request that carries no `Upgrade` header.
+
+`behindCloudflare: true` on a domain adds `set_real_ip_from` for every published
+Cloudflare range plus `real_ip_header CF-Connecting-IP`. The ranges are data in
+`core/cloudflare-ips.js`, refreshed only by `node scripts/refresh-cloudflare-ips.mjs`
+(fetch, validate every CIDR, rewrite atomically; the app and the tests never
+touch the network).
+
+This trusts the header; it does not block the origin. The app behind nginx must
+trust exactly one proxy (the Hub: `TRUST_PROXY=1`), and ports 80/443 have to be
+limited to Cloudflare's ranges at the firewall — otherwise a direct connection
+can still send its own `CF-Connecting-IP`. The full explanation is
+`docs/nginx-websocket-cloudflare.md`.
 
 ### Windows paths
 
@@ -287,13 +347,44 @@ sequenceDiagram
 
 ### The preflight
 
-Before contacting Let's Encrypt, Easy DevOps serves a throwaway token and fetches it back **through
-nginx, on this machine**. A failure costs nothing against the rate limits.
+Before any Let's Encrypt request, `core/ssl/preflight.js` checks what an issuance
+would otherwise discover only after spending a validation: that every name
+resolves (A/AAAA), that an IPv6 address does not point somewhere else, that the
+public HTTP challenge path reaches this server, and whether the name sits behind
+Cloudflare. A failed check stops there with `step: "preflight"`, the real cause
+and a one-line fix. For DNS-01 the IPv6 and HTTP checks are reported as
+`skipped`, because that challenge never uses port 80.
 
-It probes the address nginx actually listens on. A config that binds `listen 203.0.113.5:80` is not
-reachable on loopback, so probing `127.0.0.1` would look like a broken setup when nothing is wrong.
-Wildcard listens (`listen 80`, `listen [::]:80`) are probed on loopback; a specific address is probed
-as bound.
+The HTTP probe is the same shape as the real challenge: a throwaway token with a
+random name is served by the loopback listener and fetched back **through nginx,
+on this machine**. It probes the address nginx actually listens on — a config
+that binds `listen 203.0.113.5:80` is not reachable on loopback, so probing
+`127.0.0.1` would look broken when nothing is wrong — and on a standalone run
+the public probe is skipped, because that mode binds port 80 itself.
+
+When the certificate is written, HTTPS is verified by comparing the served
+certificate's X509 fingerprint with the file on disk. Behind Cloudflare that is
+`skipped` (`served by Cloudflare's edge`), since the edge terminates TLS.
+
+### Stages
+
+`core/ssl/progress.js` owns the one vocabulary every surface uses, in order:
+
+`preflight` → `account and order` → `challenge ready` →
+`waiting for validation` → `certificate received` → `files written` →
+`nginx config test` → `nginx reload` → `https verified`
+
+Each stage is `running` then `ok`, `failed` or `skipped`, and carries elapsed
+time and an optional sanitized detail (PEM blocks stripped, 300 characters at
+most). The dashboard publishes it as `ssl:progress`, the Hub receives it as
+`command:progress` on an SSL command, and the CLI renders the same list. At most
+five events leave per operation per second; the newest event of a stage is held
+back rather than dropped, so a stage cannot disappear between `running` and its
+outcome. The whole issue or renewal is bounded at five minutes.
+
+A domain link that issues a certificate uses the same stages between its own
+`domain` step and the closing `https` → `nginx config test` → `nginx reload` →
+`https verified`; a link that reuses a certificate skips the issuer stages.
 
 ### Modes
 
@@ -417,11 +508,126 @@ health, certificate checks, notifications and the Hub agent live in
 `core/jobs/` and run in whichever process owns them — the daemon when one is
 running, otherwise the dashboard while it is open. See "The daemon" below.
 
+React components worth knowing: `ui/src/components/deployments/RuntimeCards.tsx`
+(the runtime cards and the Node preset picker — Python, Go and Static are shown
+disabled as "Coming soon") and `StepsEditor.tsx` (the ordered steps list, with
+drag *and* keyboard move buttons, per-row errors and the order warnings);
+`ui/src/components/ssl/StageList.tsx`, `PreflightResult.tsx` and
+`IssuancePanels.tsx` (the shared stage list, a failed preflight with its fix,
+and the live issue/renew panels).
+
 Routes are deliberately thin. Logic belongs in a controller, and anything the CLI also needs belongs
 in `core/`.
 
 `shutdown()` in `server.js` is idempotent and releases every handle, which is what makes `ezz --dash`
 exit cleanly on Ctrl+C.
+
+### Updating Easy DevOps from the dashboard
+
+Settings → Update is the one dashboard action that outlives its own request, and
+the code is split to match that fact:
+
+| File | Role |
+|---|---|
+| `dashboard/routes/update.js`, `controllers/updateController.js` | `GET /api/update` (registry + install source + last run), `GET /api/update/status` (the record, no network), `POST /api/update` (record the run and spawn the worker) |
+| `dashboard/updateWorker.js` | The detached worker: stops the dashboard, runs `core/updater.js`, starts the dashboard on the port the request arrived on, writes the outcome |
+| `core/updateStatus.js` | `update-status.json` in the data directory: the phases, an atomic write, and `runIsActive()` / `describeRun()` |
+| `core/updater.js` | The flow shared with `ezz update`: stop, replace, refresh the Server-mode copy, start, verify the running version, roll back |
+| `core/installSource.js` | Why a git clone or loose copy cannot be updated in place, and the commands to run instead |
+
+The invariant is that **a request never reports the outcome**. It answers `202
+{ started, run }` and then the process it arrived on is stopped, so the only
+place a result can live is the file. The next dashboard reads it on its first
+poll. An active phase whose worker pid is gone and whose heartbeat is older than
+45 seconds is reported as `interrupted`, never as still running; that is why the
+worker refreshes the heartbeat and claims the record with its own pid before it
+touches anything. The worker refuses a record that is not `starting` or whose id
+does not match its argument, so a second worker cannot run npm twice.
+
+---
+
+## Deployments (`core/deploy/`)
+
+Put a project from a git repository on the server, build it there, run it under
+PM2 and keep earlier releases to roll back to. The dashboard routes in
+`dashboard/routes/deployments.js` are a thin layer over `core/deploy/`, and the
+Hub reaches the same code through `hub:manageDeploy` rather than HTTP.
+
+```
+<deployDir>/<appId>/
+  releases/<releaseId>/   one checkout per deployment, built in place
+  runs/<runId>.json       the record of one attempt
+  logs/<runId>.log        its output
+  shared/                 data that outlives a release, linked into each one
+  state.json              which release is live, and the one before it
+  deploy.lock             held while a deployment of this app runs
+```
+
+`deployDir` is a setting (default `<data dir>/ez_deploys`). It is read when an
+app is **created**, not when it is deployed: each app records its own folder, so
+changing the setting never moves an existing app, and an app created before the
+setting existed keeps `<data dir>/deploy/<id>`.
+
+One deployment runs `fetch` → `settings` → `pre` → the ordered **steps** list →
+`start` → `health` → `post` → `finish`, all in the new release directory.
+Nothing before `start` touches what is running, so a broken build or a failed
+migration costs nothing; if the new process crashes at boot or fails its health
+check and a previous release exists, that release is started again — the same
+files, not a rebuild. One deployment per app at a time is enforced by
+`deploy.lock`, because the dashboard and the background service are different
+processes.
+
+**Steps replaced the three fixed commands.** `settings.steps` is an ordered list
+of at most five `{ run, kind, enabled? }` entries, `kind` being `install`,
+`build`, `migrate` or `custom`; a disabled one is logged as skipped. An older app
+or `ez.json` that still states `install`/`build`/`migrate` is read as the same
+list, so nothing has to be migrated by hand. Precedence is by layer: the first
+layer that states `steps` wins the whole list, but a higher layer's old fields
+still win over a lower layer's list (the app's commands over `ez.json`), and the
+response says so. Saving settings that carry `steps` stores them and drops the
+old fields. `runtime` is `node` today and is one of the settings; `execMode:
+"cluster"` requires it. A step order that will probably fail — `migrate` before
+`install`, `build` before `install`, `migrate` before `build` — is a warning on
+the app, never an error, and the form shows it beside the list.
+
+**Healthy means "PM2 stayed online", not "a probe answered once".** A worker PM2
+reports as errored or stopped, or one that keeps restarting over the confirmation
+window, is a boot crash even when the HTTP check succeeded; in cluster mode every
+worker is watched. The failed run records `reason`, `logTail` (the last 40 lines of
+the crashed release's PM2 log, with environment values replaced by `***`) and
+`rollbackSucceeded` before the rollback reuses the PM2 name — which is why the log
+is read first.
+
+**Cluster mode** is `execMode: "cluster"` with `instances` (1 to the CPU count, or
+`"max"`): one PM2 worker per instance, `pm2 reload` when the app is already running
+in cluster mode, and a direct `node <file>` start command. `instances` above 1 with
+`fork` is refused, and the app is warned that it must be stateless. `status.js`
+reports `instances` and `instancesOnline` from PM2, so a partly up cluster is
+visible rather than assumed healthy.
+
+| File | Role |
+|---|---|
+| `apps.js` | The app registry (SQLite key `deployApps`), id/URL/branch validation, deploy tokens and the public key record |
+| `deployKey.js` | The ed25519 deploy key (openssh-key-v1, mode 600), GitHub's pinned host keys, and `git ls-remote` "Test connection" |
+| `store.js` | Folders, runs, releases, pruning, the `deploy.lock` |
+| `ezfile.js` | Settings precedence (`ez.json` → `package.json` → the app's overrides), the steps list and its legacy fields, `runtime`, and `persist` path validation |
+| `engine.js` | One deployment, the health check and the automatic rollback |
+| `domainLink.js` | Linking an app to a domain, and moving it when the app's port changes |
+| `hookServer.js` | The opt-in CI listener on `/.ez-deploy/` (§5 of `API-CONTRACT.md`) |
+| `github.js`, `githubApi.js` | The workflow file, the deploy key, and doing the secret/workflow setup through GitHub's API |
+| `status.js`, `launcher.js` | The public app view, and starting a release under PM2 |
+| `hubCommands.js` | The `hub:manageDeploy` / `hub:deployHook` actions the agent exposes |
+
+**Persistent paths** are `settings.persist` on the app: a project-relative folder
+or file lives once in `shared/<path>` and is linked into each release. Folders
+become symlinks (junctions on Windows without the privilege) and files hard
+links; a build that replaces a link with a real file or folder fails the
+deployment at the `build` step.
+
+**The deploy hook is not the dashboard.** `hookServer.js` is a separate listener,
+off by default, running with the background jobs, and it authenticates with the
+app's own deploy token. The dashboard's session, Host/Origin and `X-EZ-Request`
+rules do not apply to it, because CI has none of those.
 
 ---
 
@@ -445,7 +651,7 @@ core/
     ipc.js             named pipe (Windows) / Unix socket, server → client only
     run.js             ezz daemon
   jobs/
-    bus.js             in-process event channel (api-contract event names)
+    bus.js             in-process event channel (the event names in API-CONTRACT.md §3)
     monitors.js        nginx status, domain health, cert expiry
     revisionWatcher.js notices changes made by another process
     owner.js           who runs the jobs RIGHT NOW: claim, heartbeat, release
@@ -454,6 +660,7 @@ core/
     claim.js           atomic cross-process claim
     dispatch.js        evaluate → claim → send → commit
   hub/agent.js         the outbound Hub agent (background work, follows ownership)
+  hub/deployProgress.js the live deploy feed the agent starts with its socket
 ```
 
 ### Exactly one owner
@@ -628,23 +835,52 @@ Nothing connects until a valid string is saved. The string is a credential: it i
 can authenticate, and is never shown again by the dashboard or returned by any API.
 
 `core/hubLink.js` owns all of this — parsing, validation, storage, permissions, and the classification
-of handshake failures — so a future CLI pairing menu reuses the same logic.
+of handshake failures — so the dashboard and the CLI pairing path share it.
+
+### Pairing from the CLI
+
+The dashboard is not the only way in. On the Hub, **Add server → From the CLI** creates a one-time
+link (`POST /servers/:id/cli-link`, owner only) and shows the command to run:
+
+```bash
+ezz hub connect https://<hub>/api/v1/connect/cli/<token>
+```
+
+That call rotates the server's secret and disconnects the agent still using the old one, then returns
+the link — never the connection string. The link lasts **5 minutes**, works **once**, and a newer link
+replaces the previous one. `GET /api/v1/connect/cli/:token` is public because the token in the path is
+the credential; it answers the connection string once and then `410` with `LINK_USED`,
+`LINK_EXPIRED`, `LINK_REPLACED` or `LINK_REVOKED`. `core/hubConnect.js` fetches it over https only
+(plain http is accepted only for loopback), refuses redirects, bounds the request at 15 s and 16 KiB,
+and never puts the token or the string in a message. `src/cli/menus/hub.js` saves the result through
+`core/hubLink.js`, then waits up to 30 s for the daemon's `hub:agentState` before saying connected.
+
+`ezz hub status` prints the Hub origin, the server id, the granted permission count and the agent state
+without any secret; `ezz hub unlink` removes the local link (the Hub keeps the server listed as
+offline until it is deleted there). A raw `ezops://` string is accepted by `connect` as well, exactly
+as pasted into the dashboard.
 
 ### What the agent sends
 
-Outbound only. The server opens the connection; no inbound firewall change is needed.
+Outbound only. The server opens the connection; no inbound firewall change is
+needed. The full payload shapes are in `API-CONTRACT.md` §3.5.
 
-| Event | Interval |
+| Event | Interval / trigger |
 |---|---|
-| `nginx:status` | 5s |
-| `server:resources` (CPU, RAM, disk) | 30s |
-| `domain:health` | 60s |
-| `domain:configs` | 5 min, plus on connect and on every change (the full list) |
-| `service:state` | 5 min, plus on connect and on every change |
-| `processes:list` | 60s |
-| `channels:list` (names and types only) | 5 min |
-| `cert:expiry` | 12h |
-| `server:info` | on connect |
+| `server:info` | On connect |
+| `nginx:status` | 5s, and on connect |
+| `server:resources` (CPU, RAM, disk) | 30s, and on connect |
+| `domain:health` | 60s, and on connect |
+| `domain:configs` (the complete list) | On connect, 5 min, and when the revision counter moves |
+| `service:state` (the native service) | On connect, 5 min, and when the revision counter moves |
+| `processes:list` | 60s, and on connect |
+| `channels:list` (names and types only) | On connect and 5 min |
+| `cert:expiry` | On connect and 12h |
+| `deploy:apps` (the public app view) | On connect, 20s, and when a deployment begins or ends |
+| `deploy:progress` (one run's step, and its new log lines with `deploy.logs`) | At most 1/s while a run is active, and once with `done: true`; ≤200 lines / 32 KiB, redacted |
+| `permissions:state` | On connect, and whenever permissions change |
+| `nginx:configs`, `nginx:logs` | After the matching `hub:getConfigs` / `hub:getLogs` command |
+| `command:result` | Once per command, always |
 
 ### What the agent accepts
 
@@ -658,6 +894,8 @@ command against it.
 | **Nginx** | start, stop, restart, reload, test, view configs, edit configs, view logs |
 | **Domains** | create, edit, enable/disable, delete |
 | **SSL** | renew one, renew all expiring, issue new, delete |
+| **Deployments** | deploy, roll back, view logs, create/edit/delete apps, link or unlink a domain, move an app, issue its deploy token, regenerate/test its deploy key and add it to GitHub, read or edit environment values, CI through the Hub |
+| **Processes** | start, stop, restart one PM2 app by name |
 | **System** | *(coming soon)* Node.js versions, reboot |
 
 Marked **coming soon** and visible but not enableable: wildcard issuance from
@@ -688,6 +926,10 @@ every command.** The Hub holds a copy so it can grey out buttons, but that copy
 is a hint — it cannot grant anything. Turning a toggle off stops those commands
 locally whatever the Hub sends.
 
+A deployment link is its own combination: `linkDomain` needs `deploy.manage`
+and `domains.create`, and `ssl.issue` when it asks for a new certificate. The
+same list is checked here and in the Hub, against `e2e/fixtures/hub-permission-map.json`.
+
 Enabling a group enables all its children; a group with only some children on
 shows as partial. Monitoring — metrics, nginx status, the domain list, health
 and certificate expiry — is always on and is not a permission: a paired server
@@ -710,10 +952,13 @@ is a monitored server, and gating read-only telemetry would protect nothing.
 > stored in Task Scheduler. That is the specific reason the whole approach was
 > replaced: nothing in Easy DevOps asks for a password any more.
 
-The PM2 app is **ez-dashboard**, or **ez-dashboard-dev** when a dev data
-directory is in use, so a developer's instance can never stop the real one.
-It runs `src/cli/index.js --dash` — the script path, not the `ezz` shim,
-because on Windows that shim is a `.cmd` PM2 cannot run as a Node script.
+The old PM2 app was **ez-dashboard** — or **ez-dashboard-dev** when a dev data
+directory was in use, so a developer's instance could never stop the real one.
+It ran `src/cli/index.js --dash`: the script path, not the `ezz` shim, because on
+Windows that shim is a `.cmd` PM2 cannot run as a Node script. **Nothing starts
+it any more.** `core/runner.js` keeps the two names only so an install that
+still has one can recognise it, list it as ours and offer to remove it rather
+than mistake it for the user's own app.
 
 ### Start on boot
 
@@ -807,9 +1052,45 @@ Domains are written through `saveDomains()` by every path — dashboard API, CLI
 hub command and backup restore — because that is the one place that bumps the
 revision counter. A bare `dbSet('domains', ...)` would skip it.
 
-Every command carries a `requestId`, and the agent replies with
-`command:result`, so the Hub reports what actually happened rather than
-assuming success.
+Every command carries a `requestId`. A **quick** command is answered through the
+socket.io acknowledgement, which is what the Hub's HTTP response waits up to 15 s
+for; a **long** one (a deploy, a certificate, nginx start/stop/restart) is accepted
+with `202` and answered later by `command:result`. The agent sends both — the ack
+first — so an older Hub that only listens on the event keeps working, and the Hub's
+result store keeps the answer readable for ten minutes after it arrives.
+
+### The Hub's back end (`hub_backend/`)
+
+A separate product — and a separate repository — in the same workspace. Only the
+files the agent's contract depends on are listed here; the Hub's own
+documentation is in `hub_backend/ARCHITECTURE.md`.
+
+| File | Role |
+|---|---|
+| `lib/agentServer.ts` | The `/agent-socket` namespace, the handshake, the single socket per server, and the pending-request map that an ack or `command:result` settles exactly once |
+| `lib/commandResults.ts` | The bounded in-memory result store: 10 minutes from completion, 500 entries, oldest evicted, owner and server checked on read |
+| `lib/rateLimit.ts` | The JSON `429` (`RATE_LIMITED`, `retryAfterSeconds`, `Retry-After`, "Try again in …") |
+| `lib/trustProxy.ts` | `TRUST_PROXY` → Express `trust proxy`: unset trusts only a loopback proxy, `<n>` trusts exactly n hops |
+| `lib/clientIp.ts` | `req.ip` under that setting — never a forwarding header read directly |
+| `lib/singleInstance.ts` | Refuses to boot under PM2 cluster mode, `instances > 1` or a worker id other than 0 |
+| `lib/databaseUrl.ts` | Warns when `DATABASE_URL` resolves inside the release folder |
+| `lib/cliConnectLinks.ts` | The one-time CLI pairing links: a SHA-256 key, a 32-byte base64url token, 5-minute expiry, single use, per-server replace, short-lived tombstones for used/expired/replaced/revoked |
+| `routes/api/v1/connect.ts` | `GET /connect/cli/:token`, public because the token is the credential; its own 20-per-15-minute limiter |
+| `controllers/connect.controller.ts` | Creates the link (owner only; rotates the secret, disconnects the live agent, never returns the string) and consumes it once |
+
+### The Hub's front end (`hub_frontend/`)
+
+Next.js App Router. Inside a server the sections mirror the dashboard —
+Overview, Domains, SSL certificates, Nginx, Deployments, Notifications,
+Processes, Logs and Settings — with the server list/switcher, identity row,
+account and management outside that inner view; the permission tree is
+read-only under Settings. Deployments lives in `components/servers/deploy/`
+(`AppFormModal`, `AppDetailModal`, `DeleteAppModal`, `parts`, `types`, plus
+`RuntimeCards` and `StepsEditor`); SSL lives in `components/servers/ssl/`
+(`SslSection`, `SslOperation`, `StageList`, `PreflightResult`); pairing is
+`components/servers/ServerPairing.tsx`, which offers the dashboard string and
+the one-time CLI command in two tabs. A screen the agent has no command for is
+read-only and says "Managed on the server".
 
 ### Statuses
 
@@ -831,28 +1112,59 @@ new connection string.
 
 ## Testing
 
-There is no test framework here, by design — the project runs as plain ESM with no build step, and a
-runner would be one more thing to maintain. `e2e/` holds plain Node scripts with no dependencies:
+There is no test framework here, by design — the backend and CLI run as plain ESM
+with no build step, and a runner would be one more thing to maintain. `e2e/`
+holds plain Node scripts with no dependencies, and `e2e/run.mjs` is the **only**
+sanctioned way to run them:
 
 ```bash
-node e2e/ssl-challenge.test.mjs   # challenge location, preflight, real nginx proxy
-node e2e/ssl-path.test.mjs        # Windows certificate path handling
-node e2e/hublink.test.mjs         # pairing state machine
-node e2e/pairing-smoke.test.mjs   # full stack; refuses to run if ports are in use
+npm test                    # every suite, through e2e/run.mjs
+npm run test:e2e -- ssl     # one suite (the runner picks the file)
+npm run test:e2e:check      # preflight only: static imports + API contract
 ```
 
-Each isolates itself with a temporary `EASY_DEVOPS_DATA_DIR` and asserts afterwards that the real
-data directory was untouched.
+Running a suite file directly is refused by design. `e2e/run.mjs` gives every
+suite a fresh temporary `EASY_DEVOPS_DATA_DIR` and `EZ_TEST=1` in its
+environment, and the guard fails a suite whose first static import is not
+`e2e/lib/guard.mjs` or that reaches `src/` through a static import at all — code
+must be loaded with a dynamic `await import()` inside the suite. It also
+compares every registered route with `API-CONTRACT.md` before anything runs, so
+an undocumented endpoint fails the whole run.
+
+Suites that need a real binary use a fixture or a stub and assert the stub is
+what ran; nothing touches the real data directory, PM2, nginx or services.
+
+Some suites are named for the promise they protect rather than an area:
+`nginx-websocket-cloudflare` (the one map file, the `/socket.io/` location and
+the Cloudflare real-IP block), `deploy-safety` (`migrate`, boot-crash detection
+and the rollback report), `deploy-cluster` (the validation rules, `pm2
+reload`, and per-worker health), `deploy-steps` (the ordered list, legacy fields
+and precedence, order warnings, and that saving steps drops the old fields),
+`deploy-keys` (generation, file mode, pinned host keys, the one-time GitHub
+token and that no response contains a private key), `deploy-link-domain`
+(name/`www`, new/existing/no SSL, the wildcard refusal, the Hub permissions and
+the reported stages), `deploy-progress` (the cross-process run feed and its
+redaction/limits), `ssl-preflight` (each check, its fix, the DNS-01 skips,
+and that a failed check never reaches the ACME client), `hub-connect-cli` (the
+one-time link, secret rotation, the error codes and that no output carries a
+secret) and `cli-pages` (the breadcrumb, the clear decision, Enter-to-continue
+and no escape bytes when piped). `e2e/fixtures/` holds the shared
+`hub-permission-map.json`, which both the agent's map here and the Hub's copy
+are tested against.
 
 ---
 
 ## Conventions
 
-- **Pure ESM, no build step.** Node 18+. No TypeScript, no bundler. Vue comes from a CDN.
+- **Pure ESM for the backend and CLI.** Node 18+. No TypeScript, no bundler.
+  The React dashboard is the one build (`npm run build:ui` → `dist/ui`); the
+  classic EJS/Vue page is a fallback, and neither UI loads code from a CDN at
+  runtime.
 - **No new dependencies** without a good reason.
 - `run()` returns `{ success, stdout, stderr, exitCode }` and never throws — check `success`.
-- `systemctl` from the dashboard uses `sudo -n` with the full `/usr/bin/systemctl` path, matching the
-  sudoers rules written by `core/permissions.js`.
+- `systemctl` from the dashboard uses `sudo -n` with the full `/usr/bin/systemctl` path. The only
+  commands that can be run this way are the five in `SUDO_COMMANDS` in `core/permissions.js`, and
+  no code path accepts a sudo password: the operator runs the setup script in their own terminal.
 - Errors are returned as structured objects (`step`, `cause`, `consequence`), not thrown strings.
 
 The project's binding rules live in `.specify/memory/constitution.md`. Read it before changing
