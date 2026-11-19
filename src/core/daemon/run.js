@@ -35,6 +35,8 @@ import { startIpcServer } from './ipc.js';
 import { inspect } from './lock.js';
 import { watchForStop } from './stopRequest.js';
 import { getHubAgentStatus } from '../hub/agent.js';
+import { subscribe } from '../jobs/bus.js';
+import { writeDaemonState, removeDaemonState } from './stateFile.js';
 import { loadConfig } from '../config.js';
 import { ensureCode as ensureSetupCode, describe as describeSetupCode } from '../setupCode.js';
 
@@ -115,6 +117,14 @@ export async function startDaemon({
   const agent = getHubAgentStatus();
   log(`  hub agent      : ${agent?.status ?? 'unknown'}`);
 
+  // The same agent state, in the data directory, for a CLI that cannot open
+  // the pipe — in Windows Server mode it belongs to NT SERVICE\EasyDevOps. See
+  // core/daemon/stateFile.js. Rewritten on every transition the bus carries.
+  writeDaemonState({ dataDir, pid: process.pid, version, hub: agent });
+  const unsubscribeState = subscribe('hub:agentState', (payload) => {
+    writeDaemonState({ dataDir, pid: process.pid, version, hub: payload });
+  });
+
   // The first-run setup code, while the dashboard still has no password.
   // The daemon's stdout IS the service log (WinSW, systemd, the Startup
   // supervisor all capture it), which is the second of the two places the
@@ -150,6 +160,8 @@ export async function startDaemon({
       stopping = (async () => {
         log('Stopping...');
         stopWatch.stop();
+        try { unsubscribeState?.(); } catch { /* best effort */ }
+        removeDaemonState({ dataDir, pid: process.pid });
         if (ipc) {
           try { await ipc.close(); } catch { /* best effort */ }
         }

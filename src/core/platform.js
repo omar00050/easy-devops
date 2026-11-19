@@ -307,6 +307,31 @@ export function windowsProductNameCmd() {
 }
 
 /**
+ * Command that prints `True` only when this process runs ELEVATED.
+ *
+ * Membership of Administrators is not enough: with UAC on, an administrator's
+ * normal terminal carries a filtered token, and IsInRole(Administrator) is
+ * false there until "Run as administrator". That is exactly the question —
+ * a filtered token is what makes Windows raise a UAC prompt for the wrapper.
+ * @returns {string}
+ */
+export function windowsElevationCheckCmd() {
+  return '([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent())'
+    + '.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)';
+}
+
+/**
+ * The Service Control Manager's command-line tool, always with its extension.
+ *
+ * Commands run through PowerShell on Windows, and there `sc` is the built-in
+ * alias for Set-Content: `sc query EasyDevOps` silently wrote a file named
+ * `query` containing "EasyDevOps" into the current directory and "succeeded".
+ * 1.4.0 shipped that, which is why status read "unknown" and stop/start did
+ * nothing. `sc.exe` names the real program in PowerShell and cmd alike.
+ */
+export const WINDOWS_SC = 'sc.exe';
+
+/**
  * Address the daemon listens on for local event delivery to a dashboard.
  *
  * Two different kinds of thing behind one name, which is why it lives here:

@@ -121,33 +121,48 @@ function stubRun(rules = []) {
  * registration disappears only after `sc delete`. Every other command the
  * install makes is answered here; an unrecognised one fails, like stubRun.
  */
-function serviceRun({ registered = false, registerResult = null } = {}) {
+function serviceRun({ registered = false, registerResult = null, qc = 'START_TYPE : 2  AUTO_START' } = {}) {
   const calls = [];
-  const state = { registered };
+  const state = { registered, sc: registered ? 'RUNNING' : 'MISSING' };
 
   const run = async (cmd) => {
     calls.push(cmd);
 
-    if (/^sc query /.test(cmd)) {
-      return state.registered
-        ? { success: true, stdout: 'SERVICE_NAME: EasyDevOps\n        STATE              : 4  RUNNING' }
-        : {
+    // The elevation probe runs before every Server-mode operation.
+    if (/IsInRole[\s\S]*Administrator/.test(cmd)) {
+      return { success: true, stdout: 'True' };
+    }
+    if (/^sc\.exe query /.test(cmd)) {
+      return state.sc === 'MISSING'
+        ? {
           success: false,
           stdout: '',
           stderr: 'The specified service does not exist as an installed service. (1060)',
-        };
+        }
+        : { success: true, stdout: `SERVICE_NAME: EasyDevOps\n        STATE              : 4  ${state.sc}` };
     }
-    if (/^sc delete /.test(cmd)) {
+    if (/^sc\.exe qc /.test(cmd)) return { success: true, stdout: qc };
+    if (/^sc\.exe delete /.test(cmd)) {
       state.registered = false;
+      state.sc = 'MISSING';
+      return { success: true, stdout: '' };
+    }
+    if (/^sc\.exe stop /.test(cmd)) {
+      state.sc = 'STOPPED';
+      return { success: true, stdout: '' };
+    }
+    if (/^sc\.exe start /.test(cmd)) {
+      state.sc = 'RUNNING';
       return { success: true, stdout: '' };
     }
     if (/ install$/.test(cmd)) {
       if (registerResult) return registerResult;
       state.registered = true;
+      state.sc = 'RUNNING';
       return { success: true, stdout: '', stderr: '' };
     }
     if (/icacls /.test(cmd)) return { success: true, stdout: 'Successfully processed 1 files' };
-    if (/ (stop|uninstall|start)$/.test(cmd)) return { success: true, stdout: '', stderr: '' };
+    if (/ (stop|uninstall|start|restart)$/.test(cmd)) return { success: true, stdout: '', stderr: '' };
 
     return { success: false, stdout: '', stderr: `serviceRun: no rule for: ${cmd}`, unmatched: true };
   };
@@ -1784,7 +1799,7 @@ async function testWinswReregisters() {
     check('a stop runs before the register',
       before.some((c) => / stop$/.test(c)), before.join(' | '));
     check('a delete or a WinSW uninstall runs before the register',
-      before.some((c) => /^sc delete /.test(c) || / uninstall$/.test(c)), before.join(' | '));
+      before.some((c) => /^sc\.exe delete /.test(c) || / uninstall$/.test(c)), before.join(' | '));
     check('and the register follows the cleanup',
       registerAt > -1 && run.calls[run.calls.length - 1] === `& "${ws.winswPath()}" start`,
       run.calls[run.calls.length - 1]);
@@ -1897,6 +1912,7 @@ async function testServerInstallResume() {
       mode: 'server',
       deps: {
         isServerMode: () => true,
+        isElevated: () => true,
         isPidAlive: () => false,
         legacy: fakeLegacy,
         clearStopRequest: () => ({ ok: true }),
@@ -1930,6 +1946,7 @@ async function testServerInstallResume() {
       mode: 'server',
       deps: {
         isServerMode: () => true,
+        isElevated: () => true,
         isPidAlive: () => false,
         legacy: fakeLegacy,
         clearStopRequest: () => ({ ok: true }),
@@ -2065,6 +2082,7 @@ async function testDashboardRunningBlocksMigration() {
       mode: 'server',
       deps: {
         isServerMode: () => false,
+        isElevated: () => true,
         isPidAlive: (candidate) => candidate === pid,
         enableServerMode: () => {
           enableCalls++;
@@ -2101,6 +2119,660 @@ async function testReopenDb() {
     db.dbGet(key)?.value === 'still here');
 
   db.dbDelete(key);
+}
+
+// ─── 34. Every service-control command uses sc.exe ──────────────────────────
+
+async function testScExeEverywhere() {
+  setGroup('34. every service-control command uses sc.exe');
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const platform = await import(srcUrl('core/platform.js'));
+
+  const previous = process.env.ProgramData;
+  const root = scratch('sc-exe');
+  process.env.ProgramData = root;
+  platform.resetDataDirCache();
+
+  const calls = [];
+  try {
+    const dataDir = platform.programDataDir();
+    const bin = path.join(dataDir, 'bin');
+    const runtime = path.join(dataDir, 'runtime');
+    const appRoot = path.join(root, 'app');
+
+    fs.mkdirSync(bin, { recursive: true });
+    fs.mkdirSync(runtime, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, '.server-mode'), '{}\n');
+    fs.writeFileSync(ws.winswPath(), 'dummy wrapper');
+    fs.writeFileSync(ws.serviceXmlPath(), '<service/>');
+
+    let scState = 'RUNNING';
+    const run = async (cmd) => {
+      calls.push(cmd);
+      if (/IsInRole[\s\S]*Administrator/.test(cmd)) return { success: true, stdout: 'True' };
+      if (/^sc\.exe query /.test(cmd)) {
+        return scState === 'MISSING'
+          ? { success: false, stdout: '', stderr: 'The specified service does not exist. (1060)' }
+          : { success: true, stdout: `STATE : 4  ${scState}` };
+      }
+      if (/^sc\.exe qc /.test(cmd)) return { success: true, stdout: 'START_TYPE : 2  AUTO_START' };
+      if (/^sc\.exe stop /.test(cmd)) { scState = 'STOPPED'; return { success: true }; }
+      if (/^sc\.exe start /.test(cmd)) { scState = 'RUNNING'; return { success: true }; }
+      if (/^sc\.exe delete /.test(cmd)) { scState = 'MISSING'; return { success: true }; }
+      if (/icacls /.test(cmd)) return { success: true };
+      if (/ install$/.test(cmd)) { scState = 'RUNNING'; return { success: true }; }
+      if (/ (stop|uninstall|start|restart)$/.test(cmd)) return { success: true };
+      return { success: false, stdout: '', stderr: `unmatched: ${cmd}` };
+    };
+
+    const deps = {
+      isWindows: true,
+      isElevated: () => true,
+      canWrite: () => true,
+      copyRuntime: () => ({
+        ok: true,
+        dir: runtime,
+        nodeExe: path.join(runtime, 'node.exe'),
+        entry: path.join(runtime, 'app', 'src', 'cli', 'index.js'),
+      }),
+      verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
+      verifyWinsw: async () => ({ ok: true }),
+    };
+    const log = () => {};
+
+    await ws.install({
+      dataDir,
+      appRoot,
+      config: {},
+      run,
+      log,
+      fetchImpl: async () => { throw new Error('the wrapper is already present'); },
+      deps,
+    });
+    await ws.uninstall({ dataDir, config: {}, run, log });
+    scState = 'RUNNING';
+    await ws.stop({ run, stopWaitMs: 2_000 });
+    await ws.start({ run });
+    await ws.status({ dataDir, config: {}, run, granted: [] });
+
+    scState = 'RUNNING';
+    fs.mkdirSync(runtime, { recursive: true });
+    fs.writeFileSync(path.join(runtime, 'marker'), 'OLD');
+    await ws.repair({
+      dataDir,
+      appRoot,
+      config: {},
+      run,
+      log,
+      waitForStart: async () => ({ alive: true }),
+      deps,
+    });
+  } finally {
+    if (previous === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previous;
+    platform.resetDataDirCache();
+  }
+
+  check('service-control commands ran', calls.some((c) => /^sc\.exe /.test(c)));
+  check('NO command was run as bare `sc`',
+    !calls.some((c) => /^sc /.test(c)), calls.filter((c) => /^sc /.test(c)).join(' | '));
+  check('every service-control command is sc.exe',
+    calls.filter((c) => /^sc\.exe /.test(c)).every((c) => /^sc\.exe (query|qc|stop|start|delete) /.test(c)),
+    calls.filter((c) => /^sc\.exe /.test(c)).join(' | '));
+
+  for (const verb of ['query', 'qc', 'stop', 'start', 'delete']) {
+    check(`sc.exe ${verb} ran`, calls.some((c) => c.startsWith(`sc.exe ${verb} `)));
+  }
+}
+
+// ─── 35. Real elevation, before anything is copied or migrated ──────────────
+
+async function testElevation() {
+  setGroup('35. elevation is checked for real before anything');
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const svc = await import(srcUrl('core/service/index.js'));
+  const platform = await import(srcUrl('core/platform.js'));
+
+  const trueRun = stubRun([[/IsInRole/, { success: true, stdout: 'True' }]]);
+  const falseRun = stubRun([[/IsInRole/, { success: true, stdout: 'False' }]]);
+  const junkRun = stubRun([[/IsInRole/, { success: true, stdout: 'maybe' }]]);
+
+  check('"True" means elevated', (await ws.isElevated({ run: trueRun })) === true);
+  check('"False" means not elevated', (await ws.isElevated({ run: falseRun })) === false);
+  check('anything else is unknown', (await ws.isElevated({ run: junkRun })) === null);
+
+  const command = platform.windowsElevationCheckCmd();
+  check('the elevation command asks IsInRole', /IsInRole/.test(command), command);
+  check('and specifically for Administrator', /Administrator/.test(command));
+
+  let copied = 0;
+  const refused = await ws.install({
+    dataDir: scratch('elevation-nocopy'),
+    appRoot: scratch('elevation-app'),
+    run: stubRun(),
+    deps: {
+      isWindows: true,
+      isElevated: () => false,
+      canWrite: () => { throw new Error('the write probe must not be reached'); },
+      copyRuntime: () => { copied++; return { ok: true }; },
+    },
+  });
+  check('install refuses without elevation',
+    refused.ok === false && refused.needsElevation === true, refused.reason ?? '');
+  check('and copied nothing', copied === 0);
+
+  const fakeLegacy = { run: stubRun([[/schtasks/, { success: false }]]), startupDir: null };
+  let enableCalls = 0;
+  const blocked = await svc.install({
+    mode: 'server',
+    deps: {
+      isElevated: () => false,
+      isServerMode: () => false,
+      enableServerMode: () => {
+        enableCalls++;
+        return { ok: true, dataDir: 'UNUSED', migrated: true, backup: null };
+      },
+      legacy: fakeLegacy,
+      clearStopRequest: () => ({ ok: true }),
+    },
+  });
+  check('the dispatcher refuses without elevation',
+    blocked.ok === false && blocked.needsElevation === true, blocked.reason ?? '');
+  check('and nothing was migrated', enableCalls === 0);
+
+  const previous = process.env.ProgramData;
+  const root = scratch('elevation-null');
+  process.env.ProgramData = root;
+  platform.resetDataDirCache();
+
+  try {
+    const dataDir = platform.programDataDir();
+    fs.mkdirSync(path.join(dataDir, 'bin'), { recursive: true });
+    fs.writeFileSync(ws.winswPath(), 'dummy wrapper');
+
+    const logs = [];
+    let noteBeforeRegister = null;
+    const base = serviceRun({ registered: false });
+    const run = async (cmd) => {
+      if (/ install$/.test(cmd)) noteBeforeRegister = logs.includes(ws.UAC_NOTE);
+      return base(cmd);
+    };
+
+    const installed = await ws.install({
+      dataDir,
+      appRoot: path.join(root, 'app'),
+      config: {},
+      run,
+      log: (line) => logs.push(line),
+      deps: {
+        isWindows: true,
+        isElevated: () => null,
+        canWrite: () => true,
+        copyRuntime: () => ({
+          ok: true,
+          dir: path.join(dataDir, 'runtime'),
+          nodeExe: 'NODE',
+          entry: 'ENTRY',
+        }),
+        verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
+        verifyWinsw: async () => ({ ok: true }),
+      },
+    });
+
+    check('with unknown elevation the install proceeds', installed.ok === true, installed.reason ?? '');
+    check('the UAC note is logged', logs.includes(ws.UAC_NOTE));
+    check('and it is logged before the register command runs', noteBeforeRegister === true);
+  } finally {
+    if (previous === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previous;
+    platform.resetDataDirCache();
+  }
+}
+
+// ─── 36. Status agrees with Windows, not only with the files ────────────────
+
+async function testStatusAgainstWindows() {
+  setGroup('36. status asks Windows whether the service exists');
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const svc = await import(srcUrl('core/service/index.js'));
+  const db = await import(srcUrl('core/db.js'));
+  const platform = await import(srcUrl('core/platform.js'));
+
+  const previous = process.env.ProgramData;
+  const root = scratch('status-windows');
+  process.env.ProgramData = root;
+  platform.resetDataDirCache();
+
+  const savedState = db.dbGet('service-state');
+  try {
+    const dataDir = platform.programDataDir();
+    fs.mkdirSync(path.join(dataDir, 'bin'), { recursive: true });
+    fs.writeFileSync(ws.winswPath(), 'dummy wrapper');
+    fs.writeFileSync(ws.serviceXmlPath(), '<service/>');
+
+    const runningRun = async (cmd) => {
+      if (/^sc\.exe query /.test(cmd)) {
+        return { success: true, stdout: 'SERVICE_NAME: EasyDevOps\n        STATE              : 4  RUNNING' };
+      }
+      if (/^sc\.exe qc /.test(cmd)) return { success: true, stdout: 'START_TYPE : 2  AUTO_START' };
+      return { success: false, stderr: `unmatched: ${cmd}` };
+    };
+
+    const running = await ws.status({ dataDir, config: {}, run: runningRun, granted: [] });
+    check('a RUNNING state is reported', running.running === true && running.state === 'running');
+    check('Start on boot is read from sc.exe qc', running.enabledOnBoot === true);
+
+    const missingRun = async (cmd) => {
+      if (/^sc\.exe query /.test(cmd)) {
+        return {
+          success: false,
+          stdout: '',
+          stderr: 'The specified service does not exist as an installed service. (1060)',
+        };
+      }
+      return { success: false, stderr: `unmatched: ${cmd}` };
+    };
+
+    const missing = await ws.status({ dataDir, config: {}, run: missingRun, granted: [] });
+    check('1060 with the wrapper files present still means not installed',
+      missing.installed === false && missing.registered === false);
+    check('and it says why the files are there',
+      typeof missing.mismatch === 'string' && missing.mismatch.length > 0, missing.mismatch ?? '');
+
+    db.dbSet('service-state', { mode: 'server', mechanism: 'winsw' });
+    const warned = await svc.status({
+      deps: {
+        windowsService: ws,
+        windowsServiceOpts: { run: missingRun },
+        inspectRuntime: async () => ({
+          systemNode: { version: process.version, path: process.execPath },
+          pinned: { kind: 'none' },
+          warnings: [],
+        }),
+        detectLegacy: async () => ({ items: [] }),
+        isStopRequested: () => false,
+      },
+    });
+
+    check('the dispatcher says Windows has no EasyDevOps service',
+      warned.warnings.some((w) => /Windows has no EasyDevOps service/.test(w)),
+      warned.warnings.join(' | '));
+    check('and tells the user to run ezz service install',
+      warned.warnings.some((w) => /ezz service install/.test(w)),
+      warned.warnings.join(' | '));
+  } finally {
+    if (savedState === undefined) db.dbDelete('service-state');
+    else db.dbSet('service-state', savedState);
+    if (previous === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previous;
+    platform.resetDataDirCache();
+  }
+}
+
+// ─── 37. Only real process starts count as restarts ─────────────────────────
+
+async function testRestartCounting() {
+  setGroup('37. only real process starts count as restarts');
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+
+  const excerpt = [
+    '2026-11-19 19:01:15,000 INFO  - Installing service',
+    '2026-11-19 19:02:14,000 DEBUG - Starting WinSW in console mode',
+    '2026-11-19 19:02:25,000 DEBUG - Starting WinSW in console mode',
+    '2026-11-19 19:02:25,100 INFO  - Starting service',
+    '2026-11-19 19:02:26,000 DEBUG - Starting WinSW in service mode',
+    '2026-11-19 19:02:26,100 INFO  - Started process 12700',
+    '2026-11-19 19:06:45,000 INFO  - Stopping EasyDevOps',
+    '2026-11-19 19:06:45,100 INFO  - Process 12700 canceled with code 0',
+    '2026-11-19 19:08:11,000 INFO  - Stopping service',
+    '2026-11-19 19:08:11,100 INFO  - Starting service',
+    '2026-11-19 19:08:12,000 INFO  - Started process 2508',
+    '2026-11-19 19:08:40,000 INFO  - Stopping EasyDevOps',
+    '2026-11-19 19:08:40,100 INFO  - Process 2508 canceled with code 0',
+    '2026-11-19 19:08:43,000 DEBUG - Starting WinSW in service mode',
+    '2026-11-19 19:08:43,100 INFO  - Started process 14236',
+  ].join('\n');
+
+  const counted = ws.countRecentRestarts({ text: excerpt, now: Date.parse('2026-11-19T19:10:00') });
+  check('the user\'s log has two real restarts', counted.restarts === 2, String(counted.restarts));
+  check('both were clean, so neither is a crash restart',
+    counted.cleanRestarts === 2 && counted.crashRestarts === 0,
+    `clean ${counted.cleanRestarts}, crash ${counted.crashRestarts}`);
+  check('and it is not called a crash loop', counted.crashLooping === false);
+
+  const consoleOnly = [
+    '2026-11-19 19:02:14,000 DEBUG - Starting WinSW in console mode',
+    '2026-11-19 19:02:25,000 DEBUG - Starting WinSW in console mode',
+    '2026-11-19 19:08:43,000 DEBUG - Starting WinSW in console mode',
+  ].join('\n');
+  const none = ws.countRecentRestarts({ text: consoleOnly, now: Date.parse('2026-11-19T19:10:00') });
+  check('console-mode lines alone are not restarts', none.restarts === 0, String(none.restarts));
+
+  const crashes = [
+    '2026-11-19 19:00:00,000 INFO  - Started process 100',
+    '2026-11-19 19:00:06,000 INFO  - Started process 101',
+    '2026-11-19 19:00:27,000 INFO  - Started process 102',
+    '2026-11-19 19:01:28,000 INFO  - Started process 103',
+  ].join('\n');
+  const crashing = ws.countRecentRestarts({ text: crashes, now: Date.parse('2026-11-19T19:05:00') });
+  check('three unclean restarts are a crash loop',
+    crashing.crashRestarts === 3 && crashing.crashLooping === true,
+    `crash ${crashing.crashRestarts}, looping ${crashing.crashLooping}`);
+
+  const old = [
+    '2026-11-19 18:00:00,000 INFO  - Started process 200',
+    '2026-11-19 18:01:00,000 INFO  - Started process 201',
+  ].join('\n');
+  const outside = ws.countRecentRestarts({ text: old, now: Date.parse('2026-11-19T19:05:00') });
+  check('restarts older than the window are not counted', outside.restarts === 0, String(outside.restarts));
+}
+
+// ─── 38. Install waits for the daemon, and says when it is still starting ───
+
+async function testInstallWait() {
+  setGroup('38. install waits, and distinguishes still starting from failed');
+
+  const svc = await import(srcUrl('core/service/index.js'));
+  const db = await import(srcUrl('core/db.js'));
+
+  const fakeLegacy = { run: stubRun([[/schtasks/, { success: false }]]), startupDir: null };
+  const savedState = db.dbGet('service-state');
+  const work = scratch('install-wait');
+  const baseDeps = (queryState) => ({
+    isElevated: () => true,
+    isServerMode: () => true,
+    isPidAlive: () => false,
+    enableServerMode: () => ({
+      ok: true,
+      dataDir: work,
+      migrated: false,
+      backup: null,
+      originalAt: null,
+    }),
+    legacy: fakeLegacy,
+    clearStopRequest: () => ({ ok: true }),
+    startupGraceMs: 300,
+    windowsService: {
+      install: async ({ dataDir }) => ({ ok: true, granted: [dataDir], runtime: {} }),
+      queryState,
+      readLogs: () => ({ ok: true, file: 'fake', output: 'fake log' }),
+    },
+  });
+
+  try {
+    const running = await svc.install({
+      mode: 'server',
+      deps: baseDeps(async () => 'RUNNING'),
+    });
+
+    check('a running service is not reported as a failed install',
+      running.ok === true && running.stillInitialising === true, running.reason ?? '');
+    check('the detail says to check with ezz service status',
+      /ezz service status/.test(running.detail ?? ''), running.detail ?? '');
+
+    const recorded = db.dbGet('service-state') ?? {};
+    check('the install was recorded before the heartbeat wait',
+      recorded.mode === 'server' && Array.isArray(recorded.granted) && recorded.granted.length === 1,
+      JSON.stringify({ mode: recorded.mode, granted: recorded.granted }));
+
+    const stopped = await svc.install({
+      mode: 'server',
+      deps: baseDeps(async () => 'STOPPED'),
+    });
+    check('a stopped service is reported as a failure', stopped.ok === false);
+    check('and the reason names the state',
+      /stopped/i.test(stopped.reason ?? ''), stopped.reason ?? '');
+  } finally {
+    if (savedState === undefined) db.dbDelete('service-state');
+    else db.dbSet('service-state', savedState);
+  }
+
+  const empty = scratch('install-wait-progress');
+  let progress = 0;
+  const waited = await svc.waitForDaemon({
+    dataDir: empty,
+    timeoutMs: 6_000,
+    onProgress: () => { progress++; },
+  });
+  check('a long wait reports progress', waited.alive === false && progress >= 1, `${progress} progress line(s)`);
+}
+
+// ─── 39. Repair while the service is running ────────────────────────────────
+
+async function testRepairWhileRunning() {
+  setGroup('39. repair stops, replaces and restores the runtime');
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const rt = await import(srcUrl('core/service/runtime.js'));
+  const platform = await import(srcUrl('core/platform.js'));
+
+  const previous = process.env.ProgramData;
+  const root = scratch('repair-running');
+  process.env.ProgramData = root;
+  platform.resetDataDirCache();
+
+  const dataDir = platform.programDataDir();
+  const dir = path.join(dataDir, 'runtime');
+  const appRoot = path.join(root, 'app');
+
+  const makeRun = (events) => {
+    const state = { sc: 'RUNNING' };
+    const run = async (cmd) => {
+      events.push(cmd);
+      if (/^sc\.exe query /.test(cmd)) {
+        return state.sc === 'MISSING'
+          ? { success: false, stdout: '', stderr: 'The specified service does not exist. (1060)' }
+          : { success: true, stdout: `STATE : 4  ${state.sc}` };
+      }
+      if (/^sc\.exe stop /.test(cmd)) {
+        state.sc = 'STOPPED';
+        events.push('SC_STOP');
+        return { success: true };
+      }
+      if (/^sc\.exe start /.test(cmd)) {
+        state.sc = 'RUNNING';
+        events.push('SC_START');
+        return { success: true };
+      }
+      if (/^sc\.exe delete /.test(cmd)) { state.sc = 'MISSING'; return { success: true }; }
+      if (/icacls /.test(cmd)) return { success: true };
+      return { success: false, stdout: '', stderr: `unmatched: ${cmd}` };
+    };
+    run.state = state;
+    return run;
+  };
+
+  const makeDeps = (events, run) => ({
+    isWindows: true,
+    isElevated: () => true,
+    canWrite: () => true,
+    verifyWinsw: async () => ({ ok: true }),
+    copyRuntime: () => {
+      events.push('COPY');
+      events.push(`COPY_STATE:${run.state.sc}`);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'marker'), 'NEW');
+      return {
+        ok: true,
+        dir,
+        nodeExe: path.join(dir, 'node.exe'),
+        entry: path.join(dir, 'app', 'src', 'cli', 'index.js'),
+      };
+    },
+    verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
+    stopWaitMs: 2_000,
+  });
+
+  try {
+    fs.mkdirSync(path.join(dataDir, 'bin'), { recursive: true });
+    fs.writeFileSync(ws.winswPath(), 'dummy wrapper');
+    fs.writeFileSync(ws.serviceXmlPath(), '<service/>');
+    fs.mkdirSync(path.join(appRoot, 'src', 'cli'), { recursive: true });
+    fs.writeFileSync(path.join(appRoot, 'src', 'cli', 'index.js'), '// entry\n');
+    fs.writeFileSync(path.join(appRoot, 'package.json'), '{}\n');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'node.exe'), 'dummy node');
+    fs.writeFileSync(path.join(dir, 'marker'), 'OLD');
+
+    const successEvents = [];
+    const successRun = makeRun(successEvents);
+    const success = await ws.repair({
+      dataDir,
+      appRoot,
+      config: {},
+      run: successRun,
+      waitForStart: async () => ({ alive: true }),
+      deps: makeDeps(successEvents, successRun),
+    });
+
+    check('the repair succeeds', success.ok === true, success.reason ?? '');
+    check('the runtime was copied while the service was STOPPED',
+      successEvents.includes('COPY_STATE:STOPPED'), successEvents.join(' | '));
+    const copyAt = successEvents.indexOf('COPY');
+    const stopAt = successEvents.indexOf('SC_STOP');
+    check('the stop came before the copy', stopAt >= 0 && copyAt > stopAt,
+      `stop ${stopAt}, copy ${copyAt}`);
+    check('the new runtime is in place',
+      fs.readFileSync(path.join(dir, 'marker'), 'utf8') === 'NEW');
+    check('the previous copy is gone', !fs.existsSync(`${dir}.prev`));
+
+    // Rollback: the new copy starts but the daemon never reports in.
+    fs.writeFileSync(path.join(dir, 'marker'), 'OLD');
+    const rollbackEvents = [];
+    const rollbackRun = makeRun(rollbackEvents);
+    let startCalls = 0;
+    let atSecondStart = null;
+
+    const rollback = await ws.repair({
+      dataDir,
+      appRoot,
+      config: {},
+      run: rollbackRun,
+      waitForStart: async () => {
+        startCalls++;
+        if (startCalls === 1) return { alive: false };
+        atSecondStart = {
+          marker: fs.readFileSync(path.join(dir, 'marker'), 'utf8'),
+          stops: rollbackEvents.filter((e) => e === 'SC_STOP').length,
+          starts: rollbackEvents.filter((e) => e === 'SC_START').length,
+        };
+        return { alive: true };
+      },
+      deps: makeDeps(rollbackEvents, rollbackRun),
+    });
+
+    check('the repair reports failure', rollback.ok === false);
+    check('and says the previous copy was restored', rollback.restored === true, rollback.reason ?? '');
+    check('the runtime holds the old copy again',
+      fs.readFileSync(path.join(dir, 'marker'), 'utf8') === 'OLD');
+    check('a second stop ran before the restore',
+      atSecondStart?.stops >= 2, JSON.stringify(atSecondStart));
+    check('and a start ran after it',
+      atSecondStart?.starts >= 2, JSON.stringify(atSecondStart));
+    check('the old copy was observed at the second start', atSecondStart?.marker === 'OLD');
+    check('no separate previous copy is left behind', !fs.existsSync(`${dir}.prev`));
+
+    const noElevationEvents = [];
+    const noElevationRun = makeRun(noElevationEvents);
+    const refused = await ws.repair({
+      dataDir,
+      appRoot,
+      config: {},
+      run: noElevationRun,
+      deps: { isWindows: true, isElevated: () => false, canWrite: () => true },
+    });
+    check('repair refuses without elevation',
+      refused.ok === false && refused.needsElevation === true, refused.reason ?? '');
+    check('and issued no stop',
+      !noElevationEvents.some((c) => /^sc\.exe stop /.test(c)), noElevationEvents.join(' | '));
+
+    fs.writeFileSync(path.join(dir, 'node.exe'), 'dummy node');
+    const logs = [];
+    const selfCopy = rt.copyRuntime({
+      dataDir,
+      appRoot,
+      nodeExe: path.join(dir, 'node.exe'),
+      log: (line) => logs.push(line),
+    });
+    check('copyRuntime succeeds when the source is the destination',
+      selfCopy.ok === true, selfCopy.reason ?? '');
+    check('and keeps the existing node.exe instead of copying it onto itself',
+      logs.some((line) => /already the runtime copy/.test(line) && /kept/.test(line)),
+      logs.join(' | '));
+  } finally {
+    if (previous === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previous;
+    platform.resetDataDirCache();
+  }
+}
+
+// ─── 40. The daemon state file, for a pipe the CLI cannot open ──────────────
+
+async function testAgentStateFile() {
+  setGroup('40. the daemon state file is a trusted second window');
+
+  const stateFile = await import(srcUrl('core/daemon/stateFile.js'));
+  const lock = await import(srcUrl('core/daemon/lock.js'));
+  const dir = scratch('agent-state');
+  const hub = { linked: true, connected: true, status: 'connected', lastError: null, attempts: 2 };
+
+  lock.acquire({ dataDir: dir, mode: 'daemon', version: '1.2.3' });
+  try {
+    stateFile.writeDaemonState({ dataDir: dir, pid: process.pid, version: '1.2.3', hub });
+
+    const read = stateFile.readAgentStateFromFile({ dataDir: dir });
+    check('the running daemon state is read from the file',
+      read?.status === 'connected' && read?.source === 'state-file', JSON.stringify(read));
+
+    const text = fs.readFileSync(stateFile.stateFilePath(dir), 'utf8');
+    check('the file carries no token', !/token/i.test(text));
+    check('no secret', !/secret/i.test(text));
+    check('and no URL', !/https?:\/\//i.test(text), text.slice(0, 120));
+
+    stateFile.writeDaemonState({ dataDir: dir, pid: process.pid + 1, version: '1.2.3', hub });
+    check('a pid that does not hold the lock is not trusted',
+      stateFile.readAgentStateFromFile({ dataDir: dir }) === null);
+
+    stateFile.writeDaemonState({ dataDir: dir, pid: process.pid, version: '1.2.3', hub });
+    lock.release({ dataDir: dir });
+    check('after the lock is released the file is not trusted',
+      stateFile.readAgentStateFromFile({ dataDir: dir }) === null);
+
+    stateFile.writeDaemonState({ dataDir: dir, pid: 111, version: '1', hub });
+    stateFile.removeDaemonState({ dataDir: dir, pid: 222 });
+    check('a daemon does not remove another daemon\'s state file',
+      fs.existsSync(stateFile.stateFilePath(dir)));
+    stateFile.removeDaemonState({ dataDir: dir, pid: 111 });
+    check('the owning daemon removes its own file',
+      !fs.existsSync(stateFile.stateFilePath(dir)));
+
+    // In Server mode the pipe belongs to another account and cannot be opened.
+    // The file is what still answers.
+    lock.acquire({ dataDir: dir, mode: 'daemon', version: '1.2.3' });
+    stateFile.writeDaemonState({ dataDir: dir, pid: process.pid, version: '1.2.3', hub });
+
+    const ipc = await import(srcUrl('core/daemon/ipc.js'));
+    let pipeConnected = null;
+    const client = ipc.connectToDaemon({
+      dataDir: dir,
+      onEvent() {},
+      onStatus: (value) => { pipeConnected = value; },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const fromFile = stateFile.readAgentStateFromFile({ dataDir: dir });
+    check('a refused pipe still leaves the file as the source of state',
+      fromFile?.status === 'connected' && fromFile?.source === 'state-file', JSON.stringify(fromFile));
+    check('and the pipe itself did not connect', pipeConnected !== true, String(pipeConnected));
+    client.close();
+  } finally {
+    try { lock.release({ dataDir: dir }); } catch { /* already released */ }
+  }
 }
 
 // ─── Final safety check ─────────────────────────────────────────────────────
@@ -2171,6 +2843,13 @@ async function main() {
   if (isWindows) await testPersonalRefusedInServerMode();
   if (isWindows) await testDashboardRunningBlocksMigration();
   await testReopenDb();
+  if (isWindows) await testScExeEverywhere();
+  if (isWindows) await testElevation();
+  if (isWindows) await testStatusAgainstWindows();
+  await testRestartCounting();
+  if (isWindows) await testInstallWait();
+  if (isWindows) await testRepairWhileRunning();
+  await testAgentStateFile();
   assertNoRealArtifacts();
 
   const failed = results.filter((r) => !r.passed);

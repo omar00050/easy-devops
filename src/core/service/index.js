@@ -65,8 +65,18 @@ const STATE_KEY = 'service-state';
 /** The two Windows modes. */
 export const MODES = Object.freeze({ SERVER: 'server', PERSONAL: 'personal' });
 
-/** How long to wait for the daemon's heartbeat after starting a service. */
-export const STARTUP_GRACE_MS = 10_000;
+/**
+ * How long to wait for the daemon's heartbeat after starting a service.
+ *
+ * 45 s, not the 10 s it was: the first start of a freshly copied node.exe on
+ * Windows Server is routinely slow (Defender scans the new binary before it
+ * may run), and 1.4.0 reported "Install failed" for a daemon that came up a
+ * few seconds after it stopped waiting.
+ */
+export const STARTUP_GRACE_MS = 45_000;
+
+/** How often a long wait says it is still waiting. */
+const WAIT_PROGRESS_MS = 5_000;
 
 /** How long to wait for a stopping daemon to actually release its lock. */
 export const STOP_GRACE_MS = 15_000;
@@ -165,14 +175,19 @@ export async function suggestWindowsMode({ run = shellRun } = {}) {
  * @param {number} [opts.timeoutMs]
  * @returns {Promise<{ alive: boolean, waitedMs: number, lock: Object|null }>}
  */
-export async function waitForDaemon({ dataDir, timeoutMs = STARTUP_GRACE_MS } = {}) {
+export async function waitForDaemon({ dataDir, timeoutMs = STARTUP_GRACE_MS, onProgress = null } = {}) {
   const started = Date.now();
   const deadline = started + timeoutMs;
+  let nextProgress = started + WAIT_PROGRESS_MS;
 
   while (Date.now() < deadline) {
     const state = inspectLock({ dataDir });
     if (state.running) {
       return { alive: true, waitedMs: Date.now() - started, lock: state.lock };
+    }
+    if (onProgress && Date.now() >= nextProgress) {
+      nextProgress += WAIT_PROGRESS_MS;
+      try { onProgress(Date.now() - started, timeoutMs); } catch { /* a progress line must not break the wait */ }
     }
     await new Promise((r) => setTimeout(r, Math.min(500, HEARTBEAT_INTERVAL_MS)));
   }
@@ -405,6 +420,22 @@ async function installWindowsServer({ entry, root, log, legacyResult, deps = {} 
   // is reused rather than refused.
   const migrating = !(deps.isServerMode ?? isServerMode)();
 
+  // Elevation is checked for real BEFORE anything is copied or migrated. A
+  // normal terminal used to get through the write probe, move the data, and
+  // then meet a UAC prompt for the unsigned wrapper half way through.
+  const elevationProbe = deps.isElevated ?? ws.isElevated;
+  const elevated = elevationProbe ? await elevationProbe({}) : null;
+  if (elevated === false) {
+    return {
+      ok: false,
+      mechanism: 'winsw',
+      mode: MODES.SERVER,
+      needsElevation: true,
+      reason: (ws.elevationMessage ?? windowsService.elevationMessage)(),
+      legacy: legacyResult,
+    };
+  }
+
   if (migrating) {
     // A dashboard started from the menu holds the per-user database open. It
     // would make the backup rename fail, and it would keep writing to a copy
@@ -453,6 +484,22 @@ async function installWindowsServer({ entry, root, log, legacyResult, deps = {} 
     log,
     ...(deps.windowsServiceOpts ?? {}),
   });
+
+  // Recorded as soon as the service is registered and the grants are in —
+  // not only after the heartbeat. Otherwise a slow first start left a
+  // registered, granted service with no record, and `status` compared its
+  // ACLs against an empty list.
+  if (installed.ok || installed.registered) {
+    record({
+      mode: MODES.SERVER,
+      mechanism: 'winsw',
+      nodeExe: installed.runtime?.nodeExe ?? null,
+      entry: installed.runtime?.entry ?? entry,
+      dataDir,
+      granted: installed.granted ?? [],
+    });
+  }
+
   if (!installed.ok) {
     // Server mode is deliberately KEPT after a failed install. The data was
     // copied and verified and the original is still on disk, so nothing is at
@@ -475,30 +522,51 @@ async function installWindowsServer({ entry, root, log, legacyResult, deps = {} 
     };
   }
 
-  const alive = await waitForDaemon({ dataDir, timeoutMs: deps.startupGraceMs ?? STARTUP_GRACE_MS });
+  log('Waiting for the daemon to report in (the first start can take a while)…');
+  const alive = await waitForDaemon({
+    dataDir,
+    timeoutMs: deps.startupGraceMs ?? STARTUP_GRACE_MS,
+    onProgress: (waited, limit) => log(`  still waiting… ${Math.round(waited / 1000)}s of ${Math.round(limit / 1000)}s`),
+  });
   if (!alive.alive) {
+    // Out of time is not the same as failed. If Windows reports the service
+    // RUNNING, the daemon is most likely still initialising (a first start of
+    // the copied node.exe is slow while Defender scans it): the install is
+    // done, and saying "Install failed" would be wrong.
+    const scState = ws.queryState ? await ws.queryState({}) : null;
+    if (scState === 'RUNNING' || scState === 'START_PENDING') {
+      return {
+        ok: true,
+        stillInitialising: true,
+        mechanism: 'winsw',
+        mode: MODES.SERVER,
+        dataDir,
+        migrated: switched.migrated,
+        backup: switched.backup,
+        originalAt: switched.originalAt ?? null,
+        granted: installed.granted,
+        aclFailures: installed.aclFailures,
+        runtime: installed.runtime,
+        daemon: { pid: null, waitedMs: alive.waitedMs },
+        detail: 'The service is started and still initialising; check with ezz service status in a minute.',
+        legacy: legacyResult,
+      };
+    }
+
     const logs = ws.readLogs({ lines: 25, which: 'err' });
     return {
       ok: false,
       mechanism: 'winsw',
       mode: MODES.SERVER,
       reason: `the service was registered and started, but the daemon did not report in within `
-        + `${Math.round(alive.waitedMs / 1000)}s — so it is starting and failing.\n\n`
-        + `Last log lines (${logs.file}):\n${logs.output}`,
+        + `${Math.round(alive.waitedMs / 1000)}s and Windows reports it ${scState ? scState.toLowerCase() : 'in an unknown state'}.\n\n`
+        + `Last log lines (${logs.file}):\n${logs.output}\n\n`
+        + `More: ${windowsService.TROUBLESHOOTING_URL}#logs`,
       installedButNotRunning: true,
       dataDir,
       legacy: legacyResult,
     };
   }
-
-  record({
-    mode: MODES.SERVER,
-    mechanism: 'winsw',
-    nodeExe: installed.runtime?.nodeExe ?? null,
-    entry: installed.runtime?.entry ?? entry,
-    dataDir,
-    granted: installed.granted ?? [],
-  });
 
   return {
     ok: true,
@@ -1036,10 +1104,35 @@ export async function status({ cache = false, coldWaitMs, deps = {} } = {}) {
   };
 
   if (out.service.crashLooping) {
+    const crashes = out.service.crashRestarts ?? out.service.restarts;
     out.warnings.push(
-      `The service is in a crash loop: ${out.service.restarts} restart(s) recorded. `
+      `The service is in a crash loop: ${crashes} unclean restart(s) in the last 10 minutes. `
       + 'It starts and dies rather than staying up. `ezz service logs` shows why.',
     );
+  }
+
+  // The record and Windows must agree. When they do not, say which way and
+  // what to run — 1.4.0 reported "Installed: yes" for a service Windows did
+  // not have (sc query: 1060).
+  if (isWindows && mech.mode === MODES.SERVER) {
+    if (out.service.registered === false && (recorded.mechanism === 'winsw' || out.service.filesPresent)) {
+      out.warnings.push(
+        'Easy DevOps has a Server-mode install on record, but Windows has no EasyDevOps service '
+        + '(sc.exe query: 1060). Run `ezz service install` in an Administrator PowerShell to register it again.',
+      );
+    } else if (out.service.mismatch) {
+      out.warnings.push(`${out.service.mismatch}. Run \`ezz service install\` in an Administrator PowerShell.`);
+    }
+
+    // A daemon holding the lock while Windows says the service is not running
+    // was started some other way (by hand, or a dashboard) — worth naming.
+    if (out.service.installed && out.service.state && !out.service.running && lock.running
+        && out.service.state !== 'unknown') {
+      out.warnings.push(
+        `Windows reports the service ${out.service.state}, but a daemon is running (pid ${lock.lock?.pid}) — `
+        + 'it was not started by the service.',
+      );
+    }
   }
 
   // Installed but the daemon is not reporting in: the most useful single thing
@@ -1155,6 +1248,13 @@ export async function repair({ log = () => {}, deps = {} } = {}) {
       appRoot: appRoot(),
       config: loadConfig(),
       log,
+      // Repair restores the previous runtime if the daemon does not come up,
+      // and "came up" means its heartbeat — not the service manager's word.
+      waitForStart: () => waitForDaemon({
+        dataDir,
+        timeoutMs: deps.startupGraceMs ?? STARTUP_GRACE_MS,
+        onProgress: (waited, limit) => log(`  still waiting… ${Math.round(waited / 1000)}s of ${Math.round(limit / 1000)}s`),
+      }),
       ...(deps.windowsServiceOpts ?? {}),
     });
     if (result.ok) {

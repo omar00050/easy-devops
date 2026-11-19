@@ -28,7 +28,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { run as shellRun } from '../shell.js';
-import { programDataDir, isWindows } from '../platform.js';
+import { programDataDir, isWindows, WINDOWS_SC, windowsElevationCheckCmd } from '../platform.js';
 import {
   SERVICE_ID,
   SERVICE_DISPLAY_NAME,
@@ -106,18 +106,50 @@ export function canWriteProgramData() {
   }
 }
 
+/** Where the troubleshooting guide lives, for links in messages. */
+export const TROUBLESHOOTING_URL = 'https://easy-devops.devxor.team/docs/troubleshooting';
+
 /** The message to print when elevation is missing. */
-export function elevationMessage() {
+export function elevationMessage(command = 'ezz service install') {
   return [
-    'Installing the Windows service needs an Administrator terminal.',
+    'Server mode needs an elevated terminal, and this one is not.',
+    'Nothing was copied, migrated or registered.',
     '',
-    'Right-click PowerShell → "Run as administrator", then:',
+    'Open PowerShell with "Run as administrator" and run the command again:',
     '',
-    '  ezz service install',
+    `  ${command}`,
     '',
     'You will not be asked for a password: the service runs as the virtual',
     'account NT SERVICE\\EasyDevOps, which Windows manages itself.',
+    `More: ${TROUBLESHOOTING_URL}#uac-unknown-publisher`,
   ].join('\n');
+}
+
+/**
+ * One line explaining the UAC prompt, printed before the wrapper is called
+ * when elevation could not be confirmed. WinSW is not code-signed, so Windows
+ * shows "Unknown publisher" for EasyDevOps.exe; it is still the pinned binary.
+ */
+export const UAC_NOTE = `If Windows asks for permission for ${WINSW_EXE_NAME} ("Unknown publisher"): `
+  + 'it is WinSW, the open-source service wrapper, verified by SHA-256 before use and not code-signed.';
+
+/**
+ * Whether this process runs elevated — asked of Windows, not inferred.
+ *
+ * canWriteProgramData() alone was not enough: when `C:\ProgramData\easy-devops`
+ * does not exist yet it probes ProgramData itself, where ordinary users may
+ * create folders, so a normal terminal passed it, migrated the data, and then
+ * triggered a UAC prompt for the unsigned wrapper. This is the check that runs
+ * before any Server-mode step.
+ *
+ * @returns {Promise<boolean|null>} null when PowerShell gave no usable answer
+ */
+export async function isElevated({ run = shellRun } = {}) {
+  const result = await run(windowsElevationCheckCmd(), { timeout: 20_000 });
+  const output = `${result?.stdout ?? ''}`.trim();
+  if (/^true$/im.test(output)) return true;
+  if (/^false$/im.test(output)) return false;
+  return null;
 }
 
 /** Combined output of a shell result, trimmed. */
@@ -135,7 +167,7 @@ function outputOf(result) {
  * @returns {Promise<boolean|null>} null when `sc` itself gave no usable answer
  */
 export async function isRegistered({ run = shellRun } = {}) {
-  const result = await run(`sc query ${SERVICE_ID}`, { timeout: 20_000 });
+  const result = await run(`${WINDOWS_SC} query ${SERVICE_ID}`, { timeout: 20_000 });
   const output = outputOf(result);
   if (result.success || /STATE\s*:/i.test(output)) return true;
   if (/1060|does not exist/i.test(output)) return false;
@@ -166,8 +198,8 @@ export async function unregister({ run = shellRun, log = () => {} } = {}) {
   const still = await isRegistered({ run });
   if (still === false) return { ok: true, removed };
 
-  await run(`sc stop ${SERVICE_ID}`, { timeout: 60_000 });
-  const deleted = await run(`sc delete ${SERVICE_ID}`, { timeout: 30_000 });
+  await run(`${WINDOWS_SC} stop ${SERVICE_ID}`, { timeout: 60_000 });
+  const deleted = await run(`${WINDOWS_SC} delete ${SERVICE_ID}`, { timeout: 30_000 });
   const output = outputOf(deleted);
 
   if (deleted.success || /1060|does not exist/i.test(output)) {
@@ -181,7 +213,7 @@ export async function unregister({ run = shellRun, log = () => {} } = {}) {
       reason: 'Windows has marked the service for deletion; close services.msc (or reboot) to finish it.',
     };
   }
-  return { ok: false, removed, reason: output.slice(0, 400) || `sc delete ${SERVICE_ID} failed` };
+  return { ok: false, removed, reason: output.slice(0, 400) || `${WINDOWS_SC} delete ${SERVICE_ID} failed` };
 }
 
 /** Removes the wrapper 1.4.0 left under its release name. Best effort. */
@@ -235,7 +267,9 @@ export async function install({
 } = {}) {
   if (!(deps.isWindows ?? isWindows)) return { ok: false, reason: 'Server mode is Windows-only' };
 
-  if (!(deps.canWrite ?? canWriteProgramData)()) {
+  // A real elevation check first; the write probe stays as a second opinion.
+  const elevated = await (deps.isElevated ?? (() => isElevated({ run })))();
+  if (elevated === false || !(deps.canWrite ?? canWriteProgramData)()) {
     return { ok: false, reason: elevationMessage(), needsElevation: true };
   }
 
@@ -309,6 +343,9 @@ export async function install({
   // `EasyDevOps.exe`. Passing it suggested otherwise, which is how the name
   // mismatch went unnoticed.
   log('Registering the service…');
+  // Elevation is confirmed in the normal case, so no prompt appears. When it
+  // could not be confirmed, say what a prompt would be before it shows up.
+  if (elevated !== true) log(UAC_NOTE);
   const registered = await run(`& "${winswPath()}" install`, { timeout: 120_000 });
   if (!registered.success) {
     const output = outputOf(registered);
@@ -359,8 +396,13 @@ export async function install({
     return {
       ok: false,
       reason: `the service was registered but would not start:\n${output.slice(0, 400)}\n\n`
-        + `Logs: ${errLogPath()}`,
+        + `Logs: ${errLogPath()} — more at ${TROUBLESHOOTING_URL}#logs`,
       registered: true,
+      // Registration and the grants did succeed, and the caller records them:
+      // status must not report a registered service as "not installed".
+      granted: acl.applied.map((g) => g.path),
+      aclFailures: acl.failed,
+      runtime: { nodeExe: runtime.nodeExe, entry: runtime.entry, version: native.version, abi: native.abi },
     };
   }
 
@@ -383,7 +425,7 @@ export async function install({
 export async function uninstall({ dataDir, config = {}, log = () => {}, run = shellRun } = {}) {
   if (!isWindows) return { ok: false, reason: 'Server mode is Windows-only' };
 
-  if (!canWriteProgramData()) {
+  if ((await isElevated({ run })) === false || !canWriteProgramData()) {
     return {
       ok: false,
       needsElevation: true,
@@ -423,16 +465,52 @@ export async function uninstall({ dataDir, config = {}, log = () => {}, run = sh
   return { ok: true, notes };
 }
 
-/** `winsw restart`. */
+/** `winsw restart`. Calls the wrapper, so it needs elevation like install. */
 export async function restart({ run = shellRun } = {}) {
   if (!fs.existsSync(winswPath())) {
     return { ok: false, reason: 'the service is not installed' };
+  }
+  const elevated = await isElevated({ run });
+  if (elevated === false) {
+    return { ok: false, needsElevation: true, reason: elevationFor('Restarting') };
   }
   const result = await run(`& "${winswPath()}" restart`, { timeout: 90_000 });
   return {
     ok: result.success,
     reason: result.success ? null : `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 400),
   };
+}
+
+/**
+ * The Service Control Manager's state for SERVICE_ID: 'RUNNING', 'STOPPED',
+ * 'START_PENDING'…, 'MISSING' (1060) or null when `sc.exe` gave no answer.
+ */
+export async function queryState({ run = shellRun } = {}) {
+  const result = await run(`${WINDOWS_SC} query ${SERVICE_ID}`, { timeout: 20_000 });
+  const output = outputOf(result);
+  const match = output.match(/STATE\s*:\s*\d+\s+(\w+)/i);
+  if (match) return match[1].toUpperCase();
+  if (/1060|does not exist/i.test(output)) return 'MISSING';
+  return null;
+}
+
+/**
+ * Polls until the service reaches `wanted`, or the time runs out.
+ *
+ * Needed after a stop: `sc.exe stop` returns while the service is still
+ * STOP_PENDING, and node.exe stays locked until its process has exited — a
+ * copy over it in that window fails with EBUSY, which is how 1.4.0's repair
+ * failed. STOPPED is reported only once the wrapper's child is gone.
+ */
+export async function waitForState({ wanted, run = shellRun, timeoutMs = 30_000, intervalMs = 500 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let state = null;
+  while (Date.now() < deadline) {
+    state = await queryState({ run });
+    if (state === wanted || (wanted === 'STOPPED' && state === 'MISSING')) return { reached: true, state };
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return { reached: false, state };
 }
 
 /**
@@ -444,9 +522,11 @@ export async function restart({ run = shellRun } = {}) {
  * "Access is denied" with no explanation.
  */
 function elevationFor(action) {
+  // "Stopping" → `ezz service stop`. It used to print `ezz service stopping`.
+  const verb = { Stopping: 'stop', Starting: 'start', Restarting: 'restart' }[action] ?? action.toLowerCase();
   return `${action} the Windows service needs an Administrator terminal.\n\n`
-    + '  Right-click PowerShell → "Run as administrator", then:\n'
-    + `    ezz service ${action.toLowerCase()}\n\n`
+    + '  Open PowerShell with "Run as administrator" and run the command again:\n'
+    + `    ezz service ${verb}\n\n`
     + '  No password is needed — only elevation.';
 }
 
@@ -455,18 +535,19 @@ function elevationFor(action) {
  * it starts again at the next boot. `ezz service uninstall` is the permanent
  * removal.
  */
-export async function stop({ run = shellRun } = {}) {
-  if (!fs.existsSync(winswPath())) {
+export async function stop({ run = shellRun, stopWaitMs = 30_000 } = {}) {
+  // Windows is asked, not the files: a registration whose wrapper is gone can
+  // still be stopped, and files without a registration cannot.
+  if ((await isRegistered({ run })) === false) {
     return { ok: false, reason: 'the service is not installed, so there is nothing to stop' };
   }
 
-  // `sc stop` rather than `winsw stop`: it is the Service Control Manager's own
-  // verb, so it works even when the WinSW wrapper binary is missing or broken,
-  // and its "Access is denied" is the authoritative answer on elevation.
-  const result = await run(`sc stop ${SERVICE_ID}`, { timeout: 60_000 });
+  // `sc.exe stop` rather than `winsw stop`: it is the Service Control
+  // Manager's own verb, so it works even when the WinSW wrapper binary is
+  // missing or broken, and its "Access is denied" is the authoritative answer
+  // on elevation.
+  const result = await run(`${WINDOWS_SC} stop ${SERVICE_ID}`, { timeout: 60_000 });
   const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
-
-  if (result.success) return { ok: true };
 
   if (/Access is denied/i.test(output)) {
     return { ok: false, needsElevation: true, reason: elevationFor('Stopping') };
@@ -475,17 +556,30 @@ export async function stop({ run = shellRun } = {}) {
   if (/1062|has not been started/i.test(output)) {
     return { ok: true, alreadyStopped: true };
   }
+  if (!result.success) {
+    return { ok: false, reason: output.trim().slice(0, 400) || `${WINDOWS_SC} stop ${SERVICE_ID} failed` };
+  }
 
-  return { ok: false, reason: output.trim().slice(0, 400) || `sc stop ${SERVICE_ID} failed` };
+  // Accepted is not stopped. Callers replace files the process holds open
+  // (repair, update, runtime update), so this returns only once it is gone.
+  const settled = await waitForState({ wanted: 'STOPPED', run, timeoutMs: stopWaitMs });
+  if (!settled.reached) {
+    return {
+      ok: false,
+      reason: `the stop was accepted but the service was still ${settled.state ?? 'not reporting'} after `
+        + `${Math.round(stopWaitMs / 1000)}s. Check the wrapper log: ${wrapperLogPath()}`,
+    };
+  }
+  return { ok: true };
 }
 
-/** `sc start`. */
+/** `sc.exe start`. */
 export async function start({ run = shellRun } = {}) {
-  if (!fs.existsSync(winswPath())) {
+  if ((await isRegistered({ run })) === false) {
     return { ok: false, reason: 'the service is not installed; run `ezz service install` first' };
   }
 
-  const result = await run(`sc start ${SERVICE_ID}`, { timeout: 60_000 });
+  const result = await run(`${WINDOWS_SC} start ${SERVICE_ID}`, { timeout: 60_000 });
   const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
 
   if (result.success) return { ok: true };
@@ -498,7 +592,7 @@ export async function start({ run = shellRun } = {}) {
     return { ok: true, alreadyRunning: true };
   }
 
-  return { ok: false, reason: output.trim().slice(0, 400) || `sc start ${SERVICE_ID} failed` };
+  return { ok: false, reason: output.trim().slice(0, 400) || `${WINDOWS_SC} start ${SERVICE_ID} failed` };
 }
 
 /**
@@ -510,48 +604,88 @@ export async function start({ run = shellRun } = {}) {
  * Manager. WinSW logs each start, and counting those within a window is what
  * actually reveals it.
  *
+ * ── What counts ────────────────────────────────────────────────────────────
+ *
+ * Only a real process start: WinSW's "Started process <pid>", which the
+ * service-mode instance writes when it launches the daemon. 1.4.0 counted
+ * every line containing "Starting", and every CLI call of the wrapper writes
+ * "Starting WinSW in console mode" — so `install`, `start` and `restart`
+ * alone produced a "crash loop" on a perfectly healthy service.
+ *
+ * And a start is a CRASH restart only when the process before it did not stop
+ * cleanly. A service stop, restart, update or repair logs "Stopping …" and
+ * "Process <pid> canceled with code 0" first; a daemon that died on its own
+ * does not. So a stop followed by a start is a restart, not a crash.
+ *
  * @param {Object} [opts]
  * @param {number} [opts.windowMs] How far back to look (default 10 minutes)
- * @returns {{ restarts: number, crashLooping: boolean, since: Date|null }}
+ * @param {string} [opts.text]     The log text, for tests (default: the wrapper log)
+ * @returns {{ restarts: number, cleanRestarts: number, crashRestarts: number,
+ *             crashLooping: boolean, since: Date|null }}
  */
-export function countRecentRestarts({ windowMs = 10 * 60_000, now = Date.now() } = {}) {
-  let text;
-  try {
-    text = fs.readFileSync(wrapperLogPath(), 'utf8');
-  } catch {
-    return { restarts: 0, crashLooping: false, since: null };
+export function countRecentRestarts({ windowMs = 10 * 60_000, now = Date.now(), text = null } = {}) {
+  const none = { restarts: 0, cleanRestarts: 0, crashRestarts: 0, crashLooping: false, since: null };
+
+  if (text === null) {
+    try {
+      text = fs.readFileSync(wrapperLogPath(), 'utf8');
+    } catch {
+      return none;
+    }
   }
 
   // WinSW writes lines like:
-  //   2026-11-14 04:17:03,123 INFO  - Starting <exe>
+  //   2026-11-14 04:17:03,123 INFO  - Started process 12700
   // Only the tail is examined: a months-old log is large and its early history
   // says nothing about whether the service is looping right now.
   const lines = text.split(/\r?\n/).slice(-4000);
   const cutoff = now - windowMs;
 
+  const CLEAN_STOP = /\bStopping\b|canceled with code 0\b|finished with (code )?0\b|exited with code 0\b/i;
+  const STARTED = /\bStarted process\s+\d+/i;
+
+  let sawProcess = false;   // a daemon process was started earlier in the log
+  let cleanSince = false;   // ...and it was stopped cleanly since then
   let restarts = 0;
-  let earliest = null;
+  let cleanRestarts = 0;
+  let crashRestarts = 0;
+  let earliestCrash = null;
 
   for (const line of lines) {
-    if (!/\b(Starting|Restarting)\b/i.test(line)) continue;
+    if (CLEAN_STOP.test(line)) {
+      cleanSince = true;
+      continue;
+    }
+    if (!STARTED.test(line)) continue;
 
     const stamp = line.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/);
-    if (!stamp) continue;
+    const at = stamp ? Date.parse(`${stamp[1]}T${stamp[2]}`) : NaN;
+    const inWindow = Number.isFinite(at) && at >= cutoff;
 
-    const at = Date.parse(`${stamp[1]}T${stamp[2]}`);
-    if (!Number.isFinite(at) || at < cutoff) continue;
+    // The first process in the log is a start, not a restart.
+    if (sawProcess && inWindow) {
+      restarts++;
+      if (cleanSince) {
+        cleanRestarts++;
+      } else {
+        crashRestarts++;
+        if (earliestCrash === null || at < earliestCrash) earliestCrash = at;
+      }
+    }
 
-    restarts++;
-    if (earliest === null || at < earliest) earliest = at;
+    sawProcess = true;
+    cleanSince = false;
   }
 
-  // Three starts in ten minutes is not normal operation: the daemon is meant
-  // to start once and stay up. One or two can be a deliberate restart plus an
-  // upgrade, so the threshold is above that.
+  // Three unclean restarts in ten minutes is not normal operation: WinSW's
+  // backoff is 5 s, 20 s, then a minute, so that is a daemon dying on its own.
+  // Deliberate restarts never count towards it.
   return {
     restarts,
-    crashLooping: restarts >= 3,
-    since: earliest ? new Date(earliest) : null,
+    cleanRestarts,
+    crashRestarts,
+    crashLooping: crashRestarts >= 3,
+    since: earliestCrash ? new Date(earliestCrash) : null,
   };
 }
 
@@ -562,29 +696,37 @@ export function countRecentRestarts({ windowMs = 10 * 60_000, now = Date.now() }
  * @returns {Promise<Object>}
  */
 export async function status({ dataDir, config = {}, run = shellRun, granted = [] } = {}) {
-  const installed = fs.existsSync(winswPath()) && fs.existsSync(serviceXmlPath());
+  const filesPresent = fs.existsSync(winswPath()) && fs.existsSync(serviceXmlPath());
 
-  if (!installed) {
+  // Windows is the authority on whether the service exists — not the files.
+  // 1.4.0 said "Installed: yes" from the files alone while `sc query` answered
+  // 1060, and (through the Set-Content alias) could not read the state at all.
+  const scState = await queryState({ run });
+  const registered = scState === 'MISSING' ? false : scState ? true : null;
+
+  if (registered === false || (registered === null && !filesPresent)) {
     return {
       installed: false,
+      registered,
+      filesPresent,
       running: false,
       enabledOnBoot: false,
       state: 'not installed',
       restarts: 0,
+      cleanRestarts: 0,
+      crashRestarts: 0,
       crashLooping: false,
       winswPath: winswPath(),
+      // Files left behind without a registration: a removed or never-finished
+      // install. Said explicitly, because "not installed" alone is confusing
+      // when the wrapper is sitting right there.
+      mismatch: filesPresent && registered === false
+        ? `${WINSW_EXE_NAME} and ${WINSW_XML_NAME} are in ${binDir()}, but Windows has no ${SERVICE_ID} service`
+        : null,
     };
   }
 
-  // `sc query` rather than `winsw status`: it does not depend on the wrapper
-  // being runnable, so a broken WinSW still reports a registered service.
-  const query = await run(`sc query ${SERVICE_ID}`, { timeout: 20_000 });
-  const output = `${query.stdout ?? ''}\n${query.stderr ?? ''}`;
-
-  const stateMatch = output.match(/STATE\s*:\s*\d+\s+(\w+)/i);
-  const scState = stateMatch ? stateMatch[1].toUpperCase() : null;
-
-  const config2 = await run(`sc qc ${SERVICE_ID}`, { timeout: 20_000 });
+  const config2 = await run(`${WINDOWS_SC} qc ${SERVICE_ID}`, { timeout: 20_000 });
   const startType = `${config2.stdout ?? ''}`.match(/START_TYPE\s*:\s*\d+\s+([\w_]+)/i)?.[1] ?? null;
 
   const loop = countRecentRestarts();
@@ -601,11 +743,20 @@ export async function status({ dataDir, config = {}, run = shellRun, granted = [
 
   return {
     installed: true,
+    registered,
+    filesPresent,
+    // Registered, but the wrapper or its definition is missing: the service
+    // cannot start. A reinstall puts them back.
+    mismatch: registered && !filesPresent
+      ? `Windows has a ${SERVICE_ID} service, but ${WINSW_EXE_NAME} or ${WINSW_XML_NAME} is missing from ${binDir()}`
+      : null,
     running: scState === 'RUNNING',
     enabledOnBoot: startType ? /AUTO_START/i.test(startType) : null,
     state: scState ? scState.toLowerCase() : 'unknown',
     startType,
     restarts: loop.restarts,
+    cleanRestarts: loop.cleanRestarts,
+    crashRestarts: loop.crashRestarts,
     crashLooping: loop.crashLooping,
     crashLoopSince: loop.since,
     acl: aclCheck,
@@ -642,54 +793,122 @@ export function readLogs({ lines = 50, which = 'out' } = {}) {
  * and the runtime copy, when the application is upgraded under it. Both are
  * re-done; the service is then restarted so it picks them up.
  */
-export async function repair({ dataDir, appRoot, config = {}, log = () => {}, run = shellRun } = {}) {
-  if (!isWindows) return { ok: false, reason: 'Server mode is Windows-only' };
+export async function repair({
+  dataDir,
+  appRoot,
+  config = {},
+  log = () => {},
+  run = shellRun,
+  waitForStart = async () => ({ alive: true }),
+  deps = {},
+} = {}) {
+  if (!(deps.isWindows ?? isWindows)) return { ok: false, reason: 'Server mode is Windows-only' };
 
-  if (!canWriteProgramData()) {
-    return {
-      ok: false,
-      needsElevation: true,
-      reason: 'Repairing the Windows service needs an Administrator terminal.\n\n'
-        + '  Right-click PowerShell → "Run as administrator", then: ezz service repair',
-    };
+  const elevated = await (deps.isElevated ?? (() => isElevated({ run })))();
+  if (elevated === false || !(deps.canWrite ?? canWriteProgramData)()) {
+    return { ok: false, needsElevation: true, reason: elevationMessage('ezz service repair') };
   }
 
-  if (!fs.existsSync(winswPath())) {
+  if (!fs.existsSync(winswPath()) || (await isRegistered({ run })) === false) {
     return { ok: false, reason: 'the service is not installed; run `ezz service install` instead' };
   }
 
   // The wrapper itself is re-verified: a tampered or truncated WinSW is worth
   // catching at repair time too, not only at install.
-  const wrapper = await verifyWinsw(winswPath());
+  const wrapper = await (deps.verifyWinsw ?? verifyWinsw)(winswPath());
   if (!wrapper.ok) {
     log('The installed WinSW did not verify; re-downloading.');
-    const again = await downloadWinsw({ dest: winswPath(), log });
+    const again = await downloadWinsw({ dest: winswPath(), log, verify: deps.verifyWinsw });
     if (!again.ok) return { ok: false, reason: again.reason };
   }
 
-  log('Refreshing the runtime copy…');
-  const runtime = copyRuntime({ dataDir, appRoot, log });
-  if (!runtime.ok) return { ok: false, reason: runtime.reason };
+  // ── The runtime copy cannot be replaced while the service runs ──────────
+  //
+  // Windows locks a running executable: 1.4.0 copied over runtime\node.exe
+  // with the service up and failed with EBUSY. So: stop, keep the current
+  // copy aside as `runtime.prev` (a rename — same volume, instant), copy,
+  // verify, start, and wait for the daemon's own heartbeat. Any failure after
+  // the stop puts the previous copy back and starts it again.
+  const dir = runtimeDir(dataDir);
+  const prev = `${dir}.prev`;
 
-  const native = await verifyNativeModules({
+  log('Stopping the service so the runtime copy can be replaced…');
+  const stopped = await stop({ run, stopWaitMs: deps.stopWaitMs ?? 30_000 });
+  if (!stopped.ok) {
+    return { ok: false, reason: `the service could not be stopped first, so nothing was changed: ${stopped.reason}` };
+  }
+
+  const startAgain = async () => {
+    const started = await start({ run });
+    if (!started.ok) return { ok: false, reason: started.reason };
+    const alive = await waitForStart();
+    return alive.alive ? { ok: true } : { ok: false, reason: 'the daemon did not report in' };
+  };
+
+  const restorePrevious = async (why) => {
+    log(`Restoring the previous runtime copy (${why})…`);
+    // A new copy that started but never reported in still holds its files.
+    await stop({ run, stopWaitMs: deps.stopWaitMs ?? 30_000 });
+    let restored = false;
+    try {
+      if (fs.existsSync(prev)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+        fs.renameSync(prev, dir);
+        restored = true;
+      }
+    } catch (err) {
+      log(`  could not restore ${prev}: ${err.message}`);
+    }
+    const back = await startAgain();
+    return {
+      ok: false,
+      reason: `${why}. `
+        + (restored ? 'The previous runtime copy was restored' : 'The previous runtime copy could not be restored')
+        + (back.ok ? ' and the service is running on it again.' : `, and the service did not start again: ${back.reason}.`)
+        + `\nLogs: ${errLogPath()} — more at ${TROUBLESHOOTING_URL}#repair-while-running`,
+      restored,
+      restarted: back.ok,
+    };
+  };
+
+  try {
+    fs.rmSync(prev, { recursive: true, force: true });
+    if (fs.existsSync(dir)) fs.renameSync(dir, prev);
+  } catch (err) {
+    const back = await startAgain();
+    return {
+      ok: false,
+      reason: `could not set the current runtime copy aside (${err.code ?? err.message}), so nothing was changed`
+        + (back.ok ? '; the service is running again.' : `; the service did not start again: ${back.reason}`),
+    };
+  }
+
+  log('Refreshing the runtime copy…');
+  const runtime = (deps.copyRuntime ?? copyRuntime)({ dataDir, appRoot, log });
+  if (!runtime.ok) return restorePrevious(`the new runtime copy failed: ${runtime.reason}`);
+
+  const native = await (deps.verifyNativeModules ?? verifyNativeModules)({
     nodeExe: runtime.nodeExe,
     appDir: path.join(runtime.dir, 'app'),
   });
-  if (!native.ok) return { ok: false, reason: `${native.reason}\n\n${native.fix ?? ''}`.trim() };
+  if (!native.ok) {
+    return restorePrevious(`the new runtime cannot load its native modules: ${`${native.reason} ${native.fix ?? ''}`.trim()}`);
+  }
 
   log('Re-applying the service account grants…');
   const grants = requiredGrants({
     dataDir,
-    runtimeDir: runtimeDir(dataDir),
+    runtimeDir: dir,
     nginxDir: config.nginxDir ?? null,
     sslDir: config.sslDir ?? null,
   });
   const acl = await applyGrants({ grants, run, log });
 
-  const restarted = await restart({ run });
-  if (!restarted.ok) {
-    return { ok: false, reason: `permissions were re-applied but the restart failed: ${restarted.reason}` };
-  }
+  log('Starting the service…');
+  const started = await startAgain();
+  if (!started.ok) return restorePrevious(`the service did not come up on the new copy: ${started.reason}`);
+
+  try { fs.rmSync(prev, { recursive: true, force: true }); } catch { /* `ezz cleanup` offers it later */ }
 
   return {
     ok: true,

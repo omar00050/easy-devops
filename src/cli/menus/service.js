@@ -172,8 +172,16 @@ export async function showStatus() {
   const daemonDot = d.running ? dot(true) : s.stoppedByUser ? chalk.yellow('●') : dot(false);
   console.log(`  Daemon         ${daemonDot} ${daemonLine}`);
 
+  // Clean restarts (a stop, restart, update or repair) and crash restarts are
+  // told apart: only the second kind is a problem, and only it can make a
+  // crash loop.
   if (s.service.restarts) {
-    console.log(`  Restarts       ${s.service.crashLooping ? chalk.red(s.service.restarts) : s.service.restarts}`);
+    const crashes = s.service.crashRestarts ?? 0;
+    const clean = s.service.cleanRestarts ?? (s.service.restarts - crashes);
+    const parts = [];
+    if (clean) parts.push(`${clean} clean (stop/restart)`);
+    if (crashes) parts.push(s.service.crashLooping ? chalk.red(`${crashes} after a crash`) : `${crashes} after a crash`);
+    console.log(`  Restarts       ${parts.join(', ')} ${chalk.gray('in the last 10 min')}`);
   }
 
   console.log(`  Data directory ${chalk.gray(s.dataDir)}${s.serverMode ? chalk.gray('  (server mode)') : ''}`);
@@ -374,6 +382,8 @@ async function doInstall() {
       console.log('  ' + chalk.gray('No password is needed — only elevation.'));
     }
     console.log();
+    console.log('  ' + chalk.gray('Troubleshooting: https://easy-devops.devxor.team/docs/troubleshooting'));
+    console.log();
     return 1;
   }
 
@@ -415,6 +425,17 @@ async function doInstall() {
 
   if (result.daemon?.pid) {
     console.log('  ' + chalk.gray(`Daemon reported in after ${Math.round(result.daemon.waitedMs / 1000)}s (pid ${result.daemon.pid})`));
+  }
+
+  // Out of waiting time while Windows reports the service RUNNING: installed,
+  // just slow to initialise on its first start. Not a failure, so the status
+  // table (which would show the daemon as not yet running) is not printed.
+  if (result.stillInitialising) {
+    console.log('  ' + chalk.yellow('Started, still initialising.'));
+    console.log('  ' + chalk.gray('The first start can be slow while Windows scans the new runtime.'));
+    console.log('  ' + chalk.gray('Check with ') + chalk.white('ezz service status') + chalk.gray(' in a minute.'));
+    console.log();
+    return 0;
   }
 
   console.log();
@@ -695,6 +716,8 @@ async function doStart() {
       console.log('  ' + chalk.gray('No password is needed — only elevation.'));
     }
     console.log();
+    console.log('  ' + chalk.gray('Troubleshooting: https://easy-devops.devxor.team/docs/troubleshooting'));
+    console.log();
     return 1;
   }
 
@@ -792,6 +815,8 @@ async function doRepair() {
       console.log();
       console.log('  ' + chalk.gray('No password is needed — only elevation.'));
     }
+    console.log();
+    console.log('  ' + chalk.gray('Troubleshooting: https://easy-devops.devxor.team/docs/troubleshooting'));
     console.log();
     return 1;
   }

@@ -198,6 +198,31 @@ export function inspectLink(dataDir) {
  */
 const COPY_ENTRIES = ['package.json', 'src', 'node_modules', 'dist'];
 
+/** Path equality as Windows sees it: case-insensitive, separators normalised. */
+function samePath(a, b) {
+  return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+}
+
+/**
+ * copyFileSync, retried briefly on EBUSY/EPERM.
+ *
+ * A service that has just reported STOPPED can hold node.exe for a moment
+ * longer while Windows tears the process down; a few hundred milliseconds of
+ * patience turns that race into a success. Anything still locked after the
+ * retries is a real lock, and the error says so.
+ */
+function copyFileRetrying(from, to, { tries = 10, delayMs = 300 } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      fs.copyFileSync(from, to);
+      return;
+    } catch (err) {
+      if (attempt >= tries || !(err.code === 'EBUSY' || err.code === 'EPERM')) throw err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+    }
+  }
+}
+
 /**
  * Copies node.exe and the application into the runtime directory.
  *
@@ -224,10 +249,22 @@ export function copyRuntime({ dataDir, appRoot, nodeExe = process.execPath, log 
   }
 
   try {
-    fs.copyFileSync(fs.realpathSync(nodeExe), destNode);
-    log(`Copied node.exe → ${destNode}`);
+    const source = fs.realpathSync(nodeExe);
+    // The updater refreshes the copy FROM the copy's own node.exe; copying a
+    // file onto itself is at best pointless and at worst a sharing violation.
+    if (fs.existsSync(destNode) && samePath(source, fs.realpathSync(destNode))) {
+      log(`node.exe is already the runtime copy (${destNode}); kept`);
+    } else {
+      copyFileRetrying(source, destNode);
+      log(`Copied node.exe → ${destNode}`);
+    }
   } catch (err) {
-    return { ok: false, reason: `could not copy node.exe: ${err.message}` };
+    const locked = err.code === 'EBUSY' || err.code === 'EPERM';
+    return {
+      ok: false,
+      reason: `could not copy node.exe: ${err.message}`
+        + (locked ? '. Windows locks a running executable: stop the service first (ezz service stop).' : ''),
+    };
   }
 
   for (const entry of COPY_ENTRIES) {

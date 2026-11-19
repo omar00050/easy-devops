@@ -32,6 +32,8 @@ import {
 } from '../../core/hubLink.js';
 import { inspect } from '../../core/daemon/lock.js';
 import { connectToDaemon } from '../../core/daemon/ipc.js';
+import { readAgentStateFromFile } from '../../core/daemon/stateFile.js';
+import { getDataDir } from '../../core/platform.js';
 import { page, pause, BACK } from '../ui/page.js';
 
 const ACTIONS = ['connect', 'status', 'unlink'];
@@ -75,6 +77,11 @@ function say(line = '') {
  * frames over IPC (server → client only). Its hello frame carries the state at
  * connect time, so a CLI that starts after the agent connected still sees it.
  *
+ * In Windows Server mode the pipe belongs to NT SERVICE\EasyDevOps and the CLI
+ * cannot open it, so the same state is also read from the file the running
+ * daemon keeps in the data directory (core/daemon/stateFile.js) — trusted only
+ * while its pid holds the live daemon lock. Whichever answers first wins.
+ *
  * @param {Object} opts
  * @param {number} opts.timeoutMs
  * @param {(state: Object|null) => boolean} [opts.until]
@@ -86,15 +93,29 @@ function waitForAgentState({ timeoutMs, until = () => false }) {
     let finished = false;
     let client = null;
 
+    const dataDir = getDataDir();
+    let filePoll = null;
+
     const finish = (timedOut) => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      clearInterval(filePoll);
       try { client?.close(); } catch { /* already closed */ }
       resolve({ state: latest, timedOut });
     };
 
     const timer = setTimeout(() => finish(true), timeoutMs);
+
+    const fromFile = () => {
+      if (finished) return;
+      const state = readAgentStateFromFile({ dataDir });
+      if (!state) return;
+      latest = state;
+      if (until(latest)) finish(false);
+    };
+    fromFile();
+    filePoll = setInterval(fromFile, 500);
 
     client = connectToDaemon({
       onEvent(event, payload) {
