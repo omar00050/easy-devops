@@ -14,6 +14,8 @@ import { api, ApiError } from '../lib/api';
 import type {
   AuthMode,
   BackupFile,
+  DashboardUi,
+  PermissionsSetupResult,
   PermissionsSetupStatus,
   Settings,
   SettingsUpdate,
@@ -35,6 +37,7 @@ import { HubPanel } from '../components/settings/HubPanel';
 import { UpdatePanel } from '../components/settings/UpdatePanel';
 import { Card, CardBody, CardFooter, CardHeader } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
+import { CopyButton } from '../components/ui/CopyButton';
 import { Button, buttonClasses } from '../components/ui/Button';
 import { FormGrid, Select, Switch, TextInput } from '../components/ui/Field';
 import {
@@ -74,6 +77,7 @@ interface GeneralDraft {
   autoRenew: boolean;
   autoRenewDays: string;
   deployDir: string;
+  ui: DashboardUi;
 }
 
 /** Used only when the backend predates the setting and sends no limits. */
@@ -95,6 +99,7 @@ function toGeneralDraft(settings: Settings): GeneralDraft {
     autoRenew: settings.sslAutoRenew ?? true,
     autoRenewDays: String(settings.sslAutoRenewDays ?? AUTO_RENEW_FALLBACK.days),
     deployDir: settings.deployDir ?? '',
+    ui: settings.dashboardUi ?? 'classic',
   };
 }
 
@@ -202,6 +207,7 @@ export function SettingsPage() {
   // A backend older than the setting does not send it; the control is hidden
   // rather than shown as something that would silently not save.
   const autoRenewSupported = settings.data?.sslAutoRenew !== undefined;
+  const uiSupported = settings.data?.dashboardUi !== undefined;
   const autoRenewMin = settings.data?.sslAutoRenewDaysMin ?? AUTO_RENEW_FALLBACK.min;
   const autoRenewMax = settings.data?.sslAutoRenewDaysMax ?? AUTO_RENEW_FALLBACK.max;
   const autoRenewDaysNumber = general ? Number(general.autoRenewDays) : NaN;
@@ -222,6 +228,7 @@ export function SettingsPage() {
         general.nginxDir !== settings.data.nginxDir ||
         general.sslDir !== settings.data.sslDir ||
         general.acmeEmail !== settings.data.acmeEmail ||
+        (uiSupported && general.ui !== (settings.data.dashboardUi ?? 'classic')) ||
         (deployDirSupported && general.deployDir.trim() !== (settings.data.deployDir ?? '')) ||
         (autoRenewSupported &&
           (general.autoRenew !== (settings.data.sslAutoRenew ?? true) ||
@@ -239,9 +246,11 @@ export function SettingsPage() {
   );
 
   const saveGeneral = async () => {
-    if (!general || savingGeneral) return;
+    if (!general || savingGeneral || !settings.data) return;
     setGeneralTouched(true);
     if (portError || emailError || nginxDirError || sslDirError || autoRenewDaysError) return;
+    const uiChanged = uiSupported && general.ui !== (settings.data.dashboardUi ?? 'classic');
+    const portChanged = Number(general.port) !== settings.data.dashboardPort;
     setSavingGeneral(true);
     try {
       const result = await api.settings.update({
@@ -249,6 +258,7 @@ export function SettingsPage() {
         nginxDir: general.nginxDir.trim(),
         sslDir: general.sslDir.trim(),
         acmeEmail: general.acmeEmail.trim(),
+        ...(uiSupported ? { dashboardUi: general.ui } : {}),
         // Sent only when edited, so saving another field never re-validates
         // (or re-creates) the folder. Empty goes back to the default.
         ...(deployDirChanged ? { deployDir: general.deployDir.trim() } : {}),
@@ -265,7 +275,11 @@ export function SettingsPage() {
       toast.success(
         'Settings saved',
         result.needsRestart
-          ? 'Restart the dashboard for the new port to take effect.'
+          ? uiChanged && portChanged
+            ? 'Restart the dashboard for the new port and interface to take effect.'
+            : uiChanged
+              ? 'The chosen interface applies the next time the dashboard starts.'
+              : 'Restart the dashboard for the new port to take effect.'
           : undefined
       );
       settings.reload();
@@ -334,24 +348,31 @@ export function SettingsPage() {
 
   // ── Linux permissions ─────────────────────────────────────────────────────
 
-  const [sudoPassword, setSudoPassword] = useState('');
   const [permissionError, setPermissionError] = useState<string | null>(null);
   const [settingUpPermissions, setSettingUpPermissions] = useState(false);
+  const [setupResult, setSetupResult] = useState<PermissionsSetupResult | null>(null);
 
   const setupPermissions = async () => {
-    if (!sudoPassword || settingUpPermissions) return;
+    if (settingUpPermissions) return;
     setSettingUpPermissions(true);
     setPermissionError(null);
     try {
-      await api.settings.setupPermissions(sudoPassword);
-      setSudoPassword('');
-      permissions.setData({ configured: true });
-      toast.success('Permissions configured', 'nginx and systemctl no longer prompt for a password.');
+      const result = await api.settings.setupPermissions();
+      setSetupResult(result);
+      if (result.configured) {
+        permissions.setData({ configured: true });
+        toast.success('Permissions configured', 'nginx and systemctl no longer prompt for a password.');
+      }
     } catch (error) {
-      setPermissionError(failureText(error, 'The sudoers file was not written.'));
+      setPermissionError(failureText(error, 'The setup commands could not be prepared.'));
     } finally {
       setSettingUpPermissions(false);
     }
+  };
+
+  const checkPermissions = () => {
+    setPermissionError(null);
+    permissions.reload();
   };
 
   // ── Backup ────────────────────────────────────────────────────────────────
@@ -576,6 +597,19 @@ export function SettingsPage() {
                   spellCheck={false}
                 />
               )}
+              {uiSupported && (
+                <Select
+                  label="Dashboard interface"
+                  value={general.ui}
+                  onChange={(event) =>
+                    setGeneral({ ...general, ui: event.target.value as DashboardUi })
+                  }
+                  hint="Applies the next time the dashboard starts."
+                >
+                  <option value="new">New — this dashboard</option>
+                  <option value="classic">Classic — the older page</option>
+                </Select>
+              )}
             </FormGrid>
             {autoRenewSupported && (
               <div className="space-y-4 border-t border-line pt-5">
@@ -722,8 +756,17 @@ export function SettingsPage() {
                     PM2 (your apps)
                   </div>
                   <div className="mt-0.5 text-sm font-medium text-ink">
-                    {service.pm2.installed ? service.pm2.version ?? 'Installed' : 'Not installed'}
+                    {service.pm2.installed === null
+                      ? 'Checking…'
+                      : service.pm2.installed
+                        ? service.pm2.version ?? 'Installed'
+                        : 'Not installed'}
                   </div>
+                  {service.probes?.pending ? (
+                    <div className="mt-0.5 text-2xs text-faint">Measuring…</div>
+                  ) : service.probes?.refreshing ? (
+                    <div className="mt-0.5 text-2xs text-faint">Refreshing…</div>
+                  ) : null}
                 </div>
               </div>
             ) : null}
@@ -943,38 +986,60 @@ export function SettingsPage() {
                   systemctl without stopping to ask for a password.
                 </p>
               ) : (
-                <div className="max-w-md space-y-4">
+                <div className="max-w-2xl space-y-4">
                   <p className="text-sm text-muted">
-                    The dashboard needs passwordless sudo to control nginx and systemctl. Enter
-                    your sudo password once and it writes the sudoers entry for you.
+                    The dashboard needs passwordless sudo to control nginx and systemctl. Generate
+                    the exact commands below, then run them once in a terminal on this server —
+                    sudo asks for your password there, never in this browser.
                   </p>
                   {permissionError && (
-                    <InlineAlert tone="danger" title="Permissions were not configured">
+                    <InlineAlert tone="danger" title="Setup commands were not prepared">
                       {permissionError}
                     </InlineAlert>
                   )}
-                  <TextInput
-                    label="Sudo password"
-                    type="password"
-                    autoComplete="current-password"
-                    placeholder="Enter your sudo password"
-                    value={sudoPassword}
-                    onChange={(event) => {
-                      setSudoPassword(event.target.value);
-                      if (permissionError) setPermissionError(null);
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') void setupPermissions();
-                    }}
-                  />
-                  <Button
-                    variant="primary"
-                    loading={settingUpPermissions}
-                    disabled={!sudoPassword}
-                    onClick={() => void setupPermissions()}
-                  >
-                    Set up permissions
-                  </Button>
+                  {setupResult && setupResult.commands.length > 0 && (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-xs font-medium text-ink">Run these in a terminal</p>
+                        <CopyButton
+                          value={setupResult.commands.join('\n')}
+                          label="Copy commands"
+                          withText
+                        />
+                      </div>
+                      <pre className="overflow-auto rounded-md border border-line bg-canvas p-3.5 font-mono text-2xs leading-relaxed text-ink">
+                        {setupResult.commands.join('\n')}
+                      </pre>
+                    </div>
+                  )}
+                  {setupResult && setupResult.refusedDirs.length > 0 && (
+                    <InlineAlert tone="warning" title="These folders need root by hand">
+                      <ul className="mt-1.5 space-y-1">
+                        {setupResult.refusedDirs.map(({ dir, reason }) => (
+                          <li key={dir}>
+                            <code className="font-mono text-2xs">{dir}</code> — {reason}
+                          </li>
+                        ))}
+                      </ul>
+                    </InlineAlert>
+                  )}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      variant="primary"
+                      loading={settingUpPermissions}
+                      onClick={() => void setupPermissions()}
+                    >
+                      Generate setup commands
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      icon={<RefreshCw className="size-4" aria-hidden="true" />}
+                      loading={permissions.loading}
+                      onClick={checkPermissions}
+                    >
+                      Check again
+                    </Button>
+                  </div>
                 </div>
               )}
             </CardBody>

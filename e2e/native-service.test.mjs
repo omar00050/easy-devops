@@ -1427,7 +1427,12 @@ async function testStatusNeverStartsPm2() {
   const found = await legacy.detectLegacy({ run: recordingRun, startupDir: null });
   check('legacy detection completes', Array.isArray(found.items));
 
-  const pm2Commands = commands.filter((c) => /\bpm2\b/i.test(c));
+  // Matches a pm2 EXECUTABLE only: the first word of a command, or a path such
+  // as `C:\...\pm2.cmd` or `/usr/bin/pm2`. A scheduled-task NAME that merely
+  // contains the letters — `schtasks /Query /TN "EasyDevOps-PM2"` — is not a
+  // pm2 invocation and must not be counted as one.
+  const PM2_INVOCATION = /(^|[\s/\\"'])pm2(\.(?:cmd|exe|ps1))?(?=[\s"']|$)/i;
+  const pm2Commands = commands.filter((c) => PM2_INVOCATION.test(String(c)));
   if (daemonUp) {
     // A daemon is already running on this machine, so talking to it starts
     // nothing new. The assertion that matters is the other branch.

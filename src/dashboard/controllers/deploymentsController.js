@@ -30,7 +30,7 @@ import { loadChannels } from '../../core/notifier.js';
 
 import {
   getApp, createApp, updateApp, dashboardApp,
-  rotateHookToken, revokeHookToken, generateDeployKey,
+  rotateHookToken, revokeHookToken,
   DEFAULT_KEEP_RELEASES, MIN_KEEP_RELEASES, MAX_KEEP_RELEASES,
 } from '../../core/deploy/apps.js';
 import { startDeployment, startRollback, removeRelease, removeApp, moveApp } from '../../core/deploy/engine.js';
@@ -39,7 +39,10 @@ import { linkDomain, unlinkDomain } from '../../core/deploy/domainLink.js';
 import { describeApps, describeAppDetail } from '../../core/deploy/status.js';
 import { hookSettings } from '../../core/deploy/hookServer.js';
 import { hookUrl } from '../../core/deploy/github.js';
-import { githubSetupFor } from '../../core/deploy/hubCommands.js';
+import {
+  githubSetupFor, generateKeyForApp, wantsGeneratedKey, regenerateAppDeployKey, addAppDeployKeyToGithub,
+} from '../../core/deploy/hubCommands.js';
+import { testDeployKey } from '../../core/deploy/deployKey.js';
 import { applyGithubSetup, parseGithubRepo, validateGithubToken } from '../../core/deploy/githubApi.js';
 import { EZ_FILE_LOCATIONS } from '../../core/deploy/ezfile.js';
 
@@ -109,9 +112,14 @@ class DeploymentsController {
   /** POST /api/deployments */
   create(req, res, next) {
     try {
-      const result = createApp(req.body ?? {});
+      const body = req.body ?? {};
+      const result = createApp(body);
       if (!result.ok) return res.status(result.status).json(errorBody(result));
-      return res.status(201).json(dashboardApp(result.app));
+      // Creating an app never starts a deployment. The key, when asked for, is
+      // generated in this same request; a failure still leaves a usable app.
+      const extra = wantsGeneratedKey(body) ? generateKeyForApp(result.app.id) : {};
+      const app = getApp(result.app.id) ?? result.app;
+      return res.status(201).json({ ...dashboardApp(app), ...extra });
     } catch (error) {
       return next(error);
     }
@@ -169,14 +177,26 @@ class DeploymentsController {
    */
   async linkDomain(req, res, next) {
     try {
+      // Issuing is synchronous here, exactly like POST /api/ssl/create: the
+      // dashboard's own SSL flow has no background progress to reuse.
       const result = await linkDomain(req.params.id, {
         domain: req.body?.domain,
-        ssl: req.body?.ssl === true,
+        www: req.body?.www,
+        ssl: req.body?.ssl,
+        redirect: req.body?.redirect,
+        behindCloudflare: req.body?.behindCloudflare,
       });
       if (!result.ok) return res.status(result.status).json({ error: result.error });
       return res.json({
-        domain: result.domain, created: result.created, port: result.port,
-        ssl: result.ssl, nginxReloaded: result.nginxReloaded,
+        ok: result.ok,
+        domain: result.domain,
+        created: result.created,
+        port: result.port,
+        www: result.www,
+        behindCloudflare: result.behindCloudflare,
+        ssl: result.ssl,
+        redirect: result.redirect,
+        nginxReloaded: result.nginxReloaded,
       });
     } catch (error) {
       return next(error);
@@ -289,9 +309,39 @@ class DeploymentsController {
   /** POST /api/deployments/:id/deploy-key — generate (or replace) the SSH deploy key. */
   deployKey(req, res, next) {
     try {
-      const key = generateDeployKey(req.params.id);
-      if (!key) return res.status(404).json({ error: `No app named "${req.params.id}".` });
-      return res.json({ publicKey: key.publicKey });
+      const result = regenerateAppDeployKey(req.params.id);
+      if (!result.ok) return res.status(result.status).json({ error: result.error });
+      return res.json(result.value);
+    } catch (error) {
+      return next(error);
+    }
+  }
+
+  /**
+   * POST /api/deployments/:id/deploy-key/test — git ls-remote with the app's
+   * key. A completed test is 200 even when it says the key does not work; the
+   * earlier 404/400/409/500 statuses are passed through.
+   */
+  async deployKeyTest(req, res, next) {
+    try {
+      const result = await testDeployKey(req.params.id);
+      return res.status(result.status ?? 200).json(result);
+    } catch (error) {
+      return next(error);
+    }
+  }
+
+  /**
+   * POST /api/deployments/:id/deploy-key/github — add the public key to GitHub
+   * read-only. The token is typed for this request, used once and forgotten;
+   * when omitted the app's own token is tried, exactly as githubApply does.
+   */
+  async deployKeyGithub(req, res, next) {
+    try {
+      const result = await addAppDeployKeyToGithub(req.params.id, req.body?.token);
+      const { status, ...body } = result;
+      if (!result.ok) return res.status(status ?? 422).json(body);
+      return res.json(body);
     } catch (error) {
       return next(error);
     }

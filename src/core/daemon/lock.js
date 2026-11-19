@@ -43,6 +43,24 @@ export const STALE_AFTER_MS = 20_000;
 /** Lock file name inside the data directory. */
 const LOCK_FILE = 'daemon.lock';
 
+/**
+ * How long a recovery guard left by a crashed process must sit before another
+ * process may clear it. Long enough that a slow (but live) recovery is never
+ * cleared out from under itself, short enough that a crash does not need a
+ * reboot to recover from.
+ */
+const RECOVERY_GUARD_STALE_MS = 30_000;
+
+/**
+ * How long an empty, unreadable lock file may exist before another process may
+ * treat it as abandoned.
+ *
+ * Creating a lock is `writeFileSync(path, data, { flag: 'wx' })`, which creates
+ * the file and THEN writes it — so a brand-new lock is briefly empty. A reader
+ * in that window must not "recover" a lock created microseconds earlier.
+ */
+const UNREADABLE_GRACE_MS = 2_000;
+
 /** @returns {string} Absolute path to the lock file. */
 export function lockPath(dataDir = getDataDir()) {
   return path.join(dataDir, LOCK_FILE);
@@ -69,12 +87,14 @@ export function isPidAlive(pid) {
 }
 
 /**
- * Reads the lock without judging it.
+ * Reads a lock file without judging it.
+ *
+ * @param {string} file Absolute path to the lock file
  * @returns {{ pid: number, startedAt: number, heartbeatAt: number, version: string|null, mode: string|null }|null}
  */
-export function readLock(dataDir = getDataDir()) {
+function readLockAt(file) {
   try {
-    const raw = fs.readFileSync(lockPath(dataDir), 'utf8');
+    const raw = fs.readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw);
     if (!Number.isInteger(parsed?.pid)) return null;
     return {
@@ -90,6 +110,35 @@ export function readLock(dataDir = getDataDir()) {
     // that as absent is correct: nothing is holding it.
     return null;
   }
+}
+
+/**
+ * True when an unreadable lock file is a create that has not been written yet.
+ *
+ * An empty file younger than the grace is somebody's `wx` create in flight, so
+ * it counts as LIVE. An empty file older than the grace is a crash between the
+ * create and the write, and may be recovered. A file that has content but does
+ * not parse is a truncated write, which has no live owner at all.
+ *
+ * @param {string} file
+ * @param {number} now
+ * @returns {boolean}
+ */
+function isWriteInFlight(file, now) {
+  try {
+    const stat = fs.statSync(file);
+    return stat.size === 0 && now - stat.mtimeMs < UNREADABLE_GRACE_MS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reads the lock in a data directory without judging it.
+ * @returns {{ pid: number, startedAt: number, heartbeatAt: number, version: string|null, mode: string|null }|null}
+ */
+export function readLock(dataDir = getDataDir()) {
+  return readLockAt(lockPath(dataDir));
 }
 
 /**
@@ -137,10 +186,38 @@ export function isDaemonRunning(opts = {}) {
 /**
  * Takes the lock for this process.
  *
- * Recovers an abandoned lock, refuses a live one. The write is atomic — a
- * temporary file renamed into place — so a reader can never see a half-written
- * lock, and `wx` on the temp name means two daemons racing cannot both believe
- * they created it.
+ * Refuses a live lock, recovers an abandoned one. Creating a lock is a single
+ * EXCLUSIVE open (`wx`), so two daemons can never both believe they created
+ * it, and there is no check-then-write window.
+ *
+ * Recovering a STALE lock is the subtle half. Deciding from `inspect()` before
+ * the race is not enough: several processes see the same dead lock, all are
+ * entitled to recover it, and if each one deletes "the stale file" it saw, the
+ * second deletes the FIRST ONE'S BRAND-NEW LOCK. Both report success and one of
+ * them owns nothing.
+ *
+ * Moving the file aside first does not fix that either: the path is empty for
+ * as long as it takes to judge and re-create, and on a machine with real-time
+ * scanning that can be milliseconds — long enough for another process to create
+ * there. Measured with six contenders, that produced two winners.
+ *
+ * So recovery is serialised and the lock is only ever REPLACED, never removed:
+ *
+ *   1. exactly one process can create `daemon.lock.recovery` (`wx`), which is
+ *      the permission to recover; everyone else is refused;
+ *   2. inside that guard the lock is re-read — that read is authoritative,
+ *      because no other process may touch it — and a live lock is refused;
+ *   3. a dead one is replaced by an atomic `rename` of a prepared candidate
+ *      over it. The path is never empty, so there is nothing for a third
+ *      process to slip into.
+ *
+ * The guard is removed in a `finally`. One left behind by a crash is only
+ * cleared when its pid is gone and it has been sitting long enough, so it can
+ * never be cleared out from under a live recovery.
+ *
+ * Re-acquiring as the same pid stays idempotent, and rewriting one's own lock
+ * (heartbeat) still goes through the atomic temp-file rename: only the owner
+ * does that, so a reader always sees either the old lock or the new one.
  *
  * @param {Object} [opts]
  * @param {string} [opts.dataDir]
@@ -167,7 +244,192 @@ export function acquire({
     return { ok: false, reason: state.reason, lock: state.lock };
   }
 
-  return { ok: true, recovered: state.stale, lock: write({ dataDir, version, mode, now }) };
+  const payload = { pid: process.pid, startedAt: now, heartbeatAt: now, version, mode };
+
+  const first = createExclusive(dataDir, payload);
+  if (first.ok) return { ok: true, recovered: state.stale, lock: payload };
+
+  if (first.code !== 'EEXIST') {
+    return { ok: false, reason: `could not create the lock: ${first.message}`, lock: null };
+  }
+
+  // A lock file appeared after inspect() saw none. If it is a readable lock, it
+  // is somebody's and nothing here is recoverable. A file that exists but
+  // cannot be read (truncated by a crash) has no owner to respect, so it falls
+  // through to the guard below, which replaces it rather than blocking for ever.
+  if (!state.lock && !fs.existsSync(lockPath(dataDir))) {
+    return { ok: false, reason: 'another process created the lock first', lock: readLock(dataDir) };
+  }
+
+  // Empty and just created: that is a `wx` create whose write has not landed
+  // yet. Reading it in that window is not permission to take it over.
+  if (!state.lock && isWriteInFlight(lockPath(dataDir), now)) {
+    return { ok: false, reason: 'another process is writing its lock', lock: readLock(dataDir) };
+  }
+
+  const guard = acquireRecoveryGuard({ dataDir, now });
+  if (!guard.ok) {
+    return { ok: false, reason: guard.reason, lock: readLock(dataDir) };
+  }
+
+  try {
+    // Authoritative: nobody else may change the lock while we hold the guard.
+    const current = inspect({ dataDir, now });
+
+    if (current.running) {
+      if (current.lock?.pid === process.pid) {
+        return { ok: true, recovered: false, lock: write({ dataDir, version, mode, now }) };
+      }
+      return { ok: false, reason: current.reason, lock: current.lock };
+    }
+
+    if (!current.lock) {
+      // Empty and just created is still a create in flight — treat it as live.
+      if (isWriteInFlight(lockPath(dataDir), now)) {
+        return { ok: false, reason: 'another process is writing its lock', lock: null };
+      }
+
+      // Nothing readable is at the path: either the file vanished (a release,
+      // or a crash being cleaned up) or it is truncated/half-written. A lock
+      // with no readable owner cannot be waited on, so it is abandoned —
+      // created over if it is gone, replaced under the guard if it is still
+      // there. Blocking here for ever is what a crash would otherwise cause.
+      const again = createExclusive(dataDir, payload);
+      if (again.ok) return { ok: true, recovered: true, lock: payload };
+
+      if (again.code !== 'EEXIST') {
+        return { ok: false, reason: `could not create the lock: ${again.message}`, lock: null };
+      }
+
+      const replaced = replaceLock({ dataDir, payload });
+      return replaced.ok
+        ? { ok: true, recovered: true, lock: payload }
+        : { ok: false, reason: `could not replace the unreadable lock: ${replaced.message}`, lock: null };
+    }
+
+    const replaced = replaceLock({ dataDir, payload });
+    if (!replaced.ok) {
+      return { ok: false, reason: `could not replace the stale lock: ${replaced.message}`, lock: readLock(dataDir) };
+    }
+
+    return { ok: true, recovered: true, lock: payload };
+  } finally {
+    guard.release();
+  }
+}
+
+/**
+ * Creates the recovery guard exclusively, or explains why recovery may not run.
+ *
+ * @param {Object} opts
+ * @param {string} opts.dataDir
+ * @param {number} opts.now
+ * @returns {{ ok: true, release: () => void } | { ok: false, reason: string }}
+ */
+function acquireRecoveryGuard({ dataDir, now }) {
+  const file = `${lockPath(dataDir)}.recovery`;
+  const payload = { pid: process.pid, at: now };
+
+  const attempt = () => {
+    try {
+      fs.writeFileSync(file, `${JSON.stringify(payload)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, code: err?.code ?? 'UNKNOWN', message: err?.message ?? String(err) };
+    }
+  };
+
+  const release = () => {
+    try { fs.unlinkSync(file); } catch { /* already gone */ }
+  };
+
+  const first = attempt();
+  if (first.ok) return { ok: true, release };
+  if (first.code !== 'EEXIST') {
+    return { ok: false, reason: `could not create the recovery guard: ${first.message}` };
+  }
+
+  // A guard left behind by a process that died mid-recovery. It is not the
+  // lock itself, so it may be cleared — but only once its owner is provably
+  // gone and it is old enough that a slow recovery cannot be the one holding it.
+  let existing = null;
+  try {
+    existing = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch { /* unreadable: treat it as live */ }
+
+  const abandoned = Boolean(existing)
+    && Number.isInteger(existing.pid)
+    && !isPidAlive(existing.pid)
+    && now - (Number(existing.at) || 0) > RECOVERY_GUARD_STALE_MS;
+
+  if (!abandoned) return { ok: false, reason: 'another process is recovering the lock' };
+
+  try { fs.unlinkSync(file); } catch { /* another process cleared it first */ }
+
+  const second = attempt();
+  return second.ok
+    ? { ok: true, release }
+    : { ok: false, reason: 'another process is recovering the lock' };
+}
+
+/**
+ * Replaces the lock file with this process's payload, atomically.
+ *
+ * A `rename` within the directory is a replace: the lock path goes from the old
+ * file to the new one in one step, so it is never absent and no third process
+ * can create there. Called only while the recovery guard is held.
+ *
+ * @param {Object} opts
+ * @param {string} opts.dataDir
+ * @param {Object} opts.payload
+ * @returns {{ ok: true } | { ok: false, message: string }}
+ */
+function replaceLock({ dataDir, payload }) {
+  const target = lockPath(dataDir);
+  const candidate = `${target}.candidate-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+  const body = `${JSON.stringify(payload)}\n`;
+
+  try {
+    fs.writeFileSync(candidate, body, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  } catch (err) {
+    return { ok: false, message: err?.message ?? String(err) };
+  }
+
+  const moved = renameWithRetry(candidate, target);
+  if (!moved.ok) {
+    try { fs.unlinkSync(candidate); } catch { /* already gone */ }
+    return { ok: false, message: moved.message };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * `rename`, retried briefly while Windows refuses it.
+ *
+ * On Windows a file another process currently has open for reading cannot be
+ * replaced — the rename fails with EPERM/EBUSY until that handle closes. Every
+ * reader in this module reads and closes immediately, so a bounded retry is
+ * enough; bounded, so a genuinely stuck file can never hang an acquisition.
+ *
+ * @param {string} from
+ * @param {string} to
+ * @returns {{ ok: true } | { ok: false, message: string }}
+ */
+function renameWithRetry(from, to, attempts = 200, waitMs = 1) {
+  for (let i = 0; ; i++) {
+    try {
+      fs.renameSync(from, to);
+      return { ok: true };
+    } catch (err) {
+      const transient = err?.code === 'EPERM' || err?.code === 'EBUSY' || err?.code === 'EACCES';
+      if (!transient || i >= attempts) {
+        return { ok: false, message: err?.message ?? String(err) };
+      }
+      // A real blocking pause: no busy spin, no async in a synchronous path.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+    }
+  }
 }
 
 /**
@@ -269,10 +531,35 @@ export function watchLock({ dataDir = getDataDir(), onChange, debounceMs = 50 } 
 }
 
 /**
+ * Creates the lock file exclusively, or reports why it could not.
+ *
+ * `wx` is the whole guarantee: the open fails with EEXIST when the file
+ * exists, atomically, with no window between checking and creating. The file
+ * is written 0600 like the temp file it replaces.
+ *
+ * @returns {{ ok: true } | { ok: false, code: string, message: string }}
+ */
+function createExclusive(dataDir, payload) {
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(lockPath(dataDir), `${JSON.stringify(payload)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+      flag: 'wx',
+    });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, code: err?.code ?? 'UNKNOWN', message: err?.message ?? String(err) };
+  }
+}
+
+/**
  * Writes the lock atomically.
  *
  * `rename` is atomic on both platforms for a same-directory move, so a reader
- * either sees the old file or the new one — never a partial write.
+ * either sees the old file or the new one — never a partial write. Used only
+ * to refresh a lock this process already owns; taking it in the first place is
+ * createExclusive() above.
  */
 function write({ dataDir, version, mode, now, startedAt }) {
   const payload = {

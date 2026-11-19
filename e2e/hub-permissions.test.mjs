@@ -230,6 +230,62 @@ async function main() {
   check('process stop refused when denied',
     hp.checkCommandAllowed('hub:manageProcess', { action: 'stop' }, hp.defaultPermissions()).allowed === false);
 
+  // ── Link-domain permissions and the shared fixture ──────────────────────
+  setGroup('Link-domain permissions');
+
+  const fixture = JSON.parse(
+    fs.readFileSync(path.join(__dirname, 'fixtures', 'hub-permission-map.json'), 'utf8')
+  )['hub:manageDeploy'];
+
+  // The full action table must match the Hub backend's copy. linkDomain has a
+  // list here, and a second list when it issues, so both are checked.
+  for (const [action, expected] of Object.entries(fixture.actions)) {
+    const actual = hp.permissionForCommand('hub:manageDeploy', { action });
+    check(`deploy action '${action}' matches the shared fixture`,
+      JSON.stringify(actual) === JSON.stringify(expected),
+      JSON.stringify(actual));
+  }
+  check('linkDomain with a new certificate also needs ssl.issue',
+    JSON.stringify(hp.permissionForCommand('hub:manageDeploy', {
+      action: 'linkDomain', ssl: { mode: 'issue' },
+    })) === JSON.stringify(fixture.linkDomainIssue));
+  check('legacy ssl:true is the issue form',
+    JSON.stringify(hp.permissionForCommand('hub:manageDeploy', {
+      action: 'linkDomain', ssl: true,
+    })) === JSON.stringify(fixture.linkDomainIssue));
+
+  const linkPayloads = {
+    none: { action: 'linkDomain' },
+    existing: { action: 'linkDomain', ssl: { mode: 'existing', certName: 'a.example.com' } },
+    issue: { action: 'linkDomain', ssl: { mode: 'issue' } },
+  };
+
+  for (const [mode, payload] of Object.entries(linkPayloads)) {
+    const needed = hp.permissionForCommand('hub:manageDeploy', payload);
+    check(`${mode}: linkDomain requires a list`, Array.isArray(needed), JSON.stringify(needed));
+
+    const allGranted = Object.fromEntries(needed.map((id) => [id, true]));
+    check(`${mode}: allowed only when every permission is granted`,
+      hp.checkCommandAllowed('hub:manageDeploy', payload, allGranted).allowed === true);
+
+    for (const missing of needed) {
+      const partial = { ...allGranted, [missing]: false };
+      const verdict = hp.checkCommandAllowed('hub:manageDeploy', payload, partial);
+      check(`${mode}: refused with '${missing}' missing, naming it`,
+        verdict.allowed === false && verdict.reason.includes(missing), verdict.reason ?? 'allowed');
+    }
+  }
+
+  check('unlinkDomain stays deploy.manage alone',
+    hp.permissionForCommand('hub:manageDeploy', { action: 'unlinkDomain' }) === 'deploy.manage');
+
+  for (const action of ['regenerateKey', 'testKey', 'addKeyToGithub']) {
+    check(`${action} needs deploy.manage`,
+      hp.permissionForCommand('hub:manageDeploy', { action }) === 'deploy.manage'
+      && hp.checkCommandAllowed('hub:manageDeploy', { action }, hp.defaultPermissions()).allowed === false
+      && hp.checkCommandAllowed('hub:manageDeploy', { action }, { 'deploy.manage': true }).allowed === true);
+  }
+
   // ── Storage + migration (child process, temp data dir) ──────────────────
   setGroup('Storage and migration (isolated)');
 
@@ -279,16 +335,54 @@ async function main() {
   // ── Sudoers output ──────────────────────────────────────────────────────
   setGroup('Sudoers rules');
 
-  const permSrc = fs.readFileSync(path.join(ROOT, 'src/core/permissions.js'), 'utf8');
-  const block = permSrc.slice(permSrc.indexOf('const SUDO_RULES'), permSrc.indexOf('].join('));
+  // Imported, not string-parsed: the rules are a module export now, and a
+  // regex over the source could only ever prove that some text was present.
+  const sudoPerms = await import(pathToFileURL(path.join(ROOT, 'src/core/permissions.js')).href);
 
-  check('no bare /usr/bin/systemctl grant',
-    !/'\/usr\/bin\/systemctl',/.test(block));
-  check('start/stop/reload/restart nginx are granted',
-    ['start', 'stop', 'reload', 'restart'].every((v) => block.includes(`/usr/bin/systemctl ${v} nginx`)));
-  check('certbot grant removed (acme-client is in-process)', !block.includes('certbot'));
+  const EXPECTED_SUDO = [
+    '/usr/bin/systemctl start nginx',
+    '/usr/bin/systemctl stop nginx',
+    '/usr/bin/systemctl reload nginx',
+    '/usr/bin/systemctl restart nginx',
+    '/usr/bin/systemctl status nginx',
+  ];
 
-  // Every sudo -n command in the codebase must be covered by a rule.
+  check('SUDO_COMMANDS is exactly the five systemctl-nginx commands',
+    JSON.stringify(sudoPerms.SUDO_COMMANDS) === JSON.stringify(EXPECTED_SUDO),
+    sudoPerms.SUDO_COMMANDS.join(' | '));
+
+  check('no entry is a bare binary',
+    sudoPerms.SUDO_COMMANDS.every((cmd) => typeof cmd === 'string' && cmd.split(/\s+/).filter(Boolean).length >= 2),
+    sudoPerms.SUDO_COMMANDS.filter((c) => c.split(/\s+/).filter(Boolean).length < 2).join(' | ') || 'all have arguments');
+
+  check('no entry contains a wildcard',
+    sudoPerms.SUDO_COMMANDS.every((cmd) => !cmd.includes('*')),
+    sudoPerms.SUDO_COMMANDS.filter((c) => c.includes('*')).join(' | ') || 'no wildcards');
+
+  // A rule that names one of these is a root shell: a file writer, an
+  // ownership or mode changer, a service manager without a unit, or a shell.
+  const dangerous = /(^|[\s/])(cp|mkdir|chown|chmod|tee|certbot|install|sh|bash|dash|zsh|ksh|env|sudo)([\s/]|$)/;
+  check('no entry names cp/mkdir/chown/chmod/tee/certbot/install or a shell',
+    sudoPerms.SUDO_COMMANDS.every((cmd) => !dangerous.test(cmd)),
+    sudoPerms.SUDO_COMMANDS.filter((c) => dangerous.test(c)).join(' | ') || 'none');
+
+  const line = sudoPerms.buildSudoersLine('someuser');
+  check('buildSudoersLine uses (root)', /^someuser ALL=\(root\) NOPASSWD: /.test(line), line);
+  check('and never (ALL)', !line.includes('(ALL)'));
+
+  // Every `sudo -n` command in the codebase must be one of those EXACT
+  // strings — matching on the binary alone would accept `sudo -n
+  // /usr/bin/systemctl` and everything that implies.
+  //
+  // Comments are stripped first (several files mention the pattern in prose)
+  // and permissions.js itself is skipped: its `sudo -n ${command}` is the
+  // template sudoCommand() fills from SUDO_COMMANDS, not a command.
+  const codeOnly = (source) => source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split(/\r?\n/)
+    .map((l) => l.replace(/(^|[^:])\/\/.*$/, '$1'))
+    .join('\n');
+
   const files = [];
   (function walk(dir) {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -300,18 +394,15 @@ async function main() {
 
   const used = new Set();
   for (const f of files) {
-    for (const m of fs.readFileSync(f, 'utf8').matchAll(/sudo -n ([^\s'"`;]+(?: [a-z-]+)*)/g)) {
+    if (path.relative(path.join(ROOT, 'src'), f).replace(/\\/g, '/') === 'core/permissions.js') continue;
+    for (const m of codeOnly(fs.readFileSync(f, 'utf8')).matchAll(/sudo -n ([^'"`;)\n]+)/g)) {
       used.add(m[1].trim());
     }
   }
 
-  const uncovered = [...used].filter((cmd) => {
-    const bin = cmd.split(' ')[0];
-    const base = bin.startsWith('/') ? bin : `/usr/bin/${bin}`;
-    return !block.includes(base);
-  });
+  const uncovered = [...used].filter((cmd) => !sudoPerms.SUDO_COMMANDS.includes(cmd));
   check('every `sudo -n` command has a rule', uncovered.length === 0,
-    uncovered.join(' | ') || `${used.size} commands checked`);
+    uncovered.join(' | ') || `${used.size} command(s) checked`);
 
   // ── Summary ─────────────────────────────────────────────────────────────
   const failed = results.filter((r) => !r.passed);

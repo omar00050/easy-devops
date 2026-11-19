@@ -7,14 +7,26 @@
  *
  *   1. fetch     a fresh checkout into releases/<id> — never over the live one
  *   2. settings  ez.json + package.json + the app's overrides (ezfile.js)
- *   3. pre hook → install → build      all in the new directory
+ *   3. pre hook → install → build → migrate   all in the new directory
  *   4. switch    stop the old process, start the new one under PM2
  *   5. health    the app must answer (or stay up) before it counts
  *   6. post hook, save the PM2 list, prune old releases
  *
- * Nothing before step 4 touches what is running, so a broken build costs
- * nothing. If step 4 or 5 fails and there is a previous release, it is started
- * again — the same files that were running before, not a rebuild.
+ * `migrate` runs in the new release with the build's environment, after build
+ * and before anything is started. It is forward-only: rolling the code back
+ * does not undo a migration that already ran, which is why the hint on a
+ * failure says to fix the migration rather than expect the rollback to undo it.
+ *
+ * Nothing before step 4 touches what is running, so a broken build or a failed
+ * migration costs nothing. If step 4 or 5 fails and there is a previous
+ * release, it is started again — the same files that were running before, not a
+ * rebuild.
+ *
+ * Step 5 watches PM2 as well as HTTP. A release that answers once and then
+ * crash-loops, or that PM2 reports errored/stopped, is a boot crash: the
+ * previous release is restored, and the run records why, the last PM2 log
+ * lines (with the app's environment values redacted) and whether that rollback
+ * succeeded. A first release has nothing to return to, so it is stopped.
  *
  * ── What this does not do ────────────────────────────────────────────────────
  *
@@ -45,7 +57,8 @@ import { createDeployEvent } from '../events.js';
 import { sendNotification as defaultSendNotification } from '../notifier.js';
 import { publish } from '../jobs/bus.js';
 
-import { getApp, deleteApp, pm2Name, AUTH_TYPES, deployKeyPath, validateRef, setAppDir } from './apps.js';
+import { getApp, deleteApp, pm2Name, AUTH_TYPES, validateRef, setAppDir } from './apps.js';
+import { sshCommand } from './deployKey.js';
 import { deleteLinkedDomain, syncLinkedDomain } from './domainLink.js';
 import {
   EZ_FILE_LOCATIONS, parseEzFile, resolveSettings, parseStartCommand,
@@ -66,6 +79,20 @@ const HEALTH_POLL_MS = 2000;
 /** Without a port there is nothing to ask, so the app only has to stay up this long. */
 const NO_PORT_SETTLE_MS = 8000;
 const ROLLBACK_HEALTH_TIMEOUT_S = 30;
+/**
+ * How long a healthy answer must also stay online without a PM2 restart.
+ * PM2's own `min_uptime` is 5 s, so a release that dies inside that window is
+ * one PM2 itself considers unstable; matching it keeps the two judgements
+ * aligned.
+ */
+const BOOT_CONFIRM_MS = 5000;
+/** PM2 out+error lines kept in the run record when a release crashes at boot. */
+const BOOT_LOG_LINES = 40;
+
+const MIGRATE_HINT =
+  'Migrations are forward-only: rolling the code back cannot undo a migration that already ran. ' +
+  'Fix the migration, keep it backward-compatible for one release, and deploy again. ' +
+  'The release that was running was not touched.';
 
 export const RUN_STATUS = Object.freeze({
   RUNNING: 'running',
@@ -76,9 +103,11 @@ export const RUN_STATUS = Object.freeze({
 
 /** A failure with the step it happened in, so the run record can say where. */
 class StepError extends Error {
-  constructor(step, message) {
+  constructor(step, message, { bootCrash = false, reason = null } = {}) {
     super(message);
     this.step = step;
+    this.bootCrash = bootCrash;
+    this.reason = reason;
   }
 }
 
@@ -116,6 +145,31 @@ export function probeHttp(port, healthPath, timeoutMs = 5000) {
 export function isHealthyStatus(status, strict) {
   if (typeof status !== 'number') return false;
   return strict ? status >= 200 && status < 400 : status >= 100 && status < 500;
+}
+
+/**
+ * Removes the app's secret values from text that is about to leave the engine.
+ *
+ * PM2's own logs are the app's output, and an app that prints its configuration
+ * — or a crash dump that includes it — would otherwise put a database URL or a
+ * token into a run record the dashboard and the Hub can read. Every non-empty
+ * value of an environment variable on the app is replaced, longest first, so a
+ * secret that contains another one is not half-redacted. The auth token is
+ * included for the same reason even though it lives outside `env`.
+ *
+ * @param {string} text
+ * @param {Object<string, *>} [env]
+ * @param {string|null} [token]
+ * @returns {string}
+ */
+export function redactSecrets(text, env = {}, token = null) {
+  let out = String(text ?? '');
+  const values = [...Object.values(env ?? {}), token]
+    .filter((v) => typeof v === 'string' && v.length > 0)
+    .sort((a, b) => b.length - a.length);
+
+  for (const value of values) out = out.split(value).join('***');
+  return out;
 }
 
 // ─── The engine ───────────────────────────────────────────────────────────────
@@ -192,13 +246,17 @@ function gitAuth(app) {
   }
 
   if (app.auth?.type === AUTH_TYPES.DEPLOY_KEY) {
-    const key = deployKeyPath(app.id);
-    if (!key) throw new StepError('fetch', 'This app uses a deploy key, but none has been generated yet.');
-    // Forward slashes: git runs this through its own sh, where a backslash in
-    // a Windows path would be read as an escape.
-    const keyArg = key.replace(/\\/g, '/');
-    env.GIT_SSH_COMMAND =
-      `ssh -i "${keyArg}" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new`;
+    // github.com is checked against GitHub's pinned host keys; see deployKey.js.
+    let sshCmd;
+    try {
+      sshCmd = sshCommand(app.id, app.repoUrl);
+    } catch (err) {
+      throw new StepError('fetch', err.message);
+    }
+    if (!sshCmd) {
+      throw new StepError('fetch', 'This app uses a deploy key, but none has been generated yet. Generate it in the app settings, add it to the repository, then deploy again.');
+    }
+    env.GIT_SSH_COMMAND = sshCmd;
   }
 
   return { env, flags: '', display: '' };
@@ -238,7 +296,12 @@ export function loadProjectSettings(dir, overrides = {}) {
   };
 
   const resolved = resolveSettings({ ez, pkg, files, overrides });
-  return { ...resolved, warnings, ezLocation };
+  return {
+    ...resolved,
+    // ez.json warnings plus the runtime warnings (cluster mode's stateless note).
+    warnings: [...warnings, ...(resolved.warnings ?? [])],
+    ezLocation,
+  };
 }
 
 // ─── Persistent paths ────────────────────────────────────────────────────────
@@ -602,6 +665,13 @@ function writePm2Config(dir, app, settings, env) {
     entry.env[LAUNCHER_COMMAND_ENV] = start.command;
   }
 
+  // Fork (the default) is left exactly as it was: PM2's own default. Cluster
+  // needs both fields, and a rollback reads them back from the release meta.
+  if (settings.execMode === 'cluster') {
+    entry.exec_mode = 'cluster';
+    entry.instances = settings.instances === 'max' ? 'max' : (settings.instances ?? 1);
+  }
+
   const file = path.join(dir, PM2_CONFIG_FILE);
   // Holds the app's environment, so owner-only like the deploy key.
   fs.writeFileSync(file, JSON.stringify({ apps: [entry] }, null, 2), { mode: 0o600 });
@@ -620,9 +690,14 @@ function releaseHealth(dir) {
       sha: typeof meta.sha === 'string' ? meta.sha : null,
       ref: typeof meta.ref === 'string' ? meta.ref : null,
       persist: Array.isArray(meta.persist) ? meta.persist.filter((p) => typeof p === 'string') : [],
+      execMode: meta.execMode === 'cluster' ? 'cluster' : 'fork',
+      instances: meta.instances === 'max' || Number.isInteger(meta.instances) ? meta.instances : 1,
     };
   } catch {
-    return { port: null, healthPath: '/', strict: false, sha: null, ref: null, persist: [] };
+    return {
+      port: null, healthPath: '/', strict: false, sha: null, ref: null, persist: [],
+      execMode: 'fork', instances: 1,
+    };
   }
 }
 
@@ -635,70 +710,230 @@ export function describeRelease(appId, releaseId) {
     id: releaseId,
     sha: meta.sha,
     ref: meta.ref,
+    execMode: meta.execMode,
+    instances: meta.instances,
     startable: fs.existsSync(path.join(dir, PM2_CONFIG_FILE)),
   };
 }
 
 /**
+ * Reads one app's PM2 status through core/runner.js, as a list of instances.
+ *
+ * A cluster app has one PM2 entry per worker, so statusAll is preferred. The
+ * older `status` and `list` fallbacks keep injected runners working; they
+ * report one entry, which is all a fork app has anyway.
+ *
+ * @returns {Promise<{ read: boolean, apps: Object[] }>}
+ */
+async function readPm2Status(name, pm2Path, d) {
+  if (typeof d.runner.statusAll === 'function') {
+    const r = await d.runner.statusAll(name, { run: d.run, pm2Path });
+    if (!r?.ok) return { read: false, apps: [] };
+    return { read: true, apps: Array.isArray(r.apps) ? r.apps : [] };
+  }
+  if (typeof d.runner.status === 'function') {
+    const r = await d.runner.status(name, { run: d.run, pm2Path });
+    if (!r?.ok) return { read: false, apps: [] };
+    return { read: true, apps: r.app ? [r.app] : [] };
+  }
+  const listed = await d.runner.list({ run: d.run, pm2Path });
+  if (!listed.ok) return { read: false, apps: [] };
+  return { read: true, apps: listed.apps.filter((a) => a.name === name) };
+}
+
+/**
+ * Turns one PM2 observation into a boot-crash reason, or null when it is fine.
+ *
+ * `baseline` maps each instance to the restart count on the first observation
+ * after the start. Anything above its baseline means that worker exited at
+ * least once; PM2's state `errored`/`stopped` means it has given up. Both are
+ * boot crashes even when an HTTP probe happened to answer once, which is the
+ * case the health check alone cannot see. A cluster app is only healthy when
+ * EVERY worker is.
+ *
+ * @param {{ read: boolean, apps: Object[] }} observed
+ * @param {Map<number|string, number>|null} baseline
+ * @param {{ port?: number|null }} ctx
+ * @returns {string|null}
+ */
+function bootCrashReason(observed, baseline, { port = null } = {}) {
+  if (!observed.read) return null;
+  const apps = Array.isArray(observed.apps) ? observed.apps : [];
+  if (apps.length === 0) return 'crashed at boot: PM2 no longer lists the process';
+
+  for (let i = 0; i < apps.length; i++) {
+    const app = apps[i];
+    const key = app.pmId ?? i;
+    const restarts = Number.isFinite(app.restarts) ? app.restarts : 0;
+
+    if (baseline && baseline.has(key) && restarts > baseline.get(key)) {
+      return `crashed at boot: restarting ${restarts} times`;
+    }
+    if (app.status === 'errored' || app.status === 'stopped') {
+      const where = port ? ` instead of listening on port ${port}` : '';
+      return `crashed at boot: process is "${app.status}" — it exited${where}`;
+    }
+  }
+
+  return null;
+}
+
+/**
  * Waits for a freshly started app to be healthy.
- * @returns {Promise<{ ok: boolean, detail: string }>}
+ *
+ * Healthy means both: the HTTP check (or the no-port settle) passes, AND PM2
+ * keeps it online without increasing its restart count over a short
+ * confirmation window. The second half is what catches a release that answers
+ * a probe and then crashes at boot.
+ *
+ * @returns {Promise<{ ok: boolean, detail: string, crash: boolean, reason: string|null }>}
  */
 async function waitHealthy({ name, port, healthPath, strict, timeoutS, pm2Path, d }) {
-  const status = async () => {
-    const listed = await d.runner.list({ run: d.run, pm2Path });
-    if (!listed.ok) return null;
-    return listed.apps.find((a) => a.name === name) ?? null;
+  let baseline = null;
+  let last = 'no response yet';
+
+  /** @returns {string|null} A boot-crash reason, or null */
+  const observe = (observed) => {
+    const reason = bootCrashReason(observed, baseline, { port });
+    if (observed.read && observed.apps.length > 0 && baseline === null) {
+      baseline = new Map();
+      observed.apps.forEach((app, i) => {
+        baseline.set(app.pmId ?? i, Number.isFinite(app.restarts) ? app.restarts : 0);
+      });
+    }
+    return reason;
   };
+
+  const failOrNull = (reason) => (reason
+    ? { ok: false, crash: true, detail: reason, reason }
+    : null);
 
   if (!port) {
     // Nothing to ask over HTTP: the app has to stay online, without PM2
     // restarting it, for a few seconds.
     await d.sleep(Math.min(2000, NO_PORT_SETTLE_MS));
-    const early = await status();
+    const early = await readPm2Status(name, pm2Path, d);
+    const earlyCrash = failOrNull(observe(early));
+    if (earlyCrash) return earlyCrash;
+
     await d.sleep(NO_PORT_SETTLE_MS - 2000);
-    const late = await status();
-    if (!late) return { ok: false, detail: 'PM2 no longer lists the process.' };
-    if (late.status !== 'online') return { ok: false, detail: `The process is "${late.status}", not online.` };
-    if (early && late.restarts > early.restarts) {
-      return { ok: false, detail: 'The process keeps restarting — it starts and then exits.' };
+    const late = await readPm2Status(name, pm2Path, d);
+    const lateCrash = failOrNull(observe(late));
+    if (lateCrash) return lateCrash;
+
+    if (late.apps.length === 0) return { ok: false, crash: true, detail: 'crashed at boot: PM2 no longer lists the process', reason: 'crashed at boot: PM2 no longer lists the process' };
+    const notOnline = late.apps.find((a) => a.status !== 'online');
+    if (notOnline) {
+      const reason = `crashed at boot: process is "${notOnline.status}", not online`;
+      return { ok: false, crash: true, detail: reason, reason };
     }
-    return { ok: true, detail: 'The process stayed online (no port is configured, so no HTTP check was made).' };
+    return {
+      ok: true,
+      crash: false,
+      reason: null,
+      detail: 'The process stayed online (no port is configured, so no HTTP check was made).',
+    };
   }
 
   const deadline = d.now() + timeoutS * 1000;
-  let last = 'no response yet';
+  let answeredOnce = false;
 
   for (;;) {
     const res = await d.probe(port, healthPath);
     if (res.ok && isHealthyStatus(res.status, strict)) {
-      return { ok: true, detail: `GET ${healthPath} on port ${port} answered ${res.status}.` };
+      if (answeredOnce) {
+        const observed = await readPm2Status(name, pm2Path, d);
+        const crash = failOrNull(observe(observed));
+        if (crash) return crash;
+        // A PM2 status that could not be read is not evidence of a crash; the
+        // HTTP answer is what we have.
+        if (!observed.read || (observed.apps.length > 0 && observed.apps.every((a) => a.status === 'online'))) {
+          return { ok: true, crash: false, reason: null, detail: `GET ${healthPath} on port ${port} answered ${res.status}, and PM2 stayed online.` };
+        }
+      } else {
+        const first = await readPm2Status(name, pm2Path, d);
+        const crash = failOrNull(observe(first));
+        if (crash) return crash;
+        answeredOnce = true;
+        // Keep watching for one short window: an app that answers and then
+        // crash-loops must not be accepted on the strength of that first answer.
+        const remaining = Math.max(0, deadline - d.now());
+        await d.sleep(Math.min(BOOT_CONFIRM_MS, remaining));
+        continue;
+      }
     }
     last = res.ok ? `it answered ${res.status}` : `no answer (${res.error})`;
 
-    // A process PM2 has given up on will never become healthy; stop waiting.
-    const app = await status();
-    if (app && (app.status === 'errored' || app.status === 'stopped')) {
-      return { ok: false, detail: `The process is "${app.status}" — it exited instead of listening on port ${port}.` };
-    }
+    const observed = await readPm2Status(name, pm2Path, d);
+    const crash = failOrNull(observe(observed));
+    if (crash) return crash;
 
-    if (d.now() >= deadline) break;
+    if (d.now() >= deadline) {
+      // A process that never reached "online" is a boot crash, not merely a
+      // slow health endpoint.
+      const notOnline = observed.read ? observed.apps.find((a) => a.status !== 'online') : null;
+      if (notOnline) {
+        const reason = `crashed at boot: process is "${notOnline.status}", not online`;
+        return { ok: false, crash: true, detail: reason, reason };
+      }
+      const detail = `No healthy response from GET ${healthPath} on port ${port} within ${timeoutS}s (${last}).`;
+      return { ok: false, crash: false, detail, reason: `health check failed: ${detail}` };
+    }
     await d.sleep(HEALTH_POLL_MS);
   }
-
-  return {
-    ok: false,
-    detail: `No healthy response from GET ${healthPath} on port ${port} within ${timeoutS}s (${last}).`,
-  };
 }
 
-/** Stops whatever is running under the app's PM2 name and starts a release. */
-async function switchTo(dir, name, pm2Path, d, log) {
+/**
+ * Reads the tail of a crashed release's PM2 out+error log, with the app's
+ * secret values removed.
+ *
+ * @returns {Promise<string[]>} At most BOOT_LOG_LINES lines
+ */
+async function captureBootLog(name, app, pm2Path, d) {
+  if (typeof d.runner.logs !== 'function') return [];
+  try {
+    const read = await d.runner.logs(name, { lines: BOOT_LOG_LINES, run: d.run, pm2Path });
+    const text = Array.isArray(read?.lines) ? read.lines.join('\n') : String(read?.output ?? '');
+    return text
+      .replace(/\r\n/g, '\n')
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .slice(-BOOT_LOG_LINES)
+      .map((line) => redactSecrets(line, app.env ?? {}, app.auth?.token ?? null));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Starts a release under PM2, or reloads it when both the new release and the
+ * running app are in cluster mode.
+ *
+ * `delete` rather than `restart` is the ordinary path: the working directory
+ * and the environment belong to the release, and PM2 keeps the old ones across
+ * a restart. Deleting a name PM2 does not know fails harmlessly on a first
+ * deployment. Cluster-to-cluster is the exception — PM2 reload overlaps the
+ * workers, which is the zero-downtime handover; a first deployment or a
+ * fork↔cluster switch cannot overlap and takes the delete/start path.
+ *
+ * @param {{ execMode?: 'fork'|'cluster' }} [options]
+ */
+async function switchTo(dir, name, pm2Path, d, log, { execMode = 'fork' } = {}) {
   const config = path.join(dir, PM2_CONFIG_FILE);
   if (!fs.existsSync(config)) return { ok: false, output: `${PM2_CONFIG_FILE} is missing from ${dir}.` };
 
-  // `delete` rather than `restart`: the working directory and the environment
-  // belong to the release, and PM2 keeps the old ones across a restart.
-  // Deleting a name PM2 does not know fails harmlessly on a first deployment.
+  if (execMode === 'cluster' && typeof d.runner.reloadConfig === 'function') {
+    const current = await readPm2Status(name, pm2Path, d);
+    const running = current.read && current.apps.length > 0;
+    const allCluster = running && current.apps.every((a) => a.execMode === 'cluster');
+    if (allCluster) {
+      log.line(`$ pm2 reload ${PM2_CONFIG_FILE} (cluster mode, zero downtime)`);
+      const reloaded = await d.runner.reloadConfig(config, { run: d.run, pm2Path });
+      if (!reloaded.ok) log.line(reloaded.output || 'pm2 reload failed with no output');
+      return reloaded;
+    }
+  }
+
   await d.runner.del(name, { run: d.run, pm2Path });
   const started = await d.runner.startConfig(config, { run: d.run, pm2Path });
   if (!started.ok) log.line(started.output || 'pm2 start failed with no output');
@@ -706,7 +941,12 @@ async function switchTo(dir, name, pm2Path, d, log) {
 }
 
 async function notify(app, run, d) {
-  const event = createDeployEvent(app.id, run.status, {
+  // A boot crash is a failed run, but when the previous release is serving
+  // again the notification should say so rather than only "failed".
+  const outcome = run.rollbackSucceeded === true && run.status === RUN_STATUS.FAILED
+    ? RUN_STATUS.ROLLED_BACK
+    : run.status;
+  const event = createDeployEvent(app.id, outcome, {
     sha: run.sha,
     reason: run.error,
     rollback: run.trigger === 'rollback',
@@ -766,6 +1006,12 @@ export function startDeployment(appId, { trigger = 'manual', ref = null, actor =
     error: null,
     warnings: [],
     rolledBackTo: null,
+    /** A short human reason for a boot crash or health failure, else null. */
+    reason: null,
+    /** Redacted PM2 out+error tail for a boot crash; empty otherwise. */
+    logTail: [],
+    /** true/false once an automatic rollback was attempted, null when none was. */
+    rollbackSucceeded: null,
   };
   writeRun(run);
 
@@ -811,18 +1057,34 @@ async function executeDeployment(app, run, d) {
   };
 
   /** Runs the user's commands for one step, in the release directory. */
-  const userCommands = async (step, title, commands, env) => {
+  const userCommands = async (step, title, commands, env, { hint = null, includeOutput = false } = {}) => {
     if (!commands || commands.length === 0) return;
     setStep(step, title);
     for (const command of commands) {
       log.line(`$ ${command}`);
+      let tail = '';
       const r = await d.runCommandLine(command, {
-        cwd: dir, env, timeout: STEP_TIMEOUT_MS, onData: (c) => log.output(c),
+        cwd: dir,
+        env,
+        timeout: STEP_TIMEOUT_MS,
+        onData: (c) => {
+          log.output(c);
+          if (includeOutput) {
+            tail += String(c);
+            if (tail.length > 4000) tail = tail.slice(-4000);
+          }
+        },
       });
       log.flush();
       if (!r.success) {
         const why = r.exitCode === null ? (r.stderr || 'it was stopped') : `exit code ${r.exitCode}`;
-        throw new StepError(step, `${title} failed: "${command}" — ${why}`);
+        const lines = includeOutput
+          ? tail.replace(/\r\n/g, '\n').split('\n').map((l) => l.trim()).filter(Boolean).slice(-5)
+            .map((l) => redactSecrets(l, app.env ?? {}, app.auth?.token ?? null))
+          : [];
+        const detail = `${title} failed: "${command}" — ${why}${lines.length ? `\n${lines.join('\n')}` : ''}${hint ? `\n${hint}` : ''}`;
+        if (hint) log.line(`hint: ${hint}`);
+        throw new StepError(step, detail);
       }
     }
   };
@@ -866,7 +1128,7 @@ async function executeDeployment(app, run, d) {
 
     const { settings, sources } = project;
     log.line(project.ezLocation ? `ez.json found at ${project.ezLocation}` : 'no ez.json — using package.json defaults');
-    for (const field of ['install', 'build', 'start', 'port', 'healthPath']) {
+    for (const field of ['install', 'build', 'migrate', 'start', 'port', 'healthPath', 'execMode', 'instances']) {
       const value = Array.isArray(settings[field]) ? (settings[field].join(' && ') || '(none)') : (settings[field] ?? '(none)');
       log.line(`  ${field.padEnd(10)} ${value}   [${sources[field]}]`);
     }
@@ -883,11 +1145,17 @@ async function executeDeployment(app, run, d) {
     const env = appEnvironment(app, settings, run.releaseId);
     const strict = sources.healthPath !== 'default';
 
-    // ── 3. pre → install → build ────────────────────────────────────────────
+    // ── 3. pre → install → build → migrate ──────────────────────────────────
     await userCommands('pre', 'Pre-deploy hook', settings.pre, env);
     await userCommands('install', 'Install', settings.install, env);
     await userCommands('build', 'Build', settings.build, env);
     verifyPersistentLinks(app.id, dir, settings.persist);
+    // Forward-only, and before anything is started: a migration that fails
+    // leaves the release that is running exactly as it was.
+    await userCommands('migrate', 'Migrate', settings.migrate, env, {
+      hint: MIGRATE_HINT,
+      includeOutput: true,
+    });
 
     // ── 4. switch ───────────────────────────────────────────────────────────
     setStep('start', 'Starting the new release');
@@ -902,12 +1170,14 @@ async function executeDeployment(app, run, d) {
     fs.writeFileSync(path.join(dir, 'ez.release.json'), JSON.stringify({
       sha: run.sha, ref: run.ref, port: settings.port, healthPath: settings.healthPath, strict,
       persist: settings.persist,
+      execMode: settings.execMode,
+      instances: settings.instances,
       deployedAt: new Date(d.now()).toISOString(),
     }, null, 2));
 
-    log.line(`$ pm2 delete ${name}; pm2 start ${PM2_CONFIG_FILE}`);
+    log.line(`$ pm2 delete ${name}; pm2 start ${PM2_CONFIG_FILE}${settings.execMode === 'cluster' ? ' (cluster mode; a running cluster app is reloaded instead)' : ''}`);
     switched = true;
-    const started = await switchTo(dir, name, pm2Path, d, log);
+    const started = await switchTo(dir, name, pm2Path, d, log, { execMode: settings.execMode });
     if (!started.ok) throw new StepError('start', 'PM2 could not start the new release.');
 
     // ── 5. health ───────────────────────────────────────────────────────────
@@ -917,7 +1187,9 @@ async function executeDeployment(app, run, d) {
       timeoutS: settings.healthTimeout, pm2Path, d,
     });
     log.line(health.detail);
-    if (!health.ok) throw new StepError('health', health.detail);
+    if (!health.ok) {
+      throw new StepError('health', health.detail, { bootCrash: health.crash, reason: health.reason });
+    }
 
     // ── 6. it is live ───────────────────────────────────────────────────────
     writeState(app.id, { current: run.releaseId, previous: before.current });
@@ -952,25 +1224,40 @@ async function executeDeployment(app, run, d) {
     log.line('Deployment succeeded.');
   } catch (err) {
     log.flush();
+    const bootCrash = err?.bootCrash === true;
     run.error = err?.message ?? String(err);
     run.step = err?.step ?? run.step;
+    run.reason = err?.reason ?? null;
     log.line(`ERROR: ${run.error}`);
     run.status = RUN_STATUS.FAILED;
+
+    // Read the crashed release's own PM2 log BEFORE a rollback reuses the
+    // same PM2 name — afterwards these lines belong to the restored release.
+    if (bootCrash) {
+      run.logTail = await captureBootLog(name, app, pm2Path, d);
+      if (run.logTail.length > 0) {
+        log.step(`PM2 log (last ${run.logTail.length} lines, secrets redacted)`);
+        for (const line of run.logTail) log.line(line);
+      } else {
+        log.line('PM2 produced no log lines for the crashed release.');
+      }
+    }
 
     if (!switched) {
       // Nothing that was running has been touched. The half-built directory
       // is of no use to a rollback and can be large; the log is what explains
       // the failure.
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      run.logTail = [];
       log.line('The running release was not touched.');
     } else if (before.current && app.autoRollback !== false) {
       log.step(`Rolling back to ${before.current}`);
       let restored = false;
       try {
         const previousDir = releaseDir(app.id, before.current);
-        const back = await switchTo(previousDir, name, pm2Path, d, log);
+        const meta = releaseHealth(previousDir);
+        const back = await switchTo(previousDir, name, pm2Path, d, log, { execMode: meta.execMode });
         if (back.ok) {
-          const meta = releaseHealth(previousDir);
           const health = await waitHealthy({
             name, port: meta.port, healthPath: meta.healthPath, strict: meta.strict,
             timeoutS: ROLLBACK_HEALTH_TIMEOUT_S, pm2Path, d,
@@ -982,8 +1269,13 @@ async function executeDeployment(app, run, d) {
         log.line(`Rollback error: ${rollbackErr.message}`);
       }
 
+      run.rollbackSucceeded = restored;
       if (restored) {
-        run.status = RUN_STATUS.ROLLED_BACK;
+        // A boot crash stays a failed run — what was deployed never worked —
+        // but the fact that the previous release is serving again is recorded
+        // rather than hidden. A plain health-check failure keeps the older
+        // `rolled_back` status.
+        if (!bootCrash) run.status = RUN_STATUS.ROLLED_BACK;
         run.rolledBackTo = before.current;
         log.line(`The previous release (${before.current}) is running again.`);
       } else {
@@ -993,10 +1285,11 @@ async function executeDeployment(app, run, d) {
     } else {
       // No release to return to (a first deployment) or rollback is switched
       // off. Remove the broken process so PM2 does not restart it in a loop.
+      run.rollbackSucceeded = null;
       try { await d.runner.del(name, { run: d.run, pm2Path }); } catch { /* ignore */ }
       log.line(before.current
-        ? 'Automatic rollback is switched off for this app; the process was stopped.'
-        : 'There is no earlier release to roll back to; the process was stopped.');
+        ? 'Automatic rollback is switched off for this app; the process was stopped. Fix the failure and deploy again.'
+        : 'There is no earlier release to roll back to, so the new release was stopped. Fix the failure and deploy again.');
     }
   }
 
@@ -1058,6 +1351,9 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
     error: null,
     warnings: [],
     rolledBackTo: null,
+    reason: null,
+    logTail: [],
+    rollbackSucceeded: null,
   };
   writeRun(run);
 
@@ -1073,7 +1369,7 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
       pm2Path = pm2.path ?? 'pm2';
 
       log.step(`Starting release ${target}`);
-      const started = await switchTo(targetDir, name, pm2Path, d, log);
+      const started = await switchTo(targetDir, name, pm2Path, d, log, { execMode: meta.execMode });
       if (!started.ok) throw new StepError('start', 'PM2 could not start that release.');
 
       run.step = 'health';
@@ -1084,7 +1380,7 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
         timeoutS: ROLLBACK_HEALTH_TIMEOUT_S, pm2Path, d,
       });
       log.line(health.detail);
-      if (!health.ok) throw new StepError('health', health.detail);
+      if (!health.ok) throw new StepError('health', health.detail, { bootCrash: health.crash, reason: health.reason });
 
       writeState(appId, { current: target, previous: before.current });
       await d.runner.save({ run: d.run, pm2Path });
@@ -1094,13 +1390,15 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
     } catch (err) {
       run.status = RUN_STATUS.FAILED;
       run.error = err?.message ?? String(err);
+      run.reason = err?.reason ?? null;
       run.step = err?.step ?? run.step;
       log.line(`ERROR: ${run.error}`);
 
       // Put back what was running, so a failed rollback is not also an outage.
       if (before.current) {
         try {
-          const back = await switchTo(releaseDir(appId, before.current), name, pm2Path, d, log);
+          const restoreDir = releaseDir(appId, before.current);
+          const back = await switchTo(restoreDir, name, pm2Path, d, log, { execMode: releaseHealth(restoreDir).execMode });
           log.line(back.ok
             ? `Release ${before.current} was started again.`
             : `Release ${before.current} could NOT be started again. The app may be down.`);

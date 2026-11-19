@@ -1,16 +1,20 @@
-import { useEffect, useState } from 'react';
-import { KeyRound } from 'lucide-react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { api, ApiError } from '../../lib/api';
 import type {
   DeployApp,
+  DeployAppCreated,
   DeployAppInput,
   DeployAuthType,
+  DeployKeyInfo,
   DeploymentsResponse,
 } from '../../lib/types';
 import {
+  CLUSTER_STATELESS_WARNING,
   checkPersistAddition,
+  deployKeyAddUrl,
   envToText,
   fromSettingsDraft,
+  isClusterCapable,
   isSshUrl,
   parseEnvText,
   toSettingsDraft,
@@ -19,11 +23,11 @@ import {
 } from '../../lib/deployments';
 import { validatePort } from '../../lib/validation';
 import { Button } from '../ui/Button';
-import { CopyButton } from '../ui/CopyButton';
 import { Checkbox, FormGrid, Select, Switch, TagInput, TextArea, TextInput } from '../ui/Field';
 import { Modal } from '../ui/Modal';
 import { InlineAlert } from '../ui/States';
 import { useToast } from '../ui/Toast';
+import { DeployKeyPanel } from './DeployKeyPanel';
 
 interface Draft {
   id: string;
@@ -31,6 +35,7 @@ interface Draft {
   branch: string;
   authType: DeployAuthType;
   token: string;
+  generateKey: boolean;
   settings: SettingsDraft;
   envText: string;
   keepReleases: string;
@@ -45,6 +50,7 @@ function emptyDraft(keepDefault: number): Draft {
     branch: 'main',
     authType: 'none',
     token: '',
+    generateKey: true,
     settings: toSettingsDraft({}),
     envText: '',
     keepReleases: String(keepDefault),
@@ -60,7 +66,8 @@ function draftFrom(app: DeployApp): Draft {
     branch: app.branch,
     authType: app.authType,
     token: '',
-    settings: toSettingsDraft(app.settings),
+    generateKey: true,
+    settings: toSettingsDraft(app.settings, { execMode: app.execMode, instances: app.instances }),
     envText: envToText(app.env),
     keepReleases: String(app.keepReleases),
     autoRollback: app.autoRollback,
@@ -68,9 +75,50 @@ function draftFrom(app: DeployApp): Draft {
   };
 }
 
+/** The key from a create answer: an object, or a public key string from an older server. */
+function keyFrom(saved: DeployAppCreated): DeployKeyInfo | null {
+  const value = saved.deployKey;
+  if (value && typeof value === 'object' && typeof value.publicKey === 'string') return value;
+  if (typeof value === 'string' && value) {
+    return {
+      publicKey: value,
+      fingerprint: saved.deployKeyFingerprint ?? '',
+      createdAt: saved.deployKeyCreatedAt ?? '',
+      addUrl: deployKeyAddUrl(saved.repoUrl),
+    };
+  }
+  return null;
+}
+
 function errorText(error: unknown, fallback: string): string {
   if (error instanceof ApiError) return error.message;
   return error instanceof Error ? error.message : fallback;
+}
+
+/** Says whether a value is an override, and offers to drop it back to ez.json. */
+function OverrideRow({
+  overridden,
+  note,
+  onClear,
+}: {
+  overridden: boolean;
+  note: ReactNode;
+  onClear: () => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-2xs text-faint">
+      <span>{overridden ? <>Override — {note}</> : note}</span>
+      {overridden && (
+        <button
+          type="button"
+          onClick={onClear}
+          className="rounded-sm font-medium text-accent-text underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/50"
+        >
+          Use ez.json / default
+        </button>
+      )}
+    </div>
+  );
 }
 
 /**
@@ -86,35 +134,62 @@ export function AppFormModal({
   meta,
   onClose,
   onSaved,
+  onCreated,
+  onDeployNow,
+  onRefresh,
 }: {
   open: boolean;
   /** The app being edited, or null to create one. */
   app: DeployApp | null;
   meta: DeploymentsResponse;
   onClose: () => void;
+  /** Save (or a create that has no key step) is done: the modal should close. */
   onSaved: (app: DeployApp, created: boolean) => void;
+  /** A create that stays open for its deploy key; refresh the list behind it. */
+  onCreated?: (app: DeployApp) => void;
+  /** "Deploy now" from the key step: close this modal and show the deployment. */
+  onDeployNow?: (appId: string) => void;
+  /** A key was generated or replaced on an existing app. */
+  onRefresh?: () => void;
 }) {
   const toast = useToast();
   const editing = app !== null;
   const [draft, setDraft] = useState<Draft>(() => emptyDraft(meta.limits.keepReleasesDefault));
   const [touched, setTouched] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [deployKey, setDeployKey] = useState<string | null>(null);
-  const [generatingKey, setGeneratingKey] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [created, setCreated] = useState<{ app: DeployApp; key: DeployKeyInfo | null; keyError: string | null } | null>(null);
+  const [deploying, setDeploying] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setDraft(app ? draftFrom(app) : emptyDraft(meta.limits.keepReleasesDefault));
-    setDeployKey(app?.deployKey ?? null);
+    setCreated(null);
     setTouched(false);
+    setFormError(null);
     // Reset only when the modal opens or the target changes, not on every
     // background refresh of the list behind it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, app?.id]);
 
-  const set = (patch: Partial<Draft>) => setDraft((current) => ({ ...current, ...patch }));
-  const setSettings = (patch: Partial<SettingsDraft>) =>
+  const set = (patch: Partial<Draft>) => {
+    setFormError(null);
+    setDraft((current) => ({ ...current, ...patch }));
+  };
+  const setSettings = (patch: Partial<SettingsDraft>) => {
+    setFormError(null);
     setDraft((current) => ({ ...current, settings: { ...current.settings, ...patch } }));
+  };
+
+  const clearMigrateOverride = () =>
+    setSettings({ migrate: '', migrateOff: false, migrateOverride: false });
+  const clearExecModeOverride = () =>
+    setSettings({ execMode: app?.execMode ?? 'fork', execModeOverride: false });
+  const clearInstancesOverride = () =>
+    setSettings({
+      instances: app?.instances !== undefined ? String(app.instances) : '',
+      instancesOverride: false,
+    });
 
   const repoUrl = draft.repoUrl.trim();
   const ssh = isSshUrl(repoUrl);
@@ -146,8 +221,25 @@ export function AppFormModal({
       keep > meta.limits.keepReleasesMax
         ? `A whole number from ${meta.limits.keepReleasesMin} to ${meta.limits.keepReleasesMax}.`
         : null,
+    instances: (() => {
+      const value = draft.settings.instances.trim();
+      if (!value || value === 'max') return null;
+      return /^\d+$/.test(value) && Number(value) >= 1
+        ? null
+        : 'A whole number from 1 to this server’s CPU count, or "max".';
+    })(),
   };
   const invalid = Object.values(errors).some(Boolean);
+
+  // The server enforces both rules; these are the form's own hints.
+  const clusterAllowed = isClusterCapable(draft.settings.start);
+  const clusterBlocked = draft.settings.execMode === 'cluster' && clusterAllowed === false;
+  const forkWithInstances =
+    draft.settings.execMode === 'fork' && Number(draft.settings.instances) > 1;
+  const serverWarnings = (app?.warnings ?? []).filter(
+    (warning) =>
+      !(draft.settings.execMode === 'cluster' && warning === CLUSTER_STATELESS_WARNING)
+  );
 
   const submit = async () => {
     if (saving) return;
@@ -166,38 +258,90 @@ export function AppFormModal({
     };
     // Only sent when typed: an empty field keeps the stored token.
     if (draft.token.trim()) input.token = draft.token.trim();
+    // The server ignores it for every other auth type, and PUT does not take it.
+    if (!editing && draft.authType === 'deployKey') input.generateKey = draft.generateKey;
 
     setSaving(true);
+    setFormError(null);
     try {
-      const saved = editing
-        ? await api.deployments.update(app.id, input)
-        : await api.deployments.create({ ...input, id: draft.id.trim() });
-      onSaved(saved, !editing);
+      if (editing) {
+        const saved = await api.deployments.update(app.id, input);
+        onSaved(saved, false);
+        return;
+      }
+
+      const saved = await api.deployments.create({ ...input, id: draft.id.trim() });
+      const key = keyFrom(saved);
+      if (draft.authType === 'deployKey' && draft.generateKey) {
+        // Creating never starts a deployment. The key was made in the same
+        // request, so the modal becomes its setup step instead of closing.
+        const appView: DeployApp = { ...(saved as DeployApp), deployKey: key?.publicKey ?? null };
+        setCreated({ app: appView, key, keyError: key ? null : saved.deployKeyError ?? 'The key was not generated.' });
+        onCreated?.(appView);
+        return;
+      }
+      onSaved(saved as DeployApp, true);
     } catch (error) {
-      toast.error(
-        editing ? 'Could not save the app' : 'Could not create the app',
-        errorText(error, 'Nothing was changed.')
-      );
+      // The server's own words (CPU count, node <file> form, …) stay with the form.
+      setFormError(errorText(error, 'Nothing was changed.'));
     } finally {
       setSaving(false);
     }
   };
 
-  const generateKey = async () => {
-    if (!app || generatingKey) return;
-    setGeneratingKey(true);
+  const deployNow = async () => {
+    if (!created || deploying) return;
+    setDeploying(true);
     try {
-      const result = await api.deployments.generateDeployKey(app.id);
-      setDeployKey(result.publicKey);
-      toast.success('Deploy key generated', 'Add the public key to the repository, read-only.');
+      await api.deployments.deploy(created.app.id);
+      toast.success(`${created.app.id} is deploying`, 'Its log is in the Deployments tab.');
+      onDeployNow?.(created.app.id);
     } catch (error) {
-      toast.error('Could not generate the key', errorText(error, 'Try again.'));
+      toast.error('Could not start the deployment', errorText(error, 'Nothing was started.'));
     } finally {
-      setGeneratingKey(false);
+      setDeploying(false);
     }
   };
 
   const show = <K extends keyof typeof errors>(key: K) => (touched ? errors[key] : null);
+
+  if (created) {
+    return (
+      <Modal
+        open={open}
+        onClose={onClose}
+        preventClose={deploying}
+        size="lg"
+        title={`${created.app.id} created`}
+        description="Add its public key to the repository so deployments can read the code."
+        footer={
+          <>
+            <Button variant="secondary" onClick={onClose} disabled={deploying}>
+              Close
+            </Button>
+            <Button variant="primary" onClick={() => void deployNow()} loading={deploying}>
+              Deploy now
+            </Button>
+          </>
+        }
+      >
+        <DeployKeyPanel
+          appId={created.app.id}
+          repoUrl={created.app.repoUrl}
+          publicKey={created.key?.publicKey ?? null}
+          fingerprint={created.key?.fingerprint ?? null}
+          createdAt={created.key?.createdAt ?? null}
+          onDisk={Boolean(created.key)}
+          initialError={created.keyError}
+          onChanged={() => onCreated?.(created.app)}
+        />
+        <p className="mt-3 text-2xs text-faint">
+          Closing keeps the app and its key; you can add the key to GitHub later from the app’s
+          GitHub tab.
+        </p>
+      </Modal>
+    );
+  }
 
   return (
     <Modal
@@ -231,6 +375,11 @@ export function AppFormModal({
         }}
         noValidate
       >
+        {formError && (
+          <InlineAlert tone="danger" title={editing ? 'The app was not saved' : 'The app was not created'}>
+            {formError}
+          </InlineAlert>
+        )}
         <section className="space-y-4">
           <FormGrid>
             <TextInput
@@ -305,44 +454,26 @@ export function AppFormModal({
             />
           )}
 
-          {draft.authType === 'deployKey' &&
-            (editing ? (
-              <div className="rounded-md border border-line bg-inset/50 p-3.5">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="text-xs font-medium text-ink">Deploy key</div>
-                  <Button
-                    size="sm"
-                    icon={<KeyRound className="size-3.5" aria-hidden="true" />}
-                    onClick={() => void generateKey()}
-                    loading={generatingKey}
-                  >
-                    {deployKey ? 'Generate a new key' : 'Generate key'}
-                  </Button>
-                </div>
-                {deployKey ? (
-                  <>
-                    <pre className="mt-2.5 max-h-24 overflow-auto whitespace-pre-wrap break-all rounded border border-line bg-canvas p-2.5 font-mono text-2xs text-muted">
-                      {deployKey}
-                    </pre>
-                    <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-                      <p className="text-2xs text-faint">
-                        Add it under the repository’s Settings → Deploy keys. Leave “Allow write
-                        access” off.
-                      </p>
-                      <CopyButton value={deployKey} label="Copy public key" withText />
-                    </div>
-                  </>
-                ) : (
-                  <p className="mt-2 text-2xs text-faint">
-                    No key yet. The private half stays on this server and is never shown.
-                  </p>
-                )}
-              </div>
+          {draft.authType === 'deployKey' && ssh ? (
+            editing ? (
+              <DeployKeyPanel
+                appId={app.id}
+                repoUrl={app.repoUrl}
+                publicKey={app.deployKey}
+                fingerprint={app.deployKeyFingerprint ?? null}
+                createdAt={app.deployKeyCreatedAt ?? null}
+                onDisk={app.deployKeyOnDisk ?? Boolean(app.deployKey)}
+                onChanged={onRefresh}
+              />
             ) : (
-              <InlineAlert tone="info">
-                Create the app first; the key is generated from its settings afterwards.
-              </InlineAlert>
-            ))}
+              <Checkbox
+                label="Generate a deploy key for me"
+                hint="Made in the same step as the app, without deploying anything. You then add its public half to the repository."
+                checked={draft.generateKey}
+                onChange={(generateKey) => set({ generateKey })}
+              />
+            )
+          ) : null}
         </section>
 
         <section className="space-y-4 border-t border-line pt-5">
@@ -354,6 +485,11 @@ export function AppFormModal({
               <code className="font-mono">package.json</code>.
             </p>
           </div>
+          {serverWarnings.map((warning) => (
+            <InlineAlert key={warning} tone="warning">
+              {warning}
+            </InlineAlert>
+          ))}
           <FormGrid>
             <TextInput
               label="Port"
@@ -426,6 +562,100 @@ export function AppFormModal({
               />
             </div>
           </FormGrid>
+          <div className="space-y-1">
+            <TextInput
+              label="Migrate command(s)"
+              optional
+              value={draft.settings.migrate}
+              onChange={(event) =>
+                setSettings({ migrate: event.target.value, migrateOff: false, migrateOverride: true })
+              }
+              hint="Runs after build, before the new release starts. Forward-only: a rollback does not undo a migration."
+              placeholder="from ez.json, e.g. npx prisma migrate deploy"
+              className="font-mono"
+              spellCheck={false}
+            />
+            <OverrideRow
+              overridden={draft.settings.migrateOverride}
+              note={
+                draft.settings.migrateOverride
+                  ? draft.settings.migrateOff
+                    ? 'the migrate step is off for this app.'
+                    : 'saved on this app instead of ez.json.'
+                  : 'No override — read from ez.json (nothing runs when ez.json has no migrate).'
+              }
+              onClear={clearMigrateOverride}
+            />
+          </div>
+          <FormGrid>
+            <Select
+              label="Process mode"
+              value={draft.settings.execMode}
+              onChange={(event) =>
+                setSettings({
+                  execMode: event.target.value as SettingsDraft['execMode'],
+                  execModeOverride: true,
+                })
+              }
+              hint="Cluster runs one worker per instance. It needs a start command of the form node <file>."
+            >
+              <option value="fork">Fork — one process</option>
+              <option value="cluster" disabled={clusterAllowed === false}>
+                Cluster — several workers
+              </option>
+            </Select>
+            <TextInput
+              label="Instances"
+              optional
+              value={draft.settings.instances}
+              onChange={(event) =>
+                setSettings({ instances: event.target.value, instancesOverride: true })
+              }
+              error={show('instances')}
+              hint="A whole number up to this server’s CPU count, or “max”. Leave empty for 1."
+              placeholder="1"
+            />
+          </FormGrid>
+          <OverrideRow
+            overridden={draft.settings.execModeOverride}
+            note={
+              draft.settings.execModeOverride
+                ? 'the process mode is saved on this app instead of ez.json.'
+                : editing
+                  ? 'No override — the effective mode comes from ez.json, else the default.'
+                  : 'No override yet — fork is the default.'
+            }
+            onClear={clearExecModeOverride}
+          />
+          <OverrideRow
+            overridden={draft.settings.instancesOverride}
+            note={
+              draft.settings.instancesOverride
+                ? 'the instance count is saved on this app instead of ez.json.'
+                : editing
+                  ? 'No override — the effective count comes from ez.json, else the default (1).'
+                  : 'No override yet — one instance is the default.'
+            }
+            onClear={clearInstancesOverride}
+          />
+          {clusterBlocked && (
+            <InlineAlert tone="warning">
+              Cluster mode needs a start command that runs a JS file directly, such as{' '}
+              <code className="font-mono">node dist/index.js</code> — not an npm script or another
+              language. Change the start command, or choose Fork.
+            </InlineAlert>
+          )}
+          {draft.settings.execMode === 'cluster' && (
+            <InlineAlert tone="warning" title="Cluster mode">
+              {CLUSTER_STATELESS_WARNING}
+            </InlineAlert>
+          )}
+          {forkWithInstances && (
+            <InlineAlert tone="warning">
+              Fork mode starts one process. Several forked copies would all bind the same port —
+              choose Cluster for {draft.settings.instances} instances.
+            </InlineAlert>
+          )}
         </section>
 
         <section className="space-y-4 border-t border-line pt-5">

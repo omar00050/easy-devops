@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Cable, Link2, RefreshCw, Unplug } from 'lucide-react';
 import { api, ApiError } from '../../lib/api';
 import type {
+  HubAgentStateEvent,
   HubStatus,
   PermissionGroup,
   PermissionLeaf,
@@ -13,6 +14,7 @@ import {
   useConfirm,
   useResource,
 } from '../../hooks/useResource';
+import { useRealtime } from '../../app/RealtimeProvider';
 import { Card, CardBody, CardHeader } from '../ui/Card';
 import { Badge, StatusDot, type Tone } from '../ui/Badge';
 import { Button } from '../ui/Button';
@@ -90,6 +92,7 @@ export function HubPanel() {
   const toast = useToast();
   const confirm = useConfirm();
   const hub = useResource<HubStatus>((signal) => api.hub.status(signal));
+  const setHubData = hub.setData;
 
   const [connectionString, setConnectionString] = useState('');
   const [connectError, setConnectError] = useState<string | null>(null);
@@ -99,16 +102,31 @@ export function HubPanel() {
 
   const status = hub.data?.status ?? 'not_linked';
 
-  // Keep asking while the outcome can still change on its own — including when
-  // the connection is healthy, because the agent may live in the background
-  // service and restart without this page knowing. The refresh is SILENT: the
-  // status line must not flash a loading bar on every poll.
+  // The agent publishes every state transition. This is the live path; the
+  // single REST read above covers the first render and a page opened later.
+  const { client } = useRealtime();
   useEffect(() => {
-    if (!hub.data?.linked) return;
-    const delay = status === 'connecting' ? 2_000 : status === 'unreachable' ? 5_000 : 15_000;
-    const id = window.setTimeout(hub.reloadSilent, delay);
-    return () => window.clearTimeout(id);
-  }, [hub.data, hub.reloadSilent, status]);
+    if (!client) return;
+    const onAgentState = (payload: HubAgentStateEvent) => {
+      setHubData((current) =>
+        current
+          ? {
+              ...current,
+              linked: payload.linked,
+              connected: payload.connected,
+              status: payload.status,
+              lastError: payload.lastError,
+              attempts: payload.attempts,
+              ...(payload.linked
+                ? {}
+                : { hubUrl: null, serverId: null, permissions: {} }),
+            }
+          : current
+      );
+    };
+    client.on('hub:agentState', onAgentState);
+    return () => client.off('hub:agentState', onAgentState);
+  }, [client, setHubData]);
 
   const connect = async () => {
     if (connecting) return;

@@ -14,7 +14,7 @@ import {
 import { api, ApiError } from '../lib/api';
 import type { DeployApp, DeploymentsResponse } from '../lib/types';
 import { formatBytes, formatUptime, pluralize, timeAgo, truncateMiddle } from '../lib/format';
-import { RUN_STATUS, processTone, shortSha, stepLabel } from '../lib/deployments';
+import { RUN_STATUS, modeSummary, processTone, shortSha, stepLabel } from '../lib/deployments';
 import {
   useDocumentTitle,
   usePolling,
@@ -174,7 +174,11 @@ function AppRow({
             ) : (
               <span>{app.currentRelease ? 'Not running' : 'Never deployed'}</span>
             )}
+            {modeSummary(app) && <span>· {modeSummary(app)}</span>}
           </span>
+          {app.warnings?.length ? (
+            <span className="mt-1 block text-2xs text-warn">{app.warnings.join(' ')}</span>
+          ) : null}
         </span>
       </button>
 
@@ -402,17 +406,18 @@ export function DeploymentsPage() {
         app={editing}
         meta={data}
         onClose={() => setFormOpen(false)}
+        onRefresh={resource.reload}
+        onCreated={() => resource.reload()}
+        onDeployNow={(id) => {
+          setFormOpen(false);
+          setDetail({ id, tab: 'activity' });
+          resource.reload();
+        }}
         onSaved={(saved, created) => {
           setFormOpen(false);
           resource.reload();
           if (created) {
             toast.success(`${saved.id} created`, 'Press Deploy to build and start it.');
-            // A deploy-key app is not usable until its key exists; take the
-            // user straight back to where it is generated.
-            if (saved.authType === 'deployKey') {
-              setEditing(saved);
-              setFormOpen(true);
-            }
           } else {
             toast.success(`${saved.id} saved`, 'It applies to the next deployment.');
           }

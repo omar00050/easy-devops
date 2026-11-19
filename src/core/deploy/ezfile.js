@@ -1,7 +1,7 @@
 /**
  * core/deploy/ezfile.js
  *
- * Works out HOW a project is installed, built and started.
+ * Works out HOW a project is installed, built, migrated and started.
  *
  * Three sources, in order of precedence:
  *
@@ -10,10 +10,10 @@
  *   3. defaults   — read from package.json, so a plain Node project deploys
  *                   with no configuration at all
  *
- * ez.json is optional. When it gives `install`, `build` and `start`, those
- * commands are run exactly as written, whatever the language — which is what
- * lets a Python or Go project deploy before anyone has written auto-detection
- * for it. Detection only ever saves writing the file.
+ * ez.json is optional. When it gives `install`, `build`, `migrate` and
+ * `start`, those commands are run exactly as written, whatever the language —
+ * which is what lets a Python or Go project deploy before anyone has written
+ * auto-detection for it. Detection only ever saves writing the file.
  *
  * Pure: no filesystem, no shell, no config. The engine reads the files and
  * hands their contents in, so every rule here can be tested directly.
@@ -23,18 +23,34 @@
  *   {
  *     "install": "npm ci",                  string | string[] | false
  *     "build":   "npm run build",           string | string[] | false
- *     "start":   "node server.js",          string
- *     "port":    3000,                      the port the app listens on
- *     "health":  "/healthz",                string, or { "path": "/healthz", "timeout": 60 }
- *     "hooks":   { "pre": "...", "post": "..." }    string | string[]
- *     "persist": ["data", "upload"],        paths that survive deployments
+ *     "migrate": "npx prisma migrate deploy"  string | string[] | false
+ *     "start":     "node server.js",        string
+ *     "port":      3000,                    the port the app listens on
+ *     "health":    "/healthz",              string, or { "path": "/healthz", "timeout": 60 }
+ *     "hooks":     { "pre": "...", "post": "..." }  string | string[]
+ *     "persist":   ["data", "upload"],      paths that survive deployments
+ *     "instances": 2,                      1..CPU count, or "max"
+ *     "execMode":  "cluster"               "fork" (default) | "cluster"
  *   }
  *
  * A persistent path is a folder or a single file.
  *
  * `false` (or an empty string) switches a step off — "this project has no
  * build" is a real answer, and different from "work it out for me".
+ *
+ * ── The order the engine runs them in ────────────────────────────────────────
+ *
+ *   hooks.pre → install → build → migrate → start
+ *
+ * `migrate` runs in the NEW release directory, with the app's deploy
+ * environment (the same one build gets), after install and build and before
+ * the new release is started or switched to. A non-zero exit aborts the
+ * deployment at the `migrate` step; the previous release keeps running
+ * untouched. Migrations are forward-only: a code rollback cannot undo one that
+ * already ran, so keep each migration backward-compatible for one release.
  */
+
+import os from 'os';
 
 /** Where ez.json may live, relative to the repository root, first match wins. */
 export const EZ_FILE_LOCATIONS = Object.freeze(['ez.json', 'deploy/ez.json', '.deploy/ez.json']);
@@ -43,8 +59,45 @@ export const DEFAULT_HEALTH_PATH = '/';
 export const DEFAULT_HEALTH_TIMEOUT_S = 60;
 export const MAX_HEALTH_TIMEOUT_S = 600;
 
-const COMMAND_FIELDS = Object.freeze(['install', 'build']);
-const KNOWN_KEYS = Object.freeze(['$schema', 'name', 'install', 'build', 'start', 'port', 'health', 'hooks', 'persist']);
+export const EXEC_MODES = Object.freeze(['fork', 'cluster']);
+
+export const CLUSTER_STATELESS_WARNING =
+  'Cluster mode runs several copies of the app; it must be stateless ' +
+  '(no in-memory sessions, sockets, caches or schedulers that assume one process).';
+
+function clusterStartError(start) {
+  return `execMode "cluster" needs a Node app started directly, such as "node dist/index.js" or ` +
+    `"node server.mjs". "${start}" cannot run in cluster mode — change the start command to "node <file>".`;
+}
+
+function forkInstancesError(instances) {
+  return `instances is ${instances} but execMode is "fork". Fork mode runs one process, and several ` +
+    'copies would all try to bind the same port. Set execMode to "cluster" to run more than one instance.';
+}
+
+/**
+ * The CPUs this machine offers PM2's cluster mode.
+ * os.availableParallelism() respects cgroup/affinity limits where it exists;
+ * os.cpus() is the fallback on older Node versions.
+ *
+ * @returns {number}
+ */
+export function availableCpuCount() {
+  try {
+    if (typeof os.availableParallelism === 'function') return Math.max(1, os.availableParallelism());
+  } catch { /* fall through */ }
+  try {
+    return Math.max(1, os.cpus()?.length ?? 1);
+  } catch {
+    return 1;
+  }
+}
+
+const COMMAND_FIELDS = Object.freeze(['install', 'build', 'migrate']);
+const KNOWN_KEYS = Object.freeze([
+  '$schema', 'name', 'install', 'build', 'migrate', 'start', 'port', 'health', 'hooks', 'persist',
+  'instances', 'execMode',
+]);
 const MAX_COMMAND_LENGTH = 2000;
 
 export const MAX_PERSIST_PATHS = 20;
@@ -98,6 +151,102 @@ export function normalizeHealthPath(value) {
   const p = value.trim();
   if (!p.startsWith('/') || p.length > 500 || /[\s\0]/.test(p)) return null;
   return p;
+}
+
+/**
+ * Validates an `instances` value: a whole number from 1 to the CPU count, or
+ * the string "max". A number above the CPU count is refused rather than
+ * clamped: the operator asked for something the machine cannot do, and PM2
+ * would otherwise silently start fewer workers than the file says.
+ *
+ * @param {*} value
+ * @param {number} [cpu]
+ * @returns {{ value: number|'max'|null, error: string|null }}
+ */
+export function normalizeInstances(value, cpu = availableCpuCount()) {
+  if (value === undefined || value === null || value === '') return { value: null, error: null };
+
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (text === '') return { value: null, error: null };
+    if (text.toLowerCase() === 'max') return { value: 'max', error: null };
+    const asNumber = Number(text);
+    if (!Number.isFinite(asNumber) || !Number.isInteger(asNumber)) {
+      return {
+        value: null,
+        error: `must be a whole number from 1 to ${cpu} (this server has ${cpu} CPU${cpu === 1 ? '' : 's'}), or "max"`,
+      };
+    }
+    return normalizeInstances(asNumber, cpu);
+  }
+
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
+    return {
+      value: null,
+      error: `must be a whole number from 1 to ${cpu} (this server has ${cpu} CPU${cpu === 1 ? '' : 's'}), or "max"`,
+    };
+  }
+  if (value < 1 || value > cpu) {
+    return {
+      value: null,
+      error: `must be from 1 to ${cpu} — this server has ${cpu} CPU${cpu === 1 ? '' : 's'}. Use "max" for one per CPU`,
+    };
+  }
+  return { value, error: null };
+}
+
+/**
+ * Validates an `execMode` value.
+ * @param {*} value
+ * @returns {{ value: 'fork'|'cluster'|null, error: string|null }}
+ */
+export function normalizeExecMode(value) {
+  if (value === undefined || value === null || value === '') return { value: null, error: null };
+  const mode = String(value).trim().toLowerCase();
+  if (mode === 'fork' || mode === 'cluster') return { value: mode, error: null };
+  return {
+    value: null,
+    error: 'must be "fork" (one process, the default) or "cluster" (one process per instance)',
+  };
+}
+
+/**
+ * The checks that need the resolved start command and both runtime fields.
+ *
+ * `assumeFork` marks a layer whose omitted execMode really means fork: the
+ * app's own settings form. In an ez.json layer an omitted value may still be
+ * supplied by an app override, so only an explicit "fork" is judged there.
+ *
+ * @param {{ start?: string|null, instances?: number|'max'|null, execMode?: string|null }} settings
+ * @param {{ assumeFork?: boolean }} [opts]
+ * @returns {{ errors: string[], warnings: string[] }}
+ */
+function runtimeValidation(settings, { assumeFork = false } = {}) {
+  const errors = [];
+  const warnings = [];
+
+  const mode = settings.execMode ?? (assumeFork ? 'fork' : null);
+  const instances = settings.instances === 'max'
+    ? availableCpuCount()
+    : (settings.instances ?? (assumeFork ? 1 : null));
+
+  if (mode === 'cluster') {
+    warnings.push(CLUSTER_STATELESS_WARNING);
+    if (settings.start && parseStartCommand(settings.start).kind !== 'node') {
+      errors.push(clusterStartError(settings.start));
+    }
+  }
+
+  if (instances !== null && instances > 1 && mode === 'fork') {
+    errors.push(forkInstancesError(instances));
+  }
+
+  return { errors, warnings };
+}
+
+/** The advisory strings that belong with a set of (already normalized) settings. */
+export function settingsWarnings(settings = {}) {
+  return String(settings?.execMode ?? '').toLowerCase() === 'cluster' ? [CLUSTER_STATELESS_WARNING] : [];
 }
 
 /**
@@ -257,6 +406,26 @@ export function parseEzFile(text) {
     else if (n.paths !== null) value.persist = n.paths;
   }
 
+  if (raw.instances !== undefined && raw.instances !== null) {
+    const n = normalizeInstances(raw.instances);
+    if (n.error) errors.push(`ez.json: "instances" ${n.error}`);
+    else if (n.value !== null) value.instances = n.value;
+  }
+
+  if (raw.execMode !== undefined && raw.execMode !== null) {
+    const n = normalizeExecMode(raw.execMode);
+    if (n.error) errors.push(`ez.json: "execMode" ${n.error}`);
+    else if (n.value !== null) value.execMode = n.value;
+  }
+
+  const runtime = runtimeValidation({
+    start: value.start ?? null,
+    instances: value.instances ?? null,
+    execMode: value.execMode ?? null,
+  });
+  errors.push(...runtime.errors);
+  warnings.push(...runtime.warnings);
+
   return { ok: errors.length === 0, value: errors.length === 0 ? value : null, errors, warnings };
 }
 
@@ -296,22 +465,24 @@ export function defaultsFromPackageJson(pkg, files = {}) {
 /**
  * Validates the per-app overrides set in the dashboard or the Hub.
  *
- * Same shape as a parsed ez.json (`install`, `build`, `start`, `port`,
- * `healthPath`, `healthTimeout`, `pre`, `post`, `persist`). An absent, null or
- * empty field means "do not override", so a form with untouched inputs
- * overrides nothing. `false` for install/build/pre/post switches that step off;
- * `[]` or `false` for persist means "nothing persistent", overriding ez.json.
+ * Same shape as a parsed ez.json (`install`, `build`, `migrate`, `start`,
+ * `port`, `healthPath`, `healthTimeout`, `pre`, `post`, `persist`). An absent,
+ * null or empty field means "do not override", so a form with untouched inputs
+ * overrides nothing. `false` for install/build/migrate/pre/post switches that
+ * step off; `[]` or `false` for persist means "nothing persistent", overriding
+ * ez.json.
  *
  * @param {*} input
- * @returns {{ ok: boolean, value: Object, errors: string[] }}
+ * @returns {{ ok: boolean, value: Object, errors: string[], warnings: string[] }}
  */
 export function normalizeOverrides(input) {
   const errors = [];
+  const warnings = [];
   const value = {};
-  if (input === undefined || input === null) return { ok: true, value, errors };
-  if (!isPlainObject(input)) return { ok: false, value, errors: ['settings must be an object'] };
+  if (input === undefined || input === null) return { ok: true, value, errors, warnings };
+  if (!isPlainObject(input)) return { ok: false, value, errors: ['settings must be an object'], warnings };
 
-  for (const field of ['install', 'build', 'pre', 'post']) {
+  for (const field of ['install', 'build', 'migrate', 'pre', 'post']) {
     const raw = input[field];
     if (raw === undefined || raw === null || raw === '') continue;
     const n = normalizeCommands(raw);
@@ -353,7 +524,27 @@ export function normalizeOverrides(input) {
     else if (n.paths !== null) value.persist = n.paths;
   }
 
-  return { ok: errors.length === 0, value, errors };
+  if (input.instances !== undefined && input.instances !== null && input.instances !== '') {
+    const n = normalizeInstances(input.instances);
+    if (n.error) errors.push(`instances ${n.error}`);
+    else if (n.value !== null) value.instances = n.value;
+  }
+
+  if (input.execMode !== undefined && input.execMode !== null && input.execMode !== '') {
+    const n = normalizeExecMode(input.execMode);
+    if (n.error) errors.push(`execMode ${n.error}`);
+    else if (n.value !== null) value.execMode = n.value;
+  }
+
+  const runtime = runtimeValidation({
+    start: value.start ?? null,
+    instances: value.instances ?? null,
+    execMode: value.execMode ?? null,
+  }, { assumeFork: true });
+  errors.push(...runtime.errors);
+  warnings.push(...runtime.warnings);
+
+  return { ok: errors.length === 0, value, errors, warnings };
 }
 
 /**
@@ -370,10 +561,11 @@ export function normalizeOverrides(input) {
  * @param {Object} [input.overrides] Value from normalizeOverrides()
  * @returns {{
  *   ok: boolean, error: string|null,
- *   settings: { install: string[], build: string[], start: string|null, port: number|null,
+ *   settings: { install: string[], build: string[], migrate: string[], start: string|null, port: number|null,
  *               healthPath: string, healthTimeout: number, pre: string[], post: string[],
- *               persist: string[] },
- *   sources: Object<string, 'override'|'ez.json'|'package.json'|'default'>
+ *               persist: string[], instances: number|'max', execMode: 'fork'|'cluster' },
+ *   sources: Object<string, 'override'|'ez.json'|'package.json'|'default'>,
+ *   warnings: string[]
  * }}
  */
 export function resolveSettings({ ez = null, pkg = null, files = {}, overrides = {} } = {}) {
@@ -399,6 +591,7 @@ export function resolveSettings({ ez = null, pkg = null, files = {}, overrides =
   const settings = {
     install: pick('install', []),
     build: pick('build', []),
+    migrate: pick('migrate', []),
     start: pick('start', null),
     port: pick('port', null),
     healthPath: pick('healthPath', DEFAULT_HEALTH_PATH),
@@ -406,6 +599,8 @@ export function resolveSettings({ ez = null, pkg = null, files = {}, overrides =
     pre: pick('pre', []),
     post: pick('post', []),
     persist: pick('persist', []),
+    instances: pick('instances', 1),
+    execMode: pick('execMode', 'fork'),
   };
 
   if (!settings.start) {
@@ -416,10 +611,16 @@ export function resolveSettings({ ez = null, pkg = null, files = {}, overrides =
         'or give package.json a "start" script or a "main" file.',
       settings,
       sources,
+      warnings: settingsWarnings(settings),
     };
   }
 
-  return { ok: true, error: null, settings, sources };
+  const runtime = runtimeValidation(settings, { assumeFork: true });
+  if (runtime.errors.length > 0) {
+    return { ok: false, error: runtime.errors.join(' '), settings, sources, warnings: runtime.warnings };
+  }
+
+  return { ok: true, error: null, settings, sources, warnings: runtime.warnings };
 }
 
 /**

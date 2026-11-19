@@ -126,6 +126,11 @@ async function addDomainAction() {
       type: 'confirm', name: 'www', message: 'Include www subdomain?', default: false,
       when: (ans) => !ans.wildcard,
     },
+    {
+      type: 'confirm', name: 'behindCloudflare',
+      message: 'Is this domain behind Cloudflare (trust CF-Connecting-IP)?',
+      default: false,
+    },
   ]);
 
   // Check for duplicate
@@ -320,6 +325,7 @@ async function addDomainAction() {
     upstreamType: basic.upstreamType,
     www: basic.www,
     wildcard: basic.wildcard,
+    behindCloudflare: basic.behindCloudflare ?? false,
     ssl,
     performance,
     security,
@@ -381,6 +387,11 @@ async function editDomainAction() {
       choices: ['http', 'https', 'ws'],
     },
     { type: 'confirm', name: 'www', message: 'Include www?', default: existing.www || false },
+    {
+      type: 'confirm', name: 'behindCloudflare',
+      message: 'Is this domain behind Cloudflare (trust CF-Connecting-IP)?',
+      default: existing.behindCloudflare === true,
+    },
     { type: 'confirm', name: 'sslEnabled', message: 'SSL enabled?', default: existing.ssl?.enabled || false },
   ]);
 
@@ -391,6 +402,7 @@ async function editDomainAction() {
   domain.port = updates.port;
   domain.upstreamType = updates.upstreamType;
   domain.www = updates.www;
+  domain.behindCloudflare = updates.behindCloudflare === true;
   domain.ssl.enabled = updates.sslEnabled;
 
   // Regenerate config through the shared core apply. On failure the previous

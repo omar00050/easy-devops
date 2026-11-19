@@ -20,8 +20,9 @@ import crypto from 'crypto';
 import fs from 'fs';
 
 import { dbGet, dbSet } from '../db.js';
-import { normalizeOverrides } from './ezfile.js';
+import { normalizeOverrides, settingsWarnings } from './ezfile.js';
 import path from 'path';
+import { describeDeployKey } from './deployKey.js';
 import { appPaths, deployRoot, ensureAppDirs, removeAppFiles } from './store.js';
 import { EZ_APP_NAMES } from '../runner.js';
 
@@ -172,10 +173,11 @@ export function getApp(id) {
  * value, and the token is kept unless a new one is supplied — so the UI never
  * has to round-trip a secret just to change the branch.
  *
- * @returns {{ ok: boolean, value: Object|null, errors: string[] }}
+ * @returns {{ ok: boolean, value: Object|null, errors: string[], warnings: string[] }}
  */
 export function normalizeAppInput(input, existing = null) {
   const errors = [];
+  const warnings = [];
   const src = input && typeof input === 'object' ? input : {};
   const has = (k) => src[k] !== undefined;
 
@@ -206,8 +208,12 @@ export function normalizeAppInput(input, existing = null) {
     errors.push('A deploy key needs an SSH repository URL (git@github.com:owner/repo.git).');
   }
 
-  const overrides = has('settings') ? normalizeOverrides(src.settings) : { ok: true, value: existing?.settings ?? {}, errors: [] };
+  const overrides = has('settings') ? normalizeOverrides(src.settings) : { ok: true, value: existing?.settings ?? {}, errors: [], warnings: [] };
   for (const e of overrides.errors) errors.push(e);
+  for (const w of overrides.warnings ?? []) warnings.push(w);
+  for (const w of settingsWarnings(overrides.value)) {
+    if (!warnings.includes(w)) warnings.push(w);
+  }
 
   const env = has('env') ? normalizeEnv(src.env) : { ok: true, value: existing?.env ?? {}, error: null };
   if (env.error) errors.push(env.error);
@@ -227,11 +233,12 @@ export function normalizeAppInput(input, existing = null) {
     }
   }
 
-  if (errors.length > 0) return { ok: false, value: null, errors };
+  if (errors.length > 0) return { ok: false, value: null, errors, warnings };
 
   return {
     ok: true,
     errors,
+    warnings,
     value: {
       repoUrl,
       branch,
@@ -241,6 +248,8 @@ export function normalizeAppInput(input, existing = null) {
         // need the secret entered again. Only used when the type says so.
         token,
         publicKey: existing?.auth?.publicKey ?? null,
+        keyFingerprint: existing?.auth?.keyFingerprint ?? null,
+        keyCreatedAt: existing?.auth?.keyCreatedAt ?? null,
       },
       settings: overrides.value,
       env: env.value,
@@ -264,7 +273,7 @@ export function createApp(input) {
   if (apps.some((a) => a.id === id)) return { ok: false, errors: [`An app named "${id}" already exists.`], status: 409 };
 
   const normalized = normalizeAppInput(input);
-  if (!normalized.ok) return { ok: false, errors: normalized.errors, status: 400 };
+  if (!normalized.ok) return { ok: false, errors: normalized.errors, warnings: normalized.warnings, status: 400 };
 
   const now = new Date().toISOString();
   const app = {
@@ -288,7 +297,7 @@ export function createApp(input) {
     saveApps(apps);
     return { ok: false, errors: [`Could not create ${app.dir}: ${err.message}`], status: 500 };
   }
-  return { ok: true, app };
+  return { ok: true, app, warnings: normalized.warnings };
 }
 
 /**
@@ -301,12 +310,12 @@ export function updateApp(id, input) {
   if (index === -1) return { ok: false, errors: [`No app named "${id}".`], status: 404 };
 
   const normalized = normalizeAppInput(input, apps[index]);
-  if (!normalized.ok) return { ok: false, errors: normalized.errors, status: 400 };
+  if (!normalized.ok) return { ok: false, errors: normalized.errors, warnings: normalized.warnings, status: 400 };
 
   const app = { ...apps[index], ...normalized.value, updatedAt: new Date().toISOString() };
   apps[index] = app;
   saveApps(apps);
-  return { ok: true, app };
+  return { ok: true, app, warnings: normalized.warnings };
 }
 
 /** Records a new folder for an app after it has been moved. */
@@ -317,6 +326,18 @@ export function setAppDir(id, dir) {
 /** Records (or clears) the domain linked to an app. */
 export function setAppDomain(id, domain) {
   return patchApp(id, { domain: domain ?? null });
+}
+
+/**
+ * Records the PUBLIC half of a freshly written deploy key. The private key is
+ * never stored in the registry; core/deploy/deployKey.js writes it to disk.
+ */
+export function setDeployKeyRecord(id, { publicKey, fingerprint, createdAt }) {
+  const app = getApp(id);
+  if (!app) return null;
+  return patchApp(id, {
+    auth: { ...(app.auth ?? {}), publicKey, keyFingerprint: fingerprint, keyCreatedAt: createdAt },
+  });
 }
 
 /** Low-level patch for fields this module owns (hook token, deploy key, folder, domain). */
@@ -391,59 +412,6 @@ export function verifyHookToken(app, presented) {
 
 // ─── The deploy key ───────────────────────────────────────────────────────────
 
-/** SSH wire encoding of a length-prefixed byte string. */
-function sshString(buf) {
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(buf.length);
-  return Buffer.concat([len, buf]);
-}
-
-/** SSH wire encoding of a positive big integer (a leading zero if the top bit is set). */
-function sshMpint(buf) {
-  let b = buf;
-  while (b.length > 1 && b[0] === 0) b = b.subarray(1);
-  if (b[0] & 0x80) b = Buffer.concat([Buffer.from([0]), b]);
-  return sshString(b);
-}
-
-/**
- * Generates an RSA key pair for an app and stores the private half on disk.
- *
- * Generated in-process rather than with `ssh-keygen`, so it does not depend on
- * which OpenSSH tools a machine has. RSA-4096 with a PKCS#1 PEM private key is
- * the one format every OpenSSH client reads, on both platforms.
- *
- * The public key is returned and stored; the private key is written with
- * owner-only permissions and never returned by any API.
- *
- * @returns {{ publicKey: string } | null} null when the app does not exist
- */
-export function generateDeployKey(id) {
-  if (!getApp(id)) return null;
-
-  const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
-    modulusLength: 4096,
-    publicKeyEncoding: { type: 'spki', format: 'pem' },
-    privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
-  });
-
-  const jwk = crypto.createPublicKey(publicKey).export({ format: 'jwk' });
-  const blob = Buffer.concat([
-    sshString(Buffer.from('ssh-rsa')),
-    sshMpint(Buffer.from(jwk.e, 'base64url')),
-    sshMpint(Buffer.from(jwk.n, 'base64url')),
-  ]);
-  const sshPublic = `ssh-rsa ${blob.toString('base64')} easy-devops-deploy-${id}`;
-
-  const p = ensureAppDirs(id);
-  fs.writeFileSync(p.deployKey, privateKey, { mode: 0o600 });
-  try { fs.chmodSync(p.deployKey, 0o600); } catch { /* not meaningful on Windows */ }
-
-  const app = getApp(id);
-  patchApp(id, { auth: { ...(app.auth ?? {}), publicKey: sshPublic } });
-  return { publicKey: sshPublic };
-}
-
 /** Path of an app's private deploy key, or null when it has none on disk. */
 export function deployKeyPath(id) {
   const file = appPaths(id).deployKey;
@@ -460,6 +428,7 @@ export function deployKeyPath(id) {
 export function dashboardApp(app) {
   if (!app) return null;
   const paths = appPaths(app.id);
+  const key = describeDeployKey(app);
   let hasSharedData = false;
   try { hasSharedData = fs.readdirSync(paths.shared).length > 0; } catch { /* nothing persistent */ }
   return {
@@ -469,8 +438,13 @@ export function dashboardApp(app) {
     branch: app.branch,
     authType: app.auth?.type ?? AUTH_TYPES.NONE,
     hasToken: Boolean(app.auth?.token),
-    deployKey: app.auth?.publicKey ?? null,
+    deployKey: key.publicKey,
+    deployKeyFingerprint: key.fingerprint,
+    deployKeyCreatedAt: key.createdAt,
+    deployKeyOnDisk: key.onDisk,
     settings: app.settings ?? {},
+    /** Advisory notes the UI shows beside the settings (cluster mode's stateless warning). */
+    warnings: settingsWarnings(app.settings ?? {}),
     env: app.env ?? {},
     keepReleases: app.keepReleases ?? DEFAULT_KEEP_RELEASES,
     autoRollback: app.autoRollback !== false,

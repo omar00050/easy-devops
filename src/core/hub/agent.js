@@ -36,6 +36,7 @@ import {
   COMING_SOON_PERMISSION_IDS,
   checkCommandAllowed,
 } from '../hubPermissions.js';
+import { startDeployProgress, stopDeployProgress } from './deployProgress.js';
 
 /** How often the agent checks the shared revision counter. */
 const REVISION_POLL_MS = 3_000;
@@ -268,10 +269,136 @@ function getPermissions() {
   return getHubPermissions();
 }
 
+// ─── Live command progress ────────────────────────────────────────────────────
+//
+// A long Hub command (a certificate request, a deployment) used to be silent
+// between its dispatch and its one `command:result`, so the browser could only
+// show "busy". `command:progress` fills that gap. It is deliberately small:
+// a step name, a status and an optional one-line detail — never file contents,
+// paths or anything a secret could hide in.
+//
+// At most five events leave per requestId per second. Beyond that the LAST
+// event of each step is kept and sent when the window reopens, so a step's
+// running → ok/failed pair cannot be lost to the throttle.
+
+const PROGRESS_WINDOW_MS = 1_000;
+const PROGRESS_MAX_PER_WINDOW = 5;
+const PROGRESS_DETAIL_MAX = 300;
+const PROGRESS_STATUSES = new Set(['running', 'ok', 'failed', 'skipped']);
+
+/**
+ * Builds the `onProgress(step, status, detail)` handed to a command handler.
+ *
+ * Bound to one requestId. It is a no-op when there is no requestId (nothing to
+ * correlate the event with) or when the socket is down, and it never throws:
+ * progress is a convenience, and a broken listener must not fail the command
+ * that is doing the real work.
+ *
+ * @param {string|null} requestId
+ * @returns {(step: string, status: 'running'|'ok'|'failed'|'skipped', detail?: string) => void}
+ */
+export function createCommandProgress(requestId) {
+  if (!requestId) return () => {};
+
+  let windowStartedAt = 0;
+  let sentInWindow = 0;
+  let timer = null;
+  // step -> newest event held back by the throttle
+  const deferred = new Map();
+
+  const emit = (payload) => {
+    try {
+      if (socket?.connected) socket.emit('command:progress', payload);
+    } catch { /* a progress event must never break the command */ }
+  };
+
+  const flush = () => {
+    timer = null;
+    try {
+      if (!deferred.size) return;
+      const now = Date.now();
+      if (now - windowStartedAt >= PROGRESS_WINDOW_MS) {
+        windowStartedAt = now;
+        sentInWindow = 0;
+      }
+      for (const [step, payload] of [...deferred]) {
+        if (sentInWindow >= PROGRESS_MAX_PER_WINDOW) break;
+        deferred.delete(step);
+        sentInWindow += 1;
+        emit(payload);
+      }
+      if (deferred.size) {
+        timer = setTimeout(flush, Math.max(10, windowStartedAt + PROGRESS_WINDOW_MS - Date.now()));
+      }
+    } catch { /* never throw from a timer */ }
+  };
+
+  return function onProgress(step, status, detail) {
+    try {
+      if (!socket?.connected) return;
+      if (!PROGRESS_STATUSES.has(status)) return;
+
+      const now = Date.now();
+      if (now - windowStartedAt >= PROGRESS_WINDOW_MS) {
+        windowStartedAt = now;
+        sentInWindow = 0;
+      }
+
+      const payload = { requestId, step: String(step), status, at: new Date().toISOString() };
+      if (typeof detail === 'string' && detail) {
+        payload.detail = detail.length > PROGRESS_DETAIL_MAX
+          ? detail.slice(0, PROGRESS_DETAIL_MAX)
+          : detail;
+      }
+
+      if (sentInWindow < PROGRESS_MAX_PER_WINDOW) {
+        sentInWindow += 1;
+        emit(payload);
+        return;
+      }
+
+      // Over the limit: remember only the newest event for this step.
+      deferred.set(payload.step, payload);
+      if (!timer) {
+        timer = setTimeout(flush, Math.max(10, windowStartedAt + PROGRESS_WINDOW_MS - now));
+      }
+    } catch { /* never throw */ }
+  };
+}
+
 /** Emits the acknowledgement the Hub and its browser clients wait for. */
-function sendResult(requestId, ok, { error = null, data = null } = {}) {
-  if (!requestId || !socket?.connected) return;
-  socket.emit('command:result', { requestId, ok, error, data });
+function sendResult(requestId, ok, { error = null, data = null } = {}, ack = null) {
+  if (!requestId) return;
+  const payload = { requestId, ok, error, data };
+
+  // A current Hub emits the command WITH a socket.io acknowledgement and
+  // answers its HTTP request from it; an older one only relays
+  // `command:result`, so both are sent. The ack goes first: the Hub relays a
+  // `command:result` it did not consume to the browser, and answering the ack
+  // before that lets the HTTP response and the live event tell the same story.
+  if (typeof ack === 'function') {
+    try { ack(payload); } catch { /* a stale ack must never break the handler */ }
+  }
+
+  if (socket?.connected) socket.emit('command:result', payload);
+}
+
+/**
+ * Logs how long one command took, with its outcome and nothing else.
+ *
+ * The first run of a command after a Hub restart can be slow (cold imports,
+ * certificate scans, a first PM2 read). Without this line that shows up only as
+ * a browser timing out, with no way to tell which command was responsible.
+ *
+ * NEVER log the payload: it can carry environment values, config contents and
+ * deploy tokens. The command name, duration and ok/error are enough.
+ *
+ * @param {string} command
+ * @param {number} startedAt Date.now() when handling began
+ * @param {boolean} ok
+ */
+function logCommandTiming(command, startedAt, ok) {
+  console.log(`[hubAgent] ${command} ${Math.max(0, Date.now() - startedAt)}ms ${ok ? 'ok' : 'error'}`);
 }
 
 /**
@@ -280,27 +407,32 @@ function sendResult(requestId, ok, { error = null, data = null } = {}) {
  * @param {string} command
  * @param {Object} payload  May carry a requestId added by the Hub
  * @param {(payload: Object) => Promise<Object|void>} fn
+ * @param {Function|null} [ack] socket.io acknowledgement, when the Hub waits
  */
-async function runCommand(command, payload, fn) {
+async function runCommand(command, payload, fn, ack = null) {
   const requestId = payload?.requestId ?? null;
+  const startedAt = Date.now();
 
   const verdict = checkCommandAllowed(command, payload, getPermissions());
   if (!verdict.allowed) {
     console.warn('[hubAgent] refused', command, '-', verdict.reason);
-    sendResult(requestId, false, { error: verdict.reason });
+    logCommandTiming(command, startedAt, false);
+    sendResult(requestId, false, { error: verdict.reason }, ack);
     return;
   }
 
   try {
     const data = await fn(payload ?? {});
-    sendResult(requestId, true, { data: data ?? null });
+    logCommandTiming(command, startedAt, true);
+    sendResult(requestId, true, { data: data ?? null }, ack);
   } catch (err) {
     console.error('[hubAgent]', command, 'failed:', err.message);
-    sendResult(requestId, false, { error: err.message });
+    logCommandTiming(command, startedAt, false);
+    sendResult(requestId, false, { error: err.message }, ack);
   }
 }
 
-async function handleReloadNginx(payload) {
+async function handleReloadNginx(payload, ack) {
   return runCommand('hub:reloadNginx', payload, async () => {
     // Reuse the dashboard's reload path instead of rebuilding the command
     // here: it resolves the nginx.exe path on Windows and uses `sudo -n`.
@@ -309,10 +441,10 @@ async function handleReloadNginx(payload) {
     notifyLocalDashboard('nginx');
     if (!r?.success) throw new Error(r?.output || 'nginx reload failed');
     return { output: r.output ?? '' };
-  });
+  }, ack);
 }
 
-async function handleNginxAction(payload) {
+async function handleNginxAction(payload, ack) {
   return runCommand('hub:nginxAction', payload, async ({ action }) => {
     const actions = {
       start: nginxStart, stop: nginxStop, restart: nginxRestart, test: nginxTest,
@@ -325,10 +457,10 @@ async function handleNginxAction(payload) {
     notifyLocalDashboard('nginx');
     if (r && r.success === false) throw new Error(r.output || `nginx ${action} failed`);
     return { action, output: r?.output ?? '' };
-  });
+  }, ack);
 }
 
-async function handleGetConfigs(payload) {
+async function handleGetConfigs(payload, ack) {
   return runCommand('hub:getConfigs', payload, async () => {
     const files = await listConfigs();
     const configs = [];
@@ -340,7 +472,7 @@ async function handleGetConfigs(payload) {
     }
     if (socket?.connected) socket.emit('nginx:configs', configs);
     return { count: configs.length };
-  });
+  }, ack);
 }
 
 /**
@@ -378,7 +510,7 @@ export function resolveSaveConfigReload(payload, permissions) {
   };
 }
 
-async function handleSaveConfig(payload) {
+async function handleSaveConfig(payload, ack) {
   return runCommand('hub:saveConfig', payload, async (body) => {
     const { filename, content } = body;
     if (typeof filename !== 'string' || !filename.trim()) throw new Error('filename is required');
@@ -420,18 +552,18 @@ async function handleSaveConfig(payload) {
     pushDomainConfigs();
     notifyLocalDashboard('nginx');
     return result;
-  });
+  }, ack);
 }
 
-async function handleGetLogs(payload) {
+async function handleGetLogs(payload, ack) {
   return runCommand('hub:getLogs', payload, async ({ lines }) => {
     const result = await getLogs(lines ?? 200);
     if (socket?.connected) socket.emit('nginx:logs', result);
     return { lines: result?.lines?.length ?? 0 };
-  });
+  }, ack);
 }
 
-async function handleManageDomain(payload) {
+async function handleManageDomain(payload, ack) {
   return runCommand('hub:manageDomain', payload, async (p) => {
     const { handleHubDomainCommand } = await import('../domains-db.js');
     const result = await handleHubDomainCommand(p);
@@ -442,10 +574,10 @@ async function handleManageDomain(payload) {
     pushDomainConfigs();
     notifyLocalDashboard('domains');
     return result ?? null;
-  });
+  }, ack);
 }
 
-async function handleManageSSL(payload) {
+async function handleManageSSL(payload, ack) {
   return runCommand('hub:manageSSL', payload, async (p) => {
     const { handleHubSslCommand } = await import('../cert-operations.js');
     const result = await handleHubSslCommand(p);
@@ -455,7 +587,7 @@ async function handleManageSSL(payload) {
     pushDomainConfigs();
     notifyLocalDashboard('ssl');
     return result ?? null;
-  });
+  }, ack);
 }
 
 /**
@@ -474,27 +606,30 @@ async function pushDeployApps() {
   } catch { /* non-fatal */ }
 }
 
-async function handleManageDeploy(payload) {
+async function handleManageDeploy(payload, ack) {
   return runCommand('hub:manageDeploy', payload, async (p) => {
     const { handleHubDeployCommand } = await import('../deploy/hubCommands.js');
     try {
-      return await handleHubDeployCommand(p, { onFinished: () => { pushDeployApps(); } });
+      return await handleHubDeployCommand(p, {
+        onFinished: () => { pushDeployApps(); },
+        onProgress: createCommandProgress(p?.requestId),
+      });
     } finally {
       // Whatever the action was, the list is the thing that may have changed.
       if (!['list', 'detail', 'run', 'github', 'getEnv'].includes(p?.action)) pushDeployApps();
       // Linking or deleting with a domain changes the domain list too.
       if (['linkDomain', 'delete'].includes(p?.action)) { pushDomainConfigs(); pushDomainHealth(); notifyLocalDashboard('domains'); }
     }
-  });
+  }, ack);
 }
 
-async function handleDeployHook(payload) {
+async function handleDeployHook(payload, ack) {
   return runCommand('hub:deployHook', payload, async (p) => {
     const { handleHubDeployHook } = await import('../deploy/hubCommands.js');
     const result = await handleHubDeployHook(p, { onFinished: () => { pushDeployApps(); } });
     if (result?.started) pushDeployApps();
     return result;
-  });
+  }, ack);
 }
 
 /**
@@ -548,7 +683,7 @@ async function handleManageProcess(payload) {
     // keep showing the old status until the next 60-second heartbeat.
     pushProcesses();
     return { name, action, managed: Boolean(app.managed), output: result.output ?? '' };
-  });
+  }, ack);
 }
 
 // ─── Permission + revision sync ───────────────────────────────────────────────
@@ -603,7 +738,7 @@ async function checkRevision() {
  * and the transport is someone else's problem: a dashboard running the jobs
  * itself forwards it to its own browsers, and the daemon forwards it over IPC
  * to a dashboard in another process. The payload is unchanged, so
- * docs/api-contract.md still describes it exactly.
+ * API-CONTRACT.md still describes it exactly.
  *
  * @param {'domains'|'ssl'|'nginx'|'settings'} section
  */
@@ -718,11 +853,18 @@ export function initHubAgent() {
     const { sslDir } = loadConfig();
     self.emit('server:info', { platform: platformName, sslDir: sslDir ?? '' });
     startHeartbeats();
+    startDeployProgress({
+      emit: (event, payload) => {
+        if (socket === self && self.connected) self.emit(event, payload);
+      },
+      onAppsChanged: () => pushDeployApps(),
+    });
   });
 
   self.on('disconnect', (reason) => {
     if (!isCurrent()) return;
     console.log('[hubAgent] Disconnected:', reason);
+    stopDeployProgress();
     stopHeartbeats();
 
     if (agentState.status === HUB_AGENT_STATUS.CONNECTED) {
@@ -770,6 +912,7 @@ export function initHubAgent() {
       if (!isCurrent()) return;
       cancelRejoin();
       setState(HUB_AGENT_STATUS.REJECTED, describeRejection(message));
+      stopDeployProgress();
       stopHeartbeats();
       return;
     }
@@ -866,6 +1009,7 @@ export function reconcileHubAgent() {
 }
 
 export function stopHubAgent() {
+  stopDeployProgress();
   stopHeartbeats();
   cancelRejoin();
   activeLink = null;

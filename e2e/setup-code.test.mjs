@@ -234,6 +234,11 @@ async function testNoPasswordPath() {
     `${res.out.code} ${JSON.stringify(res.out.body)}`);
   check('because it already requires a loopback bind AND a loopback request',
     loadConfig().dashboardAuth === 'none');
+  // Setup is finished either way, so the code must not stay outstanding for an
+  // installation that will never ask for it.
+  check('and the outstanding setup code is cleared',
+    setupCode.required() === false && setupCode.publicState().state === 'none',
+    JSON.stringify(setupCode.publicState()));
 
   // Still refused from elsewhere, code or no code.
   await resetToFirstRun();

@@ -19,13 +19,11 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import os from 'os';
 import * as acme from 'acme-client';
 
 import { loadConfig } from './config.js';
 import { run as defaultRun } from './shell.js';
 import {
-  isWindows,
   isDevDataDir,
   nginxServiceStartCmd,
   nginxServiceStopCmd,
@@ -160,15 +158,31 @@ export async function reloadNginx(run = defaultRun) {
   return { ok: result.success, output: combineOutput(result) };
 }
 
-/** Ensures the certificate directory exists, with the right ownership. */
-async function ensureCertDir(certDir, run) {
-  if (isWindows) {
+/**
+ * Ensures the certificate directory exists.
+ *
+ * No sudo: the directory is created and handed to this account ONCE by the
+ * setup script in core/permissions.js (`Settings -> Linux permissions`), so
+ * there is no standing grant for mkdir or chown to abuse. If the directory
+ * was never handed over, the failure names that setup rather than looking
+ * like an unexplained issuance error.
+ *
+ * @param {string} certDir
+ */
+async function ensureCertDir(certDir) {
+  try {
     await fs.mkdir(certDir, { recursive: true });
-    return;
+  } catch (err) {
+    if (err?.code === 'EACCES' || err?.code === 'EPERM') {
+      throw new Error(
+        `Cannot create the certificate directory ${certDir}: permission denied. `
+        + 'Run the one-time setup from a terminal so this account owns it '
+        + '(dashboard: Settings -> Linux permissions; CLI: Settings -> Linux Permissions), '
+        + 'then try again.',
+      );
+    }
+    throw err;
   }
-  const user = os.userInfo().username;
-  await run(`sudo -n mkdir -p "${certDir}"`);
-  await run(`sudo -n chown ${user}:${user} "${certDir}"`);
 }
 
 /** Loads or creates the persistent ACME account key. */
@@ -336,7 +350,7 @@ export async function issueCertificate(domainName, options = {}) {
   }
 
   const certDir = path.join(sslDir, domainName);
-  await ensureCertDir(certDir, run);
+  await ensureCertDir(certDir);
 
   const accountKey = await getAccountKey(sslDir);
   const client = new acme.Client({ directoryUrl: directoryUrl(staging), accountKey });

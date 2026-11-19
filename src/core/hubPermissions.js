@@ -314,8 +314,19 @@ function fromMap(map, action) {
     : undefined;
 }
 
+/** The SSL mode a deploy/link payload asks for, including the legacy boolean. */
+function requestedSslMode(payload) {
+  const ssl = payload?.ssl;
+  if (ssl === true) return 'issue';
+  if (ssl && typeof ssl === 'object' && !Array.isArray(ssl)) return ssl.mode ?? 'none';
+  return 'none';
+}
+
 /**
- * Resolves the permission a hub command payload requires.
+ * Resolves the permission(s) a hub command payload requires.
+ *
+ * Usually one id. `hub:manageDeploy { action: 'linkDomain' }` needs a list:
+ * every id in it must be granted, and a refusal names the first missing one.
  *
  * Returns null when the command needs no permission (read-only telemetry).
  * Returns undefined for an unknown command, so the agent can refuse it rather
@@ -323,7 +334,7 @@ function fromMap(map, action) {
  *
  * @param {string} command
  * @param {Object} [payload]
- * @returns {string|null|undefined}
+ * @returns {string|string[]|null|undefined}
  */
 export function permissionForCommand(command, payload = {}) {
   switch (command) {
@@ -377,6 +388,17 @@ export function permissionForCommand(command, payload = {}) {
     }
 
     case 'hub:manageDeploy': {
+      const action = payload?.action;
+
+      // Linking writes a domain config, so managing an app is not enough:
+      // domains.create is required too, and issuing a certificate is its own
+      // permission. All of them must be granted.
+      if (action === 'linkDomain') {
+        const needed = ['deploy.manage', 'domains.create'];
+        if (requestedSslMode(payload) === 'issue') needed.push('ssl.issue');
+        return needed;
+      }
+
       const map = {
         // Listing the apps and their status is monitoring, like the process
         // list: a paired server is a monitored server. No secrets are in it.
@@ -391,13 +413,14 @@ export function permissionForCommand(command, payload = {}) {
         delete: 'deploy.manage',
         deleteRelease: 'deploy.manage',
         issueToken: 'deploy.manage',
-        linkDomain: 'deploy.manage',
+        regenerateKey: 'deploy.manage',
+        testKey: 'deploy.manage',
+        addKeyToGithub: 'deploy.manage',
         unlinkDomain: 'deploy.manage',
         move: 'deploy.manage',
         getEnv: 'deploy.env',
         setEnv: 'deploy.env',
       };
-      const action = payload?.action;
       return fromMap(map, action);
     }
 
@@ -425,7 +448,7 @@ export function permissionForCommand(command, payload = {}) {
  * @param {string} command
  * @param {Object} payload
  * @param {Object<string, boolean>} permissions
- * @returns {{ allowed: boolean, permission: string|null, reason: string|null }}
+ * @returns {{ allowed: boolean, permission: string|string[]|null, reason: string|null }}
  */
 export function checkCommandAllowed(command, payload, permissions) {
   const required = permissionForCommand(command, payload);
@@ -436,14 +459,26 @@ export function checkCommandAllowed(command, payload, permissions) {
   if (required === null) {
     return { allowed: true, permission: null, reason: null };
   }
-  if (isComingSoon(required)) {
-    return { allowed: false, permission: required, reason: `'${required}' is not available yet.` };
+
+  const needed = Array.isArray(required) ? required : [required];
+  const grantedMap = normalizePermissions(permissions);
+
+  for (const permission of needed) {
+    if (isComingSoon(permission)) {
+      return { allowed: false, permission, reason: `'${permission}' is not available yet.` };
+    }
+    if (grantedMap[permission] !== true) {
+      return {
+        allowed: false,
+        permission,
+        reason: `Permission '${permission}' is disabled on this server.`,
+      };
+    }
   }
 
-  const granted = normalizePermissions(permissions)[required] === true;
   return {
-    allowed: granted,
+    allowed: true,
     permission: required,
-    reason: granted ? null : `Permission '${required}' is disabled on this server.`,
+    reason: null,
   };
 }

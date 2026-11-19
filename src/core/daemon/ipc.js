@@ -30,7 +30,7 @@
  *
  * ── Why the payloads are the contract's payloads ───────────────────────────
  *
- * The event names and shapes are the ones in docs/api-contract.md, so the
+ * The event names and shapes are the ones in API-CONTRACT.md, so the
  * dashboard forwards each frame to the browser unchanged. Anything else would
  * mean two schemas describing the same data.
  */

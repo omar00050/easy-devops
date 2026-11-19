@@ -182,7 +182,7 @@ async function testBus() {
   check('clearAll removes every listener', bus.listenerCount('nginx:status') === 0);
 
   check('JOB_EVENTS matches the contract names', JSON.stringify(bus.JOB_EVENTS) ===
-    JSON.stringify(['nginx:status', 'domain:health', 'notification:new', 'local:changed', 'service:changed']));
+    JSON.stringify(['nginx:status', 'domain:health', 'notification:new', 'local:changed', 'service:changed', 'hub:agentState']));
   check('logs:line is deliberately NOT a job event', !bus.JOB_EVENTS.includes('logs:line'));
 }
 
@@ -235,7 +235,6 @@ async function testDaemonRole() {
 }
 
 // ─── 3. Ownership: the dashboard standby and the hand-over ───────────────────
-
 async function testHandover() {
   setGroup('3. ownership — hand-over in both directions');
 
@@ -284,16 +283,10 @@ async function testHandover() {
 
   // ── A stale lock must not keep a dashboard idle for ever ──────────────────
   const staleDir = scratch('jobs-stale');
-  const dead = await (async () => {
-    const c = spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' });
-    const pid = c.pid;
-    await once(c, 'exit');
-    return pid;
-  })();
   const longAgo = Date.now() - lock.STALE_AFTER_MS - 60_000;
   fs.writeFileSync(
     lock.lockPath(staleDir),
-    `${JSON.stringify({ pid: dead, startedAt: longAgo, heartbeatAt: longAgo, version: null, mode: 'daemon' })}\n`,
+    `${JSON.stringify({ pid: 0x7ffffffe, startedAt: longAgo, heartbeatAt: longAgo, version: null, mode: 'daemon' })}\n`,
   );
 
   const onStale = startJobs({
@@ -302,6 +295,262 @@ async function testHandover() {
   });
   check('a dashboard runs the jobs despite a stale lock file', onStale.state().running === true, onStale.state().reason);
   await onStale.stop();
+}
+
+// ─── 3b. The lock is atomic across real processes ─────────────────────────────
+
+/**
+ * A child that waits for a shared "go" file and then tries to take the same
+ * lock as every other child. The wait is what makes the attempt simultaneous:
+ * spawning them in a loop alone would stagger the attempts enough that the
+ * race could resolve without ever contending.
+ *
+ * `kind` selects the module's acquisition call, so the same child races both
+ * the daemon lock (acquire/readLock) and the jobs marker (claim/readOwner).
+ */
+const RACE_CHILD = `
+const [modUrl, dataDir, readyFile, goFile, kind] = process.argv.slice(2);
+const fs = await import('node:fs');
+const mod = await import(modUrl);
+
+fs.writeFileSync(readyFile, String(process.pid));
+
+const deadline = Date.now() + 15000;
+while (!fs.existsSync(goFile) && Date.now() < deadline) { /* brief spin */ }
+
+const got = kind === 'owner'
+  ? mod.claim({ dataDir, role: 'dashboard' })
+  : mod.acquire({ dataDir, version: 'race', mode: 'daemon' });
+
+// Read back what is on disk NOW. "Won" only counts when the file names this
+// process: an acquisition taken away from under us is not one this process may
+// act on, and saying so is what turns a double takeover into a visible failure.
+const held = kind === 'owner' ? mod.readOwner(dataDir) : mod.readLock(dataDir);
+
+const verdict = !got.ok
+  ? 'LOST:' + got.reason
+  : (held && held.pid === process.pid ? 'WON:' + process.pid : 'CLAIMED-BUT-NOT-HELD');
+
+process.stdout.write(verdict + '\\n');
+process.exit(0);
+`;
+
+/**
+ * A pid that cannot exist. Spawning a process and letting it exit does not give
+ * one: Windows reuses pids so aggressively that one of the racers below can be
+ * handed the "dead" pid, which makes the planted lock read as live and leaves
+ * the whole race refusing for a reason that has nothing to do with the lock.
+ * 0x7ffffffe is used for the same purpose in cleanup.test.mjs.
+ */
+const DEAD_PID = 0x7ffffffe;
+
+let raceSeq = 0;
+
+/**
+ * Starts `count` real processes that all try to acquire the same lock at the
+ * same instant, and reports what each of them said.
+ *
+ * `kind` is 'lock' (daemon lock) or 'owner' (jobs marker); `dataDir` is
+ * prepared by the caller — empty for a create race, or holding a planted stale
+ * lock for a takeover race.
+ *
+ * @returns {Promise<{ allReady: boolean, racers: Array<Object>,
+ *                     winners: Array<Object>, losers: Array<Object>,
+ *                     unheld: Array<Object> }>}
+ */
+async function raceProcesses({ dataDir, modUrl, kind = 'lock', count = 6 }) {
+  const gateDir = scratch(`race-gate-${++raceSeq}`);
+  const goFile = path.join(gateDir, 'go');
+  const childFile = writeChild('lock-race.mjs', RACE_CHILD);
+
+  const racers = [];
+
+  for (let i = 0; i < count; i++) {
+    const readyFile = path.join(gateDir, `ready-${i}`);
+    const child = spawn(
+      process.execPath,
+      [childFile, modUrl, dataDir, readyFile, goFile, kind],
+      { cwd: ROOT, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+    );
+
+    const racer = { child, out: '', readyFile };
+    child.stdout.on('data', (d) => { racer.out += d; });
+    child.stderr.on('data', (d) => { racer.out += d; });
+    // 'close', not 'exit': exit fires while the pipes may still hold the
+    // child's verdict, which would make a winner look like a non-responder.
+    racer.done = once(child, 'close').catch(() => {});
+    racers.push(racer);
+  }
+
+  const allReady = await waitUntil(
+    () => racers.every((r) => fs.existsSync(r.readyFile)),
+    { timeoutMs: 15_000 },
+  );
+
+  // The starting gun: all of them open the lock within milliseconds of each
+  // other, so the acquisition really is contended.
+  fs.writeFileSync(goFile, 'go');
+
+  await Promise.all(racers.map((r) => r.done));
+
+  return {
+    allReady,
+    racers,
+    winners: racers.filter((r) => r.out.includes('WON:')),
+    losers: racers.filter((r) => r.out.includes('LOST:')),
+    unheld: racers.filter((r) => r.out.includes('CLAIMED-BUT-NOT-HELD')),
+  };
+}
+
+/** Kills any racer that survived (none should: each exits after reporting). */
+function killRacers(racers) {
+  for (const racer of racers) {
+    if (isAlivePid(racer.child.pid)) racer.child.kill();
+  }
+}
+
+/**
+ * One race must produce exactly one winner, nobody who "won" and then found
+ * the lock gone, and a file on disk naming the winner.
+ */
+function assertSingleWinner(race, readHeld, { label, count = 6 }) {
+  check(`exactly one process acquires the ${label}`, race.winners.length === 1,
+    `${race.winners.length} won, ${race.losers.length} lost`);
+  check(`every other process is refused the ${label}`, race.losers.length === count - 1,
+    race.losers.map((r) => r.out.trim()).join(' | ').slice(0, 200));
+  check(`no process reports success without holding the ${label}`, race.unheld.length === 0,
+    race.unheld.map((r) => r.out.trim()).join(' | '));
+
+  const held = readHeld();
+  check(`the ${label} on disk names the winner`,
+    Boolean(held) && race.winners.length === 1 && held.pid === race.winners[0].child.pid,
+    `pid on disk ${held?.pid}, winner ${race.winners[0]?.child.pid}`);
+}
+
+/**
+ * Acquisition is atomic, so N processes starting at once must produce exactly
+ * one winner. The old implementation checked inspect() first and then renamed
+ * a temp file into place — a window in which every process saw "no lock" and
+ * every process wrote one.
+ *
+ * The second and third races are the harder case: with a STALE lock already
+ * on disk, every process is entitled to recover it, so an unlink-by-belief
+ * takeover lets one process delete another's brand-new lock. Exactly one may
+ * still win.
+ *
+ * These are real child processes, because an in-process test cannot race a
+ * synchronous filesystem call. Each child owns its own pid, and none of them
+ * outlives the assertion.
+ */
+async function testLockRace() {
+  setGroup('3b. the lock is exclusive across real processes');
+
+  const lock = await import(srcUrl('core/daemon/lock.js'));
+  const owner = await import(srcUrl('core/jobs/owner.js'));
+
+  // ── 1. An empty directory: exactly one create may succeed ────────────────
+  const emptyDir = scratch('lock-race');
+  const emptyRace = await raceProcesses({ dataDir: emptyDir, modUrl: srcUrl('core/daemon/lock.js') });
+  check('every racer is waiting at the same moment', emptyRace.allReady, `${emptyRace.racers.length} child(ren)`);
+  assertSingleWinner(emptyRace, () => lock.readLock(emptyDir), { label: 'lock' });
+  killRacers(emptyRace.racers);
+  fs.rmSync(lock.lockPath(emptyDir), { force: true });
+
+  // ── 2. A planted STALE lock: still exactly one may take it over ──────────
+  const staleDir = scratch('lock-race-takeover');
+  const stalePid = DEAD_PID;
+  const longAgo = Date.now() - lock.STALE_AFTER_MS - 60_000;
+  fs.writeFileSync(
+    lock.lockPath(staleDir),
+    `${JSON.stringify({ pid: stalePid, startedAt: longAgo, heartbeatAt: longAgo, version: null, mode: 'daemon' })}\n`,
+  );
+
+  const takeoverRace = await raceProcesses({ dataDir: staleDir, modUrl: srcUrl('core/daemon/lock.js') });
+  check('the racers started over a stale lock', takeoverRace.allReady, `${takeoverRace.racers.length} child(ren)`);
+  assertSingleWinner(takeoverRace, () => lock.readLock(staleDir), { label: 'stale lock' });
+  check('the recovered lock belongs to the winner, not the dead pid',
+    lock.readLock(staleDir)?.pid !== stalePid, String(lock.readLock(staleDir)?.pid));
+  killRacers(takeoverRace.racers);
+  fs.rmSync(lock.lockPath(staleDir), { force: true });
+
+  // ── 3. The same race for the jobs marker ─────────────────────────────────
+  const ownerDir = scratch('owner-race-takeover');
+  fs.writeFileSync(
+    owner.ownerPath(ownerDir),
+    `${JSON.stringify({ pid: stalePid, role: 'dashboard', at: longAgo, heartbeatAt: longAgo })}\n`,
+  );
+
+  const ownerRace = await raceProcesses({
+    dataDir: ownerDir,
+    modUrl: srcUrl('core/jobs/owner.js'),
+    kind: 'owner',
+  });
+  check('the owner racers started over a stale marker', ownerRace.allReady, `${ownerRace.racers.length} child(ren)`);
+  assertSingleWinner(ownerRace, () => owner.readOwner(ownerDir), { label: 'jobs marker' });
+  killRacers(ownerRace.racers);
+  fs.rmSync(owner.ownerPath(ownerDir), { force: true });
+
+  // ── 3c. A half-written file must not block acquisition for ever ─────────
+  //
+  // A crash between creating the file and writing it leaves a truncated one.
+  // It has no readable owner, so it is abandoned: recovered through the guard
+  // rather than waited on for ever.
+  const brokenDir = scratch('lock-broken');
+  fs.writeFileSync(lock.lockPath(brokenDir), '{"pid":12');
+  const brokenLock = lock.acquire({ dataDir: brokenDir, version: 'broken', mode: 'daemon' });
+  check('a half-written lock is recovered, not waited on', brokenLock.ok === true,
+    brokenLock.ok === false ? brokenLock.reason : '');
+  lock.release({ dataDir: brokenDir });
+
+  const brokenOwnerDir = scratch('owner-broken');
+  fs.writeFileSync(owner.ownerPath(brokenOwnerDir), '{"pid":12');
+  const brokenOwner = owner.claim({ dataDir: brokenOwnerDir, role: 'dashboard' });
+  check('a half-written jobs marker is recovered too', brokenOwner.ok === true,
+    brokenOwner.ok === false ? brokenOwner.reason : '');
+  owner.release({ dataDir: brokenOwnerDir });
+
+  // ── 3d. An EMPTY file just created is a create in flight ─────────────────
+  //
+  // `writeFileSync(..., { flag: 'wx' })` creates the path and then writes it, so
+  // a brand-new lock is briefly empty. That must not be mistaken for a crash.
+  const inFlightDir = scratch('lock-empty');
+  fs.writeFileSync(lock.lockPath(inFlightDir), '');
+  const freshEmpty = lock.acquire({ dataDir: inFlightDir, version: 'fresh', mode: 'daemon' });
+  check('an empty lock just created is NOT taken over', freshEmpty.ok === false,
+    freshEmpty.ok === true ? 'stolen' : freshEmpty.reason);
+
+  const old = new Date(Date.now() - 5_000);
+  fs.utimesSync(lock.lockPath(inFlightDir), old, old);
+  const oldEmpty = lock.acquire({ dataDir: inFlightDir, version: 'old', mode: 'daemon' });
+  check('the same empty lock with an old mtime IS recovered', oldEmpty.ok === true,
+    oldEmpty.ok === false ? oldEmpty.reason : `recovered=${oldEmpty.recovered}`);
+  lock.release({ dataDir: inFlightDir });
+
+  // ── 4. Stale recovery still works, and a re-acquire stays idempotent ─────
+  const recoverDir = scratch('lock-race-stale');
+  fs.writeFileSync(
+    lock.lockPath(recoverDir),
+    `${JSON.stringify({ pid: stalePid, startedAt: longAgo, heartbeatAt: longAgo, version: null, mode: 'daemon' })}\n`,
+  );
+
+  const recovered = lock.acquire({ dataDir: recoverDir, version: 'recover', mode: 'daemon' });
+  check('a stale lock is recovered', recovered.ok === true && recovered.recovered === true,
+    recovered.ok === false ? recovered.reason : `recovered=${recovered.recovered}`);
+  check('and the recovered lock is ours', lock.readLock(recoverDir)?.pid === process.pid);
+
+  const again = lock.acquire({ dataDir: recoverDir, version: 'recover', mode: 'daemon' });
+  check('re-acquiring as the same pid is idempotent',
+    again.ok === true && again.recovered === false,
+    again.ok === false ? again.reason : `recovered=${again.recovered}`);
+
+  lock.release({ dataDir: recoverDir });
+  check('releasing leaves no lock behind', lock.readLock(recoverDir) === null);
+}
+
+/** Signal-0 liveness check, local to this suite. */
+function isAlivePid(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
 // ─── 4. IPC ───────────────────────────────────────────────────────────────────
@@ -337,24 +586,39 @@ async function testIpc() {
   check('hello carries the daemon identity',
     received.find(([e]) => e === 'daemon:hello')?.[1]?.version === '1.2.3');
 
+  // A job runner started by an earlier section can still have a probe in
+  // flight when this one begins, and its late publish lands in `received` like
+  // any other frame. Only frames after this point are this assertion's
+  // business, or the test races the previous section's cleanup.
+  const beforeStatus = received.length;
+
   // A bus event in the server's process must reach the client unchanged.
+  //
+  // Identified by its payload rather than by being the first frame of that
+  // name: a monitor tick from the previous section can still be in flight and
+  // publish its own `nginx:status` after `beforeStatus`.
+  const ours = ([event, payload]) => event === 'nginx:status' && payload?.pid === 42;
   bus.publish('nginx:status', { running: true, version: 'nginx/1.2.3', pid: 42 });
-  const gotStatus = await waitUntil(() => received.some(([e]) => e === 'nginx:status'));
+  const gotStatus = await waitUntil(() =>
+    received.slice(beforeStatus).some(ours));
   check('a published event reaches the client', gotStatus);
-  const status = received.find(([e]) => e === 'nginx:status')?.[1];
+  const status = received.slice(beforeStatus).find(ours)?.[1];
   check('the payload is unchanged', status?.running === true && status?.pid === 42
-    && status?.version === 'nginx/1.2.3');
+    && status?.version === 'nginx/1.2.3', JSON.stringify(status ?? null));
 
   // Several frames in flight must not be merged or split: this is what the
   // newline framing is for, and a large payload is where it would break.
   const big = Array.from({ length: 200 }, (_, i) => ({ name: `d${i}.example.com`, up: i % 2 === 0, port: 3000 + i }));
+  const beforeBurst = received.length;
   bus.publish('domain:health', big);
   bus.publish('notification:new', { id: 'n1', type: 'domain_health' });
-  const gotBoth = await waitUntil(() =>
-    received.some(([e]) => e === 'domain:health') && received.some(([e]) => e === 'notification:new'));
+  const gotBoth = await waitUntil(() => {
+    const burst = received.slice(beforeBurst);
+    return burst.some(([e]) => e === 'domain:health') && burst.some(([e]) => e === 'notification:new');
+  });
   check('a large frame and the one after it both arrive whole', gotBoth);
   check('the large payload survived intact',
-    received.find(([e]) => e === 'domain:health')?.[1]?.length === 200);
+    received.slice(beforeBurst).find(([e]) => e === 'domain:health')?.[1]?.length === 200);
 
   client.close();
   await server.close();
@@ -669,6 +933,7 @@ async function main() {
   await testBus();
   await testDaemonRole();
   await testHandover();
+  await testLockRace();
   await testIpc();
   await testDaemonLifecycle();
   await testAsciiOutput();

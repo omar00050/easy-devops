@@ -283,8 +283,12 @@ async function main() {
   check('a domain without a certificate answers found:false', apiNone.status === 200 &&
     apiNone.body?.found === false, `status ${apiNone.status}`);
 
+  // The deployments link dialog asks before the domain exists, so an unknown
+  // name is a normal "not found" answer rather than 404.
   const apiUnknown = await req('GET', '/api/domains/nope.example.net/ssl-suggestion', { cookie });
-  check('an unknown domain is a 404', apiUnknown.status === 404, `status ${apiUnknown.status}`);
+  check('an unknown domain answers found:false, not 404',
+    apiUnknown.status === 200 && apiUnknown.body?.found === false,
+    `status ${apiUnknown.status}`);
 
   const stored = await req('GET', '/api/domains', { cookie });
   const storedDomain = (stored.body ?? []).find((d) => d.name === 'new.devxor.team');

@@ -539,20 +539,210 @@ export async function scan({
 // ─── Applying ────────────────────────────────────────────────────────────────
 
 /**
+ * Normalised form of an absolute path, for comparisons only.
+ *
+ * Separators are unified so a Windows path cannot dodge a check by being
+ * written with forward slashes, and case is ignored on Windows where the
+ * filesystem is. Never used to touch the filesystem.
+ *
+ * @param {string} target
+ * @returns {string}
+ */
+function normalizeForCompare(target) {
+  const forward = path.resolve(target).replace(/\\/g, '/');
+  return isWindows ? forward.toLowerCase() : forward;
+}
+
+/**
+ * True when `target` is one of `roots` or lives inside one.
+ *
+ * Segments, never string prefixes: `/data-evil` starts with `/data` but is not
+ * inside it, and a prefix check would delete it.
+ *
+ * @param {string} root Real path of the root
+ * @param {string} target Already a real path
+ * @returns {boolean}
+ */
+function isInsideOrEqual(root, target) {
+  const base = normalizeForCompare(root).replace(/\/+$/, '');
+  const real = normalizeForCompare(target);
+  if (!base) return false;
+  return real === base || real.startsWith(`${base}/`);
+}
+
+/**
+ * True when `target` lives strictly INSIDE one of `roots`.
+ *
+ * Equality is refused on purpose: an item whose real path IS a root is the
+ * data directory, the nginx directory or the PM2 home, and `rmSync` with
+ * `recursive` on one of those removes everything in it — the database
+ * included. Only a path below a root may be deleted.
+ *
+ * @param {string[]} roots Real paths, as allowedRoots() returns them
+ * @param {string} target Already a real path
+ * @returns {boolean}
+ */
+function isInsideAny(roots, target) {
+  const real = normalizeForCompare(target);
+
+  return roots.some((root) => {
+    const base = normalizeForCompare(root).replace(/\/+$/, '');
+    if (!base) return false;
+    return real !== base && real.startsWith(`${base}/`);
+  });
+}
+
+/**
+ * The directories `apply()` may delete inside.
+ *
+ * Exactly the places the scan reached, so an item id from anywhere else — a
+ * stale report, a hand-edited file, a crafted API payload — cannot become an
+ * arbitrary delete. Paths are resolved to their real form here so a symlinked
+ * root is compared the same way the item's own real path is.
+ *
+ * @param {Object} opts
+ * @returns {string[]}
+ */
+function allowedRoots({ dataDir, config, deps }) {
+  const roots = [dataDir];
+
+  // Windows Server mode writes the service's logs under ProgramData.
+  if (isWindows) roots.push(path.join(programDataDir(), 'logs'));
+
+  if (typeof config?.nginxDir === 'string' && config.nginxDir.trim()) {
+    roots.push(config.nginxDir.trim());
+  }
+
+  // PM2's own log directory, for the `pm2 flush` action.
+  try {
+    const pm2Home = (deps.pm2HomeDir ?? runner.pm2HomeDir)();
+    if (pm2Home) roots.push(pm2Home);
+  } catch { /* PM2 is not installed */ }
+
+  return roots
+    .filter((root) => typeof root === 'string' && root.length > 0)
+    .map((root) => {
+      try {
+        return fs.realpathSync(root);
+      } catch {
+        // A root that does not exist cannot contain a file that does; the
+        // resolved form keeps the comparison honest all the same.
+        return path.resolve(root);
+      }
+    });
+}
+
+/**
+ * Whether an item is one of the `<dataDir>.backup-*` directories the scan
+ * offers, which sit BESIDE the data directory rather than inside it.
+ *
+ * Matched by the exact name shape the scanner produces and by an equal parent,
+ * never by a parent-directory prefix: a prefix would also admit everything
+ * else the user keeps next to the data directory.
+ *
+ * @param {string} target Already a real path
+ * @param {string} dataDir
+ * @returns {boolean}
+ */
+function isDataDirBackupSibling(target, dataDir) {
+  const parent = normalizeForCompare(path.dirname(path.resolve(dataDir)));
+  if (normalizeForCompare(path.dirname(target)) !== parent) return false;
+
+  const prefix = `${path.basename(path.resolve(dataDir))}.backup-`;
+  const name = path.basename(target);
+  return isWindows ? name.toLowerCase().startsWith(prefix.toLowerCase()) : name.startsWith(prefix);
+}
+
+/**
+ * Why a path must never be removed, or null when it may be.
+ *
+ * Being inside a root is not enough. These live inside the very directories
+ * the scan reads, and removing any of them breaks the installation rather
+ * than reclaiming disk:
+ *
+ *   - the SQLite database and its `-wal` / `-shm` / `.migrated` siblings —
+ *     inside the data directory, and offered by nothing, but a crafted item id
+ *     naming one would otherwise pass the containment check;
+ *   - anything under the configured sslDir (certificates, private keys, the
+ *     ACME account key), including sslDir itself. The scan never lists these;
+ *     apply() must refuse them even if it is handed one;
+ *   - an active nginx config: a `.conf` file anywhere, and from the nginx
+ *     directory only `.bak` copies (which is the only thing the scan offers
+ *     there).
+ *
+ * @param {string} real Already a real path
+ * @param {{ dataDir: string, config: Object }} opts
+ * @returns {string|null} The reason to refuse, or null
+ */
+function protectedReason(real, { dataDir, config }) {
+  const name = path.basename(real);
+
+  // core/db.js keeps its database at <dataDir>/easy-devops.sqlite; the name is
+  // matched by prefix so -wal, -shm and .migrated are covered by the same rule.
+  if (normalizeForCompare(path.dirname(real)) === normalizeForCompare(dataDir)
+    && name.toLowerCase().startsWith('easy-devops.sqlite')) {
+    return 'the database and its side files are never removed';
+  }
+
+  const sslDir = typeof config?.sslDir === 'string' ? config.sslDir.trim() : '';
+  if (sslDir && isInsideOrEqual(sslDir, real)) {
+    return 'certificates and keys under the SSL directory are never removed';
+  }
+
+  if (/\.conf$/i.test(name)) {
+    return 'an active nginx config (.conf) is never removed; only .bak copies are';
+  }
+
+  const nginxDir = typeof config?.nginxDir === 'string' ? config.nginxDir.trim() : '';
+  if (nginxDir && isInsideOrEqual(nginxDir, real) && !/\.bak$/i.test(name)) {
+    return 'only .bak copies may be removed from the nginx directory';
+  }
+
+  return null;
+}
+
+/**
  * Removes the given items, and nothing else.
  *
  * Each item carries its own action, so a caller never has to know that PM2
  * logs are flushed rather than deleted, or that a Node version is uninstalled
  * by its manager.
  *
+ * Before deleting anything by path, the item's REAL path is checked against
+ * the directories this scan covers. Ids come from a previous scan, but they
+ * travel through a prompt and possibly an HTTP request, so they are re-checked
+ * where it matters: a path that is not STRICTLY inside one of those roots —
+ * including a symlink inside one that points outside, and including a root
+ * itself — is refused and reported, not removed. Strictly, because a root is
+ * the data directory, the nginx directory or the PM2 home, and removing one
+ * recursively takes everything in it, the database included.
+ *
+ * Inside a root, the protected set is refused as well: the database and its
+ * side files, anything under sslDir, and active nginx configs.
+ *
+ * The two actions that delete nothing here are unaffected: `pm2 flush` asks
+ * PM2, and a Node version is removed by its manager from a version number, so
+ * there is no path of ours to confine. The PM2 home is still one of the roots,
+ * because that is a directory the scan reads and a future path-based PM2
+ * removal must stay inside.
+ *
  * @param {Object} opts
  * @param {Array<Object>} opts.items From scan()
+ * @param {string} [opts.dataDir]
+ * @param {Object} [opts.config]
  * @returns {Promise<{ removed: Array<Object>, failed: Array<Object>, freedBytes: number }>}
  */
-export async function apply({ items = [], log = () => {}, deps = {} } = {}) {
+export async function apply({
+  items = [],
+  log = () => {},
+  deps = {},
+  dataDir = getDataDir(),
+  config = loadConfig(),
+} = {}) {
   const exec = deps.run ?? run;
   const removed = [];
   const failed = [];
+  const roots = allowedRoots({ dataDir, config, deps });
 
   for (const item of items) {
     // Defence in depth: an item the scan marked as keep must not be removable
@@ -583,7 +773,37 @@ export async function apply({ items = [], log = () => {}, deps = {} } = {}) {
       continue;
     }
 
+    // The containment check is on the REAL path: a symlink inside a root that
+    // points outside it must not become a delete outside it.
+    let real;
     try {
+      real = fs.realpathSync(item.path);
+    } catch (err) {
+      failed.push({ ...item, reason: `could not verify the path (${err.code ?? err.message}); nothing was removed` });
+      continue;
+    }
+
+    if (!isInsideAny(roots, real) && !isDataDirBackupSibling(real, dataDir)) {
+      failed.push({
+        ...item,
+        reason: 'refused: the path is outside the directories this cleanup covers',
+      });
+      log(`Refused ${item.path}: outside the directories this cleanup covers`);
+      continue;
+    }
+
+    // Inside a root is necessary, not sufficient: the database, the
+    // certificate store and live nginx configs live there too.
+    const protectedBy = protectedReason(real, { dataDir, config });
+    if (protectedBy) {
+      failed.push({ ...item, reason: `refused: ${protectedBy}` });
+      log(`Refused ${item.path}: ${protectedBy}`);
+      continue;
+    }
+
+    try {
+      // Removed by its own path, not the resolved one: a symlink is unlinked,
+      // never followed to its target.
       fs.rmSync(item.path, { recursive: true, force: true });
       removed.push(item);
       log(`Removed ${item.path}`);

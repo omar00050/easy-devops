@@ -9,6 +9,7 @@ import { Checkbox, TextInput } from '../ui/Field';
 import { Modal } from '../ui/Modal';
 import { InlineAlert } from '../ui/States';
 import { useToast } from '../ui/Toast';
+import { LinkDomainDialog } from './LinkDomainDialog';
 
 function errorText(error: unknown, fallback: string): string {
   if (error instanceof ApiError) return error.message;
@@ -153,36 +154,11 @@ export function DomainFolderTab({
   onDelete: () => void;
 }) {
   const toast = useToast();
-  const [domain, setDomain] = useState('');
-  const [ssl, setSsl] = useState(false);
-  const [linking, setLinking] = useState(false);
+  const [linkOpen, setLinkOpen] = useState(false);
   const [target, setTarget] = useState('');
   const [moving, setMoving] = useState(false);
 
-  const name = domain.trim().toLowerCase();
-  const existing = meta.domains.find((d) => d.name === name);
   const port = app.settings.port ?? null;
-
-  const link = async () => {
-    if (!name || linking) return;
-    setLinking(true);
-    try {
-      const result = await api.deployments.linkDomain(app.id, name, ssl && !existing?.ssl);
-      const base = result.created
-        ? `${result.domain} was created and proxies to port ${result.port}.`
-        : `${result.domain} now proxies to port ${result.port}.`;
-      if (result.ssl && !result.ssl.ok) toast.warning('Linked, without a certificate', `${base} ${result.ssl.detail}`);
-      else if (!result.nginxReloaded) toast.warning('Linked, but nginx was not reloaded', `${base} Reload nginx for it to take effect.`);
-      else toast.success('Domain linked', result.ssl?.ok ? `${base} ${result.ssl.detail}` : base);
-      setDomain('');
-      setSsl(false);
-      onChanged();
-    } catch (error) {
-      toast.error('Could not link the domain', errorText(error, 'Nothing was changed.'));
-    } finally {
-      setLinking(false);
-    }
-  };
 
   const unlink = async () => {
     try {
@@ -245,44 +221,14 @@ export function DomainFolderTab({
         ) : null}
 
         <div className="space-y-2.5">
-          <div>
-            <div className="flex flex-wrap items-end gap-2">
-              <TextInput
-                label={app.domain ? 'Link a different domain' : 'Domain name'}
-                value={domain}
-                onChange={(event) => setDomain(event.target.value)}
-                placeholder="app.example.com"
-                list="deploy-domain-options"
-                aria-describedby="deploy-domain-hint"
-                className="min-w-56 flex-1 font-mono"
-                spellCheck={false}
-                autoComplete="off"
-              />
-              <Button variant="primary" onClick={() => void link()} loading={linking} disabled={!name}>
-                Link domain
-              </Button>
-            </div>
-            <p id="deploy-domain-hint" className="mt-1.5 text-xs text-faint">
-              {!name
-                ? 'Type a new name, or pick one of your domains.'
-                : existing
-                  ? 'This domain exists. It will be re-pointed at this app.'
-                  : 'This domain will be created.'}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="primary" onClick={() => setLinkOpen(true)}>
+              {app.domain ? 'Link a different domain' : 'Link a domain'}
+            </Button>
+            <p className="min-w-0 flex-1 text-xs text-faint">
+              Choose the name, whether www is served too, and the certificate to use.
             </p>
           </div>
-          <datalist id="deploy-domain-options">
-            {meta.domains.map((d) => (
-              <option key={d.name} value={d.name} />
-            ))}
-          </datalist>
-          {name && !existing?.ssl && (
-            <Checkbox
-              label="Request an SSL certificate"
-              hint="Over HTTP-01, so the domain’s DNS must already point at this server. If it cannot be issued the domain still works over HTTP, and you can issue it later from the SSL page."
-              checked={ssl}
-              onChange={setSsl}
-            />
-          )}
           {!port && !app.currentRelease && (
             <InlineAlert tone="info">
               The app needs a port first: set one in Edit, or put <code className="font-mono">port</code>{' '}
@@ -291,6 +237,14 @@ export function DomainFolderTab({
           )}
         </div>
       </section>
+
+      <LinkDomainDialog
+        open={linkOpen}
+        app={app}
+        meta={meta}
+        onClose={() => setLinkOpen(false)}
+        onLinked={onChanged}
+      />
 
       {/* Folder */}
       <section className="space-y-3 border-t border-line pt-6">

@@ -244,7 +244,13 @@ async function main() {
   // ── Pair the agent ─────────────────────────────────────────────────────────
   const stamp = Date.now();
   const reg = await hubApi('POST', '/api/v1/auth/register', {
-    body: { email: `dsync-${stamp}@e2e.test`, password: 'password-dsync-123' },
+    // The Hub now requires a username as well: 3-30 lowercase letters, digits,
+    // dots, dashes or underscores, starting and ending alphanumeric.
+    body: {
+      email: `dsync-${stamp}@e2e.test`,
+      username: `dsync-${stamp}`,
+      password: 'password-dsync-123',
+    },
   });
   const token = reg.body?.data?.token;
   const created = await hubApi('POST', '/api/v1/servers', { token, body: { name: 'dsync-server' } });

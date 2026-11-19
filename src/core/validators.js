@@ -96,6 +96,30 @@ export function validatePositiveInteger(val, field) {
 }
 
 /**
+ * Validates a strictly boolean field. `undefined`/`null` mean "not supplied"
+ * and are accepted, so older clients and stored domains keep working.
+ * @param {unknown} value
+ * @param {string} field Human-readable field name for the error message
+ * @returns {string|null}
+ */
+export function validateBoolean(value, field) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'boolean') {
+    return `Invalid ${field}: must be true or false`;
+  }
+  return null;
+}
+
+/**
+ * Validates the per-domain `behindCloudflare` option.
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+export function validateBehindCloudflare(value) {
+  return validateBoolean(value, 'behindCloudflare');
+}
+
+/**
  * Validates the hub URL portion of a connection string.
  * Accepts an http/https URL or a bare host, optionally with a port.
  * @param {string} hubUrl

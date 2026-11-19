@@ -1,8 +1,9 @@
 // src/dashboard/controllers/hubController.js
 //
-// Thin HTTP layer over core/hubLink.js. All link parsing, persistence and
-// permission logic lives in core so a future CLI menu can reuse it — this
-// controller only translates between HTTP and that module.
+// Thin HTTP layer over core/hubLink.js and core/hub/agent.js. Link parsing,
+// persistence and permission logic live in core so other callers can reuse
+// them — this controller only translates between HTTP and those modules, and
+// decides which process may own the agent.
 //
 // The hub issues connection strings; this server never generates them.
 

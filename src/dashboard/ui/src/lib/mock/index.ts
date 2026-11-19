@@ -12,6 +12,8 @@
  *   service-stopped-by-you  signed in, stopped deliberately (starts at logon)
  *   service-not-installed   signed in, no launcher/service installed
  *   service-elevation   signed in, lifecycle actions answer 403 + sudo command
+ *   service-pending     signed in, the first /api/service read has unfinished
+ *                       probes (pm2 null, runtime null); the next read resolves
  *   login               signed out, password set
  *   setup               first run, no password yet
  *   setupcode           first run with a setup code (mock code: 123456)
@@ -47,6 +49,7 @@ import type {
   Domain,
   DomainNotifications,
   HubStatus,
+  HubAgentStateEvent,
   NginxStatus,
   NotificationChannel,
   PermissionMap,
@@ -68,6 +71,7 @@ export type MockScenario =
   | 'service-stopped-by-you'
   | 'service-not-installed'
   | 'service-elevation'
+  | 'service-pending'
   | 'login'
   | 'setup'
   | 'setupcode'
@@ -80,13 +84,14 @@ const SCENARIOS: MockScenario[] = [
   'service-stopped-by-you',
   'service-not-installed',
   'service-elevation',
+  'service-pending',
   'login',
   'setup',
   'setupcode',
   'setupcode-expired',
   'none',
 ];
-const STORAGE_PREFIX = 'ez-mock-state-v5';
+const STORAGE_PREFIX = 'ez-mock-state-v6';
 const SCENARIO_KEY = 'ez-mock-scenario';
 
 interface MockUpdateState {
@@ -98,12 +103,19 @@ interface MockUpdateState {
   run: UpdateRun | null;
 }
 
+interface MockRateLimit {
+  failures: number;
+  blockedUntil: number | null;
+}
+
 interface MockState {
   scenario: MockScenario;
   authenticated: boolean;
   authMode: 'password' | 'none';
   setupConfigured: boolean;
   hasPassword: boolean;
+  /** Failed attempts per public auth endpoint, mirroring the server's budget. */
+  authRate: { login: MockRateLimit; setup: MockRateLimit };
   domains: Domain[];
   certs: Certificate[];
   channels: NotificationChannel[];
@@ -113,7 +125,12 @@ interface MockState {
   accessLog: string[];
   processes: ProcessesResponse;
   service: ServiceStatus;
+  /** `service-pending`: /service stays pending until this moment, so the
+   *  first (StrictMode-doubled) reads all see the unfinished-probe shape. */
+  pendingUntil: number | null;
   settings: Settings;
+  /** Whether /etc/sudoers.d/easy-devops is installed and working. */
+  permissionsConfigured: boolean;
   hub: HubStatus;
   update: MockUpdateState;
   pendingDns: Record<string, { txtName: string; txtValue: string }>;
@@ -250,6 +267,20 @@ function serviceForScenario(scenario: MockScenario): ServiceStatus {
     };
   }
 
+  if (scenario === 'service-pending') {
+    // The cached probes have never completed: measured fields are null and
+    // PM2 detection is unknown. The next read resolves them.
+    service.pm2 = { installed: null, version: null, path: null };
+    service.probes = { ageMs: null, fresh: false, pending: true, refreshing: false };
+    service.backgroundService = {
+      ...base,
+      state: null,
+      enabledOnBoot: null,
+      runtime: null,
+      warnings: [],
+    };
+  }
+
   return service;
 }
 
@@ -270,6 +301,10 @@ function createState(scenario: MockScenario): MockState {
     authMode: scenario === 'none' ? 'none' : 'password',
     setupConfigured: !firstRun,
     hasPassword: !firstRun,
+    authRate: {
+      login: { failures: 0, blockedUntil: null },
+      setup: { failures: 0, blockedUntil: null },
+    },
     domains,
     certs: seedCertificates(),
     channels: seedChannels(),
@@ -279,11 +314,13 @@ function createState(scenario: MockScenario): MockState {
     accessLog: seedAccessLog(),
     processes: { ...seedProcesses(), apps },
     service: serviceForScenario(scenario),
+    pendingUntil: scenario === 'service-pending' ? Date.now() + 1_200 : null,
     settings: {
       ...settings,
       dashboardAuth: scenario === 'none' ? 'none' : 'password',
       canUseNoPassword: true,
     },
+    permissionsConfigured: false,
     hub: seedHub(permissions),
     update: {
       current: '1.3.4',
@@ -358,6 +395,16 @@ export function subscribeMockServiceChanges(listener: ServiceChangeListener): ()
   };
 }
 
+/** The agent half of the Hub status, as the `hub:agentState` event carries it. */
+export function mockHubAgentSnapshot(): HubAgentStateEvent | null {
+  try {
+    const { linked, connected, status, lastError, attempts } = getState().hub;
+    return clone({ linked, connected, status, lastError, attempts });
+  } catch {
+    return null;
+  }
+}
+
 function notifyServiceChanged(): void {
   const snapshot = mockServiceSnapshot();
   if (!snapshot) return;
@@ -381,6 +428,36 @@ function requireAuth(s: MockState): void {
   if (s.authMode !== 'none' && !s.authenticated) {
     throw new ApiError(401, { error: 'Unauthorized' });
   }
+}
+
+type AuthRateKey = 'login' | 'setup';
+const RATE_LIMIT_AFTER = 3;
+// Fifteen minutes on the server. The mock uses a window short enough to watch
+// the countdown finish: three failed attempts, then a 30-second wait.
+const RATE_LIMIT_MS = 30_000;
+
+function rateLimitWait(s: MockState, key: AuthRateKey): number | null {
+  const entry = s.authRate[key];
+  if (entry.blockedUntil === null) return null;
+  const remaining = entry.blockedUntil - Date.now();
+  if (remaining <= 0) {
+    entry.failures = 0;
+    entry.blockedUntil = null;
+    persist();
+    return null;
+  }
+  return Math.ceil(remaining / 1000);
+}
+
+function recordAuthFailure(s: MockState, key: AuthRateKey): void {
+  const entry = s.authRate[key];
+  entry.failures += 1;
+  if (entry.failures >= RATE_LIMIT_AFTER) entry.blockedUntil = Date.now() + RATE_LIMIT_MS;
+  persist();
+}
+
+function resetAuthFailures(s: MockState, key: AuthRateKey): void {
+  s.authRate[key] = { failures: 0, blockedUntil: null };
 }
 
 function normalisePermissions(input: unknown): PermissionMap {
@@ -641,6 +718,10 @@ function handle(
   if (path === '/auth' && method === 'GET') return getAuthPayload(s);
 
   if (path === '/login' && method === 'POST') {
+    const wait = rateLimitWait(s, 'login');
+    if (wait !== null) {
+      fail(429, 'Too many login attempts. Try again later.', { retryAfterSeconds: wait });
+    }
     if (s.authMode === 'none') {
       fail(409, 'This dashboard is configured without a password.', { authMode: 'none' });
     }
@@ -649,6 +730,13 @@ function handle(
     }
     const password = String(data.password ?? '');
     if (!password) fail(401, 'Invalid password');
+    // Any password works except this one, which exists to exercise the
+    // failure and rate-limit paths without a real credential.
+    if (password === 'wrong') {
+      recordAuthFailure(s, 'login');
+      fail(401, 'Invalid password');
+    }
+    resetAuthFailures(s, 'login');
     s.authenticated = true;
     persist();
     return { ok: true };
@@ -657,6 +745,10 @@ function handle(
   if (path === '/setup' && method === 'POST') {
     if (s.setupConfigured) {
       fail(409, 'This dashboard is already configured. Sign in, then change it in Settings.');
+    }
+    const wait = rateLimitWait(s, 'setup');
+    if (wait !== null) {
+      fail(429, 'Too many setup attempts. Try again later.', { retryAfterSeconds: wait });
     }
     if (data.mode === 'none') {
       s.authMode = 'none';
@@ -668,14 +760,18 @@ function handle(
     }
     const password = String(data.password ?? '');
     if (password.length < 6) {
+      recordAuthFailure(s, 'setup');
       fail(400, 'Password must be at least 6 characters long.');
     }
     if (s.scenario === 'setupcode-expired') {
+      recordAuthFailure(s, 'setup');
       fail(400, 'That setup code has expired. Issue a new one on the server: ezz dashboard setup-code');
     }
     if (s.scenario === 'setupcode' && data.setupCode !== '123456') {
+      recordAuthFailure(s, 'setup');
       fail(400, 'That setup code is not valid.');
     }
+    resetAuthFailures(s, 'setup');
     s.authMode = 'password';
     s.setupConfigured = true;
     s.hasPassword = true;
@@ -721,11 +817,15 @@ function handle(
   const suggestionMatch = /^\/domains\/([^/]+)\/ssl-suggestion$/.exec(path);
   if (suggestionMatch && method === 'GET') {
     const name = decodeURIComponent(suggestionMatch[1]);
-    if (!s.domains.some((d) => d.name === name)) fail(404, `Domain not found: ${name}`);
+    if (!name.trim()) fail(400, 'A domain name is required.');
+    // The real endpoint answers for names that are not domains yet: linking a
+    // domain to an app is exactly when "is there a certificate for this?" is asked.
 
     // Mirrors the server's rule: an unreadable certificate is never offered,
     // and the mock has no SAN metadata, so only the exact folder name matches.
-    const cert = s.certs.find((candidate) => candidate.domain === name && candidate.status !== 'error');
+    // A leading `*.` is ignored, as `findCertificateForDomain` does.
+    const bare = name.startsWith('*.') ? name.slice(2) : name;
+    const cert = s.certs.find((candidate) => candidate.domain === bare && candidate.status !== 'error');
     if (!cert) return { found: false };
 
     const base = s.settings.sslDir
@@ -997,7 +1097,26 @@ function handle(
   // ── Processes & service ───────────────────────────────────────────────────
   if (path === '/processes' && method === 'GET') return s.processes;
 
-  if (path === '/service' && method === 'GET') return s.service;
+  if (path === '/service' && method === 'GET') {
+    if (s.scenario === 'service-pending' && s.service.probes?.pending) {
+      if (s.pendingUntil !== null && Date.now() < s.pendingUntil) return s.service;
+      // The probes finish: answer with the measured shape from now on, the way
+      // the real cache fills in between two reads.
+      s.service = {
+        ...s.service,
+        pm2: { installed: true, version: '6.0.14', path: '/usr/local/bin/pm2' },
+        probes: { ageMs: 2_400, fresh: true, pending: false, refreshing: false },
+        backgroundService: {
+          ...s.service.backgroundService,
+          state: 'active',
+          enabledOnBoot: true,
+        },
+      };
+      s.pendingUntil = null;
+      persist();
+    }
+    return s.service;
+  }
 
   const serviceActionMatch = /^\/service\/(start|stop|restart)$/.exec(path);
   if (serviceActionMatch && method === 'POST') {
@@ -1156,6 +1275,13 @@ function handle(
       }
       next.dashboardAuth = data.dashboardAuth as 'password' | 'none';
     }
+    if (data.dashboardUi !== undefined) {
+      if (data.dashboardUi !== 'classic' && data.dashboardUi !== 'new') {
+        fail(400, "The dashboard UI must be 'classic' or 'new'.");
+      }
+      if (data.dashboardUi !== s.settings.dashboardUi) needsRestart = true;
+      next.dashboardUi = data.dashboardUi;
+    }
     if (data.nginxDir !== undefined) {
       const value = String(data.nginxDir).trim();
       if (!value) fail(400, 'Nginx directory must be a non-empty string');
@@ -1204,16 +1330,30 @@ function handle(
     s.settings = next;
     s.authMode = nextAuth;
     persist();
-    return { success: true, needsRestart, dashboardAuth: nextAuth };
+    return {
+      success: true,
+      needsRestart,
+      dashboardAuth: nextAuth,
+      dashboardUi: next.dashboardUi ?? 'classic',
+    };
   }
 
-  if (path === '/settings/permissions' && method === 'GET') return { configured: true };
+  if (path === '/settings/permissions' && method === 'GET') {
+    return { configured: s.permissionsConfigured };
+  }
 
   if (path === '/settings/permissions/setup' && method === 'POST') {
-    if (String(data.password ?? '') === 'wrong') {
-      throw new ApiError(401, { error: 'Incorrect password', output: 'Sorry, try again.' });
-    }
-    return { success: true };
+    // Same shape as the server: nothing is installed here. The lines below
+    // are the ones the operator runs once in their own terminal.
+    return {
+      configured: s.permissionsConfigured,
+      commands: [
+        `t="$(mktemp)" && printf '%s\\n' 'dev ALL=(root) NOPASSWD: /usr/bin/systemctl start nginx, /usr/bin/systemctl stop nginx, /usr/bin/systemctl reload nginx, /usr/bin/systemctl restart nginx, /usr/bin/systemctl status nginx' > "$t" && sudo visudo -cf "$t" && sudo install -o root -g root -m 0440 "$t" /etc/sudoers.d/easy-devops; rc=$?; rm -f "$t"; test $rc -eq 0`,
+        'sudo mkdir -p /etc/easy-devops/ssl',
+        'sudo chown dev:dev /etc/easy-devops/ssl',
+      ],
+      refusedDirs: [],
+    };
   }
 
   if (path === '/settings/backup' && method === 'GET') {

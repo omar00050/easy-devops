@@ -1,5 +1,5 @@
 /**
- * lib/types.ts — the wire shapes of docs/api-contract.md, typed.
+ * lib/types.ts — the wire shapes of API-CONTRACT.md, typed.
  *
  * These mirror the contract version the dashboard implements. Nothing here is
  * invented: fields absent from the contract are marked optional, and fields the
@@ -236,7 +236,8 @@ export interface NginxLogs {
 // ─── Processes & service ─────────────────────────────────────────────────────
 
 export interface Pm2Info {
-  installed: boolean;
+  /** Null while the cached probe has not completed for the first time. */
+  installed: boolean | null;
   version: string | null;
   path: string | null;
 }
@@ -364,12 +365,26 @@ export interface ServiceInstallInfo {
   shell: string | null;
 }
 
+/**
+ * Describes how fresh the cached half of `GET /api/service` is. While
+ * `pending` is true the measured fields (`state`, `enabledOnBoot`, `runtime`,
+ * warnings, PM2 detection) are null because no probe has finished yet.
+ */
+export interface ServiceProbes {
+  ageMs: number | null;
+  fresh: boolean;
+  pending: boolean;
+  refreshing: boolean;
+}
+
 export interface ServiceStatus {
   pm2: Pm2Info;
   dev: boolean;
   dataDir: string;
   backgroundService: BackgroundServiceStatus;
   install: ServiceInstallInfo;
+  /** Absent on a backend that predates the probes split. */
+  probes?: ServiceProbes;
 }
 
 export type ServiceAction = 'start' | 'stop' | 'restart';
@@ -382,6 +397,9 @@ export interface ServiceActionResponse {
 }
 
 // ─── Settings ────────────────────────────────────────────────────────────────
+
+/** Which page `ezz --dash` serves: the legacy EJS page or this React app. */
+export type DashboardUi = 'classic' | 'new';
 
 export interface Settings {
   dashboardPort: number;
@@ -400,6 +418,8 @@ export interface Settings {
   dashboardBindAddress: string;
   bindsToLoopbackOnly: boolean;
   dashboardAuth: AuthMode;
+  /** Absent on a backend that predates the setting. Applies at the next dashboard start. */
+  dashboardUi?: DashboardUi;
   canUseNoPassword: boolean;
   hasPassword: boolean;
   platform: 'win32' | 'linux';
@@ -417,16 +437,30 @@ export interface SettingsUpdate {
   deployDir?: string;
   dashboardBindAddress?: string;
   dashboardAuth?: AuthMode;
+  dashboardUi?: DashboardUi;
 }
 
 export interface SettingsUpdateResult {
   success: true;
   needsRestart: boolean;
   dashboardAuth: AuthMode;
+  dashboardUi?: DashboardUi;
 }
 
 export interface PermissionsSetupStatus {
   configured: boolean;
+}
+
+export interface RefusedPermissionDir {
+  dir: string;
+  reason: string;
+}
+
+/** `POST /settings/permissions/setup` never installs anything; it hands back
+ *  the lines the operator runs once in their own terminal. */
+export interface PermissionsSetupResult extends PermissionsSetupStatus {
+  commands: string[];
+  refusedDirs: RefusedPermissionDir[];
 }
 
 export interface BackupFile {
@@ -570,6 +604,15 @@ export interface HubConnectResponse {
   status: HubStatus;
 }
 
+/** The agent half of `HubStatus`, published on every state transition. */
+export interface HubAgentStateEvent {
+  linked: boolean;
+  connected: boolean;
+  status: HubAgentState;
+  lastError: string | null;
+  attempts: number;
+}
+
 export interface HubPermissionsResponse {
   permissions: PermissionMap;
   tree: PermissionGroup[];
@@ -616,6 +659,7 @@ export interface ServerEvents {
   'logs:line': LogLine;
   'local:changed': LocalChangeEvent;
   'service:changed': BackgroundServiceEvent;
+  'hub:agentState': HubAgentStateEvent;
   connect: undefined;
   disconnect: undefined;
   connect_error: Error;
@@ -630,10 +674,18 @@ export type DeployTrigger = 'manual' | 'webhook' | 'hub' | 'rollback';
 /** A command field: one command, several, or `false` to switch the step off. */
 export type DeployCommands = string | string[] | false;
 
+/** PM2 process model: one process (fork) or one worker per instance (cluster). */
+export type DeployExecMode = 'fork' | 'cluster';
+
+/** A whole number 1..CPU count, or "max" (one per CPU). */
+export type DeployInstances = number | 'max';
+
 /** Per-app overrides. Absent means "use ez.json, then package.json". */
 export interface DeploySettings {
   install?: DeployCommands;
   build?: DeployCommands;
+  /** Runs after build, before the new release starts. Forward-only. */
+  migrate?: DeployCommands;
   pre?: DeployCommands;
   post?: DeployCommands;
   start?: string;
@@ -642,6 +694,8 @@ export interface DeploySettings {
   healthTimeout?: number;
   /** Project-relative paths that survive deployments — folders or one file: ["data", "prisma/hub.db"]. */
   persist?: string | string[];
+  instances?: DeployInstances;
+  execMode?: DeployExecMode;
 }
 
 export interface DeployRun {
@@ -659,6 +713,12 @@ export interface DeployRun {
   error: string | null;
   warnings: string[];
   rolledBackTo: string | null;
+  /** A boot crash or health failure, in the server's words. */
+  reason?: string | null;
+  /** Last ~40 lines of a boot-crashed release, already redacted. */
+  logTail?: string[];
+  /** true/false once an automatic rollback was attempted; null when none was. */
+  rollbackSucceeded?: boolean | null;
 }
 
 export interface DeployRunDetail extends DeployRun {
@@ -673,6 +733,8 @@ export interface DeployRelease {
   startable: boolean;
   current: boolean;
   previous: boolean;
+  execMode?: DeployExecMode;
+  instances?: DeployInstances;
 }
 
 export interface DeployProcess {
@@ -692,6 +754,11 @@ export interface DeployApp {
   authType: DeployAuthType;
   hasToken: boolean;
   deployKey: string | null;
+  /** The key's SHA256 fingerprint, when one has been generated. */
+  deployKeyFingerprint?: string | null;
+  deployKeyCreatedAt?: string | null;
+  /** True while the private half is still on the server. */
+  deployKeyOnDisk?: boolean;
   settings: DeploySettings;
   env: Record<string, string>;
   keepReleases: number;
@@ -715,6 +782,13 @@ export interface DeployApp {
   activeRunId?: string | null;
   lastRun?: DeployRun | null;
   process?: DeployProcess | null;
+  /** Advisory notes from the server; in cluster mode, the stateless warning. */
+  warnings?: string[];
+  /** Configured values from the live release, else settings, else fork/1. */
+  execMode?: DeployExecMode;
+  instances?: DeployInstances;
+  /** How many copies PM2 currently reports online; 0 when PM2 is not running. */
+  instancesOnline?: number;
 }
 
 export interface DeployAppDetail extends DeployApp {
@@ -728,11 +802,47 @@ export interface DeployAppInput {
   branch?: string;
   authType?: DeployAuthType;
   token?: string;
+  /** Create only: generate the deploy key in the same request. Ignored unless authType is deployKey; defaults to true. */
+  generateKey?: boolean;
   settings?: DeploySettings;
   env?: Record<string, string>;
   keepReleases?: number;
   autoRollback?: boolean;
   notifyChannelIds?: string[];
+}
+
+/** A freshly generated deploy key, as the create and regenerate answers carry it. */
+export interface DeployKeyInfo {
+  publicKey: string;
+  fingerprint: string;
+  createdAt: string;
+  /** GitHub's "add deploy key" page for this repository, or null for other hosts. */
+  addUrl: string | null;
+}
+
+/** The create response: the app, plus its key (an object) or why it could not be made. */
+export type DeployAppCreated = Omit<DeployApp, 'deployKey'> & {
+  deployKey?: DeployKeyInfo | string | null;
+  deployKeyError?: string;
+};
+
+export interface DeployKeyRegenerateResult extends DeployKeyInfo {
+  previousFingerprint?: string | null;
+}
+
+export interface DeployKeyTestResult {
+  ok: boolean;
+  status: number;
+  error: string | null;
+  detail?: string;
+  branchFound?: boolean;
+  fingerprint?: string;
+}
+
+export interface DeployKeyGithubResult {
+  ok: boolean;
+  steps?: Array<{ id: string; ok: boolean; detail: string }>;
+  error: string | null;
 }
 
 export type DeployHookMode = 'domain' | 'direct' | 'none';
@@ -813,12 +923,28 @@ export interface DeployGithubApplyResult {
   steps: Array<{ id: 'secrets' | 'workflow' | 'deployKey'; ok: boolean; detail: string }>;
 }
 
+export type DeploySslMode = 'none' | 'issue' | 'existing';
+
+export interface DeployDomainLinkInput {
+  domain: string;
+  www?: boolean;
+  /** Existing certificates are named by `certName`; the server uses its own suggestion's paths. */
+  ssl?: { mode: DeploySslMode; certName?: string };
+  redirect?: boolean;
+  behindCloudflare?: boolean;
+}
+
 export interface DeployDomainLink {
+  ok?: boolean;
   domain: string;
   created: boolean;
   port: number;
+  www?: boolean;
+  behindCloudflare?: boolean;
+  redirect?: boolean;
   nginxReloaded: boolean;
-  ssl: { ok: boolean; detail: string } | null;
+  /** null for mode "none"; a failed issuance leaves the link standing over HTTP. */
+  ssl: { mode: DeploySslMode; ok: boolean; detail: string; certName?: string } | null;
 }
 
 export interface DeployMoveResult {

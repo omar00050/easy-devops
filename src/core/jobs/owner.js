@@ -59,18 +59,34 @@ export const HANDOVER_WAIT_MS = 8_000;
 
 const OWNER_FILE = 'jobs.owner';
 
+/**
+ * How long a recovery guard left by a crashed process must sit before another
+ * process may clear it. Long enough that a slow but live recovery is never
+ * cleared out from under itself.
+ */
+const RECOVERY_GUARD_STALE_MS = 30_000;
+
+/**
+ * How long an empty, unreadable marker may exist before another process may
+ * treat it as abandoned: creating it is `writeFileSync(path, data, { flag:
+ * 'wx' })`, which creates the file and THEN writes it, so a brand-new marker is
+ * briefly empty. A reader in that window must not "recover" it.
+ */
+const UNREADABLE_GRACE_MS = 2_000;
+
 /** @returns {string} Absolute path to the ownership marker. */
 export function ownerPath(dataDir = getDataDir()) {
   return path.join(dataDir, OWNER_FILE);
 }
 
 /**
- * Reads the marker without judging it.
+ * Reads a marker file without judging it.
+ * @param {string} file Absolute path to the marker
  * @returns {{ pid: number, role: string|null, at: number, heartbeatAt: number }|null}
  */
-export function readOwner(dataDir = getDataDir()) {
+function readOwnerAt(file) {
   try {
-    const parsed = JSON.parse(fs.readFileSync(ownerPath(dataDir), 'utf8'));
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!Number.isInteger(parsed?.pid)) return null;
     return {
       pid: parsed.pid,
@@ -82,6 +98,29 @@ export function readOwner(dataDir = getDataDir()) {
     // Missing, unreadable or half-written all mean "nobody is holding it".
     return null;
   }
+}
+
+/**
+ * True when an unreadable marker is a create that has not been written yet: an
+ * empty file younger than the grace counts as LIVE, an empty file older than it
+ * is a crash and may be recovered, and a non-empty file that does not parse is
+ * a truncated write with no live owner.
+ */
+function isWriteInFlight(file, now) {
+  try {
+    const stat = fs.statSync(file);
+    return stat.size === 0 && now - stat.mtimeMs < UNREADABLE_GRACE_MS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reads the marker in a data directory without judging it.
+ * @returns {{ pid: number, role: string|null, at: number, heartbeatAt: number }|null}
+ */
+export function readOwner(dataDir = getDataDir()) {
+  return readOwnerAt(ownerPath(dataDir));
 }
 
 /**
@@ -123,6 +162,21 @@ export function inspect({ dataDir = getDataDir(), now = Date.now() } = {}) {
 /**
  * Takes ownership of the jobs.
  *
+ * The marker is CREATED exclusively (`wx`), exactly as the daemon lock is: two
+ * processes racing for the jobs cannot both win, because only one open can
+ * create the file.
+ *
+ * Recovering a marker whose owner is gone is the subtle half, for the same
+ * reason as the daemon lock: deciding from `inspect()` before the race lets two
+ * processes both "recover" the same dead marker, and moving the file aside
+ * leaves the path empty long enough for a third process to create there.
+ *
+ * So recovery is serialised and the marker is only REPLACED, never removed:
+ * one process creates `jobs.owner.recovery` exclusively (the permission to
+ * recover), re-reads the marker under that guard, and replaces a dead one with
+ * an atomic rename of a prepared candidate. The path is never empty. Everyone
+ * else is refused, and the guard is removed in a `finally`.
+ *
  * @param {Object} opts
  * @param {string} [opts.dataDir]
  * @param {string} opts.role 'daemon' | 'dashboard'
@@ -135,8 +189,196 @@ export function claim({ dataDir = getDataDir(), role = 'unknown', now = Date.now
     return { ok: false, reason: state.reason, owner: state.owner };
   }
 
-  write({ dataDir, role, now, at: state.mine ? state.owner.at : now });
-  return { ok: true, recovered: state.stale };
+  // Refreshing our own marker is not an acquisition: keep the original `at`,
+  // and use the atomic rewrite that only the owner performs.
+  if (state.mine) {
+    write({ dataDir, role, now, at: state.owner.at });
+    return { ok: true, recovered: false };
+  }
+
+  const payload = { pid: process.pid, role, at: now, heartbeatAt: now };
+
+  const first = createExclusive(dataDir, payload);
+  if (first.ok) return { ok: true, recovered: state.stale };
+
+  if (first.code !== 'EEXIST') {
+    return { ok: false, reason: `could not create the jobs marker: ${first.message}`, owner: null };
+  }
+
+  // A marker appeared after inspect() saw none. If it is readable it is
+  // somebody's; an unreadable one (truncated by a crash) has no owner, so it
+  // falls through to the guard below, which replaces it.
+  if (!state.owner && !fs.existsSync(ownerPath(dataDir))) {
+    return { ok: false, reason: 'another process claimed the jobs first', owner: readOwner(dataDir) };
+  }
+
+  // Empty and just created: a `wx` create whose write has not landed yet.
+  if (!state.owner && isWriteInFlight(ownerPath(dataDir), now)) {
+    return { ok: false, reason: 'another process is writing its claim', owner: readOwner(dataDir) };
+  }
+
+  const guard = acquireRecoveryGuard({ dataDir, now });
+  if (!guard.ok) {
+    return { ok: false, reason: guard.reason, owner: readOwner(dataDir) };
+  }
+
+  try {
+    // Authoritative: nobody else may change the marker while we hold the guard.
+    const current = inspect({ dataDir, now });
+
+    if (current.held && !current.mine) {
+      return { ok: false, reason: current.reason, owner: current.owner };
+    }
+
+    if (current.mine) {
+      write({ dataDir, role, now, at: current.owner.at });
+      return { ok: true, recovered: false };
+    }
+
+    if (!current.owner) {
+      // Empty and just created is a create in flight — treat it as live.
+      if (isWriteInFlight(ownerPath(dataDir), now)) {
+        return { ok: false, reason: 'another process is writing its claim', owner: null };
+      }
+
+      // Unreadable or gone: a marker with no readable owner cannot be waited on
+      // (a crash mid-write would otherwise block the jobs for ever), so it is
+      // created over if it is gone, replaced under the guard if it is still
+      // there.
+      const again = createExclusive(dataDir, payload);
+      if (again.ok) return { ok: true, recovered: true };
+
+      if (again.code !== 'EEXIST') {
+        return { ok: false, reason: `could not create the jobs marker: ${again.message}`, owner: null };
+      }
+
+      const replaced = replaceOwner({ dataDir, payload });
+      return replaced.ok
+        ? { ok: true, recovered: true }
+        : { ok: false, reason: `could not replace the unreadable jobs marker: ${replaced.message}`, owner: null };
+    }
+
+    const replaced = replaceOwner({ dataDir, payload });
+    if (!replaced.ok) {
+      return {
+        ok: false,
+        reason: `could not replace the jobs marker: ${replaced.message}`,
+        owner: readOwner(dataDir),
+      };
+    }
+
+    return { ok: true, recovered: true };
+  } finally {
+    guard.release();
+  }
+}
+
+/**
+ * Creates the recovery guard exclusively, or explains why recovery may not run.
+ *
+ * @param {Object} opts
+ * @param {string} opts.dataDir
+ * @param {number} opts.now
+ * @returns {{ ok: true, release: () => void } | { ok: false, reason: string }}
+ */
+function acquireRecoveryGuard({ dataDir, now }) {
+  const file = `${ownerPath(dataDir)}.recovery`;
+  const payload = { pid: process.pid, at: now };
+
+  const attempt = () => {
+    try {
+      fs.writeFileSync(file, `${JSON.stringify(payload)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, code: err?.code ?? 'UNKNOWN', message: err?.message ?? String(err) };
+    }
+  };
+
+  const release = () => {
+    try { fs.unlinkSync(file); } catch { /* already gone */ }
+  };
+
+  const first = attempt();
+  if (first.ok) return { ok: true, release };
+  if (first.code !== 'EEXIST') {
+    return { ok: false, reason: `could not create the recovery guard: ${first.message}` };
+  }
+
+  // A guard left behind by a process that died mid-recovery: clear it only when
+  // its owner is provably gone and it is old enough not to be a slow recovery.
+  let existing = null;
+  try {
+    existing = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch { /* unreadable: treat it as live */ }
+
+  const abandoned = Boolean(existing)
+    && Number.isInteger(existing.pid)
+    && !isPidAlive(existing.pid)
+    && now - (Number(existing.at) || 0) > RECOVERY_GUARD_STALE_MS;
+
+  if (!abandoned) return { ok: false, reason: 'another process is recovering the jobs marker' };
+
+  try { fs.unlinkSync(file); } catch { /* another process cleared it first */ }
+
+  const second = attempt();
+  return second.ok
+    ? { ok: true, release }
+    : { ok: false, reason: 'another process is recovering the jobs marker' };
+}
+
+/**
+ * Replaces the marker with this process's payload, atomically.
+ *
+ * A `rename` within the directory replaces the old file with the new one in one
+ * step, so the path is never absent and no third process can create there.
+ * Called only while the recovery guard is held.
+ *
+ * @param {Object} opts
+ * @param {string} opts.dataDir
+ * @param {Object} opts.payload
+ * @returns {{ ok: true } | { ok: false, message: string }}
+ */
+function replaceOwner({ dataDir, payload }) {
+  const target = ownerPath(dataDir);
+  const candidate = `${target}.candidate-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+  const body = `${JSON.stringify(payload)}\n`;
+
+  try {
+    fs.writeFileSync(candidate, body, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  } catch (err) {
+    return { ok: false, message: err?.message ?? String(err) };
+  }
+
+  const moved = renameWithRetry(candidate, target);
+  if (!moved.ok) {
+    try { fs.unlinkSync(candidate); } catch { /* already gone */ }
+    return { ok: false, message: moved.message };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * `rename`, retried briefly while Windows refuses it.
+ *
+ * A file another process has open for reading cannot be replaced on Windows
+ * (EPERM/EBUSY) until that handle closes. Readers here read and close
+ * immediately, so a bounded retry is enough — and bounded, so a stuck file can
+ * never hang an acquisition.
+ */
+function renameWithRetry(from, to, attempts = 200, waitMs = 1) {
+  for (let i = 0; ; i++) {
+    try {
+      fs.renameSync(from, to);
+      return { ok: true };
+    } catch (err) {
+      const transient = err?.code === 'EPERM' || err?.code === 'EBUSY' || err?.code === 'EACCES';
+      if (!transient || i >= attempts) {
+        return { ok: false, message: err?.message ?? String(err) };
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+    }
+  }
 }
 
 /**
@@ -199,10 +441,30 @@ export async function waitUntilFree({
 }
 
 /**
+ * Creates the marker exclusively, or reports why it could not.
+ *
+ * @returns {{ ok: true } | { ok: false, code: string, message: string }}
+ */
+function createExclusive(dataDir, payload) {
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(ownerPath(dataDir), `${JSON.stringify(payload)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+      flag: 'wx',
+    });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, code: err?.code ?? 'UNKNOWN', message: err?.message ?? String(err) };
+  }
+}
+
+/**
  * Writes the marker atomically.
  *
  * Same temp-file-and-rename as the daemon lock: a reader must never see a
- * half-written marker and conclude nobody owns the jobs.
+ * half-written marker and conclude nobody owns the jobs. Only an owner
+ * refreshes it this way; taking it is createExclusive() above.
  */
 function write({ dataDir, role, now, at }) {
   const payload = { pid: process.pid, role, at: at ?? now, heartbeatAt: now };

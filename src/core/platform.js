@@ -5,14 +5,17 @@
  * Used by CLI managers, dashboard routes, and dashboard lib.
  * Centralises the isWindows guard, the persistent data directory, and nginx
  * shell invocations so they are defined exactly once and behave identically
- * everywhere. This module imports nothing from the project, so it is safe to
- * load before the database is initialised.
+ * everywhere. It reaches nothing that touches the database — the one project
+ * import is core/shell.js, which only spawns when it is called — so it is safe
+ * to load before the database is initialised.
  */
 
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { createHash } from 'crypto';
+
+import { run as runShell } from './shell.js';
 
 export const isWindows = process.platform === 'win32';
 
@@ -361,6 +364,49 @@ export function nginxLogPath(nginxDir, which = 'error') {
  * the settings API) do not have to read `process.platform` themselves.
  */
 export const platformName = process.platform;
+
+/**
+ * The full command line of a running process, or null when it cannot be read.
+ *
+ * Exists for one reason: a pid recorded on disk (`dashboard-pid`) may belong
+ * to a completely unrelated process by the time someone acts on it, because
+ * the OS reuses pids. Before signalling such a pid, the caller must be able to
+ * ask what that process actually is — and that question differs by platform,
+ * which is why it lives here and nowhere else:
+ *
+ *   - Linux: `/proc/<pid>/cmdline` is NUL-separated argv. Read directly, with
+ *     no subprocess at all, so this works in a context with no shell.
+ *   - Windows: there is no such file, so `Get-CimInstance` is asked through
+ *     core/shell.js like every other command.
+ *
+ * The result is a display string, not a parsed argv: callers only ever look
+ * for a path inside it. A process that has exited, a pid that never existed,
+ * and a machine that denies access all answer null — "I could not check" —
+ * which callers must treat as "not verified".
+ *
+ * @param {number} pid
+ * @returns {Promise<string|null>}
+ */
+export async function readProcessCommandLine(pid) {
+  // Never interpolate an unvalidated value into a shell command.
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+
+  if (isWindows) {
+    const query = `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`;
+    const result = await runShell(query);
+    if (!result.success) return null;
+    const text = String(result.stdout ?? '').trim();
+    return text || null;
+  }
+
+  try {
+    const raw = await fs.promises.readFile(`/proc/${pid}/cmdline`);
+    const text = raw.toString('utf8').split('\0').filter(Boolean).join(' ').trim();
+    return text || null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Returns the nginx binary invocation string suitable for use in shell commands.

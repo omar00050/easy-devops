@@ -1,5 +1,5 @@
 /**
- * lib/mock/fixtures.ts — data shaped from docs/api-contract.md.
+ * lib/mock/fixtures.ts — data shaped from API-CONTRACT.md.
  *
  * Every page is built against these first, so each fixture carries the awkward
  * cases as well as the happy ones: a certificate expiring in days, an expired
@@ -380,7 +380,7 @@ export function seedProcesses(): ProcessesResponse {
   };
 }
 
-/** Mirrors docs/api-contract.md 2.0.0 `GET /api/service`. */
+/** Mirrors API-CONTRACT.md 2.0.0 `GET /api/service`. */
 export function seedService(): ServiceStatus {
   return {
     pm2: { installed: true, version: '6.0.14', path: '/usr/local/bin/pm2' },
@@ -427,6 +427,7 @@ export function seedService(): ServiceStatus {
       },
     },
     install: { command: 'ezz service install', needsElevation: false, shell: null },
+    probes: { ageMs: 800, fresh: true, pending: false, refreshing: false },
   };
 }
 
@@ -446,6 +447,7 @@ export function seedSettings(): Settings {
     dashboardBindAddress: '127.0.0.1',
     bindsToLoopbackOnly: true,
     dashboardAuth: 'password',
+    dashboardUi: 'new',
     canUseNoPassword: true,
     hasPassword: true,
     platform: 'linux',

@@ -1,7 +1,7 @@
 /**
  * e2e/lib/api-contract-check.mjs
  *
- * Holds docs/api-contract.md to the routes the code actually registers.
+ * Holds API-CONTRACT.md to the routes the code actually registers.
  *
  * Both halves are read from the real artifacts rather than a hand-kept list:
  *
@@ -28,7 +28,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..');
 const SERVER_FILE = path.join(ROOT, 'src', 'dashboard', 'server.js');
 const ROUTES_DIR = path.join(ROOT, 'src', 'dashboard', 'routes');
-const CONTRACT_FILE = path.join(ROOT, 'docs', 'api-contract.md');
+const CONTRACT_FILE = path.join(ROOT, 'API-CONTRACT.md');
 
 /** Methods worth contracting. HEAD and OPTIONS are derived, not declared. */
 const METHODS = Object.freeze(['get', 'post', 'put', 'patch', 'delete']);
@@ -156,13 +156,13 @@ export async function checkApiContract() {
     return {
       ok: false,
       counts: { code: 0, doc: 0 },
-      problems: ['docs/api-contract.md is missing — it is the authoritative API contract'],
+      problems: ['API-CONTRACT.md is missing — it is the authoritative API contract'],
     };
   }
 
   if (!readContractVersion()) {
     problems.push(
-      'docs/api-contract.md has no "**Contract version: X.Y.Z**" line at the top'
+      'API-CONTRACT.md has no "**Contract version: X.Y.Z**" line at the top'
     );
   }
 
@@ -183,10 +183,10 @@ export async function checkApiContract() {
   const stale = documented.filter((d) => !registered.includes(d));
 
   for (const route of undocumented) {
-    problems.push(`registered but NOT in docs/api-contract.md:  ${route}`);
+    problems.push(`registered but NOT in API-CONTRACT.md:  ${route}`);
   }
   for (const route of stale) {
-    problems.push(`in docs/api-contract.md but NOT registered:  ${route}`);
+    problems.push(`in API-CONTRACT.md but NOT registered:  ${route}`);
   }
 
   return {

@@ -87,6 +87,12 @@ export function claimPath(domain, eventType, status, dataDir = getDataDir()) {
 
 /**
  * Reads a claim file.
+ *
+ * An unreadable (half-written) claim is dated from the file's mtime, never from
+ * zero. `at: 0` would make it look ancient, and every reader would then be
+ * allowed to take it over immediately — which is how two processes ended up
+ * both sending one notification while the winner was still writing its claim.
+ *
  * @returns {{ pid: number, at: number }|null}
  */
 function readClaim(file) {
@@ -94,9 +100,14 @@ function readClaim(file) {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
     return { pid: Number(parsed?.pid) || 0, at: Number(parsed?.at) || 0 };
   } catch {
-    // Unreadable or half-written: treat as a claim with no useful owner, so
-    // the TTL path below can reclaim it rather than blocking for ever.
-    return { pid: 0, at: 0 };
+    try {
+      // No usable owner, but the file's own age is still evidence: a claim
+      // written a moment ago must be waited out, not reclaimed.
+      return { pid: 0, at: fs.statSync(file).mtimeMs };
+    } catch {
+      // Gone (a release, or a commit) — nothing to reclaim.
+      return null;
+    }
   }
 }
 
@@ -147,6 +158,17 @@ export function claim({
 
   // Someone holds it. Take it over only if they are gone AND it is old.
   const held = readClaim(file);
+  if (!held) {
+    // It vanished between the exclusive create and this read — its owner
+    // committed or released. Try once more to take it.
+    try {
+      fs.writeFileSync(file, payload, { flag: 'wx', encoding: 'utf8', mode: 0o600 });
+      return finish(false);
+    } catch (err) {
+      return { ok: false, heldBy: null, reason: `could not write a claim: ${err.message}` };
+    }
+  }
+
   const age = now - held.at;
   const ownerGone = held.pid === 0 || !isPidAlive(held.pid);
 
@@ -200,6 +222,7 @@ export function sweepAbandoned({ dataDir = getDataDir(), now = Date.now() } = {}
     if (!name.endsWith('.claim')) continue;
     const file = path.join(claimDir(dataDir), name);
     const held = readClaim(file);
+    if (!held) continue;
 
     const ownerGone = held.pid === 0 || !isPidAlive(held.pid);
     if (!ownerGone) continue;

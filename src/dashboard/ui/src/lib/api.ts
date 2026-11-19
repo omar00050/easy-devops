@@ -1,7 +1,7 @@
 /**
  * lib/api.ts — the only place that talks HTTP.
  *
- * Follows docs/api-contract.md exactly:
+ * Follows API-CONTRACT.md exactly:
  *   - session cookie, same-origin;
  *   - `X-EZ-Request: 1` on every state-changing request (and on the socket
  *     handshake, see lib/socket.ts);
@@ -21,9 +21,14 @@ import type {
   CertificateDeleteResult,
   ChannelInput,
   DeployApp,
+  DeployAppCreated,
   DeployAppDetail,
   DeployAppInput,
   DeployDomainLink,
+  DeployDomainLinkInput,
+  DeployKeyGithubResult,
+  DeployKeyRegenerateResult,
+  DeployKeyTestResult,
   DeployMoveResult,
   DeployGithubApplyInput,
   DeployGithubApplyResult,
@@ -47,6 +52,7 @@ import type {
   NginxLogs,
   NginxStatus,
   NotificationChannel,
+  PermissionsSetupResult,
   PermissionsSetupStatus,
   ProcessAction,
   ProcessActionResponse,
@@ -102,7 +108,7 @@ interface RequestOptions {
   body?: unknown;
   query?: QueryParams;
   signal?: AbortSignal;
-  /** Login, first-run setup and the sudo prompt report 401 for their own reasons. */
+  /** Login and first-run setup report 401 for their own reasons. */
   skipAuthEvents?: boolean;
 }
 
@@ -273,7 +279,7 @@ export const api = {
     get: (id: string, signal?: AbortSignal) =>
       request<DeployAppDetail>(`/deployments/${enc(id)}`, { signal }),
     create: (input: DeployAppInput) =>
-      request<DeployApp>('/deployments', { method: 'POST', body: input }),
+      request<DeployAppCreated>('/deployments', { method: 'POST', body: input }),
     update: (id: string, input: DeployAppInput) =>
       request<DeployApp>(`/deployments/${enc(id)}`, { method: 'PUT', body: input }),
     remove: (id: string, options: { deleteDomain?: boolean; purgeData?: boolean } = {}) =>
@@ -290,10 +296,10 @@ export const api = {
           purgeData: options.purgeData ? 1 : undefined,
         },
       }),
-    linkDomain: (id: string, domain: string, ssl = false) =>
+    linkDomain: (id: string, input: DeployDomainLinkInput) =>
       request<DeployDomainLink>(`/deployments/${enc(id)}/domain`, {
         method: 'PUT',
-        body: { domain, ssl },
+        body: input,
       }),
     unlinkDomain: (id: string) =>
       request<{ unlinked: true }>(`/deployments/${enc(id)}/domain`, { method: 'DELETE' }),
@@ -322,7 +328,14 @@ export const api = {
     revokeHookToken: (id: string) =>
       request<{ revoked: true }>(`/deployments/${enc(id)}/hook-token`, { method: 'DELETE' }),
     generateDeployKey: (id: string) =>
-      request<{ publicKey: string }>(`/deployments/${enc(id)}/deploy-key`, { method: 'POST' }),
+      request<DeployKeyRegenerateResult>(`/deployments/${enc(id)}/deploy-key`, { method: 'POST' }),
+    testDeployKey: (id: string) =>
+      request<DeployKeyTestResult>(`/deployments/${enc(id)}/deploy-key/test`, { method: 'POST' }),
+    addDeployKeyToGithub: (id: string, token?: string) =>
+      request<DeployKeyGithubResult>(`/deployments/${enc(id)}/deploy-key/github`, {
+        method: 'POST',
+        body: token ? { token } : {},
+      }),
     github: (id: string, signal?: AbortSignal) =>
       request<DeployGithubSetup>(`/deployments/${enc(id)}/github`, { signal }),
     applyGithub: (id: string, input: DeployGithubApplyInput) =>
@@ -348,13 +361,8 @@ export const api = {
       request<SettingsUpdateResult>('/settings', { method: 'POST', body: input }),
     permissions: (signal?: AbortSignal) =>
       request<PermissionsSetupStatus>('/settings/permissions', { signal }),
-    setupPermissions: (password: string) =>
-      request<{ success: true }>('/settings/permissions/setup', {
-        method: 'POST',
-        body: { password },
-        // 401 here is "wrong sudo password", not an expired session.
-        skipAuthEvents: true,
-      }),
+    setupPermissions: () =>
+      request<PermissionsSetupResult>('/settings/permissions/setup', { method: 'POST' }),
     backup: (signal?: AbortSignal) => request<BackupFile>('/settings/backup', { signal }),
     restore: (backup: BackupFile) =>
       request<{ success: true }>('/settings/restore', { method: 'POST', body: backup }),

@@ -276,19 +276,38 @@
 			</div>
 			<div class="p-8 bg-background">
 				<p v-if="permissions.configured" class="text-sm text-muted">Passwordless sudo is configured. The dashboard can manage nginx and systemctl without prompting for a password.</p>
-				<div v-else>
-					<p class="text-sm text-muted mb-6">The dashboard needs passwordless sudo to control nginx and systemctl. Enter your sudo password once to configure it.</p>
-					<div class="w-full max-w-md">
-						<label class="form-label">Sudo Password</label>
-						<input v-model="permissions.password" type="password" class="form-input" placeholder="Enter your sudo password" @keyup.enter="setupPermissions" />
+				<div v-else class="space-y-6">
+					<p class="text-sm text-muted">The dashboard needs passwordless sudo to control nginx and systemctl. It installs nothing itself and never asks for your sudo password.</p>
+
+					<div v-if="permissions.commands.length" class="space-y-3">
+						<div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+							<p class="text-sm text-muted">Run these commands once in a terminal on the server. sudo asks for the password there; the dashboard never sees it.</p>
+							<button @click="copyPermissionCommands" class="btn btn-secondary btn-sm shrink-0 self-start sm:self-auto">Copy</button>
+						</div>
+						<pre class="font-mono text-[12px] leading-relaxed p-4 bg-black/5 dark:bg-white/5 border border-border rounded-[10px] whitespace-pre-wrap break-all select-all">{{ permissions.commands.join('\n') }}</pre>
+					</div>
+
+					<div v-if="permissions.refusedDirs.length" class="p-4 bg-yellow-500/10 border border-yellow-500/20 rounded-[10px]">
+						<p class="text-[13px] font-bold text-yellow-500 mb-2">These directories are not handed over automatically — each needs root by hand:</p>
+						<ul class="space-y-1.5">
+							<li v-for="r in permissions.refusedDirs" :key="r.dir + '|' + r.reason" class="text-[12px] text-muted">
+								<span class="font-mono font-bold text-foreground">{{ r.dir }}</span> — {{ r.reason }}
+							</li>
+						</ul>
 					</div>
 				</div>
 			</div>
-			<div v-if="!permissions.configured" class="p-5 border-t border-border bg-black/5 dark:bg-white/5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-				<button @click="setupPermissions" :disabled="permissions.loading || !permissions.password" class="btn btn-primary min-w-[180px] shadow-sm">
-					<svg v-if="permissions.loading" class="w-4 h-4 animate-spin -ml-1 mr-2 inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
-					{{ permissions.loading ? 'Setting up...' : 'Setup Permissions' }}
-				</button>
+			<div v-if="!permissions.configured || permissions.msg || permissions.error" class="p-5 border-t border-border bg-black/5 dark:bg-white/5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+				<div class="flex flex-wrap items-center gap-2">
+					<button v-if="!permissions.configured" @click="setupPermissions" :disabled="permissions.loading || permissions.checking" class="btn btn-primary min-w-[180px] shadow-sm">
+						<svg v-if="permissions.loading" class="w-4 h-4 animate-spin -ml-1 mr-2 inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
+						{{ permissions.loading ? 'Preparing...' : 'Show Setup Commands' }}
+					</button>
+					<button v-if="!permissions.configured" @click="checkPermissionsAgain" :disabled="permissions.checking || permissions.loading" class="btn btn-secondary">
+						<svg v-if="permissions.checking" class="w-4 h-4 animate-spin -ml-1 mr-2 inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
+						{{ permissions.checking ? 'Checking...' : 'Check again' }}
+					</button>
+				</div>
 				<div>
 					<span v-if="permissions.msg" class="text-green-500 text-[13px] font-bold px-3 py-1.5 rounded-[10px] bg-green-500/10 border border-green-500/20">{{ permissions.msg }}</span>
 					<span v-if="permissions.error" class="text-red-500 text-[13px] font-bold px-3 py-1.5 rounded-[10px] bg-red-500/10 border border-red-500/20">{{ permissions.error }}</span>

@@ -1,7 +1,7 @@
 # Easy DevOps dashboard UI
 
 React rewrite of the dashboard, self-contained in `src/dashboard/ui/`. It talks
-only to the REST and Socket.io API described in `docs/api-contract.md`, and is
+only to the REST and Socket.io API described in `API-CONTRACT.md`, and is
 temporarily built beside the old Vue/EJS UI until it is approved.
 
 - React 19 · TypeScript 5.8 (strict) · Vite 6 · Tailwind 4 · react-router 7 · socket.io-client
@@ -29,7 +29,7 @@ against the contract. Scenarios are selected with `?mock=`:
 | URL | Shows |
 | --- | --- |
 | `/?mock=dashboard` | Normal dashboard with domains, certificates, PM2 processes |
-| `/?mock=login` | Login screen (any non-empty password) |
+| `/?mock=login` | Login screen (any non-empty password; `wrong` fails) |
 | `/?mock=setup` | First run — set a password |
 | `/?mock=setupcode` | First run with a setup code (code `123456`, mock-only) |
 | `/?mock=setupcode-expired` | First run whose setup code has expired — shows how to get a new one |
@@ -38,11 +38,15 @@ against the contract. Scenarios are selected with `?mock=`:
 | `/?mock=service-stopped-by-you` | Personal-mode service stopped by the user (with a differing pinned Node) |
 | `/?mock=service-not-installed` | Personal mode, service never installed |
 | `/?mock=service-elevation` | Service running, but Start/Stop/Restart answer `403 elevation_required` |
+| `/?mock=service-pending` | First `/api/service` read has unfinished probes: PM2 shows “Checking…”, runtime is measuring; the next read fills them in |
 
-Mock state is kept in `sessionStorage` under `ez-mock-state-v5:<scenario>`.
+Mock state is kept in `sessionStorage` under `ez-mock-state-v6:<scenario>`.
 Reload the page after changing fixtures; destructive mock actions only change
 that state. Service lifecycle actions in mock mode update the card in place and
 emit `service:changed` on the mock socket, which is also replayed on connect.
+The mock socket also replays `hub:agentState` on connect and drops/reconnects
+the fake agent after 9 s and 15 s. Three `wrong` passwords (or three bad setup
+codes) trigger a 429 with `retryAfterSeconds`.
 
 Settings → Update runs a simulated update against this state: the phases
 advance with the clock (about ten seconds in total), `/update/status` fails with
@@ -187,14 +191,14 @@ certificates, domains, processes or settings should be run in mock mode.
 - [ ] Start / Stop / Restart confirm first and update the card, banner, sidebar and Overview without a reload; a restart clears the stopped-by-you state.
 - [ ] `?mock=service-elevation` shows the exact `sudo systemctl …` command with a Copy button instead of an error toast; `?mock=service-not-installed` shows the install command; starting an already-running service shows an info toast.
 - [ ] Banner action “Open Processes” is hidden while the Processes page is open.
-- [ ] Mock scenarios `service-stopped`, `service-stopped-by-you`, `service-not-installed` and `service-elevation` show the right banner and card copy.
+- [ ] Mock scenarios `service-stopped`, `service-stopped-by-you`, `service-not-installed`, `service-elevation` and `service-pending` show the right banner and card copy; a pending read shows “Checking…”/“Measuring…” instead of “Not installed”, then resolves without a manual reload.
 - [ ] PM2 card lists only your own apps; the managed `ez-dashboard` entry never appears; `pm2-logrotate` appears under “PM2 modules” with a stop warning about unbounded logs.
 - [ ] CPU and memory show `—`, not 0 B / 0%, when PM2 reports nothing.
 - [ ] Process actions confirm first; failures show the contract error.
 - [ ] Logs modal shows the process tail and handles an empty log.
 
 **Settings**
-- [ ] General: port/email/dirs validate inline; saving warns when a restart is needed.
+- [ ] General: port/email/dirs validate inline; saving warns when a restart is needed; the interface choice says it applies at the next dashboard start.
 - [ ] Access: bind address and auth mode restrictions are enforced; password fields never echo values.
 - [ ] Linux permissions panel explains missing sudoers rules; setup failure shows the server message.
 - [ ] Hub: unlinked state, connect validation, agent status, permission tree, unlink confirmation.

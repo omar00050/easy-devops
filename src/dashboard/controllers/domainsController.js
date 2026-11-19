@@ -10,7 +10,7 @@ import { findCertificateForDomain } from '../../core/cert-suggest.js';
 import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk, hasBackslashPath } from '../../core/platform.js';
 import {
   validateDomainName, validatePort, validateUpstreamType,
-  validateMaxBodySize,
+  validateMaxBodySize, validateBehindCloudflare,
 } from '../../core/validators.js';
 import { getDomainNotifConfig, saveDomainNotifConfig } from '../../core/domainNotifier.js';
 
@@ -118,6 +118,11 @@ class DomainsController {
         return res.status(400).json({ error: maxSizeError });
       }
 
+      const cloudflareError = validateBehindCloudflare(body.behindCloudflare);
+      if (cloudflareError) {
+        return res.status(400).json({ error: cloudflareError });
+      }
+
       // Check for duplicate
       if (findDomain(body.name)) {
         return res.status(409).json({ error: `Domain already exists: ${body.name}` });
@@ -159,6 +164,7 @@ class DomainsController {
           customLocations: body.advanced?.customLocations ?? '',
         },
         wildcard: body.wildcard ?? false,
+        behindCloudflare: body.behindCloudflare ?? false,
         enabled: true,
       });
 
@@ -217,6 +223,14 @@ class DomainsController {
         const upstreamError = validateUpstreamType(body.upstreamType);
         if (upstreamError) {
           return res.status(400).json({ error: upstreamError });
+        }
+      }
+
+      // Validate behindCloudflare if provided
+      if (body.behindCloudflare !== undefined) {
+        const cloudflareError = validateBehindCloudflare(body.behindCloudflare);
+        if (cloudflareError) {
+          return res.status(400).json({ error: cloudflareError });
         }
       }
 
@@ -431,9 +445,8 @@ class DomainsController {
       if (!name || !name.trim()) {
         return res.status(400).json({ error: 'A domain name is required' });
       }
-      if (!findDomain(name)) {
-        return res.status(404).json({ error: `Domain not found: ${name}` });
-      }
+      // The deployments link dialog asks about a domain before it exists, so
+      // an unknown name is not an error: the answer is simply "not found".
       res.json(await findCertificateForDomain(name));
     } catch (error) {
       next(error);

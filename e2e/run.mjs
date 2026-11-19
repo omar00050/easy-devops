@@ -212,7 +212,7 @@ async function main() {
 
   // ── Preflight: the API contract matches the code ──────────────────────────
   //
-  // docs/api-contract.md is authoritative, so it is held to the routes the
+  // API-CONTRACT.md is authoritative, so it is held to the routes the
   // dashboard actually registers. A route added without documenting it fails
   // the run here rather than drifting quietly.
   //
@@ -252,7 +252,7 @@ async function main() {
     process.stdout.write(`FAIL (${contract.problems.length} problem(s))\n\n`);
     for (const p of contract.problems) process.stdout.write(`  - ${p}\n`);
     process.stdout.write(
-      '\ndocs/api-contract.md is authoritative: any change to an endpoint updates\n' +
+      '\nAPI-CONTRACT.md is authoritative: any change to an endpoint updates\n' +
       'that file in the same change. Fix the document, or the route.\n\n'
     );
     process.exit(1);

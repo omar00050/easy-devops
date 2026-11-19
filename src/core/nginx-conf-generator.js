@@ -11,6 +11,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { loadConfig } from './config.js';
 import { isWindows, toNginxPath, toEscapedNginxPath } from './platform.js';
+import { CLOUDFLARE_RANGES } from './cloudflare-ips.js';
 
 /**
  * How certificate paths are written into a generated config.
@@ -56,6 +57,68 @@ export function buildChallengeLocation(port = DEFAULT_ACME_CHALLENGE_PORT) {
 
 /** Path prefix the deploy hook answers on. Shared with core/deploy/hookServer.js. */
 export const DEPLOY_HOOK_PATH = '/.ez-deploy/';
+
+/**
+ * File holding the single `map $http_upgrade $ezz_connection_upgrade` definition.
+ *
+ * nginx permits a `map` only in the `http` context, and a second definition of
+ * the same variable fails `nginx -t`. Writing it to one file in conf.d means
+ * every domain config can use `$ezz_connection_upgrade` without any of them
+ * defining it, so the map exists exactly once no matter how many domains there
+ * are. The leading `00-` keeps it first in conf.d's lexical include order.
+ */
+export const WEBSOCKET_MAP_FILENAME = '00-easy-devops-websocket.conf';
+
+/** Prefix the Socket.IO endpoint is served under. */
+export const SOCKET_IO_PATH = '/socket.io/';
+
+/** Long enough for an idle WebSocket behind Socket.IO (1 hour). */
+export const SOCKET_IO_TIMEOUT = '3600s';
+
+/**
+ * Content of the shared WebSocket map file.
+ *
+ * `'' ''` (empty, not `close`) is deliberate: a plain HTTP request has no
+ * `Upgrade` header, so nginx sends no `Connection` header at all and upstream
+ * keep-alive keeps working. `close` would force every ordinary request onto a
+ * new connection. A real WebSocket request gets `upgrade` via `default`.
+ *
+ * @returns {string}
+ */
+export function buildWebsocketMapConf() {
+  return [
+    '# Easy DevOps — WebSocket upgrade map. Written once for ALL proxied domains;',
+    '# a map may only live in the http context and must not be defined twice.',
+    'map $http_upgrade $ezz_connection_upgrade {',
+    '    default upgrade;',
+    "    ''      '';",
+    '}',
+    '',
+  ].join('\n');
+}
+
+/**
+ * Path of the shared WebSocket map file for a given nginx installation.
+ * @param {string} nginxDir
+ * @returns {string}
+ */
+export function websocketMapPath(nginxDir) {
+  const join = isWindows ? path.win32.join : path.posix.join;
+  return join(getConfDDir(nginxDir), WEBSOCKET_MAP_FILENAME);
+}
+
+/**
+ * Writes the shared WebSocket map file, overwriting it with identical content
+ * on later calls. One file, so it can never be included twice from our side.
+ * @param {string} nginxDir
+ * @returns {Promise<string>} Path written
+ */
+export async function ensureWebsocketMap(nginxDir) {
+  const confPath = websocketMapPath(nginxDir);
+  await fs.mkdir(path.dirname(confPath), { recursive: true });
+  await fs.writeFile(confPath, buildWebsocketMapConf(), 'utf8');
+  return confPath;
+}
 
 /**
  * Builds the location block that exposes the deploy hook through a domain.
@@ -181,9 +244,12 @@ function formatCertPath(p, style) {
 
 /** Returns the conf.d directory for domain config files. */
 export function getConfDDir(nginxDir) {
+  // Explicit win32/posix instead of the host default: `isWindows` is the only
+  // decision, so the generated location cannot depend on which OS runs the
+  // code (and a simulated platform in tests gets the real separators).
   return isWindows
-    ? path.join(nginxDir, 'conf', 'conf.d')
-    : path.join(nginxDir, 'conf.d');
+    ? path.win32.join(nginxDir, 'conf', 'conf.d')
+    : path.posix.join(nginxDir, 'conf.d');
 }
 
 /** Returns the path to nginx.conf. */
@@ -242,6 +308,7 @@ export const DOMAIN_DEFAULTS = {
   www: false,
   wildcard: false,    // *.example.com server_name; forces DNS-01
   enabled: true,      // false = conf file renamed to .conf.disabled
+  behindCloudflare: false, // true = trust CF-Connecting-IP from Cloudflare ranges
   ssl: {
     enabled: false,
     certPath: '',
@@ -285,6 +352,7 @@ export function migrateDomain(d) {
       ...d,
       wildcard: d.wildcard ?? false,
       enabled: d.enabled ?? true,
+      behindCloudflare: d.behindCloudflare ?? false,
       ssl: { ...DOMAIN_DEFAULTS.ssl, ...d.ssl },
       performance: { ...DOMAIN_DEFAULTS.performance, ...d.performance },
       security: { ...DOMAIN_DEFAULTS.security, ...d.security },
@@ -314,6 +382,7 @@ export function migrateDomain(d) {
     advanced: { ...DOMAIN_DEFAULTS.advanced },
     wildcard: d.wildcard ?? false,
     enabled: d.enabled ?? true,
+    behindCloudflare: d.behindCloudflare ?? false,
     configFile: d.configFile ?? null,
     createdAt: d.createdAt ?? new Date().toISOString(),
     updatedAt: d.updatedAt ?? new Date().toISOString(),
@@ -359,20 +428,20 @@ export function buildConf(domain, nginxDir, sslDir, options = {}) {
     try { upstreamHostHeader = new URL(backendHost).host; } catch { /* keep $host */ }
   }
 
-  // Build proxy headers (always include standard set)
-  let proxyHeaders = `
+  // Build proxy headers (always include standard set).
+  //
+  // WebSocket-ready for EVERY proxied domain: `$ezz_connection_upgrade` is empty
+  // for a plain request (see buildWebsocketMapConf) and `upgrade` only when the
+  // client asked for an upgrade. The old `Connection "upgrade"` forced every
+  // ordinary request to claim an upgrade, which is wrong.
+  const proxyHeaders = `
+ proxy_http_version 1.1;
+ proxy_set_header Upgrade $http_upgrade;
+ proxy_set_header Connection $ezz_connection_upgrade;
  proxy_set_header Host ${upstreamHostHeader};
  proxy_set_header X-Real-IP $remote_addr;
  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
  proxy_set_header X-Forwarded-Proto $scheme;`;
-
-  // Add WebSocket headers if upstreamType is 'ws'
-  if (upstreamType === 'ws') {
-    proxyHeaders = `
- proxy_http_version 1.1;
- proxy_set_header Upgrade $http_upgrade;
- proxy_set_header Connection "upgrade";${proxyHeaders}`;
-  }
 
   // Build rate limiting zone name (dots → underscores)
   const rateLimitZone = name.replace(/\./g, '_').replace(/\*/g, 'wildcard');
@@ -461,6 +530,21 @@ ${challengeLocation}
   mainBlock.push(` listen ${listenPort};`);
   mainBlock.push(` server_name ${serverNames};`);
 
+  // ─── Cloudflare real IP (per domain, opt-in) ────────────────────────────────
+  // set_real_ip_from only says whose X-Forwarded-For/CF-Connecting-IP to
+  // believe. It does NOT stop a direct connection to this origin: limit ports
+  // 80/443 to Cloudflare's ranges at the firewall for that. The app then trusts
+  // exactly one proxy — for the Hub that is TRUST_PROXY=1.
+  if (domain.behindCloudflare === true) {
+    mainBlock.push(``);
+    mainBlock.push(` # Behind Cloudflare: trust CF-Connecting-IP only from Cloudflare ranges.`);
+    mainBlock.push(` # The app trusts one proxy (Hub: TRUST_PROXY=1); firewall 80/443 to these ranges to block direct origin access.`);
+    for (const range of CLOUDFLARE_RANGES) {
+      mainBlock.push(` set_real_ip_from ${range};`);
+    }
+    mainBlock.push(` real_ip_header CF-Connecting-IP;`);
+  }
+
   // When this block is the port-80 listener (SSL off) it must answer the ACME
   // challenge too. `location ^~` outranks the `location /` proxy below.
   if (!ssl?.enabled) {
@@ -506,27 +590,44 @@ ${challengeLocation}
     mainBlock.push(buildDeployHookLocation(options.deployHookPort));
   }
 
-  // ─── Location Block ─────────────────────────────────────────────────────────
-  mainBlock.push(``);
-  mainBlock.push(` location / {`);
+  // ─── Location Blocks ────────────────────────────────────────────────────────
   // proxy_pass: full external URL → use directly (no scheme/port added)
   // local backend → build from scheme + host + port
   const proxyTarget = backendIsUrl
     ? backendHost.replace(/\/$/, '')
     : `${proxyScheme}://${backendHost}:${port}`;
-  mainBlock.push(` proxy_pass ${proxyTarget};`);
+
   // Add proxy_ssl_server_name for external HTTPS upstreams (SNI — required for Vercel, Railway, etc.)
   // Only when: HTTPS URL, not an IP address, not localhost, and nginx itself is not terminating SSL
   // (if nginx has its own cert the backend connection is separate — SNI directive is irrelevant)
+  let needsSni = false;
   if (backendIsUrl && /^https:/i.test(backendHost) && !ssl?.enabled) {
     let upstreamHostname = '';
     try { upstreamHostname = new URL(backendHost).hostname; } catch { /* skip */ }
     const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(upstreamHostname) || upstreamHostname.startsWith('[');
     const isLocal = upstreamHostname === 'localhost' || upstreamHostname === '127.0.0.1';
-    if (!isIp && !isLocal) {
-      mainBlock.push(` proxy_ssl_server_name on;`);
-    }
+    needsSni = !isIp && !isLocal;
   }
+
+  // Socket.IO / WebSocket path: no buffering and long idle timeouts. `^~` makes
+  // it win over `location /` (and regex locations) without stopping ordinary
+  // HTTP on the rest of the domain.
+  mainBlock.push(``);
+  mainBlock.push(` # Socket.IO / WebSockets — long-lived, unbuffered.`);
+  mainBlock.push(` location ^~ ${SOCKET_IO_PATH} {`);
+  mainBlock.push(` proxy_pass ${proxyTarget};`);
+  if (needsSni) mainBlock.push(` proxy_ssl_server_name on;`);
+  mainBlock.push(proxyHeaders);
+  mainBlock.push(``);
+  mainBlock.push(` proxy_buffering off;`);
+  mainBlock.push(` proxy_read_timeout ${SOCKET_IO_TIMEOUT};`);
+  mainBlock.push(` proxy_send_timeout ${SOCKET_IO_TIMEOUT};`);
+  mainBlock.push(` }`);
+
+  mainBlock.push(``);
+  mainBlock.push(` location / {`);
+  mainBlock.push(` proxy_pass ${proxyTarget};`);
+  if (needsSni) mainBlock.push(` proxy_ssl_server_name on;`);
   mainBlock.push(proxyHeaders);
   mainBlock.push(``);
   mainBlock.push(` proxy_read_timeout ${performance?.readTimeout || 60}s;`);
@@ -606,6 +707,10 @@ export async function generateConf(domain, options = {}) {
   // Ensure conf.d directory exists
   await fs.mkdir(confDir, { recursive: true });
   await fs.writeFile(confPath, confContent, 'utf8');
+
+  // The single WebSocket map lives in its own conf.d file, so every domain can
+  // reference $ezz_connection_upgrade without defining the map itself.
+  await ensureWebsocketMap(nginxDir);
 
   // Ensure nginx.conf includes conf.d
   await ensureNginxInclude(nginxDir);

@@ -16,7 +16,7 @@
  * ── Why the event names are the browser's names ────────────────────────────
  *
  * `nginx:status`, `domain:health`, `notification:new` and `local:changed` are
- * the names in docs/api-contract.md, and they are used unchanged here. A
+ * the names in API-CONTRACT.md, and they are used unchanged here. A
  * translation table between internal and external names would be one more
  * thing to keep in step with the contract, and the contract is the thing that
  * must not drift. So a forwarder is a one-liner: subscribe, emit the same name

@@ -103,7 +103,7 @@ function RunResult({ run }: { run: UpdateRun }) {
         <VersionFacts run={run} />
         {run.dashboardRestarted === false && (
           <InlineAlert tone="warning" title="The dashboard did not come back by itself">
-            Start it again with <code className="font-mono">ezz dashboard</code> in a terminal.
+            Start it again with <code className="font-mono">ezz --dash</code> in a terminal.
           </InlineAlert>
         )}
       </div>

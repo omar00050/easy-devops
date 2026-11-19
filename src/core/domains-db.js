@@ -88,6 +88,7 @@ export async function handleHubDomainCommand(payload) {
         upstreamType: domain.upstreamType ?? DOMAIN_DEFAULTS.upstreamType,
         www: domain.www ?? false,
         wildcard: domain.wildcard ?? false,
+        behindCloudflare: domain.behindCloudflare ?? false,
         enabled: true,
         ssl: { ...DOMAIN_DEFAULTS.ssl, ...domain.ssl },
         performance: { ...DOMAIN_DEFAULTS.performance, ...domain.performance },

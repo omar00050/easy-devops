@@ -148,6 +148,101 @@ function explain(result, needs) {
   return `GitHub answered ${result.status}${result.message ? `: ${result.message}` : ''}.`;
 }
 
+/** The "add a deploy key" page for a github.com repository, or null. */
+export function deployKeyAddUrl(repoUrl) {
+  const repo = parseGithubRepo(repoUrl);
+  return repo ? `https://github.com/${repo.owner}/${repo.repo}/settings/keys/new` : null;
+}
+
+/** Type and base64 only: GitHub drops the trailing comment, so compare the material. */
+function keyMaterial(key) {
+  return String(key ?? '').trim().split(/\s+/).slice(0, 2).join(' ');
+}
+
+/**
+ * Adds the app's public key to a github.com repository as a read-only deploy
+ * key, and removes an older key with the same title and different material
+ * (the key a regeneration replaced).
+ *
+ * Each step is reported on its own so the UI can say exactly what happened.
+ * The old key is only removed after the current one is on the repository, so a
+ * failed add never leaves the app locked out.
+ *
+ * @param {Object} opts
+ * @param {string} opts.repoUrl
+ * @param {string} opts.token GitHub token, used for this call only
+ * @param {string} opts.title
+ * @param {string} opts.key The public key line
+ * @param {Function} [opts.fetchImpl]
+ * @returns {Promise<{ ok: boolean, steps: Array<{ id: string, ok: boolean, detail: string }>,
+ *   error: string|null }>}
+ */
+export async function addDeployKey({
+  repoUrl, token, title, key, fetchImpl = globalThis.fetch,
+}) {
+  const repo = parseGithubRepo(repoUrl);
+  if (!repo) {
+    return { ok: false, steps: [], error: 'Automatic setup works with github.com repositories only.' };
+  }
+  if (!validateGithubToken(token)) {
+    return { ok: false, steps: [], error: 'A GitHub token is required.' };
+  }
+
+  const gh = makeClient(token, fetchImpl);
+  const base = `/repos/${repo.owner}/${repo.repo}`;
+  const material = keyMaterial(key);
+  const steps = [];
+
+  const list = await gh('GET', `${base}/keys?per_page=100`);
+  if (!list.ok) {
+    return {
+      ok: false,
+      steps: [{ id: 'deployKey', ok: false, detail: explain(list, '“Administration: read and write”') }],
+      error: null,
+    };
+  }
+
+  const keys = Array.isArray(list.json) ? list.json : [];
+  const currentPresent = keys.some((k) => keyMaterial(k?.key) === material);
+  if (currentPresent) {
+    steps.push({ id: 'deployKey', ok: true, detail: 'The deploy key is already on the repository.' });
+  } else {
+    const add = await gh('POST', `${base}/keys`, { title, key: material, read_only: true });
+    steps.push(add.ok
+      ? { id: 'deployKey', ok: true, detail: 'Added the deploy key, read-only.' }
+      : { id: 'deployKey', ok: false, detail: explain(add, '“Administration: read and write”') });
+  }
+
+  // Only trust a current key that is really there before removing an older one.
+  const currentOnRepo = currentPresent || steps[0]?.ok === true;
+  const stale = currentOnRepo
+    ? keys.filter((k) => k?.title === title && keyMaterial(k?.key) !== material)
+    : [];
+  if (stale.length > 0) {
+    const failed = [];
+    let removed = 0;
+    for (const k of stale) {
+      if (k?.id === undefined || k?.id === null) continue;
+      const del = await gh('DELETE', `${base}/keys/${encodeURIComponent(k.id)}`);
+      if (del.ok) removed += 1;
+      else failed.push(explain(del, '“Administration: read and write”'));
+    }
+    if (failed.length > 0) {
+      steps.push({ id: 'oldKey', ok: false, detail: failed.join(' ') });
+    } else if (removed > 0) {
+      steps.push({
+        id: 'oldKey',
+        ok: true,
+        detail: removed === 1
+          ? 'Removed the previous deploy key with the same title.'
+          : `Removed ${removed} previous deploy keys with the same title.`,
+      });
+    }
+  }
+
+  return { ok: steps.every((s) => s.ok), steps, error: null };
+}
+
 /**
  * Applies the setup to a repository.
  *
@@ -242,19 +337,11 @@ export async function applyGithubSetup({
 
   // ── deploy key ────────────────────────────────────────────────────────────
   if (deployKey) {
-    // Compare the key material only: GitHub drops the trailing comment.
-    const material = deployKey.key.split(/\s+/).slice(0, 2).join(' ');
-    const list = await gh('GET', `${base}/keys?per_page=100`);
-    if (!list.ok) {
-      steps.push({ id: 'deployKey', ok: false, detail: explain(list, '“Administration: read and write”') });
-    } else if (Array.isArray(list.json) && list.json.some((k) => String(k.key ?? '').trim() === material)) {
-      steps.push({ id: 'deployKey', ok: true, detail: 'The deploy key is already on the repository.' });
-    } else {
-      const add = await gh('POST', `${base}/keys`, { title: deployKey.title, key: deployKey.key, read_only: true });
-      steps.push(add.ok
-        ? { id: 'deployKey', ok: true, detail: 'Added the deploy key, read-only.' }
-        : { id: 'deployKey', ok: false, detail: explain(add, '“Administration: read and write”') });
-    }
+    const added = await addDeployKey({
+      repoUrl, token, title: deployKey.title, key: deployKey.key, fetchImpl,
+    });
+    if (added.steps.length > 0) steps.push(...added.steps);
+    else steps.push({ id: 'deployKey', ok: false, detail: added.error ?? 'The deploy key could not be added.' });
   }
 
   return { ok: steps.length > 0 && steps.every((s) => s.ok), repo: full, error: null, steps };

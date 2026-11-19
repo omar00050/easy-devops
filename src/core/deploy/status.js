@@ -12,6 +12,7 @@
 
 import * as defaultRunner from '../runner.js';
 import { listApps, getApp, dashboardApp, pm2Name } from './apps.js';
+import { settingsWarnings } from './ezfile.js';
 import { describeRelease } from './engine.js';
 import { listRuns, readState, listReleases, lockHolder } from './store.js';
 
@@ -30,7 +31,21 @@ export async function pm2Statuses({ runner = defaultRunner } = {}) {
     const pm2 = await runner.detect({ probeVersion: false });
     if (!pm2.installed) return byName;
     const listed = await runner.list({ pm2Path: pm2.path ?? 'pm2' });
-    if (listed.ok) for (const app of listed.apps) byName.set(app.name, app);
+    if (listed.ok) {
+      for (const app of listed.apps) {
+        const existing = byName.get(app.name);
+        if (existing) {
+          existing.instances.push(app);
+          if (app.status === 'online') existing.instancesOnline += 1;
+        } else {
+          byName.set(app.name, {
+            ...app,
+            instances: [app],
+            instancesOnline: app.status === 'online' ? 1 : 0,
+          });
+        }
+      }
+    }
   } catch { /* status is decoration; the list still renders */ }
   return byName;
 }
@@ -47,6 +62,12 @@ export function describeApp(app, processes, view = dashboardApp) {
   const runs = listRuns(app.id, { limit: 1 });
   const holder = lockHolder(app.id);
   const proc = processes.get(pm2Name(app.id)) ?? null;
+  const live = state.current ? describeRelease(app.id, state.current) : null;
+  const execMode = live?.execMode ?? app.settings?.execMode ?? 'fork';
+  const warnings = [...(view(app).warnings ?? [])];
+  for (const w of settingsWarnings({ execMode })) {
+    if (!warnings.includes(w)) warnings.push(w);
+  }
 
   return {
     ...view(app),
@@ -55,6 +76,12 @@ export function describeApp(app, processes, view = dashboardApp) {
     deploying: Boolean(holder),
     activeRunId: holder?.runId ?? null,
     lastRun: runs[0] ?? null,
+    /** Advisory notes for the UI; empty unless the app runs a cluster. */
+    warnings,
+    /** What the live release was started with; settings when it never ran. */
+    execMode,
+    instances: live?.instances ?? app.settings?.instances ?? 1,
+    instancesOnline: proc?.instancesOnline ?? (proc?.status === 'online' ? 1 : 0),
     process: proc
       ? {
         status: proc.status, pid: proc.pid, cpu: proc.cpu, memoryBytes: proc.memoryBytes,

@@ -9,6 +9,387 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### Update Easy DevOps from the dashboard
+Settings → Update works from the browser, with the same `core/updater.js` flow
+as `ezz update` and the same refusals. The request cannot do the work itself —
+npm replaces the files the server is running from, and that server is stopped
+mid-way — so it records the run and starts a detached worker that outlives it.
+
+- **`GET /api/update`** — registry check, install source (`npm`, `clone` or
+  `unknown`) and the last run. **`GET /api/update/status`** is the run record
+  alone: no registry call, so it is what a client polls while the dashboard is
+  going down and coming back. **`POST /api/update`** takes an optional
+  `{ version }` and answers `202 { started, run }`; the outcome is only ever in
+  the run record.
+- **A git clone or loose copy is refused** (`409`, with `source`), because
+  `npm install -g` would install a second copy and leave the service running
+  the clone. A run already in flight is refused too, and a registry that cannot
+  be reached is `502` rather than a guess.
+- **The worker survives the restart it causes**: it stops the dashboard, runs
+  the identical update, starts the dashboard again on the port the request
+  actually arrived on, and leaves phases (`starting` → `stopping` → `updating` →
+  `restarting` → `done`/`failed`) in `core/updateStatus.js`. An active run whose
+  worker is gone and whose heartbeat is older than 45 s is reported as
+  `interrupted`, never as still running, so a crashed worker cannot leave a page
+  polling for ever. The file is `update-status.json` in the data directory,
+  written atomically, and survives a failed rollback.
+- **Settings → Update renders the run after the restart**, including `step` and
+  `reason` on a failure and whether the previous version was reinstalled.
+- Contract 2.10.0. `e2e/dashboard-update.test.mjs` covers the endpoints and the
+  guard rails; `e2e/updater.test.mjs` covers the update itself.
+
+#### Deployments: persistent paths
+A project can now keep data across releases without copying it. `settings.persist`
+lists project-relative folders — or single files, such as `prisma/hub.db` — and
+each lives once in `<app dir>/shared/<path>` and is linked into every release at
+the same path, so an upload, a SQLite database or a generated cache is never
+replaced by a deploy.
+
+- **Enabling it on an app that already ran seeds from its live release**, so data
+  written before the setting existed is not lost. A path already in the shared
+  area wins; a new one is seeded from the live release and then the checkout for
+  a folder (a file the other way round), and created empty when neither has it.
+- **The kind is decided from evidence, not the name** where possible, and only
+  then from the last segment — a dot means a file.
+- **On Windows without the symlink privilege** folders become junctions and files
+  hard links; the link is verified after the build.
+- **A build that replaces a link with a real file or folder fails the deployment
+  at the `build` step**, rather than silently deploying with data that will
+  vanish on the next release.
+- Paths are validated in `core/deploy/ezfile.js`: relative, no `.` or `..`, not
+  `.git` or `node_modules`, at most 20, no case-insensitive overlap.
+- `apps[]` and `GET /api/deployments/:id` expose `sharedDir` and
+  `hasSharedData`; `DELETE /api/deployments/:id` keeps the shared area unless
+  `purgeData` is asked for. Contract 2.8.0.
+
+#### Certificates: delete, and a suggestion before issuing
+- **Delete a certificate from the SSL page.** `DELETE /api/ssl/:domain` removes
+  the certificate's directory — after scanning the whole nginx config tree,
+  including the main `nginx.conf` and `.conf.disabled` files, for anything that
+  points into it. If a config still references it the answer is `409
+  cert_in_use` with the file, line and text of every reference and nothing is
+  deleted, which is what keeps nginx from being left pointing at missing files.
+  Deleting a domain can do it in the same step with `?deleteCert=true`.
+- **A suggestion instead of a blind issuance.** `GET
+  /api/domains/:name/ssl-suggestion` looks for an existing certificate that
+  already covers the name — an exact directory, a SAN entry, or a wildcard
+  covering one label — and offers its paths and expiry. It changes nothing; the
+  UI fills the paths only when the operator accepts. `e2e/ssl-suggest.test.mjs`.
+
+#### Deployments: migrations, boot-crash detection and cluster mode
+Three additions to what a deployment does with a release that is not obviously
+healthy, and what it reports afterwards.
+
+- **`migrate`** — a command, a list, or `false` to skip — runs in the new release
+  directory after `build` and before `start`, with the build's environment. It is
+  also read from `ez.json`. A non-zero exit fails the run at the `migrate` step
+  before anything running is touched, and the previous release keeps running.
+  Migrations are **forward-only**: rolling the code back cannot undo one, so keep
+  each migration backward-compatible for one release.
+- **A release that crashes at boot is caught, not just one failed HTTP probe.**
+  A worker PM2 reports as errored or stopped, or one that keeps restarting over
+  the confirmation window, fails the deployment even when a probe answered once;
+  in cluster mode every worker is watched. The previous release is started again
+  automatically.
+- **The run records why.** `reason` carries a short explanation such as
+  `crashed at boot: restarting 3 times`, `logTail` the last 40 lines of the
+  crashed release's PM2 log with every environment value replaced by `***`, and
+  `rollbackSucceeded` whether the previous release came back healthy (`null` when
+  no rollback was attempted — a first release, or `autoRollback: false`). The
+  dashboard shows them as a rollback report on the failed run.
+- **Cluster mode.** `execMode: "cluster"` runs one worker per `instances` (a whole
+  number from 1 to the CPU count, or `"max"`). A deployment of an app already
+  running in cluster mode uses `pm2 reload` instead of delete-and-start, so the
+  new workers start before the old ones stop. Cluster mode needs a direct
+  `node <file>` start command; `instances` above 1 with `fork` is refused, and
+  the app is warned that it must be stateless.
+- `apps[]` and `GET /api/deployments/:id` report `execMode`, `instances` and
+  `instancesOnline`, so the dashboard shows `Cluster · 3/4 online` (and `0` when
+  PM2 is not running) instead of assuming every configured worker is up.
+- Contract 2.11.0. `e2e/deploy-safety.test.mjs` covers `migrate` and the
+  boot-crash report; `e2e/deploy-cluster.test.mjs` covers the validation rules,
+  the reload and the per-worker health check.
+
+#### Hub commands answer in the HTTP request
+A quick command — reading or saving a config, logs, deploy list/detail, an SSL
+suggestion, a PM2 action — is now answered by the dispatch request itself. The
+Hub sends it with a socket.io acknowledgement and waits up to **15 s**, so a page
+whose socket has not finished subscribing no longer misses the event and spins
+for ever.
+
+- **Long commands** (deploy, rollback, certificate issue/renew, nginx
+  start/stop/restart) still answer `202` immediately and keep running; their live
+  `command:result` events are unchanged.
+- **A result stays collectable.** `GET /servers/:id/commands/:requestId` returns
+  it for the server's owner for 10 minutes from completion, capped at 500
+  entries and evicted oldest-first. A page reload, or a browser that was never
+  subscribed, can collect a long command's answer. Another user's or server's id
+  is `404`, so an id cannot be probed.
+- **The failure is named.** `409 AGENT_OFFLINE`, `424 AGENT_TIMEOUT` (naming the
+  command and the 15 s) and `422 AGENT_ERROR` carrying the server's own message,
+  instead of a generic "no response from the server". The body keeps `error`
+  and adds `code`, and none of them is a 5xx.
+- **The agent logs each command's duration and outcome** —
+  `[hubAgent] hub:getConfigs 34ms ok` — and never its payload, which can carry
+  environment values, config contents and deploy tokens. It is how a cold first
+  run is told apart from a Hub-side timeout.
+- **The Hub's deployment panel no longer polls a command every 8 s.** The app
+  list is pushed when a run starts or ends, Refresh re-reads the details and the
+  run log, and returning to a background tab does one fresh read.
+
+#### Deploy keys in one step
+Creating a deploy-key app can now generate its key in the same step, and the
+key can be proved and installed without leaving the App form. The private half
+never leaves the server: every response carries only the public key, its
+fingerprint and where to add it.
+
+- **"Generate a deploy key for me" is on by default** when the repository
+  access is a deploy key. The app is still created **without a deployment**,
+  and the response has `deployKey: { publicKey, fingerprint, createdAt, addUrl }`
+  — `addUrl` is the repository's GitHub "Add deploy key" page. A generation
+  failure leaves the app in place with `deployKeyError`, and "Regenerate key"
+  is still offered.
+- **The key is ed25519**, written in the app folder as `id_deploy` with mode
+  `600` (the data directory's ACL on Windows). An app created before this keeps
+  its RSA key and keeps working until the key is regenerated.
+- **Test connection** runs `git ls-remote --heads` with the app's key and
+  GitHub's **pinned** host keys (`StrictHostKeyChecking=yes`, never
+  `accept-new`), with a 12-second bound inside the Hub's 15-second quick-command
+  window. A wrong key, a changed host key, DNS or port 22, and a missing git
+  each get their own reason and next step. Another SSH host is refused by the
+  test, and a deploy to one keeps `accept-new`.
+- **"Add it to GitHub for me"** takes a token typed for that request, used once
+  and not stored. It adds the key **read-only** and removes an older key with
+  the same title only after the current one is on the repository. A GitHub
+  refusal is reported per step.
+- **Regenerate key** replaces the private half, so the old key stops working on
+  this server at once; it is refused while a deployment is running. GitHub
+  still lists the old public key until it is removed, which is why the previous
+  fingerprint is returned.
+- All of it is also a Hub command (`regenerateKey`, `testKey`,
+  `addKeyToGithub`) under `deploy.manage`. Contract 2.13.0.
+
+#### Link a domain with SSL
+Linking an app to a domain can now choose the certificate in the same step,
+with the same validation and nginx output as the Add-domain page.
+
+- **Name and `www`**, an SSL choice of **new** (HTTP-01, also covering `www`),
+  **existing** from the server's suggestion (wildcards included) or **none**,
+  an HTTP→HTTPS redirect that defaults on whenever SSL is used, and the
+  **Behind Cloudflare** option.
+- **A new wildcard is refused**: DNS-01 is out of scope here. Issue the
+  wildcard from the SSL page, then link the app to it with an existing
+  certificate.
+- **A new certificate is issued over HTTP-01.** The link is applied first, so a
+  failed issuance still leaves the domain working over HTTP and the result says
+  why. The dashboard answers when issuance finishes; from the Hub it is a long
+  command with a stored result, and the dialog shows each step live (domain,
+  certificate, HTTPS, nginx reload) through the new `command:progress` event.
+- **Existing certificate paths only ever come from the server's own
+  suggestion**; a `certPath`/`keyPath` from the caller is ignored, and a name
+  that does not cover the domain(s) is refused before anything is written.
+- The Hub needs `deploy.manage` and `domains.create` to link, plus `ssl.issue`
+  to issue a new certificate. Contract 2.12.0.
+
+#### Live deployment progress through the Hub
+A deployment now streams its current step — and, with `deploy.logs`, its new
+log lines — to the Hub's run view while it runs, wherever it was started: the
+Hub, the local dashboard, `ezz daemon` or a CI hook.
+
+- The agent reads the same deploy lock, run record and log file the engine
+  writes, so a run started in another process is visible too. At most one event
+  per run per second; one event carries at most 200 lines and 32 KiB (each line
+  capped at 2000 characters), with `skipped` counting the newest-kept overflow.
+- Every line is redacted with the app's own environment values and token before
+  it leaves, and PEM private-key blocks are dropped from BEGIN to END.
+- The Hub relays it to the browser and **stores nothing**. The stored run from
+  `hub:manageDeploy { action: "run" }` is still the source of truth once the
+  deployment ends. Contract 2.13.0.
+
+#### The Hub's server page is the dashboard's
+Inside a server, the Hub now uses the dashboard's sections, in its order, with
+the same names, icons and structure: Overview, Domains, SSL certificates,
+Nginx, Deployments, Notifications, Processes, Logs and Settings. The server
+list and switcher, the identity row with one overflow menu (rename, regenerate
+secret, remove), permissions, account and management sit around that inner
+view. A screen with no Hub command yet is read-only and says **"Managed on the
+server"** instead of offering a control that cannot work.
+
+### Changed
+
+#### Hub agent failures use non-5xx statuses
+An offline agent is `409 AGENT_OFFLINE`, one that does not answer within 15 s is
+`424 AGENT_TIMEOUT`, and an agent refusal is `422 AGENT_ERROR` — for commands
+**and** the CI deploy hook. The body keeps `error` and adds `code`. This is
+deliberate: the Hub sits behind Cloudflare, which may replace an origin 5xx page
+and hide the agent's reason.
+
+#### `request-ip` removed from the Hub
+The Hub takes the client address from Express's `req.ip` under `TRUST_PROXY`;
+the `request-ip` package and its types are gone.
+
+#### Dashboard UI fixes
+- **PM2 shows "Checking…"** instead of "Not installed" while its detection probe
+  has never completed. `GET /api/service` says so with `probes.pending`, and the
+  Settings/Processes panels render the three states apart.
+- **Probes are visible while they are measured.** A page that arrives before the
+  cached probes are warm re-fetches once shortly afterwards instead of blocking
+  the first render, and says "Measuring…" / "Refreshing…" where a measured value
+  is not in yet.
+- **The interface is a setting in the dashboard again.** Settings → General has
+  the `new` / `classic` control with the honest hint that it applies on the next
+  start, and `GET` and `POST /api/settings` now resolve the same value through
+  one helper, so a config `GET` reads as `classic` can never be echoed back as
+  something else.
+- **The Hub panel follows `hub:agentState`** instead of polling. The agent is
+  often in the background service, so a page that only polled could sit on
+  "Connecting…" through a reconnect or a stop; it now reflects every real state
+  transition as it happens.
+- **A `429` says how long to wait, and the form counts it down.** The login and
+  first-run forms show "Try again in 2 minutes" from `retryAfterSeconds` (and the
+  `Retry-After` header) and disable the button until it reaches zero, instead of
+  inviting a retry that cannot work.
+- **No sudo password field anywhere.** Settings → Linux permissions in both UIs
+  asks the server for the setup commands and shows them to copy; it never
+  collects, sends or stores a password. The classic page and the React page do
+  the same thing through the same endpoint.
+- **`Settings → Linux permissions` can be re-checked** without re-generating the
+  commands, and says plainly when the rules are still missing.
+- **The "dashboard did not come back" hint names a real command.** It said
+  `ezz dashboard`, which issues a first-run setup code rather than starting the
+  server; after a failed restart it now says `ezz --dash`, which is what actually
+  starts the dashboard in that terminal.
+- **The Dashboard CLI menu explains first-run setup** (`ezz --dash`): it names
+  the one-time setup code and `ezz dashboard setup-code` instead of the old
+  "admin" login, and gains a "How to use" entry.
+
+#### nginx: WebSocket-ready domains, and an option for Cloudflare
+- **Every proxied domain can now carry a WebSocket.** Generated configs send
+  `proxy_http_version 1.1`, `Upgrade $http_upgrade` and
+  `Connection $ezz_connection_upgrade`. The map behind that variable is written
+  once to `00-easy-devops-websocket.conf` in `conf.d`, because the `http` context
+  may define it only once and a second copy fails `nginx -t`. A plain request
+  sends no `Connection` header at all, so upstream keep-alive is preserved.
+- **`/socket.io/` is proxied unbuffered** (`proxy_buffering off`, one-hour read
+  and send timeouts) while ordinary HTTP keeps the domain's read timeout.
+- **"Behind Cloudflare" is a per-domain option.** When `behindCloudflare` is on,
+  the server block adds `set_real_ip_from` for every published Cloudflare IPv4
+  and IPv6 range plus `real_ip_header CF-Connecting-IP`. It is off by default, and
+  a domain saved before it existed generates the same output as before apart from
+  the WebSocket headers. The ranges live in `src/core/cloudflare-ips.js`; refresh
+  them with `node scripts/refresh-cloudflare-ips.mjs`.
+- **It trusts the header, it does not hide the origin.** The application behind
+  nginx must trust exactly one proxy (the Hub: `TRUST_PROXY=1`), and direct
+  access to ports 80/443 has to be limited to Cloudflare's ranges at the
+  firewall. Without that, anyone who knows the origin address can still connect
+  and send their own `CF-Connecting-IP`. See `docs/nginx-websocket-cloudflare.md`.
+
+#### Hub: rate limits follow the real client, and only through a trusted proxy
+- **`TRUST_PROXY` unset trusts only a loopback proxy**, which is the nginx on the
+  same machine. A caller can no longer choose its own login or request bucket by
+  sending `X-Forwarded-For`; `TRUST_PROXY=<n>` trusts exactly n hops (1 behind
+  Cloudflare with the option above, 2 without nginx `real_ip`).
+- **Sign-in counts failed attempts only**, so people who share an office or proxy
+  address do not lock each other out by signing in successfully. The password
+  change, password reset and account deletion routes keep their own budget.
+- **A `429` is distinct from a wrong email or password.** It answers
+  `code: "RATE_LIMITED"` with `retryAfterSeconds` and a `Retry-After` header, and
+  the Hub shows "Try again in …" with the button disabled until the countdown
+  ends, rather than inviting a retry that cannot work.
+
+#### The Hub runs as exactly one process
+PM2 cluster mode, `instances` above 1, or any worker id other than 0 now stops
+the Hub at boot with the reason. Every agent socket and every pending command
+request lives in memory in one process: a second instance would own a different
+set of sockets, split agents between instances, and silently lose commands sent
+to the other process. Run it as `exec_mode: "fork"`, `instances: 1`, and do not
+`pm2 scale` it.
+
+The Hub's own `ez.json` deploys it with the same engine: `prisma migrate deploy`
+runs in the `migrate` step, after `build` and before the new release starts, and
+`DATABASE_URL` points at an absolute `file:` path in a persistent folder outside
+the release directories. A database inside a release is replaced by the next
+deployment.
+
+#### Hub build: a type check that cannot emit
+`tsconfig.json` is **type-check only** (`noEmit`), `tsconfig.build.json` is the one
+config that emits — into `dist/`, with test files excluded — and `npm run dev`
+watches that config and restarts on a successful build. `src/**/*.js` is ignored
+so a stray compiled file cannot sit next to its `.ts` and shadow it.
+
+### Security
+
+- **A deploy key's private half never leaves the server.** It is written only
+  to `<app>/id_deploy` with owner-only permissions and is not returned by any
+  endpoint, log, event or Hub payload. Live progress and the Hub's stored run
+  log drop PEM private-key blocks, and redact the app's environment values and
+  token before a line is sent. A GitHub connection is verified against GitHub's
+  published host keys (`StrictHostKeyChecking=yes`, never `accept-new`), both in
+  "Test connection" and in the fetch during a deployment. A token typed for
+  "Add it to GitHub for me" is used once and not stored.
+- **The dashboard never receives a sudo password.** `POST
+  /api/settings/permissions/setup` takes no body (a `password` from an older
+  client is ignored, never read), runs nothing privileged, and answers with the
+  exact terminal commands. The operator runs them where sudo asks **them** for
+  the password. That is the only place it is typed.
+- **The sudoers grant is exactly five commands.** `core/permissions.js` is the
+  single source: `systemctl start|stop|reload|restart|status nginx` with the full
+  `/usr/bin/systemctl`, no wildcards, and nothing else. The bare `/usr/bin/systemctl`,
+  the unrestricted nginx binary, `certbot`, `mkdir`, `cp`, `chmod`, `chown` and
+  `tee` grants are gone — each was a root shell on its own. Directories that
+  used to need `sudo mkdir`/`sudo chown` at runtime (the certificate directory,
+  nginx `conf.d`) are created and handed over once by the same setup script, and
+  certificate issuance no longer calls sudo at all. **Re-run Settings → Linux
+  permissions on existing servers**; the old rules were wider.
+- **`cleanup apply()` confines every delete.** An item id is re-checked against
+  the real path before anything is removed: it must be strictly inside the data
+  directory, the nginx directory or PM2's home (or be a `<dataDir>.backup-*`
+  sibling), and the database and its side files, anything under `sslDir`, and
+  live nginx configs are refused even when they are inside. A symlink is checked
+  by its target and then unlinked, never followed. An id from a stale report or
+  a hand-edited file can no longer become an arbitrary delete.
+- **The daemon lock and the jobs marker are created exclusively.** Taking either
+  one is a single `wx` open, so a check-then-write race cannot produce two
+  winners; recovering a stale one is serialised behind its own guard and the
+  file is only ever replaced by an atomic rename, never deleted and re-created.
+  Six real processes racing for an empty lock, and for a stale one, now produce
+  exactly one winner — the second case used to let one process delete another's
+  brand-new lock. A half-written lock is recovered rather than blocking for ever.
+- **`stopDashboard` verifies the pid before killing it.** A pid recorded in the
+  settings table may have been reused by an unrelated process, so the recorded
+  pid's command line must be exactly `node <dashboard entry script>` — parsed,
+  not substring-matched — first. Anything unverifiable is not signalled, and the
+  stale record is cleared with a reason.
+- **The setup code is cleared when "no password" is chosen**, not only after a
+  password is set. Setup is finished on that path too, and an outstanding
+  credential nobody needs is one more thing that can be read.
+
+### Fixed
+
+- **`npm test` runs the suites again.** The script had been renamed to `testold`,
+  so the command every contributor types and `prepublishOnly` depends on did
+  nothing. `npm test` and `npm run test:e2e` are now the same runner.
+- **A rebuilt dashboard bundle could be served from cache for a year.**
+  `index.html` — and anything else in the build without a content hash — is
+  `no-cache` now; only a Vite-hashed asset is `immutable`. Requesting
+  `/index.html` by name gets the same policy as the SPA fallback.
+- **`install.bat` now requires Windows PowerShell 5.1, not "major version 5".**
+  It compared only the major number, so PowerShell 5.0 passed a check whose whole
+  purpose was to refuse it, and `install.ps1` then failed somewhere less
+  explicable. The comparison is major*100+minor, and the failure names Windows
+  Management Framework 5.1 as the thing to install.
+
+### Documentation
+
+- **The contract is `API-CONTRACT.md` at the repository root.** It used to be
+  referenced as `docs/api-contract.md`; it now sits with the code it describes,
+  and every reference in the source, the e2e runner, the UI and `CLAUDE.md`
+  follows. It is at 2.10.0 and now documents the outbound Hub agent events in
+  their own subsection, the update endpoints' bodies and run record, and the
+  React UI as the default.
+
+### Added
+
 #### Deployments: domains, a configurable folder, moving an app, and an ez.json guide
 - **Link an app to a domain.** From the app's "Domain & folder" tab: a new name
   is created, an existing domain is re-pointed at the app's port. It goes
@@ -62,8 +443,9 @@ things into GitHub by hand.
 - **What the Hub is sent.** The app list is monitoring, like the process list,
   and is the *public* view: names of environment variables, never values, and no
   credentials. Values leave the server only through `getEnv`, to the person who
-  asked, and are not stored by the Hub. A deploy key cannot be generated from
-  the Hub at all: its private half never leaves the server.
+  asked, and are not stored by the Hub. A deploy key generated from the Hub is
+  generated on the server; only its public half and fingerprint are returned
+  (see "Deploy keys in one step").
 - **CI through the Hub ("option B").** A GitHub Action can call the Hub instead
   of the server; the Hub forwards the request down the agent connection the
   server already holds open, so the server needs **no inbound port and no public
@@ -250,9 +632,11 @@ old code.
 - Stop, replace, refresh the Server-mode copy, start, then confirm the version
   the running daemon itself reports. On failure the previous version is
   reinstalled and the service restarted.
-- The output explains why this is not available from the dashboard or the Hub:
-  the process that performs the update is the one being stopped and replaced, so
-  it could not report what happened.
+- The output explains the constraint — the process that performs the update is
+  the one being stopped and replaced, so it cannot report from inside the
+  request. Settings → Update therefore records the run and hands it to a
+  detached worker (see "Update Easy DevOps from the dashboard" above); the Hub
+  can still only explain why it does not offer it.
 
 #### `ezz cleanup` — see what can be reclaimed, then choose
 Dry run first, always: the inventory is printed with a size per item before
@@ -452,15 +836,18 @@ Easy DevOps itself.
   answer, not an error.
 
 #### New dashboard UI, behind a flag
-The React dashboard built earlier is now wired into the server, without
-changing the default. The classic EJS page is still what every install serves
-unless it asks for the new one.
+The React dashboard built earlier was first wired into the server behind a flag,
+without changing the default. It has since become the default — see "The React
+dashboard is now the default UI" under **Changed** — and `--classic-ui` is now
+the one-run way back to the old page.
 
-- **`ezz --dash --new-ui`** serves the built React app from `dist/ui`. The flag
-  combines with `--dev` and overrides the setting below for that run.
-- **`dashboardUi: "classic" | "new"`** in the settings, default `classic`, so a
+- **`ezz --dash`** serves the built React app from `dist/ui` by default, and
+  `--classic-ui` selects the old page for that run. (When this was first added
+  the flag ran the other way, `--new-ui`; that is still accepted and does
+  nothing.)
+- **`dashboardUi: "new" | "classic"`** in the settings, default `new`, so a
   background service can select the UI on each boot without a flag. It takes
-  effect on restart; `--new-ui` does not need one. Exposed by
+  effect on restart; `--classic-ui` does not need one. Exposed by
   `GET /api/settings` and accepted by `POST /api/settings`, which reports
   `needsRestart`.
 - **Serving.** In new mode `dist/ui` is served at `/` with an `index.html`
@@ -864,10 +1251,9 @@ DevOps manages PM2 on your behalf and never implements its own daemon.
 
 ### Changed
 
-- **Sudoers rules are narrower.** The bare `/usr/bin/systemctl` grant is gone — it allowed every
-  systemctl verb against every unit, enough to disable unrelated services. The `certbot`, `cp` and
-  `chmod` grants are gone too (SSL is issued in-process by `acme-client`; no binary is invoked).
-  **Re-run `Settings → Linux Permissions` on each server to apply the tighter rules.**
+- **Sudoers rules are narrower** — exactly five fixed `systemctl … nginx`
+  commands, and the dashboard never receives the password. The rules, what was
+  removed and why, and the re-run instruction are under **Security** above.
 - Hub: `POST /servers/:id/command` now returns **403** when the server has that permission disabled,
   instead of reporting `200 dispatched` for a command the agent would silently drop.
 - Hub: server names are capped at 100 characters (trimmed), and the JSON body limit is 256 kB (was
@@ -995,7 +1381,7 @@ is what lets the handshake carry the header.
 
 ### Documentation
 
-- **New `docs/api-contract.md`** (contract v1.0.0), written from the current
+- **New `API-CONTRACT.md`** (contract v1.0.0), written from the current
   code: every dashboard REST endpoint with method, path, auth, request and
   response shapes and error codes; every Socket.io event in both directions with
   payload, emitter, and whether it belongs in the background daemon when that is

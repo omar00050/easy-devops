@@ -16,11 +16,12 @@
  *   3. Passwords are stored as scrypt hashes (core/passwords.js). An existing
  *      plain-text password still works, and is migrated on the next login.
  *   4. Login is rate limited per IP.
- *   5. First-run setup requires a one-time code printed on the server
- *      (core/setupCode.js). This endpoint is public by necessity, so without
- *      it whoever reaches a freshly started dashboard first owns it. The code
- *      itself is never in a response — a client learns only whether one is
- *      required.
+ *   5. Setting the first password requires a one-time code printed on the
+ *      server (core/setupCode.js). This endpoint is public by necessity, so
+ *      without it whoever reaches a freshly started dashboard first owns it.
+ *      The code itself is never in a response — a client learns only whether
+ *      one is required. Choosing "no password" needs none: loopback bind AND
+ *      loopback request is already a stronger constraint.
  */
 
 import {
@@ -231,6 +232,12 @@ class AuthController {
       }
 
       saveConfig({ ...loadConfig(), dashboardAuth: AUTH_MODES.NONE });
+
+      // Setup is done on this path too, so the code has no further purpose.
+      // Removed for the same reason as after a password: an outstanding
+      // credential nobody needs is one more thing that can be read.
+      setupCode.clear();
+
       return res.json({ ok: true, authMode: AUTH_MODES.NONE });
     }
 

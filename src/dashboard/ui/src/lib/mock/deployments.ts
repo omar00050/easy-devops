@@ -1,7 +1,7 @@
 /**
  * lib/mock/deployments.ts — the Deployments API for `npm run dev:mock`.
  *
- * Mirrors docs/api-contract.md §2.8 closely enough to exercise every state the
+ * Mirrors API-CONTRACT.md §2.8 closely enough to exercise every state the
  * page has: an app that is live, one whose last deployment was rolled back,
  * one that has never been deployed, and a deployment that actually progresses
  * through its steps while it is being watched.
@@ -12,29 +12,45 @@
  */
 
 import { ApiError } from '../errors';
+import { deployKeyAddUrl } from '../deployments';
 import type {
   DeployApp,
+  DeployAppCreated,
   DeployAppDetail,
   DeployHook,
+  DeployKeyInfo,
   DeployRelease,
   DeployRun,
   DeploymentsResponse,
 } from '../types';
 import type { HttpMethod } from '../api';
 
+interface MockEzJson {
+  execMode?: DeployApp['settings']['execMode'];
+  instances?: DeployApp['settings']['instances'];
+  migrate?: DeployApp['settings']['migrate'];
+  start?: string;
+}
+
 interface MockApp extends DeployApp {
+  /** Stands in for the repository's ez.json; settings overrides win over it. */
+  ezJson?: MockEzJson;
   runs: Array<DeployRun & { log: string }>;
   releases: DeployRelease[];
 }
 
-const STEPS = ['fetch', 'settings', 'install', 'build', 'start', 'health', 'finish'] as const;
+const STEPS = ['fetch', 'settings', 'install', 'build', 'migrate', 'start', 'health', 'finish'] as const;
 const STEP_MS = 1100;
+
+const STATELESS_WARNING =
+  'Cluster mode runs several copies of the app; it must be stateless (no in-memory sessions, sockets, caches or schedulers that assume one process).';
 
 const STEP_OUTPUT: Record<string, string> = {
   fetch: '$ git fetch --depth 1 origin main\n          From github.com:acme/project\n',
   settings: 'no ez.json — using package.json defaults\n  install    npm ci   [package.json]\n  build      npm run build   [package.json]\n  start      npm start   [package.json]\n',
   install: '$ npm ci\n          added 412 packages in 9s\n',
   build: '$ npm run build\n          vite v6.3.5 building for production...\n          ✓ built in 4.31s\n',
+  migrate: 'no migrate command — step skipped\n',
   start: '$ pm2 delete ez-app; pm2 start ez.pm2.json\n',
   health: 'GET / on port 3000 answered 200.\n',
   finish: 'Deployment succeeded.\n',
@@ -51,6 +67,20 @@ function id(offsetMs = 0): string {
 
 function sha(): string {
   return Array.from({ length: 40 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+}
+
+/** A plausible key pair's public half, fingerprint and creation stamp. */
+function newDeployKey(appId: string, repoUrl: string): DeployKeyInfo {
+  const publicKey = `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI${Math.random().toString(36).slice(2).repeat(4)} easy-devops-deploy-${appId}`;
+  const digest = Array.from({ length: 43 }, () =>
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'[Math.floor(Math.random() * 64)]
+  ).join('');
+  return {
+    publicKey,
+    fingerprint: `SHA256:${digest}`,
+    createdAt: new Date().toISOString(),
+    addUrl: deployKeyAddUrl(repoUrl),
+  };
 }
 
 function finishedRun(appId: string, ageMs: number, status: DeployRun['status'], extra: Partial<DeployRun> = {}): DeployRun & { log: string } {
@@ -115,10 +145,54 @@ function seed(): { apps: MockApp[]; hook: DeployHook } {
   const workerRuns = [
     finishedRun('mail-worker', 40 * 60_000, 'rolled_back', {
       error: 'No healthy response from GET /healthz on port 4100 within 60s (no answer (ECONNREFUSED)).',
+      reason: 'health check failed: no answer (ECONNREFUSED)',
     }),
     finishedRun('mail-worker', 6 * 86_400_000, 'success'),
   ];
   workerRuns[0].rolledBackTo = workerRuns[1].releaseId;
+
+  // A cluster app: four workers configured, three online, plus the stateless warning.
+  const gatewayRuns = [finishedRun('edge-gateway', 50 * 60_000, 'success', { trigger: 'hub', actor: 'hub' })];
+
+  // A run that failed at the migrate step: the previous release was never touched.
+  const billingRuns = [
+    finishedRun('billing-api', 25 * 60_000, 'failed', {
+      trigger: 'manual',
+      actor: 'dashboard',
+      step: 'migrate',
+      error: 'Migration failed: "npx prisma migrate deploy" — exit code 1',
+      reason: null,
+      logTail: [],
+      rollbackSucceeded: null,
+    }),
+    finishedRun('billing-api', 2 * 86_400_000, 'success', { trigger: 'manual', actor: 'dashboard' }),
+  ];
+
+  // A boot crash: the new release never stayed up, and the previous one was
+  // restored (rollbackSucceeded: true), with the redacted tail of its log.
+  const relayOlder = finishedRun('webhook-relay', 3 * 86_400_000, 'success');
+  const relayCrashed = finishedRun('webhook-relay', 90 * 60_000, 'failed', {
+    trigger: 'webhook',
+    actor: 'deploy hook',
+    step: 'health',
+    error: 'The new release crashed at boot. The previous release is serving again.',
+    reason: 'crashed at boot: restarting 5 times',
+    rollbackSucceeded: true,
+    rolledBackTo: relayOlder.releaseId,
+    logTail: [
+      '2026-11-18T09:12:41: PM2 | Starting execution sequence in -cluster mode- for app[name:ez-webhook-relay]',
+      '2026-11-18T09:12:41: PM2 | App [ez-webhook-relay:0] starting in -cluster mode-',
+      'Error: connect ECONNREFUSED 127.0.0.1:5432',
+      '    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1611:16)',
+      '    at Process.ChildProcess._handle.onexit (node:internal/child_process:290:12)',
+      'DATABASE_URL=***',
+      'SIGNING_SECRET=***',
+      'PM2 | App [ez-webhook-relay:0] exited with code [1] via signal [SIGINT]',
+      'PM2 | App [ez-webhook-relay:0] starting (restart #5)',
+      'PM2 | Script will not be restarted because it exceeded max_restarts',
+    ],
+  });
+  const relayRuns = [relayCrashed, relayOlder];
 
   return {
     hook: { enabled: true, port: 6445, bind: '127.0.0.1', domain: 'app.example.com', listening: true, path: '/.ez-deploy/' },
@@ -127,7 +201,10 @@ function seed(): { apps: MockApp[]; hook: DeployHook } {
         repoUrl: 'git@github.com:acme/storefront-api.git',
         authType: 'deployKey',
         deployKey: 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC7mockmockmockmockmockmockmockmock easy-devops-deploy-storefront-api',
-        settings: { port: 3000, healthPath: '/healthz', persist: ['uploads', 'data'] },
+        deployKeyFingerprint: 'SHA256:q3Vv2mZk8KbT1pWc9rLm4nXf6yHd0sAa5jTg7eRwQoE',
+        deployKeyCreatedAt: new Date(Date.now() - 19 * 86_400_000).toISOString(),
+        deployKeyOnDisk: true,
+        settings: { port: 3000, healthPath: '/healthz', migrate: 'npx prisma migrate deploy', persist: ['uploads', 'data'] },
         hasSharedData: true,
         domain: 'api.example.com',
         env: { DATABASE_URL: 'postgres://app:secret@127.0.0.1:5432/store', NODE_ENV: 'production' },
@@ -149,6 +226,30 @@ function seed(): { apps: MockApp[]; hook: DeployHook } {
         ],
       }),
       baseApp('landing', { branch: 'production' }),
+      baseApp('edge-gateway', {
+        settings: { port: 8100, healthPath: '/healthz', start: 'node dist/index.js' },
+        ezJson: { execMode: 'cluster', instances: 4 },
+        instancesOnline: 3,
+        runs: gatewayRuns,
+        releases: [
+          { id: gatewayRuns[0].releaseId, sha: gatewayRuns[0].sha, ref: 'main', startable: true, current: true, previous: false, execMode: 'cluster', instances: 4 },
+        ],
+      }),
+      baseApp('billing-api', {
+        settings: { port: 4200, healthPath: '/health' },
+        ezJson: { migrate: ['npx prisma migrate deploy'] },
+        runs: billingRuns,
+        releases: [
+          { id: billingRuns[1].releaseId, sha: billingRuns[1].sha, ref: 'main', startable: true, current: true, previous: false },
+        ],
+      }),
+      baseApp('webhook-relay', {
+        settings: { port: 4300, healthPath: '/ready', start: 'node server.js' },
+        runs: relayRuns,
+        releases: [
+          { id: relayOlder.releaseId, sha: relayOlder.sha, ref: 'main', startable: true, current: true, previous: false },
+        ],
+      }),
     ],
   };
 }
@@ -192,12 +293,31 @@ function tick(app: MockApp): void {
   }
 }
 
+/** Override > ez.json > default, as the server resolves it. */
+function configuredMode(app: MockApp, settings: DeployApp['settings']): NonNullable<DeployApp['execMode']> {
+  return settings.execMode ?? app.ezJson?.execMode ?? 'fork';
+}
+
+function configuredInstances(app: MockApp, settings: DeployApp['settings']): NonNullable<DeployApp['instances']> {
+  return settings.instances ?? app.ezJson?.instances ?? 1;
+}
+
+function appWarnings(app: MockApp): string[] {
+  const mode = configuredMode(app, app.settings);
+  return mode === 'cluster' ? [STATELESS_WARNING] : [];
+}
+
 function listView(app: MockApp): DeployApp {
   tick(app);
-  const { runs, releases, ...rest } = app;
+  const { runs, releases, ezJson: _ezJson, ...rest } = app;
   const last = runs[0] ?? null;
   const current = releases.find((r) => r.current) ?? null;
   const { log: _log, ...lastRun } = last ?? ({} as DeployRun & { log: string });
+  const execMode = configuredMode(app, app.settings);
+  const instances = configuredInstances(app, app.settings);
+  const instancesOnline = current
+    ? app.instancesOnline ?? (instances === 'max' ? 4 : instances)
+    : 0;
   return {
     ...rest,
     currentRelease: current?.id ?? null,
@@ -205,10 +325,42 @@ function listView(app: MockApp): DeployApp {
     deploying: last?.status === 'running',
     activeRunId: last?.status === 'running' ? last.id : null,
     lastRun: last ? (lastRun as DeployRun) : null,
+    execMode,
+    instances,
+    instancesOnline,
+    warnings: appWarnings(app),
     process: current
       ? { status: 'online', pid: 4000 + app.id.length, cpu: 0.4, memoryBytes: 78_000_000 + app.id.length * 1_000_000, uptimeMs: Date.now() - (last?.finishedAt ?? Date.now()), restarts: 0 }
       : null,
   };
+}
+
+/** The server's own checks, so the mock answers 400 the way the real API does. */
+function checkMode(app: MockApp, settings: DeployApp['settings']): void {
+  const mode = configuredMode(app, settings);
+  if (mode !== 'fork' && mode !== 'cluster') {
+    fail(400, 'execMode must be "fork" or "cluster".');
+  }
+  const start = typeof settings.start === 'string' && settings.start.trim()
+    ? settings.start.trim()
+    : app.ezJson?.start?.trim() || app.settings.start?.trim() || '';
+  if (mode === 'cluster' && start && !/^node\s+(?!-)\S+$/.test(start)) {
+    fail(400, 'Cluster mode needs a start command that runs a JS file directly, like node dist/index.js. An npm script or another command runs in fork mode only.');
+  }
+  const instances = configuredInstances(app, settings);
+  if (instances !== 'max') {
+    if (!Number.isInteger(instances) || instances < 1 || instances > 8) {
+      fail(400, 'instances must be a whole number from 1 to 8 (this server has 8 CPUs), or "max".');
+    }
+    if (mode === 'fork' && instances > 1) {
+      fail(400, 'instances above 1 with fork mode is refused: several forked copies would all bind the same port. Set execMode to "cluster".');
+    }
+  }
+}
+
+function syncMode(app: MockApp): void {
+  app.execMode = configuredMode(app, app.settings);
+  app.instances = configuredInstances(app, app.settings);
 }
 
 function hookView(hook: DeployHook): DeployHook {
@@ -333,8 +485,21 @@ export function handleDeployments(method: HttpMethod, path: string, body: Record
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
+    checkMode(app, app.settings);
+    syncMode(app);
     s.apps.push(app);
-    return listView(app);
+    // The create answer carries the key itself: an object when generated, null
+    // when not asked for — the app view's `deployKey` string is replaced.
+    const wantsKey = app.authType === 'deployKey' && body.generateKey !== false;
+    if (wantsKey) {
+      const key = newDeployKey(app.id, app.repoUrl);
+      app.deployKey = key.publicKey;
+      app.deployKeyFingerprint = key.fingerprint;
+      app.deployKeyCreatedAt = key.createdAt;
+      app.deployKeyOnDisk = true;
+      return { ...listView(app), deployKey: key } satisfies DeployAppCreated;
+    }
+    return { ...listView(app), deployKey: null } satisfies DeployAppCreated;
   }
 
   if (rest === '/hook' && method === 'GET') return hookView(s.hook);
@@ -368,7 +533,12 @@ export function handleDeployments(method: HttpMethod, path: string, body: Record
     if (body.branch !== undefined) app.branch = String(body.branch) || 'main';
     if (body.authType !== undefined) app.authType = body.authType as DeployApp['authType'];
     if (body.token) app.hasToken = true;
-    if (body.settings !== undefined) app.settings = body.settings as DeployApp['settings'];
+    if (body.settings !== undefined) {
+      const next = body.settings as DeployApp['settings'];
+      checkMode(app, next);
+      app.settings = next;
+      syncMode(app);
+    }
     if (body.env !== undefined) app.env = body.env as Record<string, string>;
     if (body.keepReleases !== undefined) app.keepReleases = Number(body.keepReleases);
     if (body.autoRollback !== undefined) app.autoRollback = Boolean(body.autoRollback);
@@ -396,15 +566,40 @@ export function handleDeployments(method: HttpMethod, path: string, body: Record
 
   if (sub === 'domain' && method === 'PUT') {
     const name = String(body.domain ?? '').trim().toLowerCase();
-    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(name)) fail(400, 'Invalid domain name format');
+    const rawSsl = body.ssl;
+    const sslInput =
+      rawSsl === true ? { mode: 'issue' } : rawSsl && typeof rawSsl === 'object' ? (rawSsl as { mode: string; certName?: string }) : { mode: 'none' };
+    if (name.startsWith('*.') && sslInput.mode === 'issue') {
+      fail(400, 'A new wildcard certificate needs DNS validation, which linking does not do. Issue it from the SSL page, then link with an existing certificate.');
+    }
+    if (!/^(\*\.)?[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(name)) fail(400, 'Invalid domain name format');
     if (!app.settings.port) fail(409, 'This app has no port yet. Set its port (or put "port" in ez.json and deploy once), then link the domain.');
+    // The legacy `ssl: true|false` and the object form both reach here.
+    const www = body.www === true;
+    const behindCloudflare = body.behindCloudflare === true;
     app.domain = name;
+    let ssl: { mode: string; ok: boolean; detail: string; certName?: string } | null = null;
+    if (sslInput.mode === 'issue') {
+      const covered = www ? `${name} and www.${name}` : name;
+      ssl =
+        name.endsWith('.invalid') || name.includes('nxdomain')
+          ? { mode: 'issue', ok: false, detail: `DNS problem: no A record for ${name}. The domain works over HTTP; point its DNS here, then issue the certificate from the SSL page.` }
+          : { mode: 'issue', ok: true, detail: `Certificate issued for ${covered} and installed.`, certName: name };
+    } else if (sslInput.mode === 'existing') {
+      if (!sslInput.certName) fail(400, 'Choose a certificate for this domain.');
+      ssl = { mode: 'existing', ok: true, detail: `Using the certificate in ${sslInput.certName}.`, certName: sslInput.certName };
+    }
+    const redirect = sslInput.mode === 'none' ? false : body.redirect !== false;
     return {
+      ok: true,
       domain: name,
       created: !['app.example.com', 'api.example.com', 'legacy.example.com'].includes(name),
       port: app.settings.port,
+      www,
+      behindCloudflare,
+      redirect,
       nginxReloaded: true,
-      ssl: body.ssl ? { ok: false, detail: 'DNS problem: NXDOMAIN looking up A for the domain. The domain works over HTTP; issue the certificate from the SSL page once its DNS points here.' } : null,
+      ssl,
     };
   }
 
@@ -464,8 +659,51 @@ export function handleDeployments(method: HttpMethod, path: string, body: Record
   }
 
   if (sub === 'deploy-key' && method === 'POST') {
-    app.deployKey = `ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQD${Math.random().toString(36).slice(2).repeat(6)} easy-devops-deploy-${app.id}`;
-    return { publicKey: app.deployKey };
+    if (app.authType !== 'deployKey' || !/^(ssh:\/\/|[\w.-]+@)/.test(app.repoUrl)) {
+      fail(400, 'A deploy key needs an app with deployKey authentication and an SSH repository URL.');
+    }
+    const previousFingerprint = app.deployKeyFingerprint ?? null;
+    const key = newDeployKey(app.id, app.repoUrl);
+    app.deployKey = key.publicKey;
+    app.deployKeyFingerprint = key.fingerprint;
+    app.deployKeyCreatedAt = key.createdAt;
+    app.deployKeyOnDisk = true;
+    return { ...key, previousFingerprint };
+  }
+
+  if (sub === 'deploy-key/test' && method === 'POST') {
+    if (!app.deployKey) fail(409, 'Generate the deploy key first.');
+    if (!/github\.com[:/]/.test(app.repoUrl)) {
+      fail(400, 'Testing works with github.com repositories only.');
+    }
+    return {
+      ok: true,
+      status: 200,
+      error: null,
+      detail: `Read access confirmed; ${app.branch} was found.`,
+      branchFound: true,
+      fingerprint: app.deployKeyFingerprint ?? undefined,
+    };
+  }
+
+  if (sub === 'deploy-key/github' && method === 'POST') {
+    if (!app.deployKey) fail(409, 'Generate the deploy key first.');
+    if (!/github\.com[:/]/.test(app.repoUrl)) {
+      fail(400, 'Automatic setup works with github.com repositories only.');
+    }
+    const typed = String(body.token ?? '');
+    if (!typed && !(app.authType === 'token' && app.hasToken)) {
+      fail(400, 'A GitHub token with write access to the repository is required.');
+    }
+    // A token starting with "ro" plays the part of one that cannot administer keys.
+    const readOnly = typed.startsWith('ro');
+    const steps = readOnly
+      ? [{ id: 'deployKey', ok: false, detail: 'GitHub refused (403: Resource not accessible by personal access token). The token needs “Administration: read and write” on this repository.' }]
+      : [
+          { id: 'oldKey', ok: true, detail: 'Removed the earlier “Easy DevOps” key with the old material.' },
+          { id: 'deployKey', ok: true, detail: 'Added the public key as a read-only deploy key.' },
+        ];
+    return { ok: !readOnly, steps, error: readOnly ? steps[0].detail : null };
   }
 
   if (sub === 'github' && method === 'GET') {

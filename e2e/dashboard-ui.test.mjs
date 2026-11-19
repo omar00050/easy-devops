@@ -23,6 +23,10 @@
  *   that vanished after startup used to surface Express's stack trace in the
  *   browser instead of falling back to the classic page.
  *
+ *   Caching is pinned as well: only content-hashed build assets may be
+ *   `immutable`; index.html and any other file in the build must be
+ *   revalidated, or a rebuilt bundle keeps being served from cache.
+ *
  * Safety: free ports and temporary EASY_DEVOPS_DATA_DIRs, one per scenario.
  * The React build is a fixture in the temp directory, pointed at with
  * EASY_DEVOPS_UI_DIST, so the suite does not depend on (or touch) dist/ui.
@@ -56,6 +60,11 @@ const PASSWORD = 'ui-flag-test-password';
 const NEW_UI_MARKER = 'EZ_NEW_UI_FIXTURE';
 /** Stable markers of the classic EJS page. */
 const CLASSIC_MARKERS = ['v-cloak', '/js/app.js'];
+/**
+ * A build asset name shaped like Vite's output: a content hash in the name is
+ * what makes a one-year cache safe, so the fixture has to carry one.
+ */
+const HASHED_ASSET = '/assets/fixture-D3adB33f.js';
 
 const results = [];
 let group = '';
@@ -214,18 +223,22 @@ function looksClassic(r) {
 }
 
 function looksNew(r) {
-  return r.status === 200 && r.text.includes(NEW_UI_MARKER) && r.text.includes('/assets/fixture.js');
+  return r.status === 200 && r.text.includes(NEW_UI_MARKER) && r.text.includes(HASHED_ASSET);
 }
 
 async function main() {
   // ── Fixtures ──────────────────────────────────────────────────────────────
   const fixtureDist = path.join(tmpRoot, 'dist-fixture');
   fs.mkdirSync(path.join(fixtureDist, 'assets'), { recursive: true });
-  fs.writeFileSync(path.join(fixtureDist, 'assets', 'fixture.js'), 'window.__ezFixture = true;\n');
+  fs.writeFileSync(path.join(fixtureDist, 'assets', 'fixture-D3adB33f.js'),
+    'window.__ezFixture = true;\n');
+  // Deliberately unhashed: a file copied into assets/ keeps its name across
+  // releases, so it must not inherit the hashed-asset cache policy.
+  fs.writeFileSync(path.join(fixtureDist, 'assets', 'theme.css'), 'body{margin:0}\n');
   fs.writeFileSync(path.join(fixtureDist, 'index.html'), [
     '<!doctype html>',
     '<html><head><title>Easy DevOps</title>',
-    '<script type="module" src="/assets/fixture.js"></script></head>',
+    `<script type="module" src="${HASHED_ASSET}"></script></head>`,
     `<body><div id="root">${NEW_UI_MARKER}</div></body></html>`,
   ].join('\n'));
   const missingDist = path.join(tmpRoot, 'dist-missing');
@@ -252,11 +265,29 @@ async function main() {
   check('index.html is served with no-cache', /no-cache/.test(newRoot.cacheControl),
     newRoot.cacheControl);
 
-  const asset = await req('GET', '/assets/fixture.js');
+  const asset = await req('GET', HASHED_ASSET);
   check('static assets from the build are public (no session)',
     asset.status === 200 && asset.text.includes('__ezFixture'), `status ${asset.status}`);
-  check('hashed assets are cached as immutable', /immutable/.test(asset.cacheControl),
+  check('hashed assets are cached as immutable',
+    /public, max-age=31536000, immutable/.test(asset.cacheControl),
     asset.cacheControl);
+
+  // ── (1b) Caching follows the content hash, not the directory ─────────────
+  setGroup('(1b) only content-hashed build assets are immutable');
+
+  const plainAsset = await req('GET', '/assets/theme.css');
+  check('an unhashed asset in assets/ is served', plainAsset.status === 200,
+    `status ${plainAsset.status}`);
+  check('but it is not cached for a year',
+    !/immutable/.test(plainAsset.cacheControl) && !/max-age=31536000/.test(plainAsset.cacheControl),
+    plainAsset.cacheControl);
+  check('an unhashed asset is revalidated instead',
+    /no-cache/.test(plainAsset.cacheControl), plainAsset.cacheControl);
+
+  const directIndex = await req('GET', '/index.html');
+  check('index.html requested by name is not cached',
+    /no-cache/.test(directIndex.cacheControl) && !/immutable/.test(directIndex.cacheControl),
+    directIndex.cacheControl);
 
   check('startup says which UI is served, with no reason suffix',
     outputOf('default').includes(`Dashboard UI: new (${fixtureDist})`),
@@ -526,11 +557,11 @@ async function main() {
     tmpRoot, '.bun', 'install', 'global', 'node_modules', 'easy-devops', 'dist', 'ui'
   );
   fs.mkdirSync(path.join(dotDist, 'assets'), { recursive: true });
-  fs.writeFileSync(path.join(dotDist, 'assets', 'fixture.js'), 'window.__ezFixture = true;\n');
+  fs.writeFileSync(path.join(dotDist, 'assets', 'fixture-D3adB33f.js'), 'window.__ezFixture = true;\n');
   fs.writeFileSync(path.join(dotDist, 'index.html'), [
     '<!doctype html>',
     '<html><head><title>Easy DevOps</title>',
-    '<script type="module" src="/assets/fixture.js"></script></head>',
+    `<script type="module" src="${HASHED_ASSET}"></script></head>`,
     `<body><div id="root">${NEW_UI_MARKER}</div></body></html>`,
   ].join('\n'));
 
@@ -550,7 +581,7 @@ async function main() {
   check('a deep link from the dot path still returns index.html',
     dotDeep.status === 200 && dotDeep.text.includes(NEW_UI_MARKER), `status ${dotDeep.status}`);
 
-  const dotAsset = await req('GET', '/assets/fixture.js');
+  const dotAsset = await req('GET', HASHED_ASSET);
   check('assets still load from the dot path',
     dotAsset.status === 200 && dotAsset.text.includes('__ezFixture'), `status ${dotAsset.status}`);
 

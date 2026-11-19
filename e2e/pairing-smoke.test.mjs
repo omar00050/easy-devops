@@ -235,7 +235,13 @@ Using random ports — hub ${HUB_PORT}, dashboard ${DASH_PORT}
 
   const stamp = Date.now();
   const reg = await hubApi('POST', '/api/v1/auth/register', {
-    body: { email: `smoke-${stamp}@e2e.test`, password: 'password-smoke-123' },
+    // The Hub now requires a username as well: 3-30 lowercase letters, digits,
+    // dots, dashes or underscores, starting and ending alphanumeric.
+    body: {
+      email: `smoke-${stamp}@e2e.test`,
+      username: `smoke-${stamp}`,
+      password: 'password-smoke-123',
+    },
   });
   check('registered a hub account', reg.status === 201, `status ${reg.status}`);
   const token = reg.body?.data?.token;

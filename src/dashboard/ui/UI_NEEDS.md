@@ -1,6 +1,6 @@
 # UI needs from the backend
 
-What the new UI needs that `docs/api-contract.md` and the current backend do not
+What the new UI needs that `API-CONTRACT.md` and the current backend do not
 provide yet. Items 1–2 block shipping the built bundle; the rest are contract
 accuracy and data-shape clarifications that the UI already works around.
 
@@ -195,7 +195,7 @@ informational toast.
 
 ## 13. Update the contract to the native service model — done in 2.0.0
 
-`docs/api-contract.md` is **version 1.4.0** (the UI task referenced 1.2.0) and
+`API-CONTRACT.md` is **version 1.4.0** (the UI task referenced 1.2.0) and
 §2.7 still documents the removed model: a Task Scheduler task, a PM2 app named
 `ez-dashboard`, “Windows must ask for the account password”, and the old
 `installed`/`running`/`enabledOnBoot` fields. Please rewrite §2.7 around

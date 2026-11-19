@@ -191,6 +191,7 @@ function makeFakePm2() {
 async function main() {
   const ez = await import(srcUrl('core/deploy/ezfile.js'));
   const apps = await import(srcUrl('core/deploy/apps.js'));
+  const deployKey = await import(srcUrl('core/deploy/deployKey.js'));
   const store = await import(srcUrl('core/deploy/store.js'));
   const engine = await import(srcUrl('core/deploy/engine.js'));
   const hook = await import(srcUrl('core/deploy/hookServer.js'));
@@ -392,15 +393,15 @@ async function main() {
 
     // Deploy key
     const sshApp = apps.createApp({ id: 'keyed', repoUrl: 'git@github.com:me/keyed.git', authType: 'deployKey' });
-    const key = apps.generateDeployKey('keyed');
+    const key = deployKey.generateDeployKey('keyed');
     const [type, blob, comment] = key.publicKey.split(' ');
     const decoded = Buffer.from(blob, 'base64');
     const firstLen = decoded.readUInt32BE(0);
     check('the public key is in OpenSSH format',
-      sshApp.ok && type === 'ssh-rsa' && decoded.subarray(4, 4 + firstLen).toString() === 'ssh-rsa' && comment === 'easy-devops-deploy-keyed');
+      sshApp.ok && type === 'ssh-ed25519' && decoded.subarray(4, 4 + firstLen).toString() === 'ssh-ed25519' && comment === 'easy-devops-deploy-keyed');
     const privPath = apps.deployKeyPath('keyed');
     check('the private key is on disk, inside the data directory',
-      privPath !== null && privPath.startsWith(TEST_DATA_DIR) && fs.readFileSync(privPath, 'utf8').includes('BEGIN RSA PRIVATE KEY'));
+      privPath !== null && privPath.startsWith(TEST_DATA_DIR) && fs.readFileSync(privPath, 'utf8').includes('BEGIN OPENSSH PRIVATE KEY'));
     check('the private key is never in the registry or the dashboard view',
       !JSON.stringify(dbGet('deployApps')).includes('PRIVATE KEY') && apps.dashboardApp(apps.getApp('keyed')).deployKey === key.publicKey);
     if (process.platform !== 'win32') {
@@ -408,7 +409,7 @@ async function main() {
     }
     const keygen = spawnSync('ssh-keygen', ['-l', '-f', privPath], { encoding: 'utf8' });
     if (keygen.status === 0) {
-      check('ssh-keygen accepts the generated key', /4096/.test(keygen.stdout), keygen.stdout.trim());
+      check('ssh-keygen accepts the generated key', /ED25519|256/.test(keygen.stdout), keygen.stdout.trim());
     } else {
       process.stdout.write('   SKIP  ssh-keygen is not available to cross-check the key\n');
     }
@@ -604,7 +605,9 @@ async function main() {
       'ez.json': JSON.stringify({ install: false, start: 'node server.js', health: { path: '/healthz', timeout: 4 } }),
     }, 'unhealthy');
     const d4 = await deploy('site');
-    check('an unhealthy release is rolled back', d4.run.status === 'rolled_back' && d4.run.step === 'health', `${d4.run.status} ${d4.run.error}`);
+    check('a boot-crashing release is rolled back and reported as failed',
+      d4.run.status === 'failed' && d4.run.step === 'health' && d4.run.rollbackSucceeded === true
+      && /crashed at boot/.test(d4.run.reason ?? ''), `${d4.run.status} ${d4.run.reason ?? d4.run.error}`);
     check('the previous version is answering again', await body() === 'v2');
     check('the state still points at the good release',
       store.readState('site').current === liveBefore && d4.run.rolledBackTo === liveBefore);
@@ -688,7 +691,9 @@ async function main() {
 
     commit(workerRepo, { 'worker.js': 'process.exit(1);' }, 'crashing worker');
     const d11 = await deploy('worker');
-    check('an app without a port that exits is caught and rolled back', d11.run.status === 'rolled_back', `${d11.run.status} ${d11.run.error}`);
+    check('an app without a port that exits is caught and rolled back',
+      d11.run.status === 'failed' && d11.run.rollbackSucceeded === true
+      && /crashed at boot/.test(d11.run.reason ?? ''), `${d11.run.status} ${d11.run.reason ?? d11.run.error}`);
 
     // PM2 missing.
     pm2.installed = false;

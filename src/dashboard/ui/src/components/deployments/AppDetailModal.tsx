@@ -17,7 +17,10 @@ import { formatDateTime, timeAgo } from '../../lib/format';
 import {
   RUN_STATUS,
   TRIGGER_LABELS,
+  modeSummary,
+  rollbackOutcome,
   runDuration,
+  runStepStates,
   shortSha,
   stepLabel,
 } from '../../lib/deployments';
@@ -31,6 +34,7 @@ import { EmptyState, ErrorState, InlineAlert, Skeleton, Spinner } from '../ui/St
 import { Tabs, TabPanel } from '../ui/Tabs';
 import { useToast } from '../ui/Toast';
 import { DomainFolderTab, EzJsonTab } from './AppSetupTabs';
+import { DeployKeyPanel } from './DeployKeyPanel';
 
 function errorText(error: unknown, fallback: string): string {
   if (error instanceof ApiError) return error.message;
@@ -38,6 +42,82 @@ function errorText(error: unknown, fallback: string): string {
 }
 
 // ─── Activity: runs and their logs ────────────────────────────────────────────
+
+const STEP_SHORT: Record<string, string> = {
+  fetch: 'Fetch',
+  settings: 'Settings',
+  pre: 'Pre',
+  install: 'Install',
+  build: 'Build',
+  migrate: 'Migrate',
+  start: 'Start',
+  health: 'Health',
+  post: 'Post',
+  finish: 'Finish',
+};
+
+const STEP_STATE_STYLE = {
+  done: 'border-ok/30 bg-ok-soft text-ok',
+  active: 'border-accent/40 bg-accent-soft text-accent-text',
+  failed: 'border-bad/30 bg-bad-soft text-bad',
+  pending: 'border-line bg-inset/50 text-faint',
+} as const;
+
+/** The contract's step chain, so migrate is a visible member of the run. */
+function RunSteps({ run }: { run: DeployRun }) {
+  return (
+    <ol className="flex flex-wrap items-center gap-1" aria-label="Deployment steps">
+      {runStepStates(run).map(({ step, state }, index) => (
+        <li key={step} className="flex items-center gap-1">
+          {index > 0 && (
+            <span className="text-2xs text-faint" aria-hidden="true">
+              ›
+            </span>
+          )}
+          <span
+            aria-current={state === 'active' ? 'step' : undefined}
+            className={cn('rounded border px-1.5 py-0.5 text-2xs font-medium', STEP_STATE_STYLE[state])}
+          >
+            {STEP_SHORT[step] ?? stepLabel(step)}
+          </span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/** Why a failed release did not stay up, and what happened to the one before it. */
+function RollbackReport({ run }: { run: DeployRun }) {
+  const outcome = rollbackOutcome(run.rollbackSucceeded);
+  const tone =
+    outcome.tone === 'ok' ? 'text-ok' : outcome.tone === 'bad' ? 'text-bad' : 'text-muted';
+
+  return (
+    <div className="rounded-md border border-line bg-inset/40 p-3.5">
+      <h4 className="text-xs font-semibold uppercase tracking-[0.12em] text-faint">Rollback report</h4>
+      <div className="mt-2 space-y-1.5 text-xs text-muted">
+        <p>
+          <span className="font-medium text-ink">Reason: </span>
+          {run.reason ?? run.error ?? 'The server did not report a reason.'}
+        </p>
+        <p className={tone}>{outcome.text}</p>
+      </div>
+      {run.logTail && run.logTail.length > 0 && (
+        <div className="mt-2.5">
+          <div className="mb-1 text-2xs text-faint">
+            Last lines from the new release (environment values are redacted)
+          </div>
+          <pre
+            className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded border border-line bg-canvas p-2.5 font-mono text-2xs leading-relaxed text-muted"
+            aria-label="Boot log of the failed release"
+          >
+            {run.logTail.join('\n')}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function RunLog({ appId, run }: { appId: string; run: DeployRun }) {
   const detail = useResource<DeployRunDetail>(
@@ -63,6 +143,7 @@ function RunLog({ appId, run }: { appId: string; run: DeployRun }) {
 
   return (
     <div className="space-y-2.5">
+      <RunSteps run={current} />
       {current.error && (
         <InlineAlert
           tone={current.status === 'rolled_back' ? 'warning' : 'danger'}
@@ -73,6 +154,9 @@ function RunLog({ appId, run }: { appId: string; run: DeployRun }) {
           }
         >
           {current.error}
+          {current.status !== 'failed' && current.reason ? (
+            <span className="mt-1 block">{current.reason}</span>
+          ) : null}
         </InlineAlert>
       )}
       {current.warnings?.map((warning) => (
@@ -80,6 +164,7 @@ function RunLog({ appId, run }: { appId: string; run: DeployRun }) {
           {warning}
         </InlineAlert>
       ))}
+      {current.status === 'failed' && <RollbackReport run={current} />}
       {detail.error && !detail.data ? (
         <ErrorState error={detail.error} onRetry={detail.reload} title="Could not load the log" />
       ) : (
@@ -205,6 +290,9 @@ function ReleasesTab({
               <div className="mt-0.5 font-mono text-2xs text-faint">
                 {shortSha(release.sha)}
                 {release.ref ? ` · ${release.ref}` : ''}
+                {release.execMode
+                  ? ` · ${release.execMode === 'cluster' ? `Cluster ×${release.instances ?? '?'}` : 'Fork'}`
+                  : ''}
               </div>
             </div>
             {!release.current && (
@@ -534,28 +622,22 @@ function GithubTab({
       </h4>
 
       <ol className="space-y-5">
-        {data.deployKey !== null && (
+        {app.authType === 'deployKey' ? (
           <Step n={1} title="Let this server read the repository">
-            <p className="text-xs text-muted">
-              In the repository: Settings → Deploy keys → Add deploy key. Paste this, and leave
-              “Allow write access” off.
-            </p>
-            <div className="flex items-start justify-between gap-2 rounded-md border border-line bg-inset/50 p-2.5">
-              <code className="min-w-0 break-all font-mono text-2xs text-muted">
-                {data.deployKey}
-              </code>
-              <CopyButton value={data.deployKey} label="Copy the deploy key" withText />
-            </div>
+            <DeployKeyPanel
+              appId={app.id}
+              repoUrl={app.repoUrl}
+              publicKey={app.deployKey}
+              fingerprint={app.deployKeyFingerprint ?? null}
+              createdAt={app.deployKeyCreatedAt ?? null}
+              onDisk={app.deployKeyOnDisk ?? Boolean(app.deployKey)}
+              onChanged={() => {
+                setup.reload();
+                onChanged();
+              }}
+            />
           </Step>
-        )}
-        {app.authType === 'deployKey' && data.deployKey === null && (
-          <Step n={1} title="Let this server read the repository">
-            <InlineAlert tone="warning">
-              This app uses a deploy key but none has been generated. Open Edit and press
-              “Generate key”.
-            </InlineAlert>
-          </Step>
-        )}
+        ) : null}
 
         <Step n={keyStep + 1} title="Create the deploy token">
           <p className="text-xs text-muted">
@@ -739,6 +821,7 @@ export function AppDetailModal({
       title={
         <span className="flex flex-wrap items-center gap-2.5">
           <span className="font-mono">{appId}</span>
+          {app && modeSummary(app) && <Badge tone="neutral">{modeSummary(app)}</Badge>}
           {app?.deploying && (
             <Badge tone="info" dot>
               Deploying
@@ -756,6 +839,11 @@ export function AppDetailModal({
         </div>
       ) : (
         <div className="space-y-4">
+          {app.warnings?.map((warning) => (
+            <InlineAlert key={warning} tone="warning">
+              {warning}
+            </InlineAlert>
+          ))}
           <Tabs
             ariaLabel="App sections"
             value={tab}

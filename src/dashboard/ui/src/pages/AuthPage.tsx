@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import {
   ArrowRight,
   Check,
@@ -146,14 +146,63 @@ function PasswordToggle({
   );
 }
 
-function ServerError({ error }: { error: ApiError | null }) {
+function ServerError({
+  error,
+  cooldown = 0,
+}: {
+  error: ApiError | null;
+  cooldown?: number;
+}) {
   if (!error) return null;
   const hint = typeof error.payload.hint === 'string' ? error.payload.hint : undefined;
+  const retry = retryAfterSeconds(error);
+  const wait = cooldown > 0 ? cooldown : retry;
   return (
-    <InlineAlert tone="danger" title={error.message} className="mb-4">
-      {hint ?? (error.status === 429 ? 'Wait a moment before trying again.' : undefined)}
+    <InlineAlert
+      tone="danger"
+      title={retry === null ? error.message : 'Too many attempts'}
+      className="mb-4"
+    >
+      {hint ??
+        (wait === null
+          ? undefined
+          : cooldown > 0
+            ? `Try again in ${waitLabel(wait)}.`
+            : 'You can try again now.')}
     </InlineAlert>
   );
+}
+
+/** The wait the server asked for, when this was a rate-limit answer. */
+function retryAfterSeconds(error: ApiError | null): number | null {
+  if (error?.status !== 429) return null;
+  const value = error.payload.retryAfterSeconds;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null;
+  return Math.ceil(value);
+}
+
+function waitLabel(seconds: number): string {
+  if (seconds >= 120) return `${Math.ceil(seconds / 60)} minutes`;
+  if (seconds >= 60) return '1 minute';
+  return `${seconds} second${seconds === 1 ? '' : 's'}`;
+}
+
+/** Counts down the server's wait so the form cannot be retried too early. */
+function useCooldown(): { remaining: number; start: (error: ApiError | null) => void } {
+  const [remaining, setRemaining] = useState(0);
+
+  useEffect(() => {
+    if (remaining <= 0) return;
+    const id = window.setTimeout(() => setRemaining((value) => Math.max(0, value - 1)), 1_000);
+    return () => window.clearTimeout(id);
+  }, [remaining]);
+
+  const start = (error: ApiError | null) => {
+    const seconds = retryAfterSeconds(error);
+    if (seconds !== null) setRemaining(seconds);
+  };
+
+  return { remaining, start };
 }
 
 function LoginForm() {
@@ -163,9 +212,12 @@ function LoginForm() {
   const [fieldError, setFieldError] = useState<string | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const cooldown = useCooldown();
+  const remaining = cooldown.remaining;
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (remaining > 0) return;
     if (!password) {
       setFieldError('Enter your password.');
       return;
@@ -185,6 +237,7 @@ function LoginForm() {
         await retryBoot();
         return;
       }
+      if (apiError?.status === 429) cooldown.start(apiError);
       setError(apiError);
     } finally {
       setSubmitting(false);
@@ -207,7 +260,7 @@ function LoginForm() {
         </InlineAlert>
       )}
 
-      <ServerError error={error} />
+      <ServerError error={error} cooldown={remaining} />
 
       <form onSubmit={submit} noValidate>
         <TextInput
@@ -229,10 +282,13 @@ function LoginForm() {
           variant="primary"
           size="lg"
           loading={submitting}
+          disabled={remaining > 0}
           className="mt-5 w-full"
         >
-          Sign in
-          {!submitting && <ArrowRight className="size-4" aria-hidden="true" />}
+          {remaining > 0 ? `Try again in ${remaining}s` : 'Sign in'}
+          {!submitting && remaining === 0 && (
+            <ArrowRight className="size-4" aria-hidden="true" />
+          )}
         </Button>
       </form>
     </div>
@@ -254,9 +310,12 @@ function SetupForm() {
   const [errors, setErrors] = useState<{ code?: string; password?: string; confirm?: string }>({});
   const [error, setError] = useState<ApiError | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const cooldown = useCooldown();
+  const remaining = cooldown.remaining;
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (remaining > 0) return;
 
     const next: typeof errors = {};
     if (needsCode && !setupCode.trim()) next.code = 'Enter the setup code shown by the server.';
@@ -289,6 +348,7 @@ function SetupForm() {
         setError(null);
         return;
       }
+      if (apiError?.status === 429) cooldown.start(apiError);
       setError(apiError);
     } finally {
       setSubmitting(false);
@@ -307,7 +367,7 @@ function SetupForm() {
         </p>
       </div>
 
-      <ServerError error={error} />
+      <ServerError error={error} cooldown={remaining} />
 
       <form onSubmit={submit} noValidate>
         <div
@@ -422,10 +482,17 @@ function SetupForm() {
           variant="primary"
           size="lg"
           loading={submitting}
+          disabled={remaining > 0}
           className="mt-5 w-full"
         >
-          {choice === 'password' ? 'Save password and sign in' : 'Start without a password'}
-          {!submitting && <ArrowRight className="size-4" aria-hidden="true" />}
+          {remaining > 0
+            ? `Try again in ${remaining}s`
+            : choice === 'password'
+              ? 'Save password and sign in'
+              : 'Start without a password'}
+          {!submitting && remaining === 0 && (
+            <ArrowRight className="size-4" aria-hidden="true" />
+          )}
         </Button>
       </form>
     </div>
@@ -500,7 +567,9 @@ export function AuthPage() {
         </div>
         {import.meta.env.DEV && MOCK_ENABLED && (
           <p className="mt-2 leading-relaxed">
-            Mock mode: any password works. Add{' '}
+            Mock mode: any password works — type{' '}
+            <code className="rounded bg-inset px-1 py-0.5 font-mono">wrong</code> three times to
+            see the rate-limit wait. Add{' '}
             <code className="rounded bg-inset px-1 py-0.5 font-mono">
               ?mock=login|setup|setupcode|setupcode-expired|none
             </code>{' '}

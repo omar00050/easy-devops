@@ -52,9 +52,33 @@ export function ServiceProvider({ children }: { children: ReactNode }) {
     [authenticated],
     { enabled: authenticated }
   );
-  const { setData, reload } = resource;
+  const { setData, reload, reloadSilent } = resource;
 
   usePolling(reload, 60_000, authenticated);
+
+  // A pending response means at least one cached probe has never completed, so
+  // the measured fields are null. Re-read once shortly after instead of
+  // blocking the first render — and only once, so a slow probe never becomes
+  // a poll loop. A non-pending response re-arms this for the next episode.
+  const pendingRetryScheduled = useRef(false);
+  useEffect(() => {
+    if (!authenticated) {
+      pendingRetryScheduled.current = false;
+      return;
+    }
+    const probes = resource.data?.probes;
+    if (!probes) return;
+    if (!probes.pending) {
+      pendingRetryScheduled.current = false;
+      return;
+    }
+    if (pendingRetryScheduled.current) return;
+    const id = setTimeout(() => {
+      pendingRetryScheduled.current = true;
+      reloadSilent();
+    }, 1_500);
+    return () => clearTimeout(id);
+  }, [authenticated, resource.data, reloadSilent]);
 
   const applyBackgroundService = useCallback(
     (update: Partial<BackgroundServiceStatus>) => {

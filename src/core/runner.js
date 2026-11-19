@@ -1,20 +1,20 @@
 /**
  * core/runner.js
  *
- * The one PM2 wrapper. Everything that talks to PM2 — the CLI `service`
- * commands, the dashboard's Processes page, the hub agent's reporting — goes
- * through here.
+ * The one PM2 wrapper. Everything in Easy DevOps that talks to PM2 — the
+ * dashboard's Processes page, the Hub agent's process commands and telemetry,
+ * and the deploy engine's start/stop of deployed projects — goes through here.
  *
- * Why PM2 at all: Easy DevOps deliberately does not implement its own daemon.
- * PM2 already solves keeping a process alive, restarting it after a crash and
- * bringing it back after a reboot, on both platforms this project supports.
- * Easy DevOps' job is to manage PM2 on the user's behalf, never to reinvent it.
+ * PM2 is what runs the PROJECTS Easy DevOps deploys, and any PM2 app the user
+ * already has. Easy DevOps' own dashboard is not a PM2 app: it runs as a
+ * native background service (core/service/), so nothing here should assume an
+ * `ez-dashboard` app exists.
  *
  * Rules this module keeps:
  *   - Every subprocess call goes through core/shell.js.
  *   - Every OS difference comes from core/platform.js.
- *   - PM2 is NEVER installed silently. install() exists, but the decision to
- *     call it belongs to the CLI or the dashboard, which must ask first.
+ *   - PM2 is NEVER installed silently. install() exists, but nothing here
+ *     calls it: a caller must ask the user first.
  *   - `run` is injectable on every function so tests can assert the exact
  *     command without executing it.
  */
@@ -31,11 +31,13 @@ const PM2_TIMEOUT_MS = 60_000;
 const INSTALL_TIMEOUT_MS = 300_000;
 
 /**
- * Name PM2 knows the dashboard by.
+ * The PM2 app name the dashboard used before it became a native service.
  *
- * Dev mode gets its own app so a developer's instance can never be mistaken
- * for — or stop — the real one. The suffix follows the data directory, which
- * is the thing that actually differs.
+ * Nothing starts the dashboard under PM2 any more. The names are kept because
+ * an old install still has such an app on some machines, and it has to be
+ * recognised (and removable) rather than mistaken for one of the user's. Dev
+ * mode had its own name so a developer's instance could never be mistaken for
+ * — or stop — the real one.
  *
  * @param {boolean} dev
  * @returns {string}
@@ -44,7 +46,7 @@ export function appName(dev) {
   return dev ? 'ez-dashboard-dev' : 'ez-dashboard';
 }
 
-/** Both names, so callers can recognise anything Easy DevOps created. */
+/** Both legacy names, so callers can recognise anything Easy DevOps created. */
 export const EZ_APP_NAMES = Object.freeze(['ez-dashboard', 'ez-dashboard-dev']);
 
 /** @returns {boolean} True when PM2 knows this app name as one of ours. */
@@ -130,30 +132,6 @@ export async function install({ run = defaultRun } = {}) {
 }
 
 /**
- * Installs the pm2-logrotate module, so PM2's logs cannot grow without bound.
- *
- * A PM2 module, not an npm dependency of this project: it is installed into
- * the user's PM2, exactly like PM2 itself.
- *
- * @param {{ run?: Function, pm2Path?: string }} [deps]
- * @returns {Promise<{ ok: boolean, output: string }>}
- */
-export async function installLogrotate({ run = defaultRun, pm2Path = 'pm2' } = {}) {
-  const r = await run(`${quoteExe(pm2Path)} install pm2-logrotate`, { timeout: INSTALL_TIMEOUT_MS });
-  return { ok: r.success, output: combine(r) };
-}
-
-/**
- * True when pm2-logrotate is present.
- * @param {{ run?: Function, pm2Path?: string }} [deps]
- * @returns {Promise<boolean>}
- */
-export async function hasLogrotate({ run = defaultRun, pm2Path = 'pm2' } = {}) {
-  const r = await run(`${quoteExe(pm2Path)} ls`, { timeout: PM2_TIMEOUT_MS });
-  return /pm2-logrotate/.test(combine(r));
-}
-
-/**
  * Lists PM2 apps.
  *
  * `pm2 jlist` prints JSON on stdout, but PM2 also writes its daemonisation
@@ -186,6 +164,63 @@ export async function list({ run = defaultRun, pm2Path = 'pm2' } = {}) {
 }
 
 /**
+ * One app's PM2 status, keyed by name — or null when PM2 does not know it.
+ *
+ * This is the read the deploy engine uses while it watches a new release for a
+ * boot crash: the restart count from `jlist` is what tells "it answered once"
+ * apart from "it is crash-looping". It NEVER starts the PM2 daemon. A status
+ * read on a machine that does not use PM2 must not create one, so the pid file
+ * is checked first and the answer is `daemonRunning: false` instead of a
+ * subprocess. `isRunning` is injectable so tests can prove that.
+ *
+ * @param {string} name PM2 app name
+ * @param {{ run?: Function, pm2Path?: string, isRunning?: () => boolean }} [deps]
+ * @returns {Promise<{ ok: boolean, app: Object|null, daemonRunning: boolean, error: string|null }>}
+ */
+export async function status(name, { run = defaultRun, pm2Path = 'pm2', isRunning = isDaemonRunning } = {}) {
+  const all = await statusAll(name, { run, pm2Path, isRunning });
+  if (!all.ok) {
+    return { ok: false, app: null, daemonRunning: all.daemonRunning, error: all.error };
+  }
+  return {
+    ok: true,
+    app: all.apps[0] ?? null,
+    apps: all.apps,
+    daemonRunning: true,
+    error: null,
+  };
+}
+
+/**
+ * Every PM2 entry with one name — a cluster app has one per worker.
+ *
+ * The same daemon rule as status(): this must never be what starts PM2. A
+ * deploy's boot-crash check uses it so one crashing worker among several is
+ * not hidden behind the first entry PM2 happens to list.
+ *
+ * @param {string} name PM2 app name
+ * @param {{ run?: Function, pm2Path?: string, isRunning?: () => boolean }} [deps]
+ * @returns {Promise<{ ok: boolean, apps: Array<Object>, daemonRunning: boolean, error: string|null }>}
+ */
+export async function statusAll(name, { run = defaultRun, pm2Path = 'pm2', isRunning = isDaemonRunning } = {}) {
+  if (!isRunning()) {
+    return { ok: false, apps: [], daemonRunning: false, error: 'PM2 is not running.' };
+  }
+
+  const listed = await list({ run, pm2Path });
+  if (!listed.ok) {
+    return { ok: false, apps: [], daemonRunning: true, error: listed.error };
+  }
+
+  return {
+    ok: true,
+    apps: listed.apps.filter((a) => a.name === name),
+    daemonRunning: true,
+    error: null,
+  };
+}
+
+/**
  * Reduces a `pm2 jlist` entry to the fields the UI needs.
  *
  * Shapes the numbers here rather than in each consumer: PM2 reports memory in
@@ -209,6 +244,8 @@ export function normalizeApp(app) {
     uptimeMs: startedAt && env.status === 'online' ? Math.max(0, Date.now() - startedAt) : null,
     restarts: typeof env.restart_time === 'number' ? env.restart_time : 0,
     unstableRestarts: typeof env.unstable_restarts === 'number' ? env.unstable_restarts : 0,
+    /** PM2 reports "cluster_mode" or "fork_mode"; anything else is fork. */
+    execMode: String(env.exec_mode ?? '').toLowerCase().includes('cluster') ? 'cluster' : 'fork',
     execPath: env.pm_exec_path ?? null,
     cwd: env.pm_cwd ?? null,
     user: env.username ?? null,
@@ -279,6 +316,23 @@ export async function reload(name, { run = defaultRun, pm2Path = 'pm2' } = {}) {
   return simple('reload', name, run, pm2Path);
 }
 
+/**
+ * Zero-downtime reload of the app(s) in a config file.
+ *
+ * `--update-env` matters for a deployment: the new release's environment and
+ * working directory come from the file, and PM2 otherwise keeps the ones the
+ * process was first started with. Only valid for an app already running in
+ * cluster mode; a fork app cannot overlap its old and new process.
+ *
+ * @param {string} file Absolute path to the PM2 config file
+ * @param {{ run?: Function, pm2Path?: string }} [deps]
+ * @returns {Promise<{ ok: boolean, output: string }>}
+ */
+export async function reloadConfig(file, { run = defaultRun, pm2Path = 'pm2' } = {}) {
+  const r = await run(`${quoteExe(pm2Path)} reload "${file}" --update-env`, { timeout: PM2_TIMEOUT_MS });
+  return { ok: r.success, output: combine(r) };
+}
+
 /** Removes the app from PM2 entirely. @returns {Promise<{ ok: boolean, output: string }>} */
 export async function del(name, { run = defaultRun, pm2Path = 'pm2' } = {}) {
   return simple('delete', name, run, pm2Path);
@@ -304,7 +358,8 @@ export async function logs(name, { lines = 200, run = defaultRun, pm2Path = 'pm2
 
 /**
  * Saves the current process list, so `pm2 resurrect` can restore it.
- * This is what makes a reboot bring the dashboard back.
+ * This is what makes DEPLOYED APPS come back after a reboot; the dashboard
+ * itself is a native service and does not depend on it.
  * @returns {Promise<{ ok: boolean, output: string }>}
  */
 export async function save({ run = defaultRun, pm2Path = 'pm2' } = {}) {
@@ -316,7 +371,8 @@ export async function save({ run = defaultRun, pm2Path = 'pm2' } = {}) {
  * Asks PM2 for its init-system startup hook.
  *
  * Linux and macOS only. PM2 has no Windows support here and exits non-zero,
- * which is why Windows gets its own two mechanisms — see core/service.js.
+ * which is why the old Windows setup used its own mechanisms — see
+ * core/service/legacy.js.
  *
  * PM2 does not install the hook itself when it needs root: it prints a command
  * for the user to run under sudo. That command is returned verbatim rather

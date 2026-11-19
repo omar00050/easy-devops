@@ -113,7 +113,7 @@ function currentBinding() {
 // override.
 //
 // This reverses the earlier default. It changed because the new UI is now the
-// one being developed against docs/api-contract.md, and leaving the old page
+// one being developed against API-CONTRACT.md, and leaving the old page
 // as the default meant every new install started on the implementation that is
 // no longer maintained. The EJS files stay in the tree: an operator who hits a
 // regression in the new UI needs a working dashboard in the same minute, not
@@ -148,8 +148,13 @@ if (classicRequested) {
   );
 }
 
-// Static files - disable index serving so the classic EJS page handles root.
-// Kept in both modes: the React build reuses /img assets from here.
+// Static files for the classic page (its Vue bundle, /img assets). Index
+// serving is off in both modes so the route that serves root decides which UI
+// answers. The React build reuses /img assets from here.
+//
+// No maxAge: the default is `public, max-age=0`, which makes a browser
+// revalidate on every use. These files carry no content hash, so a long cache
+// would keep serving an old bundle after an upgrade.
 app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 
 /**
@@ -177,10 +182,39 @@ app.use('/api', processesRouter);
 app.use('/api/deployments', deploymentsRouter);
 app.use('/api', updateRouter);
 
+/**
+ * True for a build asset whose NAME carries a content hash.
+ *
+ * Vite writes `assets/index-4f3a9c2b.js`, and the hash changes when the bytes
+ * do — which is the only thing that makes a one-year cache safe. Everything
+ * else in the build keeps its name across releases (a favicon copied into
+ * assets/, and index.html itself) and must be revalidated instead.
+ *
+ * @param {string} filePath Absolute path the static middleware is serving
+ * @returns {boolean}
+ */
+function isHashedAsset(filePath) {
+  const rel = path.relative(uiDistDir, filePath);
+  if (!rel.startsWith(`assets${path.sep}`)) return false;
+  return /-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$/.test(path.basename(rel));
+}
+
 if (servingNewUi) {
-  // Hashed Vite assets are immutable; index.html is served with no-cache
-  // below, so a rebuilt bundle is picked up on the next page load.
-  app.use(express.static(uiDistDir, { index: false, maxAge: '1y', immutable: true }));
+  // Only hashed assets are immutable; every other file in the build (including
+  // index.html, requested directly) gets `no-cache`, so a rebuilt bundle is
+  // picked up on the next page load. The route below serves index.html for the
+  // SPA with the same policy.
+  app.use(express.static(uiDistDir, {
+    index: false,
+    setHeaders(res, filePath) {
+      res.setHeader(
+        'Cache-Control',
+        isHashedAsset(filePath)
+          ? 'public, max-age=31536000, immutable'
+          : 'no-cache',
+      );
+    },
+  }));
 
   // Client-side routes such as /#/domains arrive here as GET / and are
   // handled by the static index. A real path (/domains/example.com) gets the
@@ -332,7 +366,8 @@ let shutdownPromise = null;
 
 /**
  * Releases everything this module started: the HTTP server, the Socket.io
- * polling intervals and log tails, the hub agent, and the SQLite handle.
+ * server and its log tails, the daemon bridge, the background jobs, and the
+ * SQLite handle.
  *
  * Idempotent — concurrent or repeated calls (a second Ctrl+C during shutdown)
  * return the same promise and never double-close.

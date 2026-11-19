@@ -8,7 +8,10 @@ import {
   hashPassword, validateNewPassword, MIN_PASSWORD_LENGTH,
 } from '../../core/passwords.js';
 import { dbGet } from '../../core/db.js';
-import { setupLinuxPermissions, checkPermissionsConfigured } from '../../core/permissions.js';
+import { isWindows } from '../../core/platform.js';
+import {
+  setupLinuxPermissions, checkPermissionsConfigured, buildSetupScript, deriveOwnDirs,
+} from '../../core/permissions.js';
 import {
   getAutoRenewSettings, normalizeAutoRenewDays, MIN_AUTO_RENEW_DAYS, MAX_AUTO_RENEW_DAYS,
 } from '../../core/cert-renewal.js';
@@ -40,7 +43,7 @@ export default async function settingsMenu() {
       ? `on, ${autoRenew.days} day${autoRenew.days === 1 ? '' : 's'} before expiry`
       : 'off';
 
-    const isLinux = process.platform !== 'win32';
+    const isLinux = !isWindows;
     const permsOk = isLinux ? await checkPermissionsConfigured() : true;
 
     console.log();
@@ -83,9 +86,28 @@ export default async function settingsMenu() {
     if (field === 'back') return;
 
     if (field === 'permissions') {
-      if (process.platform !== 'win32') {
-        console.log(chalk.yellow('\n  You will be prompted for your sudo password once.\n'));
-        const result = await setupLinuxPermissions();
+      if (!isWindows) {
+        // Same derivation and same script as the dashboard's
+        // POST /api/settings/permissions/setup: one source, so the two can
+        // never show or run different rules. The commands are printed BEFORE
+        // anything runs, so they can be copied into a terminal by hand.
+        const { ownDirs, refused } = deriveOwnDirs(config);
+        const script = buildSetupScript({ ownDirs });
+
+        for (const item of refused) {
+          console.log(chalk.yellow(`\n  Skipped ${item.dir}: ${item.reason}`));
+        }
+
+        if (!script.ok) {
+          console.log(chalk.red(`\n  ✗ Failed: ${script.reason}\n`));
+          continue;
+        }
+
+        console.log(chalk.bold('\n  These commands will run now:'));
+        for (const line of script.lines) console.log(chalk.gray(`    ${line}`));
+        console.log(chalk.gray('\n  sudo asks for YOUR password in this terminal; Easy DevOps never sees it.\n'));
+
+        const result = await setupLinuxPermissions({ ownDirs });
         if (result.success) {
           console.log(chalk.green('\n  ✅ Permissions configured! No more password prompts.\n'));
         } else {

@@ -22,15 +22,17 @@ import { getDomains } from '../domains-db.js';
 import { getHubLink, getHubPermissions, resolveHubOrigin } from '../hubLink.js';
 
 import {
-  getApp, createApp, updateApp, publicApp, normalizeEnv, rotateHookToken, verifyHookToken, validateAppId,
+  getApp, createApp, updateApp, publicApp, normalizeEnv, rotateHookToken, verifyHookToken, validateAppId, isSshUrl,
 } from './apps.js';
 import { startDeployment, startRollback, removeRelease, removeApp, moveApp } from './engine.js';
 import { linkDomain, unlinkDomain } from './domainLink.js';
-import { findDomain } from '../domains-db.js';
 import { describeGithubSetup } from './github.js';
+import { addDeployKey, deployKeyAddUrl, validateGithubToken } from './githubApi.js';
+import { generateDeployKey, testDeployKey } from './deployKey.js';
 import { hookSettings } from './hookServer.js';
 import { describeApps, describeAppDetail } from './status.js';
-import { isId, readLogTail, readRun } from './store.js';
+import { isId, lockHolder, readLogTail, readRun } from './store.js';
+import { safeLogText } from '../hub/deployProgress.js';
 
 /** An error whose message is safe to show the Hub user as-is. */
 function refuse(message) {
@@ -67,10 +69,111 @@ export function githubSetupFor(app, view) {
 function appInputFromHub(input) {
   const src = input && typeof input === 'object' ? input : {};
   const out = {};
-  for (const key of ['repoUrl', 'branch', 'authType', 'token', 'settings', 'keepReleases', 'autoRollback', 'notifyChannelIds']) {
+  for (const key of ['repoUrl', 'branch', 'authType', 'token', 'generateKey', 'settings', 'keepReleases', 'autoRollback', 'notifyChannelIds']) {
     if (src[key] !== undefined) out[key] = src[key];
   }
   return out;
+}
+
+/**
+ * True when a create request asks for the key in the same step. Ignored for
+ * every auth type except deployKey; absent means yes for deployKey.
+ */
+export function wantsGeneratedKey(input) {
+  return input?.authType === 'deployKey' && input?.generateKey !== false;
+}
+
+/**
+ * Generates a new app's key and shapes the create response's `deployKey`
+ * object. A failure is returned as `deployKeyError`: the app exists either way,
+ * and the UI can offer "Regenerate key".
+ */
+export function generateKeyForApp(id) {
+  try {
+    const key = generateDeployKey(id);
+    if (!key) return { deployKeyError: `No app named "${id}".` };
+    return {
+      deployKey: {
+        publicKey: key.publicKey,
+        fingerprint: key.fingerprint,
+        createdAt: key.createdAt,
+        addUrl: deployKeyAddUrl(getApp(id)?.repoUrl),
+      },
+    };
+  } catch (err) {
+    return { deployKeyError: err.message };
+  }
+}
+
+/**
+ * Regenerates an app's deploy key. Shared by the dashboard route and the Hub
+ * command so both enforce the same auth, URL and deploy-lock rules.
+ *
+ * @returns {{ ok: true, value: Object } | { ok: false, status: number, error: string }}
+ */
+export function regenerateAppDeployKey(id) {
+  const app = typeof id === 'string' ? getApp(id) : null;
+  if (!app) return { ok: false, status: 404, error: `No app named "${id}".` };
+  if (app.auth?.type !== 'deployKey' || !isSshUrl(app.repoUrl)) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'A deploy key needs an app with deployKey authentication and an SSH repository URL.',
+    };
+  }
+  if (lockHolder(app.id)) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'A deployment is running; regenerate the key after it finishes.',
+    };
+  }
+
+  try {
+    const key = generateDeployKey(app.id);
+    if (!key) return { ok: false, status: 404, error: `No app named "${id}".` };
+    return {
+      ok: true,
+      value: {
+        publicKey: key.publicKey,
+        fingerprint: key.fingerprint,
+        createdAt: key.createdAt,
+        previousFingerprint: key.previousFingerprint,
+        addUrl: deployKeyAddUrl(app.repoUrl),
+      },
+    };
+  } catch (err) {
+    return { ok: false, status: 500, error: err.message };
+  }
+}
+
+/**
+ * Adds an app's public key to GitHub. `token` is a typed token used once; when
+ * it is absent the app's own token is tried, exactly as githubApply does.
+ */
+export async function addAppDeployKeyToGithub(id, token, { fetchImpl } = {}) {
+  const app = typeof id === 'string' ? getApp(id) : null;
+  if (!app) return { ok: false, status: 404, error: `No app named "${id}".` };
+
+  const typed = typeof token === 'string' ? token.trim() : '';
+  const effective = typed || (app.auth?.type === 'token' ? app.auth.token : '');
+  const key = app.auth?.publicKey ?? null;
+  if (!key) return { ok: false, status: 409, error: 'Generate the deploy key first.' };
+  if (!validateGithubToken(effective)) {
+    return { ok: false, status: 400, error: 'A GitHub token with write access to the repository is required.' };
+  }
+
+  const result = await addDeployKey({
+    repoUrl: app.repoUrl,
+    token: effective,
+    title: `Easy DevOps — ${app.id}`,
+    key,
+    fetchImpl,
+  });
+  if (result.error) return { ok: false, status: 400, ...result };
+  const failed = result.steps.find((s) => !s.ok);
+  if (failed) return { ok: false, status: 422, ...result, error: failed.detail };
+  return { ok: true, status: 200, ...result };
 }
 
 /**
@@ -81,7 +184,7 @@ function appInputFromHub(input) {
  * @param {(run: Object) => void} [opts.onFinished] Called when a deployment or rollback started here ends
  * @returns {Promise<Object>} The command's result data. Throws to refuse.
  */
-export async function handleHubDeployCommand(payload, { onFinished = null } = {}) {
+export async function handleHubDeployCommand(payload, { onFinished = null, onProgress = null } = {}) {
   const { action, id } = payload ?? {};
   const watch = (started) => {
     if (onFinished) started.done.then((run) => { try { onFinished(run); } catch { /* ignore */ } });
@@ -109,7 +212,9 @@ export async function handleHubDeployCommand(payload, { onFinished = null } = {}
       // A smaller tail than the dashboard's: this travels over the agent
       // socket and through the Hub to a browser.
       const log = readLogTail(app.id, run.id, { maxBytes: 32 * 1024 });
-      return { ...run, log: log.text, logTruncated: log.truncated };
+      // The log on disk is the raw build output. What leaves the server gets
+      // the same treatment as live progress: secrets redacted, keys dropped.
+      return { ...run, log: safeLogText(log.text, app), logTruncated: log.truncated };
     }
 
     case 'deploy': {
@@ -143,7 +248,30 @@ export async function handleHubDeployCommand(payload, { onFinished = null } = {}
       const input = appInputFromHub(payload.app);
       const result = createApp({ ...input, id: String(payload.app?.id ?? '').trim() });
       if (!result.ok) throw refuse(result.errors[0]);
-      return publicApp(result.app);
+      // Creating an app never starts a deployment. The key, when asked for, is
+      // generated in this same command.
+      const extra = wantsGeneratedKey(input) ? generateKeyForApp(result.app.id) : {};
+      return { ...publicApp(getApp(result.app.id) ?? result.app), ...extra };
+    }
+
+    case 'regenerateKey': {
+      const result = regenerateAppDeployKey(id);
+      if (!result.ok) throw refuse(result.error);
+      return result.value;
+    }
+
+    case 'testKey': {
+      requireApp(id);
+      return testDeployKey(String(id));
+    }
+
+    case 'addKeyToGithub': {
+      const result = await addAppDeployKeyToGithub(id, payload.token);
+      // A missing app or key is a refusal; a GitHub failure is a result the
+      // caller reads (ok:false, steps, error), exactly like the dashboard.
+      if (!result.ok && result.steps === undefined) throw refuse(result.error);
+      const { status: _status, ...data } = result;
+      return data;
     }
 
     case 'update': {
@@ -171,18 +299,27 @@ export async function handleHubDeployCommand(payload, { onFinished = null } = {}
 
     case 'linkDomain': {
       requireApp(id);
-      const name = String(payload.domain ?? '').trim().toLowerCase();
-      // Linking writes a domain's nginx config, so it also needs the domain
-      // permission that action would need on its own.
-      const needed = findDomain(name) ? 'domains.edit' : 'domains.create';
-      if (getHubPermissions()[needed] !== true) {
-        throw refuse(`Linking this domain needs '${needed}', which this server has switched off (Settings → Hub).`);
-      }
-      // No certificate request from here: `ssl.issue` is its own permission
-      // and its own action, on the SSL section.
-      const result = await linkDomain(id, { domain: name, ssl: false });
+      // Permissions are checked in core/hub/agent.js before this runs: the map
+      // there requires deploy.manage + domains.create, plus ssl.issue when the
+      // link asks for a new certificate.
+      const result = await linkDomain(id, {
+        domain: payload.domain,
+        www: payload.www,
+        ssl: payload.ssl,
+        redirect: payload.redirect,
+        behindCloudflare: payload.behindCloudflare,
+      }, { onProgress });
       if (!result.ok) throw refuse(result.error);
-      return { domain: result.domain, created: result.created, port: result.port, nginxReloaded: result.nginxReloaded };
+      return {
+        domain: result.domain,
+        created: result.created,
+        port: result.port,
+        www: result.www,
+        behindCloudflare: result.behindCloudflare,
+        ssl: result.ssl,
+        redirect: result.redirect,
+        nginxReloaded: result.nginxReloaded,
+      };
     }
 
     case 'unlinkDomain': {
@@ -269,6 +406,9 @@ export async function handleHubDeployHook(payload, { onFinished = null } = {}) {
         sha: run.sha,
         error: run.error,
         rolledBackTo: run.rolledBackTo ?? null,
+        reason: run.reason ?? null,
+        logTail: Array.isArray(run.logTail) ? run.logTail : [],
+        rollbackSucceeded: run.rollbackSucceeded ?? null,
         startedAt: run.startedAt,
         finishedAt: run.finishedAt,
       },

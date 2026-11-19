@@ -7,18 +7,33 @@ on: workflow_dispatch
 
 
 jobs:
-  build:
+  # Publishing is gated on CI. This workflow only runs on workflow_dispatch
+  # (see "on:" above), so a workflow_run trigger on ci.yml would never fire a
+  # manual run here; the same checks are reused as a job instead and
+  # publish-npm waits for it with needs:.
+  ci:
+    name: CI
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
       - run: npm ci
-      # - run: npm test
+      - name: Run tests
+        run: npm test
+      - name: Install dashboard UI dependencies
+        run: npm --prefix src/dashboard/ui install
+      - name: Typecheck the dashboard UI
+        run: npm --prefix src/dashboard/ui run typecheck
+      - name: Lint the dashboard UI
+        run: npm --prefix src/dashboard/ui run lint
+      - name: Build the dashboard UI
+        run: npm --prefix src/dashboard/ui run build
 
   publish-npm:
-    needs: build
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,8 +65,8 @@ jobs:
           "
           rm pack.json
 
-      # --ignore-scripts: the UI is already built above and the tests already
-      # ran in the build job, so prepublishOnly must not do both again.
-      - run: npm publish --ignore-scripts
+      # prepublishOnly (npm run build:ui && npm test) runs as part of publish;
+      # it is what gates the published tarball on a working build and tests.
+      - run: npm publish
         env:
           NODE_AUTH_TOKEN: ${{secrets.npm_token}}

@@ -6,8 +6,19 @@
  */
 
 import type { RealtimeClient } from '../socket';
-import type { DomainHealthEntry, LogLine, NginxStatus, NotificationEvent, ServerEvents } from '../types';
-import { mockServiceSnapshot, subscribeMockServiceChanges } from './index';
+import type {
+  DomainHealthEntry,
+  HubAgentStateEvent,
+  LogLine,
+  NginxStatus,
+  NotificationEvent,
+  ServerEvents,
+} from '../types';
+import {
+  mockHubAgentSnapshot,
+  mockServiceSnapshot,
+  subscribeMockServiceChanges,
+} from './index';
 
 type Handler = (payload: unknown) => void;
 
@@ -132,6 +143,10 @@ export async function createMockSocket(): Promise<RealtimeClient> {
           // every new connection; mirror that so the card is live on connect.
           const snapshot = mockServiceSnapshot();
           if (snapshot) fire('service:changed', snapshot);
+          // The server replays the agent state on connect; keep the Hub card
+          // live from the same event the real backend publishes.
+          const hub = mockHubAgentSnapshot();
+          if (hub) fire('hub:agentState', hub);
           unsubscribeService?.();
           unsubscribeService = subscribeMockServiceChanges((payload) => {
             if (connected) fire('service:changed', payload);
@@ -155,7 +170,30 @@ export async function createMockSocket(): Promise<RealtimeClient> {
               domain: 'api.example.com',
             })
           );
-        }, 5200)
+        }, 5200),
+        setTimeout(() => {
+          const current = mockHubAgentSnapshot();
+          if (!current?.linked) return;
+          const dropped: HubAgentStateEvent = {
+            ...current,
+            connected: false,
+            status: 'unreachable',
+            attempts: current.attempts + 1,
+            lastError: 'connect ECONNREFUSED 10.0.0.20:443',
+          };
+          fire('hub:agentState', dropped);
+        }, 9_000),
+        setTimeout(() => {
+          const current = mockHubAgentSnapshot();
+          if (!current?.linked) return;
+          fire('hub:agentState', {
+            ...current,
+            connected: true,
+            status: 'connected',
+            attempts: 0,
+            lastError: null,
+          });
+        }, 15_000)
       );
       intervals.push(
         setInterval(() => {

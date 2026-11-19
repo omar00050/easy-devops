@@ -76,7 +76,7 @@ async function startTestHub() {
   const io = new Server(http);
   const ns = io.of('/agent-socket');
 
-  const state = { connects: 0, evictions: 0, rejections: [], events: [], results: [], socket: null };
+  const state = { connects: 0, evictions: 0, rejections: [], events: [], results: [], progress: [], socket: null };
   const agentSockets = new Map();
 
   ns.use((socket, next) => {
@@ -105,6 +105,7 @@ async function startTestHub() {
     // The acknowledgement a dispatched command produces. Kept whole so a test
     // can assert on what the agent actually reported.
     socket.on('command:result', (payload) => state.results.push(payload));
+    socket.on('command:progress', (payload) => state.progress.push(payload));
 
     socket.on('disconnect', () => {
       if (agentSockets.get(socket.serverId) === socket) agentSockets.delete(socket.serverId);
@@ -691,6 +692,200 @@ async function testHandoverIsExclusive() {
   }
 }
 
+// ─── 9. Quick commands are acknowledged ─────────────────────────────────────
+
+/**
+ * The Hub answers a quick command's HTTP request from the socket.io
+ * acknowledgement. The agent must therefore do BOTH: call the ack (so a
+ * current Hub can answer its caller) and still emit `command:result` (so an
+ * older Hub, and any open browser, keeps working).
+ *
+ * The command used here is `hub:manageSSL { action: 'suggest' }`: read-only, no
+ * permission needed, and against an empty temp ssl directory it completes
+ * without touching nginx or the real certificate store.
+ */
+async function testCommandAcknowledgement() {
+  setGroup('9. quick commands: ack + command:result + a timing log');
+
+  const hub = await startTestHub();
+  const dataDir = scratch('command-ack');
+
+  const agent = await import(srcUrl('core/hub/agent.js'));
+  const { saveHubLink, clearHubLink } = await import(srcUrl('core/hubLink.js'));
+  const { dbSet } = await import(srcUrl('core/db.js'));
+
+  dbSet('config', {
+    nginxDir: path.join(dataDir, 'no-nginx'),
+    sslDir: path.join(dataDir, 'no-ssl'),
+    dashboardPort: 0,
+    dashboardAuth: 'none',
+    dashboardBindAddress: '127.0.0.1',
+    dashboardUi: 'new',
+    dashboardUiMigrated: true,
+    acmeEmail: '',
+    os: process.platform,
+  });
+  dbSet('domains', []);
+  saveHubLink({ hubUrl: hub.url, serverId: SERVER_ID, secret: SECRET });
+
+  // Capture, and still print, everything the agent logs while the command runs.
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => {
+    logs.push(args.map((a) => (typeof a === 'string' ? a : String(a))).join(' '));
+    originalLog.apply(console, args);
+  };
+
+  const REQUEST_ID = 'req-ack-1';
+  // A value that appears only in the arguments, never in a log line.
+  const CANARY = 'timing-canary-9f3c1.example.com';
+
+  try {
+    agent.initHubAgent();
+    check('the agent connects', await waitUntil(() => hub.live() === 1), `live: ${hub.live()}`);
+
+    let acked = null;
+    if (hub.state.socket) {
+      acked = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(null), 12_000);
+        hub.state.socket.emit(
+          'hub:manageSSL',
+          { action: 'suggest', domain: CANARY, requestId: REQUEST_ID },
+          (ack) => { clearTimeout(timer); resolve(ack); },
+        );
+      });
+    }
+
+    check('the agent called the acknowledgement', acked !== null);
+    check('the ack carries the requestId', acked?.requestId === REQUEST_ID, String(acked?.requestId));
+    check('the ack reports success', acked?.ok === true, acked?.error ?? '');
+    check('the ack carries the handler data',
+      Boolean(acked?.data) && typeof acked.data.found === 'boolean', JSON.stringify(acked?.data));
+
+    // Compatibility: the event is what an older Hub and every browser consume.
+    const sawEvent = await waitUntil(
+      () => hub.state.results.some((r) => r.requestId === REQUEST_ID),
+      5_000,
+    );
+    const event = hub.state.results.find((r) => r.requestId === REQUEST_ID);
+    check('command:result is still emitted', sawEvent);
+    check('the event agrees with the ack',
+      event?.ok === acked?.ok && Boolean(event?.data) === Boolean(acked?.data),
+      JSON.stringify(event));
+
+    const timing = logs.find((l) => l.startsWith('[hubAgent] hub:manageSSL '));
+    check('a timing line is logged for the command', Boolean(timing), timing ?? 'no timing line');
+    check('it names the command, its duration and the outcome',
+      /^\[hubAgent\] hub:manageSSL \d+ms (ok|error)$/.test(timing ?? ''), timing ?? '');
+    check('the timing line contains no argument value',
+      !(timing ?? '').includes(CANARY) && !(timing ?? '').includes(REQUEST_ID), timing ?? '');
+  } finally {
+    console.log = originalLog;
+    agent.stopHubAgent();
+    clearHubLink();
+    await hub.close();
+  }
+}
+
+// ─── 10. Progress frames belong to the command that asked for them ──────────
+
+/**
+ * The Hub correlates a `command:progress` frame by its requestId. This drives
+ * a real linkDomain command through the agent socket and checks that every
+ * frame carries that id, and that a command without one emits nothing.
+ *
+ * The nginx directory is made unusable on purpose (a file where a directory
+ * would have to be), so the domain write fails at once. The test therefore
+ * exercises the whole requestId → onProgress → socket path without running
+ * nginx, reloading a service or requesting a real certificate.
+ */
+async function testCommandProgress() {
+  setGroup('10. linkDomain emits command:progress for its own requestId only');
+
+  const hub = await startTestHub();
+  const dataDir = scratch('command-progress');
+
+  const agent = await import(srcUrl('core/hub/agent.js'));
+  const { saveHubLink, clearHubLink, saveHubPermissions } = await import(srcUrl('core/hubLink.js'));
+  const { dbSet } = await import(srcUrl('core/db.js'));
+  const apps = await import(srcUrl('core/deploy/apps.js'));
+
+  const blocker = path.join(dataDir, 'blocker');
+  fs.writeFileSync(blocker, 'not a directory', 'utf8');
+
+  dbSet('config', {
+    nginxDir: path.join(blocker, 'nginx'),
+    sslDir: path.join(dataDir, 'no-ssl'),
+    dashboardPort: 0,
+    dashboardAuth: 'none',
+    dashboardBindAddress: '127.0.0.1',
+    dashboardUi: 'new',
+    dashboardUiMigrated: true,
+    acmeEmail: 'ops@example.com',
+    os: process.platform,
+  });
+  dbSet('domains', []);
+  apps.createApp({
+    id: 'progress-app',
+    repoUrl: 'https://github.com/me/progress-app.git',
+    settings: { port: 4321 },
+  });
+  saveHubPermissions({ 'deploy.manage': true, 'domains.create': true, 'ssl.issue': true });
+  saveHubLink({ hubUrl: hub.url, serverId: SERVER_ID, secret: SECRET });
+
+  const REQUEST_ID = 'req-progress-1';
+
+  try {
+    agent.initHubAgent();
+    check('the agent connects', await waitUntil(() => hub.live() === 1), `live: ${hub.live()}`);
+
+    hub.state.socket.emit('hub:manageDeploy', {
+      action: 'linkDomain',
+      id: 'progress-app',
+      domain: 'progress.example.com',
+      ssl: { mode: 'issue' },
+      requestId: REQUEST_ID,
+    });
+
+    const answered = await waitUntil(
+      () => hub.state.results.some((r) => r.requestId === REQUEST_ID),
+      { timeoutMs: 15_000 },
+    );
+    check('the command is answered with its requestId', answered,
+      `${hub.state.results.length} result(s)`);
+
+    check('it emitted progress frames', hub.state.progress.length > 0,
+      `${hub.state.progress.length} frame(s)`);
+    check('every frame carries that requestId',
+      hub.state.progress.every((p) => p.requestId === REQUEST_ID),
+      hub.state.progress.map((p) => String(p.requestId)).join(', '));
+    check('every frame has a step, a valid status and an ISO timestamp',
+      hub.state.progress.every((p) =>
+        typeof p.step === 'string' && p.step.length > 0
+        && ['running', 'ok', 'failed', 'skipped'].includes(p.status)
+        && typeof p.at === 'string' && !Number.isNaN(Date.parse(p.at))));
+    check('the domain step is one of the frames',
+      hub.state.progress.some((p) => p.step === 'domain'));
+
+    const before = hub.state.progress.length;
+    hub.state.socket.emit('hub:manageDeploy', {
+      action: 'linkDomain',
+      id: 'progress-app',
+      domain: 'progress-no-id.example.com',
+      ssl: { mode: 'none' },
+    });
+    await sleep(1_500);
+
+    check('a command without a requestId emits no progress frame',
+      hub.state.progress.length === before,
+      `${hub.state.progress.length - before} extra frame(s)`);
+  } finally {
+    agent.stopHubAgent();
+    clearHubLink();
+    await hub.close();
+  }
+}
+
 // ─── main ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -705,6 +900,8 @@ async function main() {
   await testReconcileIsQuiet();
   await testSaveConfigReloadGate();
   await testSaveConfigDispatch();
+  await testCommandAcknowledgement();
+  await testCommandProgress();
   await testHandoverIsExclusive();
 
   const failed = results.filter((r) => !r.passed);

@@ -41,6 +41,8 @@ router.get('/:id/runs/:runId', (req, res, next) => controller.run(req, res, next
 router.post('/:id/hook-token', (req, res, next) => controller.hookToken(req, res, next));
 router.delete('/:id/hook-token', (req, res, next) => controller.revokeHookToken(req, res, next));
 router.post('/:id/deploy-key', (req, res, next) => controller.deployKey(req, res, next));
+router.post('/:id/deploy-key/test', (req, res, next) => controller.deployKeyTest(req, res, next));
+router.post('/:id/deploy-key/github', (req, res, next) => controller.deployKeyGithub(req, res, next));
 router.get('/:id/github', (req, res, next) => controller.github(req, res, next));
 router.post('/:id/github/apply', (req, res, next) => controller.githubApply(req, res, next));
 

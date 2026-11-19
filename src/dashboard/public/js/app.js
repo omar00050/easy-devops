@@ -164,7 +164,8 @@ createApp({
       },
 
       permissions: {
-        configured: false, loading: false, password: '', msg: '', error: '',
+        configured: false, loading: false, checking: false,
+        commands: [], refusedDirs: [], msg: '', error: '',
       },
 
       backup: {
@@ -1092,7 +1093,7 @@ createApp({
     async loadPermissionsStatus() {
       if (this.settings.platform === 'win32') { this.permissions.configured = true; return; }
       const r = await this.api('GET', '/api/settings/permissions');
-      if (r.ok) this.permissions.configured = r.data.configured;
+      if (r.ok) this.permissions.configured = r.data.configured === true;
     },
 
     // ── Hub ──────────────────────────────────────────────────────────────────────
@@ -1264,14 +1265,48 @@ createApp({
 
     async setupPermissions() {
       this.permissions.loading = true; this.permissions.msg = ''; this.permissions.error = '';
-      const r = await this.api('POST', '/api/settings/permissions/setup', { password: this.permissions.password });
+      // The dashboard never receives a sudo password: the endpoint takes no
+      // body and answers with the commands the operator runs themselves.
+      const r = await this.api('POST', '/api/settings/permissions/setup');
       this.permissions.loading = false;
-      if (r.ok) {
-        this.permissions.configured = true;
+      const d = r.data || {};
+      this.permissions.commands = Array.isArray(d.commands) ? d.commands : [];
+      this.permissions.refusedDirs = Array.isArray(d.refusedDirs) ? d.refusedDirs : [];
+      if (typeof d.configured === 'boolean') this.permissions.configured = d.configured;
+
+      if (!r.ok) {
+        this.permissions.error = d.error || 'Could not prepare the setup commands';
+      } else if (this.permissions.configured) {
         this.permissions.msg = 'Permissions configured ✓';
-        this.permissions.password = '';
+      } else if (this.permissions.commands.length) {
+        this.permissions.msg = '';
       } else {
-        this.permissions.error = r.data?.error || 'Setup failed';
+        this.permissions.error = 'No setup commands were returned';
+      }
+    },
+
+    async checkPermissionsAgain() {
+      this.permissions.checking = true; this.permissions.msg = ''; this.permissions.error = '';
+      const r = await this.api('GET', '/api/settings/permissions');
+      this.permissions.checking = false;
+      if (!r.ok) {
+        this.permissions.error = r.data?.error || 'Could not read the permissions status';
+        return;
+      }
+      this.permissions.configured = r.data.configured === true;
+      this.permissions.msg = this.permissions.configured
+        ? 'Permissions configured ✓'
+        : 'Still not configured — run the commands above in a terminal on the server.';
+    },
+
+    async copyPermissionCommands() {
+      const text = this.permissions.commands.join('\n');
+      if (!text) return;
+      try {
+        await navigator.clipboard.writeText(text);
+        this.permissions.msg = 'Commands copied to the clipboard';
+      } catch {
+        this.permissions.error = 'Copy failed — select the commands and copy them manually.';
       }
     },
 

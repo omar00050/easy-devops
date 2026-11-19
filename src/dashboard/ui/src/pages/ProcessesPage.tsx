@@ -929,6 +929,11 @@ export function ProcessesPage() {
 
                   {serviceView.runtime ? (
                     <RuntimeBlock runtime={serviceView.runtime} />
+                  ) : service?.probes?.pending ? (
+                    <p className="flex items-center gap-2 text-2xs text-faint">
+                      <Spinner />
+                      Measuring the Node runtime…
+                    </p>
                   ) : (
                     <p className="text-2xs text-faint">
                       The service and system Node versions are not available for this install.

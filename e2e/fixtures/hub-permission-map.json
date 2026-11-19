@@ -1,0 +1,26 @@
+{
+  "hub:manageDeploy": {
+    "actions": {
+      "list": null,
+      "detail": null,
+      "github": null,
+      "deploy": "deploy.run",
+      "rollback": "deploy.rollback",
+      "run": "deploy.logs",
+      "create": "deploy.manage",
+      "update": "deploy.manage",
+      "delete": "deploy.manage",
+      "deleteRelease": "deploy.manage",
+      "issueToken": "deploy.manage",
+      "regenerateKey": "deploy.manage",
+      "testKey": "deploy.manage",
+      "addKeyToGithub": "deploy.manage",
+      "linkDomain": ["deploy.manage", "domains.create"],
+      "unlinkDomain": "deploy.manage",
+      "move": "deploy.manage",
+      "getEnv": "deploy.env",
+      "setEnv": "deploy.env"
+    },
+    "linkDomainIssue": ["deploy.manage", "domains.create", "ssl.issue"]
+  }
+}

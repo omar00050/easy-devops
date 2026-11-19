@@ -6,14 +6,14 @@
  * It used to: nginx polling, domain health probes, certificate checks and the
  * notification decisions all lived here, driven by intervals that only ran
  * while a browser was connected. That is why none of it worked without an open
- * dashboard, and why it could not move into a service.
+ * dashboard.
  *
  * All of it now lives in core/jobs/, runs in whichever process owns the jobs,
  * and arrives here as events on core/jobs/bus.js — published either by the
  * monitors in this process, or by the daemon over IPC and republished onto the
  * bus by dashboard/lib/daemonBridge.js. This module's whole job is to forward
  * them to connected browsers unchanged, which is why the bus uses the names
- * and payloads from docs/api-contract.md.
+ * and payloads from API-CONTRACT.md.
  *
  * What is still genuinely socket work and stays here: the session and
  * local-request guards on the handshake, and the live log tails — a tail exists
@@ -27,7 +27,7 @@ import { socketRequireAuth } from './lib/requireAuth.js';
 import { socketRequireLocalRequest } from './lib/localRequest.js';
 import { loadConfig } from '../core/config.js';
 import { nginxLogPath } from '../core/platform.js';
-import { publish, subscribeAll } from '../core/jobs/bus.js';
+import { subscribeAll } from '../core/jobs/bus.js';
 
 let connectedClients = 0;
 const activeTails = new Map();
@@ -185,27 +185,6 @@ function stopTail(socketId) {
   }
 }
 
-// ─── Outbound helper ──────────────────────────────────────────────────────────
-
-/**
- * Tells every open dashboard tab that a section changed, so the UI can refresh
- * just that part instead of reloading the page.
- *
- * Used when a change did NOT originate in this browser — most importantly when
- * the Hub applies a command through core/hub/agent.js, or when another process
- * moves the revision counter.
- *
- * It publishes to the job bus rather than emitting at the socket server
- * directly, so the same call works in the daemon, which has no socket server,
- * and still reaches browsers through IPC. Safe to call before initSocket().
- *
- * @param {'domains'|'ssl'|'nginx'|'settings'} section
- * @param {Object} [detail] Optional extra context for the client
- */
-function emitLocalChange(section, detail = {}) {
-  publish('local:changed', { section, source: 'hub', at: Date.now(), ...detail });
-}
-
 /**
  * Stops everything initSocket() started: the bus subscription, every active
  * log tail (each is a spawned child process), and the Socket.io server itself.
@@ -243,4 +222,4 @@ async function stopSocket() {
   });
 }
 
-export { initSocket, stopSocket, emitLocalChange };
+export { initSocket, stopSocket };

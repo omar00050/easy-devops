@@ -1,6 +1,5 @@
 import fs from 'fs/promises';
 import path from 'path';
-import os from 'os';
 import crypto from 'crypto';
 import {
 	loadConfig, saveConfig, BIND_ALL, BIND_LOOPBACK, BIND_LOOPBACK_V6,
@@ -12,12 +11,28 @@ import { validatePort, validateEmail } from '../../core/validators.js';
 import {
 	getAutoRenewSettings, normalizeAutoRenewDays, MIN_AUTO_RENEW_DAYS, MAX_AUTO_RENEW_DAYS,
 } from '../../core/cert-renewal.js';
-import { run, runWithStdin } from '../../core/shell.js';
-import { checkPermissionsConfigured } from '../../core/permissions.js';
-import { dbGet, dbSet } from '../../core/db.js';
+import { isWindows } from '../../core/platform.js';
+import {
+	checkPermissionsConfigured, buildSetupScript, deriveOwnDirs,
+} from '../../core/permissions.js';
+import { dbGet } from '../../core/db.js';
 import { deployRoot, defaultDeployRoot, validateDeployDir } from '../../core/deploy/store.js';
 import { saveDomains } from '../../core/domains-db.js';
 import { loadChannels, saveChannels, sendNotification } from '../../core/notifier.js';
+
+/**
+ * The UI a configuration selects, resolved identically on read and write.
+ *
+ * Anything but an explicit `new` reads as `classic`, which is also the value a
+ * client must assume when the field is absent. GET and POST both go through
+ * here so they can never disagree about the same config.
+ *
+ * @param {Object} config
+ * @returns {string} One of UI_MODES
+ */
+function resolveDashboardUi(config) {
+	return config?.dashboardUi === UI_MODES.NEW ? UI_MODES.NEW : UI_MODES.CLASSIC;
+}
 
 class SettingsController {
 	get(req, res) {
@@ -48,13 +63,13 @@ class SettingsController {
 				dashboardAuth: effectiveAuthMode(config),
 				// Anything unrecognised reads as classic, which is also the
 				// default. The value only takes effect on restart.
-				dashboardUi: config.dashboardUi === UI_MODES.NEW ? UI_MODES.NEW : UI_MODES.CLASSIC,
+				dashboardUi: resolveDashboardUi(config),
 				// Whether the UI may offer 'none' at all: the bind must be loopback
 				// and the person asking must be on this machine.
 				canUseNoPassword: isLoopbackBind(dashboardBindAddress) &&
 					isLoopbackAddress(req.ip ?? req.socket?.remoteAddress),
 				hasPassword,
-				platform: process.platform === 'win32' ? 'win32' : 'linux',
+				platform: isWindows ? 'win32' : 'linux',
 			});
 		} catch (err) {
 			res.status(500).json({ error: 'Internal server error' });
@@ -208,7 +223,9 @@ class SettingsController {
 				success: true,
 				needsRestart,
 				dashboardAuth: effectiveAuthMode({ ...currentConfig, ...updates }),
-				dashboardUi: updates.dashboardUi ?? currentConfig.dashboardUi,
+				// Resolved by the same helper GET uses, so a stored value GET
+				// would read as classic cannot be echoed back as something else.
+				dashboardUi: resolveDashboardUi({ ...currentConfig, ...updates }),
 			});
 		} catch (err) {
 			res.status(500).json({ error: 'Internal server error' });
@@ -216,7 +233,7 @@ class SettingsController {
 	}
 
 	async getPermissions(req, res) {
-		if (process.platform === 'win32') return res.json({ configured: true });
+		if (isWindows) return res.json({ configured: true });
 		try {
 			const configured = await checkPermissionsConfigured();
 			res.json({ configured });
@@ -225,72 +242,60 @@ class SettingsController {
 		}
 	}
 
-	async setupPermissions(req, res) {
-		if (process.platform === 'win32') {
+	/**
+	 * POST /api/settings/permissions/setup
+	 *
+	 * Reports the sudoers state and the exact terminal commands that install
+	 * the rules. It INSTALLS NOTHING and never accepts a password:
+	 *
+	 *   - the request body is deliberately not read at all. An older client
+	 *     that still sends `password` has it ignored, never stored, never
+	 *     forwarded;
+	 *   - no privileged command runs here. `checkPermissionsConfigured()` only
+	 *     asks sudo whether it would prompt (`sudo -n`);
+	 *   - the operator pastes the commands into their own terminal, where sudo
+	 *     asks THEM for their password. That is the only place it is typed.
+	 *
+	 * `deps` exists so a test can drive both outcomes without a real dashboard
+	 * and without ever running sudo.
+	 *
+	 * @param {Object} req
+	 * @param {Object} res
+	 * @param {Object} [deps]
+	 * @param {boolean} [deps.isWindows]
+	 * @param {() => Promise<boolean>} [deps.checkConfigured]
+	 * @param {string} [deps.user] Account the rules are written for; defaults
+	 *        to the one this process runs as (injectable for tests)
+	 */
+	async setupPermissions(req, res, deps = {}) {
+		if (deps.isWindows ?? isWindows) {
 			return res.status(400).json({ error: 'Not applicable on Windows' });
 		}
 
-		const { password } = req.body ?? {};
-		if (!password || typeof password !== 'string') {
-			return res.status(400).json({ error: 'Password is required' });
-		}
-
-		const whichResult = await run('which nginx');
-		if (!whichResult.success || !whichResult.stdout.trim()) {
-			return res.status(500).json({ error: 'nginx not found. Is nginx installed?' });
-		}
-		const nginxPath = whichResult.stdout.trim().split('\n')[0].trim();
-		const user = os.userInfo().username;
-
-		const sudoRules = [
-			'/usr/bin/systemctl start nginx',
-			'/usr/bin/systemctl stop nginx',
-			'/usr/bin/systemctl reload nginx',
-			'/usr/bin/systemctl restart nginx',
-			'/usr/bin/systemctl',
-			nginxPath,
-			`${nginxPath} -t`,
-			`${nginxPath} -s reload`,
-			`${nginxPath} -s stop`,
-			`${nginxPath} -s quit`,
-			'/usr/bin/certbot',
-			'/usr/bin/mkdir',
-			'/usr/bin/cp',
-			'/usr/bin/chmod',
-			'/usr/bin/chown',
-			'/usr/bin/tee',
-		].join(', ');
-
-		const sudoersContent = `${user} ALL=(ALL) NOPASSWD: ${sudoRules}\n`;
-
-		const tmpFile = path.join('/tmp', `easy-devops-sudoers-${Date.now()}`);
 		try {
-			await fs.writeFile(tmpFile, sudoersContent, { mode: 0o600 });
+			const checkConfigured = deps.checkConfigured ?? checkPermissionsConfigured;
+
+			const { ownDirs, refused } = deriveOwnDirs(loadConfig());
+			const script = buildSetupScript({ user: deps.user, ownDirs });
+
+			let configured = false;
+			try {
+				configured = await checkConfigured();
+			} catch { /* reported as not configured, which is actionable */ }
+
+			if (!script.ok) {
+				return res.status(400).json({
+					configured,
+					error: script.reason,
+					commands: [],
+					refusedDirs: refused,
+				});
+			}
+
+			res.json({ configured, commands: script.lines, refusedDirs: refused });
 		} catch (err) {
-			return res.status(500).json({ error: 'Failed to write temp file', output: err.message });
+			res.status(500).json({ error: 'Internal server error' });
 		}
-
-		const setupCmd = [
-			`mkdir -p /etc/easy-devops /var/log/easy-devops`,
-			`chown ${user}:${user} /etc/easy-devops /var/log/easy-devops`,
-			`chown -R ${user}:${user} /etc/nginx/conf.d 2>/dev/null || true`,
-			`cp '${tmpFile}' /etc/sudoers.d/easy-devops`,
-			`chmod 440 /etc/sudoers.d/easy-devops`,
-		].join(' && ');
-
-		const result = await runWithStdin('sudo', ['-S', 'bash', '-c', setupCmd], password + '\n');
-		await fs.unlink(tmpFile).catch(() => {});
-
-		if (!result.success) {
-			const output = result.stderr || result.stdout;
-			const wrongPassword = output.includes('incorrect password') || output.includes('Sorry, try again') || output.includes('3 incorrect');
-			return res.status(wrongPassword ? 401 : 500).json({
-				error: wrongPassword ? 'Incorrect password' : 'Setup failed',
-				output,
-			});
-		}
-
-		res.json({ success: true });
 	}
 
 	backup(req, res) {
