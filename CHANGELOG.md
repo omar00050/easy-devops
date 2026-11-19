@@ -7,7 +7,58 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-11-19
+
+### Fixed
+
+- Windows Server-mode install failed at "Registering the service" with
+  "Unable to locate WinSW-x64.[xml|yml]": WinSW v2 only reads a config named
+  after its own executable. The wrapper is now stored as EasyDevOps.exe beside
+  EasyDevOps.xml, both names come from one constant, a leftover WinSW-x64.exe
+  is renamed or removed, an existing registration is removed and re-registered,
+  and a failed registration is cleaned up and printed with a hint.
+  **If you hit this error on 1.4.0: update, then simply run
+  `ezz service install` again.** It reuses the data already moved to
+  C:\ProgramData\easy-devops, finishes the install and starts the service; no
+  manual steps.
+- "migrated; backup at null": the install process had the database open, so
+  Windows refused to rename the original to its backup name; the original was
+  always kept, the message just did not say where. The database is now closed
+  for the move and reopened in the new location (so install details are
+  recorded in the live database), and the message names the real backup path,
+  or where the original was left. Same fix for moving the data back on
+  uninstall. A running dashboard now blocks the move with a message instead of
+  racing it.
+- After a failed Server-mode install, Server mode stays enabled with the
+  migrated data, and running `ezz service install` again resumes from there.
+
+### Changed
+
+- On Windows Server, answering No to "Install in Server mode?" offers Personal
+  mode, with a warning: it only runs while you are logged in, signing out of
+  RDP stops it (disconnecting keeps it), and it does not start at boot.
+  Personal mode is refused, with the steps to move the data back, while the
+  machine is already in Server mode.
+
 ## [1.4.0] — 2026-11-19
+
+### Highlights
+
+- **A native background service.** `ezz service install` registers a systemd
+  unit or a Windows service that runs `ezz daemon`; no PM2 for Easy DevOps
+  itself, and never a password.
+- **The React dashboard is the default UI**, served from the package; the
+  classic page stays one flag away (`--classic-ui`).
+- **Deployments**: put a Git project on the server with ordered steps, runtime
+  cards, preset cards, automatic rollback, live progress, and control from the
+  Hub.
+- **SSL that checks first**: a preflight stops before Let's Encrypt when DNS,
+  IPv6, a redirect or port 80 would fail, and issuing shows live stages.
+- **Pair with the Hub from the terminal** with a one-time
+  `ezz hub connect <link>`.
+- **Security hardening**: a session on every API route, scrypt passwords, a
+  one-time setup code, Host/Origin checks, and exactly five fixed sudo rules on
+  Linux.
 
 ### Upgrading from 1.2/1.3
 
@@ -854,117 +905,21 @@ Easy DevOps itself.
   the service install through UAC; declining the prompt is treated as an
   answer, not an error.
 
-#### New dashboard UI, behind a flag
-The React dashboard built earlier was first wired into the server behind a flag,
-without changing the default. It has since become the default — see "The React
-dashboard is now the default UI" under **Changed** — and `--classic-ui` is now
-the one-run way back to the old page.
-
-- **`ezz --dash`** serves the built React app from `dist/ui` by default, and
-  `--classic-ui` selects the old page for that run. (When this was first added
-  the flag ran the other way, `--new-ui`; that is still accepted and does
-  nothing.)
-- **`dashboardUi: "new" | "classic"`** in the settings, default `new`, so a
-  background service can select the UI on each boot without a flag. It takes
-  effect on restart; `--classic-ui` does not need one. Exposed by
-  `GET /api/settings` and accepted by `POST /api/settings`, which reports
-  `needsRestart`.
-- **Serving.** In new mode `dist/ui` is served at `/` with an `index.html`
-  fallback for deep links and immutable caching for built assets.
-  `/api` and `/socket.io` are mounted exactly as before; static files are
-  public, and every API route and socket handshake keeps the session,
-  Host/Origin, `X-EZ-Request` and bind-address rules in both UI modes.
-- **Missing build.** If the new UI is requested before `npm run build:ui` has
-  produced `dist/ui`, the server prints the expected path and that command, and
-  serves the classic UI for that run instead of failing to start.
-- **Build and packaging.** `npm run build:ui` installs and builds the UI;
-  `prepublishOnly` runs it before `npm test`. The published package ships
-  `dist/ui` and excludes the `src/dashboard/ui` sources and its
-  `node_modules`; `dist/ui` and `src/dashboard/ui/node_modules` are ignored by
-  git.
-- **Tests.** A suite covers classic by default, the flag and the setting, the
-  SPA fallback, the missing-build fallback, and every registered `/api` route
-  still returning 401 without a session while the new UI is on.
-
-#### Background service (via PM2)
-**Superseded in this cycle.** Easy DevOps itself no longer runs under PM2 — see
-"A native OS service, and never a password again". The PM2 behaviour below still
-describes the user's own applications, which the Processes page manages.
-
-Easy DevOps no longer needs a terminal left open. PM2 keeps the dashboard
-running, restarts it after a crash, and brings it back after a reboot; Easy
-DevOps manages PM2 on your behalf and never implements its own daemon.
-
-- **`ezz service install | uninstall | status | restart | logs`**. Install
-  starts the dashboard as the PM2 app **ez-dashboard** (or **ez-dashboard-dev**
-  under `--dev`/`EASY_DEVOPS_DATA_DIR`, with the data directory carried into
-  the saved process list), runs `pm2 save` so a reboot can restore it, and
-  offers `pm2-logrotate` so PM2's own logs cannot fill the disk. **Nothing is
-  installed without asking.**
-- **Start on boot, per platform.**
-  - *Linux / macOS*: `pm2 startup` detects the init system and prints the
-    command to run as root. Easy DevOps shows it rather than running it, so this
-    needs no sudoers rules at all.
-  - *Windows*: `pm2 startup` is unsupported, so install offers two modes.
-    **Personal/dev machine** drops a hidden launcher in the Startup folder
-    running `pm2 resurrect` — no administrator rights, no password, but it
-    starts at logon and stops when you sign out. **Server** creates a Task
-    Scheduler task at system startup as the same user with a 30-second delay,
-    which survives a reboot with nobody logged in. Windows Server is detected
-    (`Win32_OperatingSystem.ProductType`) and defaults to Server mode;
-    otherwise you are asked.
-- **Easy DevOps never sees your Windows password.** The server-mode task is
-  created with `schtasks /RP *`, which makes *Windows* prompt for it and store
-  it in its own credential vault. The password is not in the command, not in
-  argv, not in the database and not in any log line — asserted by a test. That
-  is also why server mode is CLI-only and needs an elevated, interactive
-  terminal; the dashboard reports the status and tells you to run
-  `ezz service install` in an Administrator PowerShell.
-- **Same-user checks.** PM2 keeps one process list per OS user, so a service
-  installed by another account cannot be controlled at all. The CLI, the
-  dashboard and the Hub all say so explicitly instead of silently doing nothing.
-- **Visibility everywhere.** `ezz service status` and the dashboard (Settings
-  and the new Processes page) show installed / running / start-on-boot and which
-  mechanism is in use. The agent reports the same to the Hub, where the server
-  page shows it — so a server running as a service with boot enabled means
-  "offline" is a real outage rather than a closed terminal.
-- **Updates.** `npm update -g easy-devops` through the CLI now restarts the
-  service instead of killing it by pid: PM2 owns the process, so a kill would
-  only revive the old code, and a detached copy would fight it for the port.
-  The Dashboard menu defers to the service when one is installed.
-- **New dashboard page: Processes.** Lists every PM2 app with status, CPU,
-  memory, uptime and restart count, with start / stop / restart / logs. Apps
-  Easy DevOps created are labelled; anything else is listed but asks for
-  confirmation before being stopped or restarted, because it may be an
-  unrelated production app sharing that PM2. These endpoints are behind the
-  dashboard session check.
-- **Hub:** a read-only process list and service panel on the server page.
-  Acting on a process remotely is available once the owner grants
-  `process.start`, `process.stop` and `process.restart`.
-- **Uninstall never breaks anyone else's start-on-boot.** The boot mechanism is
-  shared — one systemd unit, one scheduled task, one Startup launcher, each
-  just running `pm2 resurrect`, which restores *every* saved app. Uninstall
-  removes its own app and re-saves, but tears the mechanism down only when PM2
-  has no other apps left; otherwise it keeps it and names the apps it is
-  protecting. If the app list cannot be read at all it also keeps it, because
-  leaving a hook behind is recoverable and breaking someone's reboot is not.
-- **Detecting start-on-boot never runs `pm2 startup`.** That command is not a
-  query: given the rights to act it installs the hook, so using it to read
-  state would silently enable start-on-boot during a status check — and start
-  the PM2 daemon as a side effect. Detection reads
-  `systemctl is-enabled pm2-<user>` instead, and reports **unknown** rather
-  than guessing on systems that do not use systemd. The CLI, the dashboard and
-  the Hub all render that third state rather than showing it as "no".
-- **`status()` is cached for 60 seconds**, and invalidated immediately by
-  install, uninstall and restart. A status read shells out several times, and
-  the dashboard, Settings and the Hub agent all ask for it.
-- **A failed replacement says so.** `install` deletes the existing app before
-  starting the new one; if the start then fails, the result reports that the
-  previous service was removed and that nothing is running now, instead of
-  leaving the user to discover it.
-- No new npm dependencies: PM2 and pm2-logrotate are installed into the user's
-  environment, and the Windows paths use `schtasks` and the Startup folder,
-  both built in.
+#### Superseded during this cycle
+Two features were added earlier in this cycle and then replaced before release.
+The **dashboard UI behind a flag** (`--new-ui`) became the default: the React
+dashboard in `dist/ui` is served unless `dashboardUi: "classic"` or
+`--classic-ui` asks for the old page, and `--new-ui` is accepted and does
+nothing (see "The React dashboard is now the default UI" under **Changed**).
+The **background service via PM2** (`ez-dashboard`, `pm2 startup`, the Task
+Scheduler mode that needed a Windows password) was replaced by a native OS
+service running `ezz daemon` — see "A native OS service, and never a password
+again"; `core/service/legacy.js` only finds and offers to remove the old
+setup. What stays from that work is PM2 for the user's own apps: the
+**Processes** page lists every PM2 app (status, CPU, memory, uptime, restarts)
+with start, stop, restart and logs, asks before touching an app Easy DevOps did
+not create, and the Hub shows the same list, acting on it only with
+`process.start`, `process.stop` and `process.restart`.
 
 #### "No password" is now an explicit, bounded option
 An empty password used to mean "no login", which was indistinguishable from a
@@ -1315,7 +1270,7 @@ npm run test:e2e:check          the static-import check only
   release. Two principles were added: **VII. Test Isolation** (enforced in code,
   not convention) and **VIII. Simplicity and Zero Configuration** (measured by
   the time from install to a first domain on HTTPS).
-- **`CLAUDE.md` now carries the hard rules** as a 27-point summary, because
+- **`CLAUDE.md` now carries the hard rules** as a 30-rule summary, because
   spec-kit is no longer used day to day and the constitution was not being read.
   The two must be updated together.
 

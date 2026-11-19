@@ -146,18 +146,23 @@ export function backupPathFor(dir, now = new Date()) {
  * @param {string} opts.to
  * @param {boolean} [opts.keepBackup] Leave the backup in place (default true)
  * @param {(line: string) => void} [opts.log]
- * @returns {{ ok: true, moved: boolean, backup: string|null, reason?: string }
+ * `originalAt` always says where the original data is afterwards: the backup
+ * path when the rename worked, or `from` itself when it could not be renamed
+ * (Windows refuses to rename a directory while a file in it is open). It is
+ * null only when there was no original, or it was removed on request.
+ *
+ * @returns {{ ok: true, moved: boolean, backup: string|null, originalAt: string|null, reason?: string }
  *          | { ok: false, reason: string }}
  */
 export function moveDataDir({ from, to, keepBackup = true, log = () => {} }) {
   if (!fs.existsSync(from)) {
     // Nothing to move is a success: a fresh install has no per-user data, and
     // the service simply starts with an empty ProgramData directory.
-    return { ok: true, moved: false, backup: null, reason: `${from} does not exist` };
+    return { ok: true, moved: false, backup: null, originalAt: null, reason: `${from} does not exist` };
   }
 
   if (path.resolve(from).toLowerCase() === path.resolve(to).toLowerCase()) {
-    return { ok: true, moved: false, backup: null, reason: 'source and destination are the same' };
+    return { ok: true, moved: false, backup: null, originalAt: from, reason: 'source and destination are the same' };
   }
 
   const busy = assertNotInUse(from);
@@ -203,10 +208,12 @@ export function moveDataDir({ from, to, keepBackup = true, log = () => {} }) {
     // The copy is good and verified, so the data is safe in two places. Not
     // being able to rename the original is worth reporting but not worth
     // undoing a verified migration over.
+    log(`Original left in place at ${from} (it could not be renamed: ${err.code ?? err.message})`);
     return {
       ok: true,
       moved: true,
       backup: null,
+      originalAt: from,
       reason: `the data was copied and verified, but the original could not be renamed: ${err.message}. `
         + `It is still at ${from} — remove it by hand once you are satisfied.`,
     };
@@ -216,13 +223,30 @@ export function moveDataDir({ from, to, keepBackup = true, log = () => {} }) {
     try {
       fs.rmSync(backup, { recursive: true, force: true });
       log('Backup removed as requested.');
-      return { ok: true, moved: true, backup: null };
+      return { ok: true, moved: true, backup: null, originalAt: null };
     } catch (err) {
-      return { ok: true, moved: true, backup, reason: `the backup could not be removed: ${err.message}` };
+      return { ok: true, moved: true, backup, originalAt: backup, reason: `the backup could not be removed: ${err.message}` };
     }
   }
 
-  return { ok: true, moved: true, backup };
+  return { ok: true, moved: true, backup, originalAt: backup };
+}
+
+/**
+ * One line saying where the user's original data is after a migration.
+ *
+ * Exists because 1.4.0 printed `backup at null`: the rename to a backup name
+ * fails on Windows while the database inside is open, the original then stays
+ * where it was, and `backup` is null for exactly that reason. The data was
+ * never lost — the message just did not say where it was.
+ *
+ * @param {{ backup?: string|null, originalAt?: string|null }} result
+ * @returns {string}
+ */
+export function describeOriginal(result) {
+  if (result?.backup) return `the original is kept as a backup at ${result.backup}`;
+  if (result?.originalAt) return `the original was left in place at ${result.originalAt}; remove it by hand once you are satisfied`;
+  return 'there was no earlier data to keep';
 }
 
 /**
@@ -235,7 +259,8 @@ export function moveDataDir({ from, to, keepBackup = true, log = () => {} }) {
  *
  * @param {Object} [opts]
  * @param {(line: string) => void} [opts.log]
- * @returns {{ ok: boolean, dataDir: string, migrated: boolean, backup: string|null, reason?: string }}
+ * @returns {{ ok: boolean, dataDir: string, migrated: boolean, backup: string|null, originalAt?: string|null,
+ *             reason?: string }}
  */
 export function enableServerMode({ log = () => {} } = {}) {
   if (!isWindows) {
@@ -289,7 +314,7 @@ export function enableServerMode({ log = () => {} } = {}) {
   resetDataDirCache();
   log(`Server mode enabled. Data directory: ${target}`);
 
-  return { ok: true, dataDir: target, migrated: moved.moved, backup: moved.backup, reason: moved.reason };
+  return { ok: true, dataDir: target, migrated: moved.moved, backup: moved.backup, originalAt: moved.originalAt, reason: moved.reason };
 }
 
 /**
@@ -341,5 +366,5 @@ export function disableServerMode({ log = () => {} } = {}) {
   }
 
   log(`Server mode disabled. Data directory: ${target}`);
-  return { ok: true, dataDir: target, moved: moved.moved, backup: moved.backup, reason: moved.reason };
+  return { ok: true, dataDir: target, moved: moved.moved, backup: moved.backup, originalAt: moved.originalAt, reason: moved.reason };
 }

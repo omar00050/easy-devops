@@ -252,7 +252,30 @@ async function doInstall() {
         message: 'Install in Server mode?',
         default: true,
       }]);
-      mode = confirmServer ? service.MODES.SERVER : service.MODES.PERSONAL;
+      if (confirmServer) {
+        mode = service.MODES.SERVER;
+      } else {
+        // Allowed, but not without saying what it costs on a server: Personal
+        // mode is tied to this user's logon session.
+        console.log();
+        console.log('  ' + chalk.yellow('Personal mode instead:'));
+        console.log('  ' + chalk.gray('• It only runs while this user is logged in.'));
+        console.log('  ' + chalk.gray('• Signing out of RDP stops it; disconnecting the RDP window keeps it running.'));
+        console.log('  ' + chalk.gray('• It does not start at boot before someone logs in.'));
+        console.log();
+
+        const { confirmPersonal } = await inquirer.prompt([{
+          type: 'confirm',
+          name: 'confirmPersonal',
+          message: 'Install in Personal mode?',
+          default: true,
+        }]);
+        if (!confirmPersonal) {
+          console.log('  ' + chalk.gray('Nothing was changed.'));
+          return 0;
+        }
+        mode = service.MODES.PERSONAL;
+      }
     } else {
       const { chosen } = await inquirer.prompt([{
         type: 'list',
@@ -359,7 +382,8 @@ async function doInstall() {
 
   if (result.migrated) {
     console.log('  ' + chalk.gray(`Data moved to ${result.dataDir}`));
-    if (result.backup) console.log('  ' + chalk.gray(`Backup kept at ${result.backup}`));
+    const original = service.describeOriginal(result);
+    console.log('  ' + chalk.gray(`${original[0].toUpperCase()}${original.slice(1)}.`));
   }
 
   if (result.legacy?.removed?.length) {

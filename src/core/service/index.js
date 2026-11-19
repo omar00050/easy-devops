@@ -43,7 +43,8 @@ import {
 } from '../platform.js';
 import { run as shellRun } from '../shell.js';
 import { loadConfig } from '../config.js';
-import { dbGet, dbSet } from '../db.js';
+import { dbGet, dbSet, closeDb, reopenDb } from '../db.js';
+import { isPidAlive } from '../dashboardProcess.js';
 import { inspect as inspectLock, HEARTBEAT_INTERVAL_MS } from '../daemon/lock.js';
 import { requestStop, clearStopRequest, isStopRequested } from '../daemon/stopRequest.js';
 import { inspect as inspectOwner } from '../jobs/owner.js';
@@ -53,7 +54,7 @@ import * as systemd from './systemd.js';
 import * as windowsService from './windowsService.js';
 import * as windowsPersonal from './windowsPersonal.js';
 import * as legacy from './legacy.js';
-import { enableServerMode, disableServerMode } from './dataDir.js';
+import { enableServerMode, disableServerMode, describeOriginal } from './dataDir.js';
 import { linkRuntime, inspectRuntime, runtimeNodePath } from './runtime.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -396,14 +397,52 @@ async function installWindowsServer({ entry, root, log, legacyResult, deps = {} 
   // the service XML's EASY_DEVOPS_DATA_DIR — has to refer to the final
   // location, and a half-installed service pointing at the old one would see
   // an empty database.
+  //
+  // A machine already in Server mode — including one left there by a 1.4.0
+  // install that failed at "Registering the service" — skips the migration
+  // and resumes from here: enableServerMode() sees the marker and returns
+  // without copying, so a ProgramData database that is already the live data
+  // is reused rather than refused.
+  const migrating = !(deps.isServerMode ?? isServerMode)();
+
+  if (migrating) {
+    // A dashboard started from the menu holds the per-user database open. It
+    // would make the backup rename fail, and it would keep writing to a copy
+    // nothing reads once the move is done.
+    const dashboardPid = dbGet('dashboard-pid');
+    if (dashboardPid && (deps.isPidAlive ?? isPidAlive)(dashboardPid)) {
+      return {
+        ok: false,
+        mechanism: 'winsw',
+        mode: MODES.SERVER,
+        reason: `the dashboard is running (pid ${dashboardPid}) and has the database open, so the data `
+          + 'cannot be moved safely. Stop it first (Easy DevOps > Dashboard > Stop), then run '
+          + 'ezz service install again. Nothing was changed.',
+        legacy: legacyResult,
+      };
+    }
+  }
+
   log('Switching to the machine-wide data directory…');
-  const switched = (deps.enableServerMode ?? enableServerMode)({ log });
+
+  // This process's own connection is closed for the move, so Windows can
+  // rename the original to its backup name, then reopened on whichever
+  // directory getDataDir() now answers — the new one on success, the old one
+  // if the switch was refused. Everything after this (loadConfig, record)
+  // must read and write the live database, not the abandoned copy.
+  (deps.closeDb ?? closeDb)();
+  let switched;
+  try {
+    switched = (deps.enableServerMode ?? enableServerMode)({ log });
+  } finally {
+    (deps.reopenDb ?? reopenDb)();
+  }
   if (!switched.ok) {
     return { ok: false, mechanism: 'winsw', mode: MODES.SERVER, reason: switched.reason, legacy: legacyResult };
   }
 
   const dataDir = switched.dataDir;
-  if (switched.migrated) log(`  migrated; backup at ${switched.backup}`);
+  if (switched.migrated) log(`  migrated; ${describeOriginal(switched)}`);
 
   const config = loadConfig();
 
@@ -415,12 +454,22 @@ async function installWindowsServer({ entry, root, log, legacyResult, deps = {} 
     ...(deps.windowsServiceOpts ?? {}),
   });
   if (!installed.ok) {
+    // Server mode is deliberately KEPT after a failed install. The data was
+    // copied and verified and the original is still on disk, so nothing is at
+    // risk; moving it back and forth would be. Any half-registered service has
+    // already been removed by windowsService.install(), and running
+    // `ezz service install` again resumes from this point.
+    const resume = installed.needsElevation
+      ? ''
+      : `\n\nServer mode stays enabled (data in ${dataDir}); after fixing the cause, run `
+        + 'ezz service install again to finish — it resumes from here.';
     return {
       ok: false,
       mechanism: 'winsw',
       mode: MODES.SERVER,
-      reason: installed.reason,
+      reason: `${installed.reason}${resume}`,
       needsElevation: installed.needsElevation ?? false,
+      registrationFailed: installed.registrationFailed ?? false,
       dataDir,
       legacy: legacyResult,
     };
@@ -458,6 +507,7 @@ async function installWindowsServer({ entry, root, log, legacyResult, deps = {} 
     dataDir,
     migrated: switched.migrated,
     backup: switched.backup,
+    originalAt: switched.originalAt ?? null,
     granted: installed.granted,
     aclFailures: installed.aclFailures,
     runtime: installed.runtime,
@@ -470,6 +520,25 @@ async function installWindowsServer({ entry, root, log, legacyResult, deps = {} 
 async function installWindowsPersonal({ entry, log, legacyResult, deps = {} }) {
   const dataDir = getDataDir();
   const wp = deps.windowsPersonal ?? windowsPersonal;
+
+  // Personal mode runs as the logged-in user. On a machine already in Server
+  // mode the live data is under ProgramData, written by an elevated install,
+  // and a per-user daemon there could not write its own database. So the data
+  // has to come back to %APPDATA% first, through the uninstall question that
+  // already asks exactly that — never silently from here.
+  if ((deps.isServerMode ?? isServerMode)()) {
+    return {
+      ok: false,
+      mechanism: 'startup-supervisor',
+      mode: MODES.PERSONAL,
+      reason: `this machine is in Server mode: the data is in ${programDataDir()}.\n`
+        + 'Personal mode needs it back in %APPDATA% first. In an Administrator PowerShell run\n'
+        + '  ezz service uninstall\n'
+        + 'and choose to move the data back, then install again and pick Personal mode.\n'
+        + 'Or answer Yes to Server mode to finish the Server install instead.',
+      legacy: legacyResult,
+    };
+  }
 
   const installed = wp.install({ dataDir, entry, log, ...(deps.windowsPersonalOpts ?? {}) });
   if (!installed.ok) {
@@ -551,12 +620,22 @@ export async function uninstall({
       result.dataDir = programDataDir();
     } else {
       log('Moving the data back to %APPDATA%…');
-      const moved = (deps.disableServerMode ?? disableServerMode)({ log });
+      // Same reason as on install: this process's own handle would stop
+      // Windows renaming the ProgramData directory, and every write after the
+      // move must reach the database that is now live.
+      (deps.closeDb ?? closeDb)();
+      let moved;
+      try {
+        moved = (deps.disableServerMode ?? disableServerMode)({ log });
+      } finally {
+        (deps.reopenDb ?? reopenDb)();
+      }
       if (!moved.ok) return { ok: false, ...result, reason: moved.reason };
       result.dataDir = moved.dataDir;
       result.movedData = moved.moved;
       result.backup = moved.backup;
-      if (moved.backup) result.notes.push(`A backup was kept at ${moved.backup}`);
+      result.originalAt = moved.originalAt ?? null;
+      if (moved.moved) result.notes.push(`Data moved back: ${describeOriginal(moved)}.`);
     }
   } else {
     const removed = (deps.windowsPersonal ?? windowsPersonal).uninstall({ log, ...(deps.windowsPersonalOpts ?? {}) });
@@ -1125,4 +1204,4 @@ export function recordRuntime({ nodeExe }) {
   dbSet(STATE_KEY, { ...existing, nodeExe, runtimeUpdatedAt: new Date().toISOString() });
 }
 
-export { legacy, runtimeNodePath };
+export { legacy, runtimeNodePath, describeOriginal };

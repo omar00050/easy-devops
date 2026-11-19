@@ -32,7 +32,9 @@ import { programDataDir, isWindows } from '../platform.js';
 import {
   SERVICE_ID,
   SERVICE_DISPLAY_NAME,
-  WINSW_ASSET,
+  WINSW_EXE_NAME,
+  WINSW_XML_NAME,
+  LEGACY_WINSW_NAME,
   buildServiceXml,
   downloadWinsw,
   verifyWinsw,
@@ -44,15 +46,22 @@ import { runtimeDir, copyRuntime, verifyNativeModules } from './runtime.js';
 export function binDir() {
   return path.join(programDataDir(), 'bin');
 }
+/**
+ * The wrapper and its definition: `EasyDevOps.exe` beside `EasyDevOps.xml`.
+ *
+ * WinSW v2 reads its configuration only from `<own base name>.xml` in its own
+ * directory — a path given on the command line is ignored — so the two names
+ * must share a stem. Both come from winsw.js, derived from SERVICE_ID.
+ */
 export function winswPath() {
-  return path.join(binDir(), WINSW_ASSET);
+  return path.join(binDir(), WINSW_EXE_NAME);
 }
 export function serviceXmlPath() {
-  // WinSW requires the XML to sit beside the executable with the same stem,
-  // OR to be named as an argument. It is named explicitly here, but keeping it
-  // in the same directory means a `WinSW-x64.xml` convention also works if a
-  // future WinSW version insists on it.
-  return path.join(binDir(), `${SERVICE_ID}.xml`);
+  return path.join(binDir(), WINSW_XML_NAME);
+}
+/** Where 1.4.0 left the wrapper. Only ever removed, never run. */
+export function legacyWinswPath() {
+  return path.join(binDir(), LEGACY_WINSW_NAME);
 }
 export function logDir() {
   return path.join(programDataDir(), 'logs');
@@ -111,6 +120,82 @@ export function elevationMessage() {
   ].join('\n');
 }
 
+/** Combined output of a shell result, trimmed. */
+function outputOf(result) {
+  return `${result?.stdout ?? ''}\n${result?.stderr ?? ''}`.trim();
+}
+
+/**
+ * Whether the Service Control Manager knows a service called SERVICE_ID.
+ *
+ * Asked of `sc`, not of WinSW: a registration left behind by a failed or
+ * interrupted install may point at a wrapper that no longer exists, and `sc`
+ * still answers for it. 1060 is "The specified service does not exist".
+ *
+ * @returns {Promise<boolean|null>} null when `sc` itself gave no usable answer
+ */
+export async function isRegistered({ run = shellRun } = {}) {
+  const result = await run(`sc query ${SERVICE_ID}`, { timeout: 20_000 });
+  const output = outputOf(result);
+  if (result.success || /STATE\s*:/i.test(output)) return true;
+  if (/1060|does not exist/i.test(output)) return false;
+  return null;
+}
+
+/**
+ * Removes a registration of SERVICE_ID, whatever state it is in.
+ *
+ * WinSW's own `stop`/`uninstall` first, when the wrapper is present and has
+ * its definition beside it — that is the clean path. Then, if the Service
+ * Control Manager still knows the name, `sc stop` + `sc delete`, which work
+ * without the wrapper. A service that is marked for deletion while a handle
+ * is open (services.msc, for instance) disappears once that handle closes;
+ * `sc delete` reports success in that case, and so does this.
+ *
+ * @returns {Promise<{ ok: boolean, removed: boolean, reason?: string }>}
+ */
+export async function unregister({ run = shellRun, log = () => {} } = {}) {
+  let removed = false;
+
+  if (fs.existsSync(winswPath()) && fs.existsSync(serviceXmlPath())) {
+    await run(`& "${winswPath()}" stop`, { timeout: 60_000 });
+    const viaWinsw = await run(`& "${winswPath()}" uninstall`, { timeout: 60_000 });
+    if (viaWinsw.success) removed = true;
+  }
+
+  const still = await isRegistered({ run });
+  if (still === false) return { ok: true, removed };
+
+  await run(`sc stop ${SERVICE_ID}`, { timeout: 60_000 });
+  const deleted = await run(`sc delete ${SERVICE_ID}`, { timeout: 30_000 });
+  const output = outputOf(deleted);
+
+  if (deleted.success || /1060|does not exist/i.test(output)) {
+    log(`Removed the ${SERVICE_ID} service registration.`);
+    return { ok: true, removed: true };
+  }
+  if (/1072|marked for deletion/i.test(output)) {
+    return {
+      ok: true,
+      removed: true,
+      reason: 'Windows has marked the service for deletion; close services.msc (or reboot) to finish it.',
+    };
+  }
+  return { ok: false, removed, reason: output.slice(0, 400) || `sc delete ${SERVICE_ID} failed` };
+}
+
+/** Removes the wrapper 1.4.0 left under its release name. Best effort. */
+function removeLegacyWinsw(log) {
+  const legacy = legacyWinswPath();
+  if (legacy === winswPath() || !fs.existsSync(legacy)) return;
+  try {
+    fs.rmSync(legacy, { force: true });
+    log(`Removed ${legacy} (the wrapper's old name).`);
+  } catch (err) {
+    log(`  warning: could not remove ${legacy}: ${err.message}`);
+  }
+}
+
 /**
  * Installs the service.
  *
@@ -134,7 +219,10 @@ export function elevationMessage() {
  * @param {(line: string) => void} [opts.log]
  * @param {Function} [opts.run]
  * @param {Function} [opts.fetchImpl]
- * @returns {Promise<{ ok: boolean, reason?: string, granted?: string[], runtime?: Object }>}
+ * @param {Object} [opts.deps]  Injected for tests: canWrite, isWindows, copyRuntime, verifyNativeModules,
+ *                              verifyWinsw
+ * @returns {Promise<{ ok: boolean, reason?: string, granted?: string[], runtime?: Object,
+ *                     registrationFailed?: boolean }>}
  */
 export async function install({
   dataDir,
@@ -143,21 +231,22 @@ export async function install({
   log = () => {},
   run = shellRun,
   fetchImpl = fetch,
+  deps = {},
 } = {}) {
-  if (!isWindows) return { ok: false, reason: 'Server mode is Windows-only' };
+  if (!(deps.isWindows ?? isWindows)) return { ok: false, reason: 'Server mode is Windows-only' };
 
-  if (!canWriteProgramData()) {
+  if (!(deps.canWrite ?? canWriteProgramData)()) {
     return { ok: false, reason: elevationMessage(), needsElevation: true };
   }
 
   // ── 1. The pinned runtime ────────────────────────────────────────────────
   log('Copying the runtime…');
-  const runtime = copyRuntime({ dataDir, appRoot, log });
+  const runtime = (deps.copyRuntime ?? copyRuntime)({ dataDir, appRoot, log });
   if (!runtime.ok) return { ok: false, reason: runtime.reason };
 
   // ── 2. Prove it can actually run ─────────────────────────────────────────
   log('Checking that native modules load with the copied node.exe…');
-  const native = await verifyNativeModules({
+  const native = await (deps.verifyNativeModules ?? verifyNativeModules)({
     nodeExe: runtime.nodeExe,
     appDir: path.join(runtime.dir, 'app'),
   });
@@ -169,9 +258,10 @@ export async function install({
   }
   log(`  ok — Node ${native.version}, ABI ${native.abi}`);
 
-  // ── 3. WinSW, hash-verified ──────────────────────────────────────────────
-  const winsw = await downloadWinsw({ dest: winswPath(), log, fetchImpl });
+  // ── 3. WinSW, hash-verified, stored as EasyDevOps.exe ────────────────────
+  const winsw = await downloadWinsw({ dest: winswPath(), log, fetchImpl, verify: deps.verifyWinsw });
   if (!winsw.ok) return { ok: false, reason: winsw.reason };
+  removeLegacyWinsw(log);
 
   // ── 4. The service definition ────────────────────────────────────────────
   const xml = buildServiceXml({
@@ -195,11 +285,50 @@ export async function install({
   // The ACL grants have to come AFTER this: `NT SERVICE\EasyDevOps` does not
   // exist as a security principal until a service of that name is registered,
   // and icacls refuses an unknown account.
+  //
+  // A registration left by an earlier attempt (an interrupted install, or one
+  // that pointed at a wrapper that has since moved) is removed first:
+  // `winsw install` refuses a name that already exists, and re-registering is
+  // the only way to make it point at this wrapper and this definition.
+  const existing = await isRegistered({ run });
+  if (existing) {
+    log(`A ${SERVICE_ID} service is already registered; removing it before registering again…`);
+    const cleared = await unregister({ run, log });
+    if (!cleared.ok) {
+      return {
+        ok: false,
+        registrationFailed: true,
+        reason: `an existing ${SERVICE_ID} service could not be removed first:\n${cleared.reason}\n\n`
+          + `Hint: stop and delete it in an Administrator PowerShell (sc.exe stop ${SERVICE_ID}; `
+          + `sc.exe delete ${SERVICE_ID}), then run ezz service install again.`,
+      };
+    }
+  }
+
+  // No path argument: WinSW v2 ignores it and reads `EasyDevOps.xml` beside
+  // `EasyDevOps.exe`. Passing it suggested otherwise, which is how the name
+  // mismatch went unnoticed.
   log('Registering the service…');
-  const registered = await run(`& "${winswPath()}" install "${serviceXmlPath()}"`, { timeout: 120_000 });
+  const registered = await run(`& "${winswPath()}" install`, { timeout: 120_000 });
   if (!registered.success) {
-    const output = `${registered.stdout ?? ''}\n${registered.stderr ?? ''}`.trim();
-    return { ok: false, reason: `WinSW could not register the service:\n${output.slice(0, 600)}` };
+    const output = outputOf(registered);
+
+    // WinSW can fail after the Service Control Manager accepted the name, so
+    // a failed register is followed by a clean-up: nothing half-registered is
+    // left for the next attempt to trip over.
+    const cleanup = await unregister({ run, log });
+    const leftover = cleanup.ok
+      ? 'Nothing was left registered.'
+      : `A partial registration could not be removed (${cleanup.reason}); `
+        + `remove it with: sc.exe delete ${SERVICE_ID}`;
+
+    return {
+      ok: false,
+      registrationFailed: true,
+      reason: `WinSW could not register the service:\n${output.slice(0, 600)}\n\n`
+        + `Hint: ${WINSW_EXE_NAME} and ${WINSW_XML_NAME} must sit side by side in ${binDir()}; `
+        + `fix the cause above and run ezz service install again in an Administrator PowerShell. ${leftover}`,
+    };
   }
 
   // ── 6. ACLs, from the live Settings — never a hardcoded path ─────────────
@@ -265,21 +394,18 @@ export async function uninstall({ dataDir, config = {}, log = () => {}, run = sh
 
   const notes = [];
 
-  if (fs.existsSync(winswPath())) {
-    // Stop first. A stop of something already stopped exits non-zero, which is
-    // not a failure worth aborting on.
-    const stopped = await run(`& "${winswPath()}" stop`, { timeout: 60_000 });
-    if (!stopped.success) notes.push('the service was not running');
-
-    const removed = await run(`& "${winswPath()}" uninstall`, { timeout: 60_000 });
-    if (!removed.success) {
-      const output = `${removed.stdout ?? ''}\n${removed.stderr ?? ''}`.trim();
-      return { ok: false, reason: `WinSW could not unregister the service:\n${output.slice(0, 600)}` };
-    }
-    log('Service unregistered.');
-  } else {
-    notes.push(`${WINSW_ASSET} was not found, so there was nothing to unregister`);
+  // WinSW's own stop + uninstall when the wrapper is there, and `sc delete`
+  // for a registration whose wrapper is missing — so a service left behind by
+  // a failed or interrupted install can always be removed.
+  const removed = await unregister({ run, log });
+  if (!removed.ok) {
+    return { ok: false, reason: `the service could not be unregistered:\n${removed.reason}` };
   }
+  if (removed.reason) notes.push(removed.reason);
+  if (removed.removed) log('Service unregistered.');
+  else notes.push('no service was registered, so there was nothing to unregister');
+
+  removeLegacyWinsw(log);
 
   // Revoked while the account still resolves. After the service is gone the
   // SID may no longer map to a name, and icacls would refuse — so the order

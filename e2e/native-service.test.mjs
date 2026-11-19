@@ -19,8 +19,9 @@
  *   - the ProgramData path is redirected by overriding `%ProgramData%` for the
  *     child processes that need it, and `assertNoRealArtifacts()` at the end
  *     proves none of the real locations were written.
- *   - `windowsService.install()` and friends are never called directly: they
- *     probe real elevation. The dispatcher is tested with them replaced.
+ *   - `windowsService.install()` is driven with `deps` that replace the
+ *     elevation probe, the runtime copy and the WinSW verification, and with an
+ *     injected `run`; the dispatcher is tested with the mechanism replaced.
  *
  * The one thing that really runs is the generated Personal-mode batch script,
  * against a stub daemon in the temp directory — because batch syntax cannot be
@@ -109,6 +110,50 @@ function stubRun(rules = []) {
 
   run.calls = calls;
   run.matching = (re) => calls.filter((c) => re.test(c));
+  return run;
+}
+
+/**
+ * A `run` stub for the Windows-service install flow.
+ *
+ * `sc query` answers from a mutable registration state, so a test can model a
+ * machine with no service, one that is already registered, or one whose
+ * registration disappears only after `sc delete`. Every other command the
+ * install makes is answered here; an unrecognised one fails, like stubRun.
+ */
+function serviceRun({ registered = false, registerResult = null } = {}) {
+  const calls = [];
+  const state = { registered };
+
+  const run = async (cmd) => {
+    calls.push(cmd);
+
+    if (/^sc query /.test(cmd)) {
+      return state.registered
+        ? { success: true, stdout: 'SERVICE_NAME: EasyDevOps\n        STATE              : 4  RUNNING' }
+        : {
+          success: false,
+          stdout: '',
+          stderr: 'The specified service does not exist as an installed service. (1060)',
+        };
+    }
+    if (/^sc delete /.test(cmd)) {
+      state.registered = false;
+      return { success: true, stdout: '' };
+    }
+    if (/ install$/.test(cmd)) {
+      if (registerResult) return registerResult;
+      state.registered = true;
+      return { success: true, stdout: '', stderr: '' };
+    }
+    if (/icacls /.test(cmd)) return { success: true, stdout: 'Successfully processed 1 files' };
+    if (/ (stop|uninstall|start)$/.test(cmd)) return { success: true, stdout: '', stderr: '' };
+
+    return { success: false, stdout: '', stderr: `serviceRun: no rule for: ${cmd}`, unmatched: true };
+  };
+
+  run.calls = calls;
+  run.state = state;
   return run;
 }
 
@@ -1583,6 +1628,481 @@ async function testServiceEndpoints() {
   }
 }
 
+// ─── 25. One name for the wrapper and its config ────────────────────────────
+
+async function testServiceFileNames() {
+  setGroup('25. the wrapper and its config share one name');
+
+  const winsw = await import(srcUrl('core/service/winsw.js'));
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+
+  check('the wrapper is named after the service id',
+    winsw.WINSW_EXE_NAME === `${winsw.SERVICE_ID}.exe`, winsw.WINSW_EXE_NAME);
+  check('the config is named after the service id',
+    winsw.WINSW_XML_NAME === `${winsw.SERVICE_ID}.xml`, winsw.WINSW_XML_NAME);
+
+  const exeStem = path.basename(ws.winswPath(), path.extname(ws.winswPath()));
+  const xmlStem = path.basename(ws.serviceXmlPath(), path.extname(ws.serviceXmlPath()));
+  check('the wrapper and the config share a base name',
+    exeStem === xmlStem && exeStem === winsw.SERVICE_ID, `${exeStem} / ${xmlStem}`);
+  check('and live in the same directory',
+    path.dirname(ws.winswPath()) === path.dirname(ws.serviceXmlPath()));
+  check('the installed wrapper is NOT the release asset name',
+    path.basename(ws.winswPath()) !== winsw.WINSW_ASSET && winsw.WINSW_EXE_NAME !== winsw.WINSW_ASSET,
+    path.basename(ws.winswPath()));
+  check('the legacy name is the release asset name, so it can be found and removed',
+    winsw.LEGACY_WINSW_NAME === winsw.WINSW_ASSET
+      && path.basename(ws.legacyWinswPath()) === winsw.WINSW_ASSET);
+}
+
+// ─── 26. A 1.4.0 leftover is upgraded in place ──────────────────────────────
+
+async function testWinswLeftoverUpgrade() {
+  setGroup('26. a 1.4.0 leftover upgrades in place');
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const platform = await import(srcUrl('core/platform.js'));
+
+  const previous = process.env.ProgramData;
+  const root = scratch('winsw-leftover');
+  process.env.ProgramData = root;
+  platform.resetDataDirCache();
+
+  try {
+    const dataDir = platform.programDataDir();
+    const bin = path.join(dataDir, 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+
+    // Exactly what 1.4.0 left behind after it failed at "Registering the
+    // service": the marker, the moved database, the release-named wrapper and
+    // the config it could never find.
+    fs.writeFileSync(path.join(dataDir, '.server-mode'), '{}\n');
+    fs.writeFileSync(path.join(dataDir, 'easy-devops.sqlite'), 'EXISTING');
+    fs.writeFileSync(path.join(bin, 'WinSW-x64.exe'), 'dummy legacy wrapper bytes');
+    fs.writeFileSync(path.join(bin, 'EasyDevOps.xml'), '<service/>');
+
+    const run = serviceRun({ registered: false });
+
+    let fetched = false;
+    const installed = await ws.install({
+      dataDir,
+      appRoot: path.join(root, 'app'),
+      config: {},
+      run,
+      fetchImpl: async () => {
+        fetched = true;
+        throw new Error('a verified leftover must not be downloaded again');
+      },
+      deps: {
+        canWrite: () => true,
+        isWindows: true,
+        copyRuntime: () => ({
+          ok: true,
+          dir: path.join(dataDir, 'runtime'),
+          nodeExe: 'NODE',
+          entry: 'ENTRY',
+        }),
+        verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
+        verifyWinsw: async () => ({ ok: true, sha256: 'stub' }),
+      },
+    });
+
+    check('the install succeeds', installed.ok === true, installed.reason ?? '');
+    check('the wrapper is now EasyDevOps.exe', fs.existsSync(ws.winswPath()));
+    check('the 1.4.0 WinSW-x64.exe is gone', !fs.existsSync(ws.legacyWinswPath()));
+    check('EasyDevOps.xml sits beside the wrapper',
+      fs.existsSync(ws.serviceXmlPath())
+        && path.dirname(ws.serviceXmlPath()) === path.dirname(ws.winswPath()));
+
+    const register = run.calls.find((c) => / install$/.test(c));
+    check('the register command is exactly the wrapper with install, no XML path',
+      register === `& "${ws.winswPath()}" install`, register ?? '(none)');
+    check('no download happened', fetched === false);
+
+    const registerAt = run.calls.indexOf(register);
+    const aclAt = run.calls.findIndex((c) => /icacls /.test(c));
+    check('the ACL grant runs after the registration', aclAt > registerAt,
+      `register ${registerAt}, acl ${aclAt}`);
+    check('start is the last command',
+      run.calls[run.calls.length - 1] === `& "${ws.winswPath()}" start`,
+      run.calls[run.calls.length - 1]);
+  } finally {
+    if (previous === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previous;
+    platform.resetDataDirCache();
+  }
+}
+
+// ─── 27. An existing registration is replaced, not tripped over ─────────────
+
+async function testWinswReregisters() {
+  setGroup('27. an existing registration is replaced');
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const platform = await import(srcUrl('core/platform.js'));
+
+  const previous = process.env.ProgramData;
+  const root = scratch('winsw-reregister');
+  process.env.ProgramData = root;
+  platform.resetDataDirCache();
+
+  try {
+    const dataDir = platform.programDataDir();
+    fs.mkdirSync(path.join(dataDir, 'bin'), { recursive: true });
+    fs.writeFileSync(ws.winswPath(), 'dummy wrapper bytes');
+    fs.writeFileSync(path.join(dataDir, '.server-mode'), '{}\n');
+
+    // Registered at first; WinSW's uninstall does not clear the SCM's view in
+    // this stub, so only `sc delete` does. That is the awkward real case.
+    const run = serviceRun({ registered: true });
+
+    const installed = await ws.install({
+      dataDir,
+      appRoot: path.join(root, 'app'),
+      config: {},
+      run,
+      fetchImpl: async () => { throw new Error('the wrapper is already present'); },
+      deps: {
+        canWrite: () => true,
+        isWindows: true,
+        copyRuntime: () => ({
+          ok: true,
+          dir: path.join(dataDir, 'runtime'),
+          nodeExe: 'NODE',
+          entry: 'ENTRY',
+        }),
+        verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
+        verifyWinsw: async () => ({ ok: true, sha256: 'stub' }),
+      },
+    });
+
+    check('the install succeeds even though a service was registered',
+      installed.ok === true, installed.reason ?? '');
+
+    const registerAt = run.calls.findIndex((c) => / install$/.test(c));
+    const before = run.calls.slice(0, registerAt);
+    check('a stop runs before the register',
+      before.some((c) => / stop$/.test(c)), before.join(' | '));
+    check('a delete or a WinSW uninstall runs before the register',
+      before.some((c) => /^sc delete /.test(c) || / uninstall$/.test(c)), before.join(' | '));
+    check('and the register follows the cleanup',
+      registerAt > -1 && run.calls[run.calls.length - 1] === `& "${ws.winswPath()}" start`,
+      run.calls[run.calls.length - 1]);
+  } finally {
+    if (previous === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previous;
+    platform.resetDataDirCache();
+  }
+}
+
+// ─── 28. A failed registration is printed with a hint and cleaned up ────────
+
+async function testWinswRegistrationFailure() {
+  setGroup('28. a failed registration is cleaned up and explained');
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const platform = await import(srcUrl('core/platform.js'));
+
+  const previous = process.env.ProgramData;
+  const root = scratch('winsw-register-failure');
+  process.env.ProgramData = root;
+  platform.resetDataDirCache();
+
+  const output = 'FATAL - Unable to locate WinSW-x64.xml or WinSW-x64.yml';
+
+  try {
+    const dataDir = platform.programDataDir();
+    fs.mkdirSync(path.join(dataDir, 'bin'), { recursive: true });
+    fs.writeFileSync(ws.winswPath(), 'dummy wrapper bytes');
+    fs.writeFileSync(path.join(dataDir, '.server-mode'), '{}\n');
+
+    const run = serviceRun({
+      registered: false,
+      registerResult: { success: false, stdout: '', stderr: output },
+    });
+
+    const failed = await ws.install({
+      dataDir,
+      appRoot: path.join(root, 'app'),
+      config: {},
+      run,
+      fetchImpl: async () => { throw new Error('the wrapper download must not be reached'); },
+      deps: {
+        canWrite: () => true,
+        isWindows: true,
+        copyRuntime: () => ({
+          ok: true,
+          dir: path.join(dataDir, 'runtime'),
+          nodeExe: 'NODE',
+          entry: 'ENTRY',
+        }),
+        verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
+        verifyWinsw: async () => ({ ok: true, sha256: 'stub' }),
+      },
+    });
+
+    check('the install fails', failed.ok === false);
+    check('and says registration was the failing step', failed.registrationFailed === true);
+    check('the reason carries WinSW\'s own output', (failed.reason ?? '').includes(output));
+    check('the reason has a line starting "Hint:"',
+      (failed.reason ?? '').split('\n').some((line) => line.startsWith('Hint:')),
+      (failed.reason ?? '').split('\n').find((line) => line.startsWith('Hint:')) ?? '(none)');
+
+    const registerAt = run.calls.findIndex((c) => / install$/.test(c));
+    const cleanup = run.calls.slice(registerAt + 1);
+    check('the failed registration was cleaned up afterwards',
+      cleanup.some((c) => / (stop|uninstall)$/.test(c) || /^sc delete /.test(c)),
+      cleanup.join(' | '));
+  } finally {
+    if (previous === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previous;
+    platform.resetDataDirCache();
+  }
+}
+
+// ─── 29. A Server install resumes without re-migrating the data ─────────────
+
+async function testServerInstallResume() {
+  setGroup('29. a failed Server install resumes without re-migrating');
+
+  const svc = await import(srcUrl('core/service/index.js'));
+  const platform = await import(srcUrl('core/platform.js'));
+  const lock = await import(srcUrl('core/daemon/lock.js'));
+  const db = await import(srcUrl('core/db.js'));
+
+  const previousProgramData = process.env.ProgramData;
+  const previousDataDir = process.env.EASY_DEVOPS_DATA_DIR;
+
+  const root = scratch('server-resume');
+  const dataDir = path.join(root, 'easy-devops');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, '.server-mode'), '{}\n');
+
+  const fakeLegacy = { run: stubRun([[/schtasks/, { success: false }]]), startupDir: null };
+
+  try {
+    process.env.ProgramData = root;
+    process.env.EASY_DEVOPS_DATA_DIR = dataDir;
+    platform.resetDataDirCache();
+
+    // The database 1.4.0 already moved here, with a value that proves this is
+    // the file reused rather than a fresh one created somewhere else.
+    db.reopenDb();
+    db.dbSet('resume-probe', 'kept');
+
+    lock.acquire({ dataDir, mode: 'daemon', version: '9.9.9' });
+
+    let installCalls = 0;
+    const installed = await svc.install({
+      mode: 'server',
+      deps: {
+        isServerMode: () => true,
+        isPidAlive: () => false,
+        legacy: fakeLegacy,
+        clearStopRequest: () => ({ ok: true }),
+        startupGraceMs: 2_000,
+        windowsService: {
+          install: async ({ dataDir: used }) => {
+            installCalls++;
+            return { ok: true, granted: [used], runtime: {} };
+          },
+          readLogs: () => ({ ok: true, file: 'fake', output: 'fake log' }),
+        },
+      },
+    });
+
+    check('a machine already in Server mode is not refused',
+      installed.ok === true, installed.reason ?? '');
+    check('there is no "already contains a database" refusal',
+      !/already contains a database/.test(installed.reason ?? ''));
+    check('the migration is skipped, not repeated', installed.migrated === false);
+    check('windowsService.install was called', installCalls === 1);
+    check('the daemon heartbeat was verified', installed.daemon?.pid === process.pid);
+    check('the existing ProgramData database was reused',
+      db.dbGet('resume-probe') === 'kept');
+    check('the install was recorded in the live database',
+      Boolean(db.dbGet('service-state')?.installedAt));
+
+    lock.release({ dataDir });
+
+    let failedCalls = 0;
+    const failed = await svc.install({
+      mode: 'server',
+      deps: {
+        isServerMode: () => true,
+        isPidAlive: () => false,
+        legacy: fakeLegacy,
+        clearStopRequest: () => ({ ok: true }),
+        startupGraceMs: 500,
+        windowsService: {
+          install: async () => {
+            failedCalls++;
+            return { ok: false, reason: 'register failed in the test' };
+          },
+          readLogs: () => ({ ok: true, file: 'fake', output: 'fake log' }),
+        },
+      },
+    });
+
+    check('a failed install still reports failure', failed.ok === false);
+    check('Server mode is kept with the migrated data', failed.mode === 'server');
+    check('and the reason says running install again resumes it',
+      /run ezz service install again/.test(failed.reason ?? ''), failed.reason ?? '');
+    check('the injected install was attempted', failedCalls === 1);
+  } finally {
+    try { lock.release({ dataDir }); } catch { /* already released */ }
+    if (previousProgramData === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previousProgramData;
+    if (previousDataDir === undefined) delete process.env.EASY_DEVOPS_DATA_DIR;
+    else process.env.EASY_DEVOPS_DATA_DIR = previousDataDir;
+    platform.resetDataDirCache();
+    try { db.reopenDb(); } catch { /* best effort restore */ }
+  }
+}
+
+// ─── 30. A migration always says where the original data is ─────────────────
+
+async function testDataDirOriginal() {
+  setGroup('30. a migration names where the original data is');
+
+  const { moveDataDir, enableServerMode, describeOriginal } =
+    await import(srcUrl('core/service/dataDir.js'));
+  const platform = await import(srcUrl('core/platform.js'));
+
+  const previousProgramData = process.env.ProgramData;
+  const previousAppData = process.env.APPDATA;
+  const root = scratch('datadir-original');
+  const appRoot = path.join(root, 'appdata');
+  const source = path.join(appRoot, 'easy-devops');
+
+  try {
+    process.env.ProgramData = path.join(root, 'programdata');
+    process.env.APPDATA = appRoot;
+    platform.resetDataDirCache();
+
+    fs.mkdirSync(source, { recursive: true });
+    fs.writeFileSync(path.join(source, 'easy-devops.sqlite'), 'ORIGINAL');
+
+    const switched = enableServerMode({});
+    check('the migration succeeds', switched.ok === true && switched.migrated === true,
+      switched.reason ?? '');
+    check('the backup is a real path, not null',
+      typeof switched.backup === 'string' && switched.backup.length > 0, String(switched.backup));
+    check('the backup exists', Boolean(switched.backup) && fs.existsSync(switched.backup));
+    check('originalAt names the backup', switched.originalAt === switched.backup);
+    check('describeOriginal names that backup',
+      describeOriginal(switched).includes(switched.backup), describeOriginal(switched));
+
+    // moveDataDir is the primitive underneath, and must carry the same fact.
+    const direct = moveDataDir({
+      from: path.join(root, 'second-source'),
+      to: path.join(root, 'second-target'),
+    });
+    check('nothing to move reports no original, not a false path',
+      direct.ok === true && direct.originalAt === null);
+  } finally {
+    if (previousProgramData === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previousProgramData;
+    if (previousAppData === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = previousAppData;
+    platform.resetDataDirCache();
+  }
+
+  const cases = [
+    ['no earlier data', { backup: null, originalAt: null }],
+    ['an original left in place', { backup: null, originalAt: 'X' }],
+    ['a backup', { backup: 'Y' }],
+  ];
+  for (const [label, value] of cases) {
+    const text = describeOriginal(value);
+    check(`describeOriginal says something for ${label}`,
+      typeof text === 'string' && text.length > 0, text);
+    check(`and never says "null" for ${label}`, !/null/i.test(text), text);
+  }
+  check('an original left in place is named',
+    describeOriginal({ backup: null, originalAt: 'X' }).includes('X'));
+  check('a backup is named', describeOriginal({ backup: 'Y' }).includes('Y'));
+}
+
+// ─── 31. Personal mode is refused while Server mode is on ───────────────────
+
+async function testPersonalRefusedInServerMode() {
+  setGroup('31. Personal mode is refused while Server mode is on');
+
+  const svc = await import(srcUrl('core/service/index.js'));
+  const fakeLegacy = { run: stubRun([[/schtasks/, { success: false }]]), startupDir: null };
+
+  const refused = await svc.install({
+    mode: 'personal',
+    deps: {
+      isServerMode: () => true,
+      legacy: fakeLegacy,
+      clearStopRequest: () => ({ ok: true }),
+    },
+  });
+
+  check('the install is refused', refused.ok === false);
+  check('the reason names `ezz service uninstall`',
+    /ezz service uninstall/.test(refused.reason ?? ''), refused.reason ?? '');
+  check('and it reports Personal mode as the refused request', refused.mode === 'personal');
+}
+
+// ─── 32. A running dashboard blocks the migration ───────────────────────────
+
+async function testDashboardRunningBlocksMigration() {
+  setGroup('32. a running dashboard blocks the data move');
+
+  const svc = await import(srcUrl('core/service/index.js'));
+  const db = await import(srcUrl('core/db.js'));
+  const fakeLegacy = { run: stubRun([[/schtasks/, { success: false }]]), startupDir: null };
+
+  const pid = 424242;
+  db.dbSet('dashboard-pid', pid);
+
+  let enableCalls = 0;
+  try {
+    const blocked = await svc.install({
+      mode: 'server',
+      deps: {
+        isServerMode: () => false,
+        isPidAlive: (candidate) => candidate === pid,
+        enableServerMode: () => {
+          enableCalls++;
+          return { ok: true, dataDir: 'UNUSED', migrated: true, backup: null };
+        },
+        legacy: fakeLegacy,
+        clearStopRequest: () => ({ ok: true }),
+      },
+    });
+
+    check('the install is refused', blocked.ok === false);
+    check('the reason says to stop the dashboard',
+      /stop it first/i.test(blocked.reason ?? ''), blocked.reason ?? '');
+    check('the data was not moved', enableCalls === 0);
+  } finally {
+    db.dbDelete('dashboard-pid');
+  }
+}
+
+// ─── 33. The database reopens in the same data directory ────────────────────
+
+async function testReopenDb() {
+  setGroup('33. the database reopens in the same data directory');
+
+  const db = await import(srcUrl('core/db.js'));
+  const key = 'reopen-check';
+
+  db.dbSet(key, { value: 'still here' });
+  const file = db.reopenDb();
+
+  check('reopenDb returns the database file',
+    typeof file === 'string' && file.endsWith('easy-devops.sqlite'), file);
+  check('a value written before the reopen is still readable',
+    db.dbGet(key)?.value === 'still here');
+
+  db.dbDelete(key);
+}
+
 // ─── Final safety check ─────────────────────────────────────────────────────
 
 /**
@@ -1642,6 +2162,15 @@ async function main() {
   await testStoppedByYou();
   await testStatusNeverStartsPm2();
   await testServiceEndpoints();
+  await testServiceFileNames();
+  await testWinswLeftoverUpgrade();
+  await testWinswReregisters();
+  await testWinswRegistrationFailure();
+  if (isWindows) await testServerInstallResume();
+  if (isWindows) await testDataDirOriginal();
+  if (isWindows) await testPersonalRefusedInServerMode();
+  if (isWindows) await testDashboardRunningBlocksMigration();
+  await testReopenDb();
   assertNoRealArtifacts();
 
   const failed = results.filter((r) => !r.passed);

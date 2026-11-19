@@ -21,18 +21,25 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: Verify minimum PowerShell version (5.1)
-for /f "usebackq tokens=*" %%v in (
-    `powershell.exe -NoProfile -Command "$PSVersionTable.PSVersion.Major" 2^>nul`
-) do set PS_MAJOR=%%v
+:: Verify minimum PowerShell version (5.1). Windows PowerShell 5.0 and the
+:: 4.x that ships with older Windows releases cannot run install.ps1.
+for /f "usebackq tokens=1,2 delims=." %%a in (
+    `powershell.exe -NoProfile -Command "$PSVersionTable.PSVersion.Major.ToString() + '.' + $PSVersionTable.PSVersion.Minor.ToString()" 2^>nul`
+) do (
+    set PS_MAJOR=%%a
+    set PS_MINOR=%%b
+)
 
 if not defined PS_MAJOR (
     echo Error: Could not determine PowerShell version. >&2
     exit /b 1
 )
-if %PS_MAJOR% LSS 5 (
-    echo Error: PowerShell 5.1 or later is required. Found version %PS_MAJOR%. >&2
-    echo Please upgrade PowerShell: https://github.com/PowerShell/PowerShell/releases >&2
+if not defined PS_MINOR set PS_MINOR=0
+set /a PS_VERSION_NUM=PS_MAJOR*100+PS_MINOR
+if %PS_VERSION_NUM% LSS 501 (
+    echo Error: PowerShell 5.1 or later is required. Found %PS_MAJOR%.%PS_MINOR%. >&2
+    echo Install Windows Management Framework 5.1, which upgrades Windows PowerShell to 5.1: >&2
+    echo   https://www.microsoft.com/download/details.aspx?id=54616 >&2
     exit /b 1
 )
 

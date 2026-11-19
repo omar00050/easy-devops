@@ -12,6 +12,11 @@ const DATA_DIR = getDataDir();
 
 const DB_PATH = path.join(DATA_DIR, 'easy-devops.sqlite');
 
+// The file the open connection uses. It equals DB_PATH for the life of almost
+// every process; only reopenDb() moves it, after the Windows Server-mode
+// migration has changed what getDataDir() answers.
+let dbPath = DB_PATH;
+
 // ─── One-time migration from old package-relative location ───────────────────
 const OLD_DATA_DIR = path.join(__dirname, '..', '..', 'data');
 const OLD_DB_PATH = path.join(OLD_DATA_DIR, 'easy-devops.sqlite');
@@ -70,7 +75,7 @@ let db;
  * per call site without every future caller having to remember.
  */
 function createDbConnection() {
-  return new GoodDB(new SQLiteDriver({ path: DB_PATH }), {
+  return new GoodDB(new SQLiteDriver({ path: dbPath }), {
     nested: "..",
     nestedIsEnabled: true,
     cache: {
@@ -116,4 +121,24 @@ export function initDb() {
     // Connection is closed, create a new one
     db = createDbConnection();
   }
+}
+
+/**
+ * Closes the connection and opens the database in the CURRENT data directory.
+ *
+ * For the one place where the data directory changes within a process: the
+ * Windows Server-mode switch during `ezz service install`. Without it, the
+ * installing process kept writing to the per-user database it opened at
+ * startup — a file every later process ignores — and Windows refused to
+ * rename that directory to its backup name because this handle held it open.
+ *
+ * @returns {string} The database file now in use
+ */
+export function reopenDb() {
+  closeDb();
+  const dir = getDataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  dbPath = path.join(dir, 'easy-devops.sqlite');
+  db = createDbConnection();
+  return dbPath;
 }

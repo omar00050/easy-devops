@@ -54,6 +54,25 @@ export const WINSW_BYTES = 18_243_033;
 /** Service identity. The display name is what appears in services.msc. */
 export const SERVICE_ID = 'EasyDevOps';
 export const SERVICE_DISPLAY_NAME = 'Easy DevOps';
+
+/**
+ * The names the wrapper and its definition are stored under.
+ *
+ * WinSW v2 finds its configuration ONLY as `<its own base name>.xml` in its
+ * own directory; a path passed on the command line is ignored. Storing the
+ * downloaded `WinSW-x64.exe` under its release name beside `EasyDevOps.xml`
+ * is exactly what made 1.4.0's Server-mode install fail with "Unable to
+ * locate WinSW-x64.[xml|yml]". Both names are derived from SERVICE_ID here,
+ * and nowhere else, so they cannot drift apart again.
+ *
+ * WINSW_ASSET stays the RELEASE asset name: it is what is downloaded and what
+ * the hash pins, not what the file is called once it is installed.
+ */
+export const WINSW_EXE_NAME = `${SERVICE_ID}.exe`;
+export const WINSW_XML_NAME = `${SERVICE_ID}.xml`;
+
+/** The name 1.4.0 stored the wrapper under. Found and removed on install. */
+export const LEGACY_WINSW_NAME = WINSW_ASSET;
 export const SERVICE_DESCRIPTION =
   'Monitors nginx, domains and certificates, sends notifications, and runs the Easy DevOps Hub agent.';
 
@@ -125,15 +144,37 @@ export async function verifyWinsw(file) {
  * @param {typeof fetch} [opts.fetchImpl] Injectable, for tests
  * @returns {Promise<{ ok: boolean, path?: string, reason?: string, sha256?: string }>}
  */
-export async function downloadWinsw({ dest, log = () => {}, fetchImpl = fetch } = {}) {
+export async function downloadWinsw({ dest, log = () => {}, fetchImpl = fetch, verify = verifyWinsw } = {}) {
   // Already there and correct: do not download 18MB again.
   if (fs.existsSync(dest)) {
-    const existing = await verifyWinsw(dest);
+    const existing = await verify(dest);
     if (existing.ok) {
       log(`${WINSW_ASSET} ${WINSW_VERSION} already present and verified.`);
       return { ok: true, path: dest, sha256: existing.sha256 };
     }
     log(`An existing ${path.basename(dest)} did not verify (${existing.reason.split('\n')[0]}); re-downloading.`);
+  }
+
+  // 1.4.0 left the wrapper beside `dest` under its release name. A copy that
+  // still verifies is the same pinned binary, so it is moved into place
+  // instead of downloading 18MB again; one that does not verify is removed.
+  // Either way the old name does not survive, because a second WinSW binary
+  // in the directory is only ever a source of confusion.
+  const legacy = path.join(path.dirname(dest), LEGACY_WINSW_NAME);
+  if (legacy !== dest && fs.existsSync(legacy)) {
+    const old = await verify(legacy);
+    try {
+      if (old.ok) {
+        fs.rmSync(dest, { force: true });
+        fs.renameSync(legacy, dest);
+        log(`Renamed the verified ${LEGACY_WINSW_NAME} to ${path.basename(dest)}.`);
+        return { ok: true, path: dest, sha256: old.sha256 };
+      }
+      fs.rmSync(legacy, { force: true });
+      log(`Removed an unverified ${LEGACY_WINSW_NAME} left by an earlier install.`);
+    } catch (err) {
+      log(`Could not tidy up ${legacy}: ${err.message}. Downloading a fresh copy instead.`);
+    }
   }
 
   fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -157,7 +198,7 @@ export async function downloadWinsw({ dest, log = () => {}, fetchImpl = fetch } 
     return { ok: false, reason: `download failed: ${err.message}` };
   }
 
-  const verified = await verifyWinsw(temp);
+  const verified = await verify(temp);
   if (!verified.ok) {
     try { fs.rmSync(temp, { force: true }); } catch { /* nothing to clean */ }
     return { ok: false, reason: verified.reason };
