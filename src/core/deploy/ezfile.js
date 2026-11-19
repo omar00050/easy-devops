@@ -10,10 +10,10 @@
  *   3. defaults   — read from package.json, so a plain Node project deploys
  *                   with no configuration at all
  *
- * ez.json is optional. When it gives `install`, `build`, `migrate` and
- * `start`, those commands are run exactly as written, whatever the language —
- * which is what lets a Python or Go project deploy before anyone has written
- * auto-detection for it. Detection only ever saves writing the file.
+ * ez.json is optional. When it gives `steps`, or the older `install`, `build`,
+ * `migrate` and `start`, those commands are run exactly as written, whatever the
+ * language — which is what lets a Python or Go project deploy before anyone has
+ * written auto-detection for it. Detection only ever saves writing the file.
  *
  * Pure: no filesystem, no shell, no config. The engine reads the files and
  * hands their contents in, so every rule here can be tested directly.
@@ -21,10 +21,17 @@
  * ── ez.json ──────────────────────────────────────────────────────────────────
  *
  *   {
- *     "install": "npm ci",                  string | string[] | false
+ *     "steps": [                            at most 5, run in list order
+ *       { "run": "npm ci", "kind": "install", "enabled": true },
+ *       { "run": "node scripts/build.js", "kind": "build" },
+ *       { "run": "npx prisma migrate deploy", "kind": "migrate" },
+ *       { "run": "node scripts/seed.js", "kind": "custom" }
+ *     ],
+ *     "install": "npm ci",                  the old three fields still work
  *     "build":   "npm run build",           string | string[] | false
  *     "migrate": "npx prisma migrate deploy"  string | string[] | false
  *     "start":     "node server.js",        string
+ *     "runtime":   "node",                  the runtime; only "node" today
  *     "port":      3000,                    the port the app listens on
  *     "health":    "/healthz",              string, or { "path": "/healthz", "timeout": 60 }
  *     "hooks":     { "pre": "...", "post": "..." }  string | string[]
@@ -35,19 +42,20 @@
  *
  * A persistent path is a folder or a single file.
  *
- * `false` (or an empty string) switches a step off — "this project has no
- * build" is a real answer, and different from "work it out for me".
+ * `false` (or an empty string) switches an old command off — "this project has
+ * no build" is a real answer, and different from "work it out for me". A
+ * skipped old field contributes no step. When `steps` and the old fields are
+ * both present, `steps` wins and the old fields are ignored with a warning.
  *
  * ── The order the engine runs them in ────────────────────────────────────────
  *
- *   hooks.pre → install → build → migrate → start
+ *   hooks.pre → steps (in list order) → start → health → hooks.post
  *
- * `migrate` runs in the NEW release directory, with the app's deploy
- * environment (the same one build gets), after install and build and before
- * the new release is started or switched to. A non-zero exit aborts the
- * deployment at the `migrate` step; the previous release keeps running
- * untouched. Migrations are forward-only: a code rollback cannot undo one that
- * already ran, so keep each migration backward-compatible for one release.
+ * Every step runs in the NEW release directory, with the app's deploy
+ * environment. `migrate` keeps its forward-only hint. A non-zero exit aborts the
+ * deployment at that step; the previous release keeps running untouched.
+ * Migrations are forward-only: a code rollback cannot undo one that already ran,
+ * so keep each migration backward-compatible for one release.
  */
 
 import os from 'os';
@@ -94,8 +102,17 @@ export function availableCpuCount() {
 }
 
 const COMMAND_FIELDS = Object.freeze(['install', 'build', 'migrate']);
+
+/** Runtimes an app may run on. Only Node today; the list is the extension point. */
+export const RUNTIMES = Object.freeze(['node']);
+
+/** What a step does. `custom` has no special handling. */
+export const STEP_KINDS = Object.freeze(['install', 'build', 'migrate', 'custom']);
+
+export const MAX_STEPS = 5;
+
 const KNOWN_KEYS = Object.freeze([
-  '$schema', 'name', 'install', 'build', 'migrate', 'start', 'port', 'health', 'hooks', 'persist',
+  '$schema', 'name', 'install', 'build', 'migrate', 'steps', 'start', 'runtime', 'port', 'health', 'hooks', 'persist',
   'instances', 'execMode',
 ]);
 const MAX_COMMAND_LENGTH = 2000;
@@ -133,6 +150,127 @@ export function normalizeCommands(value) {
   // An empty string or an empty list is the same answer as `false`.
   if (out.length === 0) return { commands: [], disabled: true, error: null };
   return { commands: out, disabled: false, error: null };
+}
+
+/**
+ * Normalises a `steps` field to the ordered list a deployment runs.
+ *
+ * A step is `{ run, kind, enabled }`, where `run` is one command line (the
+ * same validation as the old install/build/migrate fields), `kind` is one of
+ * STEP_KINDS, and `enabled` defaults to true. `false` or `[]` is the explicit
+ * "no steps" answer that clears a list from a lower-precedence source;
+ * `null`/`undefined` means "not specified here".
+ *
+ * @param {*} value
+ * @returns {{ steps: Array<{run:string,kind:string,enabled:boolean}>|null, error: string|null }}
+ */
+export function normalizeSteps(value) {
+  if (value === undefined || value === null) return { steps: null, error: null };
+  if (value === false) return { steps: [], error: null };
+  if (!Array.isArray(value)) return { steps: null, error: `must be a list of steps (at most ${MAX_STEPS})` };
+  if (value.length > MAX_STEPS) return { steps: null, error: `has more than ${MAX_STEPS} steps` };
+
+  const steps = [];
+  for (let i = 0; i < value.length; i++) {
+    const raw = value[i];
+    const at = `step ${i + 1}`;
+    if (!isPlainObject(raw)) {
+      return { steps: null, error: `${at} must be an object with "run", "kind" and optionally "enabled"` };
+    }
+
+    const command = normalizeCommands(raw.run);
+    if (command.error) return { steps: null, error: `${at} "run" ${command.error}` };
+    if (command.disabled || command.commands.length !== 1) {
+      return { steps: null, error: `${at} "run" must be a single non-empty command` };
+    }
+
+    const kind = typeof raw.kind === 'string' ? raw.kind.trim().toLowerCase() : '';
+    if (!STEP_KINDS.includes(kind)) {
+      return { steps: null, error: `${at} "kind" must be one of: ${STEP_KINDS.join(', ')}` };
+    }
+
+    if (raw.enabled !== undefined && typeof raw.enabled !== 'boolean') {
+      return { steps: null, error: `${at} "enabled" must be true or false` };
+    }
+
+    steps.push({ run: command.commands[0], kind, enabled: raw.enabled !== false });
+  }
+
+  return { steps, error: null };
+}
+
+/**
+ * The steps an older app or ez.json describes with install/build/migrate.
+ * A skipped field (false or an empty list) contributes no step: the two
+ * representations have the same effect, and an omitted step cannot be
+ * confused with a disabled one.
+ *
+ * @param {{install?:string[],build?:string[],migrate?:string[]}} commands
+ * @returns {Array<{run:string,kind:string,enabled:boolean}>}
+ */
+export function stepsFromCommands(commands = {}) {
+  const steps = [];
+  for (const kind of ['install', 'build', 'migrate']) {
+    const commandsForKind = commands[kind];
+    if (typeof commandsForKind === 'string' && commandsForKind.trim()) {
+      steps.push({ run: commandsForKind.trim(), kind, enabled: true });
+      continue;
+    }
+    for (const run of Array.isArray(commandsForKind) ? commandsForKind : []) {
+      steps.push({ run, kind, enabled: true });
+    }
+  }
+  return steps;
+}
+
+/**
+ * Advisory notes for a list whose order would probably fail. Only enabled
+ * steps are considered, and nothing here is an error: a custom step may
+ * legitimately put a command between them.
+ *
+ * @param {Array<{kind:string,enabled?:boolean}>} steps
+ * @returns {string[]}
+ */
+export function stepOrderWarnings(steps = []) {
+  const first = {};
+  steps.forEach((step, index) => {
+    if (step?.enabled === false) return;
+    if (!(step?.kind in first)) first[step.kind] = index;
+  });
+
+  const warnings = [];
+  const before = (a, b, advice) => {
+    if (first[a] !== undefined && first[b] !== undefined && first[a] < first[b]) warnings.push(advice);
+  };
+
+  before(
+    'migrate', 'install',
+    `The "migrate" step is listed before "install", but dependencies are not installed yet. Put "install" before "migrate".`,
+  );
+  before(
+    'build', 'install',
+    `The "build" step is listed before "install", but dependencies are not installed yet. Put "install" before "build".`,
+  );
+  before(
+    'migrate', 'build',
+    `The "migrate" step is listed before "build". Build first, then migrate, so the migration runs against the release that is about to start.`,
+  );
+  return warnings;
+}
+
+/**
+ * Validates a `runtime` value.
+ * @param {*} value
+ * @returns {{ value: string|null, error: string|null }}
+ */
+export function normalizeRuntime(value) {
+  if (value === undefined || value === null || value === '') return { value: null, error: null };
+  const runtime = String(value).trim().toLowerCase();
+  if (RUNTIMES.includes(runtime)) return { value: runtime, error: null };
+  return {
+    value: null,
+    error: `must be one of: ${RUNTIMES.join(', ')}. Leave it out to use "node".`,
+  };
 }
 
 /**
@@ -217,7 +355,7 @@ export function normalizeExecMode(value) {
  * app's own settings form. In an ez.json layer an omitted value may still be
  * supplied by an app override, so only an explicit "fork" is judged there.
  *
- * @param {{ start?: string|null, instances?: number|'max'|null, execMode?: string|null }} settings
+ * @param {{ start?: string|null, instances?: number|'max'|null, execMode?: string|null, runtime?: string|null }} settings
  * @param {{ assumeFork?: boolean }} [opts]
  * @returns {{ errors: string[], warnings: string[] }}
  */
@@ -226,12 +364,19 @@ function runtimeValidation(settings, { assumeFork = false } = {}) {
   const warnings = [];
 
   const mode = settings.execMode ?? (assumeFork ? 'fork' : null);
+  const runtime = settings.runtime ?? 'node';
   const instances = settings.instances === 'max'
     ? availableCpuCount()
     : (settings.instances ?? (assumeFork ? 1 : null));
 
   if (mode === 'cluster') {
     warnings.push(CLUSTER_STATELESS_WARNING);
+    if (runtime !== 'node') {
+      errors.push(
+        `execMode "cluster" is only available for runtime "node". Set runtime to "node", ` +
+        `or set execMode to "fork" for runtime "${runtime}".`,
+      );
+    }
     if (settings.start && parseStartCommand(settings.start).kind !== 'node') {
       errors.push(clusterStartError(settings.start));
     }
@@ -246,7 +391,12 @@ function runtimeValidation(settings, { assumeFork = false } = {}) {
 
 /** The advisory strings that belong with a set of (already normalized) settings. */
 export function settingsWarnings(settings = {}) {
-  return String(settings?.execMode ?? '').toLowerCase() === 'cluster' ? [CLUSTER_STATELESS_WARNING] : [];
+  const warnings = String(settings?.execMode ?? '').toLowerCase() === 'cluster' ? [CLUSTER_STATELESS_WARNING] : [];
+  const steps = Array.isArray(settings?.steps) ? settings.steps : stepsFromCommands(settings);
+  for (const warning of stepOrderWarnings(steps)) {
+    if (!warnings.includes(warning)) warnings.push(warning);
+  }
+  return warnings;
 }
 
 /**
@@ -350,6 +500,18 @@ export function parseEzFile(text) {
     else if (n.commands !== null) value[field] = n.commands;
   }
 
+  if (raw.steps !== undefined && raw.steps !== null) {
+    const n = normalizeSteps(raw.steps);
+    if (n.error) errors.push(`ez.json: "steps" ${n.error}`);
+    else {
+      value.steps = n.steps;
+      if (COMMAND_FIELDS.some((field) => raw[field] !== undefined && raw[field] !== null)) {
+        warnings.push('ez.json: "steps" is set, so "install", "build" and "migrate" were ignored.');
+        for (const field of COMMAND_FIELDS) delete value[field];
+      }
+    }
+  }
+
   if (raw.start !== undefined && raw.start !== null) {
     const n = normalizeCommands(raw.start);
     if (n.error) errors.push(`ez.json: "start" ${n.error}`);
@@ -418,13 +580,23 @@ export function parseEzFile(text) {
     else if (n.value !== null) value.execMode = n.value;
   }
 
+  if (raw.runtime !== undefined && raw.runtime !== null) {
+    const n = normalizeRuntime(raw.runtime);
+    if (n.error) errors.push(`ez.json: "runtime" ${n.error}`);
+    else if (n.value !== null) value.runtime = n.value;
+  }
+
   const runtime = runtimeValidation({
     start: value.start ?? null,
     instances: value.instances ?? null,
     execMode: value.execMode ?? null,
+    runtime: value.runtime ?? (raw.runtime ? String(raw.runtime) : null),
   });
   errors.push(...runtime.errors);
   warnings.push(...runtime.warnings);
+  for (const warning of stepOrderWarnings(value.steps ?? stepsFromCommands(value))) {
+    if (!warnings.includes(warning)) warnings.push(warning);
+  }
 
   return { ok: errors.length === 0, value: errors.length === 0 ? value : null, errors, warnings };
 }
@@ -482,7 +654,27 @@ export function normalizeOverrides(input) {
   if (input === undefined || input === null) return { ok: true, value, errors, warnings };
   if (!isPlainObject(input)) return { ok: false, value, errors: ['settings must be an object'], warnings };
 
-  for (const field of ['install', 'build', 'migrate', 'pre', 'post']) {
+  const stepsPresent = input.steps !== undefined && input.steps !== null && input.steps !== '';
+  const legacyPresent = COMMAND_FIELDS.some((field) => input[field] !== undefined && input[field] !== null);
+
+  if (stepsPresent) {
+    const n = normalizeSteps(input.steps);
+    if (n.error) errors.push(`steps ${n.error}`);
+    else {
+      value.steps = n.steps;
+      if (legacyPresent) warnings.push('"steps" is set, so "install", "build" and "migrate" were ignored.');
+    }
+  } else {
+    for (const field of COMMAND_FIELDS) {
+      const raw = input[field];
+      if (raw === undefined || raw === null || raw === '') continue;
+      const n = normalizeCommands(raw);
+      if (n.error) errors.push(`${field} ${n.error}`);
+      else if (n.commands !== null) value[field] = n.commands;
+    }
+  }
+
+  for (const field of ['pre', 'post']) {
     const raw = input[field];
     if (raw === undefined || raw === null || raw === '') continue;
     const n = normalizeCommands(raw);
@@ -536,13 +728,25 @@ export function normalizeOverrides(input) {
     else if (n.value !== null) value.execMode = n.value;
   }
 
+  if (input.runtime !== undefined && input.runtime !== null && input.runtime !== '') {
+    const n = normalizeRuntime(input.runtime);
+    if (n.error) errors.push(`runtime ${n.error}`);
+    else if (n.value !== null) value.runtime = n.value;
+  }
+
   const runtime = runtimeValidation({
     start: value.start ?? null,
     instances: value.instances ?? null,
     execMode: value.execMode ?? null,
+    runtime: value.runtime ?? (input.runtime !== undefined && input.runtime !== null && input.runtime !== ''
+      ? String(input.runtime)
+      : null),
   }, { assumeFork: true });
   errors.push(...runtime.errors);
   warnings.push(...runtime.warnings);
+  for (const warning of stepOrderWarnings(value.steps ?? stepsFromCommands(value))) {
+    if (!warnings.includes(warning)) warnings.push(warning);
+  }
 
   return { ok: errors.length === 0, value, errors, warnings };
 }
@@ -561,7 +765,8 @@ export function normalizeOverrides(input) {
  * @param {Object} [input.overrides] Value from normalizeOverrides()
  * @returns {{
  *   ok: boolean, error: string|null,
- *   settings: { install: string[], build: string[], migrate: string[], start: string|null, port: number|null,
+ *   settings: { install: string[], build: string[], migrate: string[], steps: Array<Object>, start: string|null,
+ *               runtime: string, port: number|null,
  *               healthPath: string, healthTimeout: number, pre: string[], post: string[],
  *               persist: string[], instances: number|'max', execMode: 'fork'|'cluster' },
  *   sources: Object<string, 'override'|'ez.json'|'package.json'|'default'>,
@@ -593,6 +798,7 @@ export function resolveSettings({ ez = null, pkg = null, files = {}, overrides =
     build: pick('build', []),
     migrate: pick('migrate', []),
     start: pick('start', null),
+    runtime: pick('runtime', 'node'),
     port: pick('port', null),
     healthPath: pick('healthPath', DEFAULT_HEALTH_PATH),
     healthTimeout: pick('healthTimeout', DEFAULT_HEALTH_TIMEOUT_S),
@@ -603,6 +809,62 @@ export function resolveSettings({ ez = null, pkg = null, files = {}, overrides =
     execMode: pick('execMode', 'fork'),
   };
 
+  // `steps` is one field: the first layer that states it wins whole. When no
+  // layer does, the old install/build/migrate fields are read as the same
+  // list, so an existing app or ez.json deploys exactly as before.
+  //
+  // A higher layer can still be an older app whose stored settings use the old
+  // fields. App settings must keep winning: when a layer above the one that
+  // states `steps` has any old command fields, those become the list and the
+  // lower `steps` are not used.
+  const precedenceWarnings = [];
+  const explicitIndex = layers.findIndex(([, layer]) => layer.steps !== undefined && layer.steps !== null);
+  const higherWithLegacy = explicitIndex > 0
+    ? layers.slice(0, explicitIndex).find(([, layer]) => COMMAND_FIELDS.some(
+      (field) => layer[field] !== undefined && layer[field] !== null,
+    ))
+    : null;
+
+  if (explicitIndex !== -1 && higherWithLegacy) {
+    const higherLayers = layers.slice(0, explicitIndex);
+    const higherCommands = {};
+    const higherSources = {};
+    for (const field of COMMAND_FIELDS) {
+      const found = higherLayers.find(([, layer]) => layer[field] !== undefined && layer[field] !== null);
+      higherCommands[field] = found ? found[1][field] : [];
+      higherSources[field] = found ? found[0] : 'default';
+    }
+
+    settings.steps = stepsFromCommands(higherCommands);
+    sources.steps = higherWithLegacy[0];
+    for (const field of COMMAND_FIELDS) {
+      settings[field] = settings.steps.filter((s) => s.enabled !== false && s.kind === field).map((s) => s.run);
+      sources[field] = higherSources[field];
+    }
+
+    const stepsLayer = layers[explicitIndex][0];
+    const higherName = higherWithLegacy[0] === 'override' ? "The app's" : `The "${higherWithLegacy[0]}"`;
+    precedenceWarnings.push(
+      `${higherName} install/build/migrate settings override the "steps" in ${stepsLayer}. ` +
+      `Save the app's commands as steps to make this explicit.`,
+    );
+  } else if (explicitIndex !== -1) {
+    settings.steps = layers[explicitIndex][1].steps;
+    sources.steps = layers[explicitIndex][0];
+    // Keep the legacy fields meaningful for older readers and the run log.
+    // They are informational only: the engine runs settings.steps.
+    for (const field of COMMAND_FIELDS) {
+      settings[field] = settings.steps.filter((s) => s.enabled !== false && s.kind === field).map((s) => s.run);
+      sources[field] = sources.steps;
+    }
+  } else {
+    settings.steps = stepsFromCommands(settings);
+    const legacyLayer = layers.find(([, layer]) => COMMAND_FIELDS.some(
+      (field) => layer[field] !== undefined && layer[field] !== null,
+    ));
+    sources.steps = legacyLayer ? legacyLayer[0] : 'default';
+  }
+
   if (!settings.start) {
     return {
       ok: false,
@@ -611,16 +873,20 @@ export function resolveSettings({ ez = null, pkg = null, files = {}, overrides =
         'or give package.json a "start" script or a "main" file.',
       settings,
       sources,
-      warnings: settingsWarnings(settings),
+      warnings: [...new Set([...settingsWarnings(settings), ...precedenceWarnings])],
     };
   }
 
   const runtime = runtimeValidation(settings, { assumeFork: true });
+  const warnings = [...runtime.warnings];
+  for (const warning of [...stepOrderWarnings(settings.steps), ...precedenceWarnings]) {
+    if (!warnings.includes(warning)) warnings.push(warning);
+  }
   if (runtime.errors.length > 0) {
-    return { ok: false, error: runtime.errors.join(' '), settings, sources, warnings: runtime.warnings };
+    return { ok: false, error: runtime.errors.join(' '), settings, sources, warnings };
   }
 
-  return { ok: true, error: null, settings, sources, warnings: runtime.warnings };
+  return { ok: true, error: null, settings, sources, warnings };
 }
 
 /**

@@ -16,17 +16,20 @@ import {
   getAutoRenewSettings, normalizeAutoRenewDays, MIN_AUTO_RENEW_DAYS, MAX_AUTO_RENEW_DAYS,
 } from '../../core/cert-renewal.js';
 import { deployRoot, defaultDeployRoot, validateDeployDir } from '../../core/deploy/store.js';
+import { page, pause, BACK } from '../ui/page.js';
 
 export default async function settingsMenu() {
   // T021: detect missing/corrupted config before loadConfig() creates defaults
   const wasStored = dbGet('config') !== undefined;
   const config = loadConfig();
-
-  if (!wasStored) {
-    console.log(chalk.yellow('\nDefaults applied — config not found or reset.'));
-  }
+  let announceDefaults = !wasStored;
 
   while (true) {
+    page(['Settings']);
+    if (announceDefaults) {
+      announceDefaults = false;
+      console.log(chalk.yellow('Defaults applied — config not found or reset.'));
+    }
     // T013: display current values
     const authMode = effectiveAuthMode(config);
     const hasPassword = Boolean(config.dashboardPasswordHash || config.dashboardPassword);
@@ -46,8 +49,6 @@ export default async function settingsMenu() {
     const isLinux = !isWindows;
     const permsOk = isLinux ? await checkPermissionsConfigured() : true;
 
-    console.log();
-    console.log(chalk.bold('⚙️ Settings'));
     console.log(chalk.gray('─'.repeat(40)));
     console.log(` Dashboard Port: ${chalk.cyan(config.dashboardPort)}`);
     console.log(` Dashboard Auth: ${chalk.cyan(authDisplay)}`);
@@ -79,7 +80,7 @@ export default async function settingsMenu() {
             : '🔓 Setup Linux Permissions  ⚠ required',
           value: 'permissions',
         }] : []),
-        { name: '← Back', value: 'back' },
+        { name: BACK, value: 'back' },
       ],
     }]);
 
@@ -100,6 +101,7 @@ export default async function settingsMenu() {
 
         if (!script.ok) {
           console.log(chalk.red(`\n  ✗ Failed: ${script.reason}\n`));
+          await pause();
           continue;
         }
 
@@ -114,6 +116,7 @@ export default async function settingsMenu() {
           console.log(chalk.red(`\n  ✗ Failed: ${result.reason || 'unknown error'}\n`));
         }
       }
+      await pause();
       continue;
     }
 
@@ -165,12 +168,14 @@ export default async function settingsMenu() {
         if (!loopbackBound) {
           console.log(chalk.yellow(`\n  Not allowed while listening on ${config.dashboardBindAddress}.`));
           console.log(chalk.gray('  Set "Listen On" to this machine only first.\n'));
+          await pause();
           continue;
         }
         config.dashboardAuth = AUTH_MODES.NONE;
         saveConfig(config);
         console.log(chalk.green('\n  ✓ The dashboard will no longer ask for a password.'));
         console.log(chalk.gray('  It stays reachable from this machine only.\n'));
+        await pause();
         continue;
       }
 
@@ -186,12 +191,14 @@ export default async function settingsMenu() {
         config.dashboardAuth = AUTH_MODES.PASSWORD;
         saveConfig(config);
         console.log(chalk.green('\n  ✓ A password is now required.\n'));
+        await pause();
         continue;
       }
 
       const problem = validateNewPassword(value);
       if (problem) {
         console.log(chalk.red(`\n  ${problem}\n`));
+        await pause();
         continue;
       }
 
@@ -222,6 +229,7 @@ export default async function settingsMenu() {
       if (!isLoopbackBind(value) && authMode === AUTH_MODES.NONE) {
         console.log(chalk.yellow('\n  This dashboard has no password, so it can only listen on this machine.'));
         console.log(chalk.gray('  Set a password first (Dashboard Auth), then change this.\n'));
+        await pause();
         continue;
       }
 
@@ -311,5 +319,9 @@ export default async function settingsMenu() {
       config[field] = value;
       saveConfig(config); // T016
     }
+
+    // The menu clears the screen when it redraws, so a saved value would
+    // otherwise vanish before it could be read.
+    await pause();
   }
 }

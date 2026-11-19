@@ -8,7 +8,6 @@ import {
   Pencil,
   Plus,
   RefreshCw,
-  Send,
   Server,
   ShieldAlert,
   Sparkles,
@@ -46,6 +45,7 @@ import {
 } from '../components/ui/States';
 import { useToast } from '../components/ui/Toast';
 import { ChannelFormModal } from '../components/notifications/ChannelFormModal';
+import { ChannelTypeBadge } from '../components/notifications/ChannelTypeBadge';
 
 const TYPE_LABEL: Record<string, string> = {
   nginx_down: 'nginx',
@@ -275,7 +275,6 @@ export function NotificationsPage() {
               ) : (
                 <ul className="divide-y divide-line/70">
                   {channels.map((channel) => {
-                    const Icon = channel.type === 'discord' ? Webhook : Send;
                     const entry = usage.get(channel.id);
                     const isDeleting = deleting === channel.id;
                     return (
@@ -284,24 +283,15 @@ export function NotificationsPage() {
                         className="flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:px-5"
                       >
                         <div className="flex min-w-0 items-start gap-3">
-                          <div
-                            className={cn(
-                              'flex size-9 shrink-0 items-center justify-center rounded-md border border-line',
-                              channel.type === 'discord'
-                                ? 'bg-info-soft text-info'
-                                : 'bg-accent-soft text-accent-text'
-                            )}
-                          >
-                            <Icon className="size-4" aria-hidden="true" />
+                          <div className="flex size-9 shrink-0 items-center justify-center rounded-md border border-line bg-inset text-muted">
+                            <BellRing className="size-4" aria-hidden="true" />
                           </div>
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
                               <span className="truncate text-sm font-medium text-ink">
                                 {channel.name}
                               </span>
-                              <Badge tone="neutral">
-                                {channel.type === 'discord' ? 'Discord' : 'Telegram'}
-                              </Badge>
+                              <ChannelTypeBadge type={channel.type} />
                               {domainsResource.data &&
                                 (entry ? (
                                   <Badge

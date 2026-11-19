@@ -12,7 +12,8 @@
  */
 
 import { ApiError } from '../errors';
-import { deployKeyAddUrl } from '../deployments';
+import { deployKeyAddUrl, stepOrderWarnings, stepsFromSettings } from '../deployments';
+import { playMockLinkProgress } from './ssl';
 import type {
   DeployApp,
   DeployAppCreated,
@@ -204,7 +205,18 @@ function seed(): { apps: MockApp[]; hook: DeployHook } {
         deployKeyFingerprint: 'SHA256:q3Vv2mZk8KbT1pWc9rLm4nXf6yHd0sAa5jTg7eRwQoE',
         deployKeyCreatedAt: new Date(Date.now() - 19 * 86_400_000).toISOString(),
         deployKeyOnDisk: true,
-        settings: { port: 3000, healthPath: '/healthz', migrate: 'npx prisma migrate deploy', persist: ['uploads', 'data'] },
+        settings: {
+          port: 3000,
+          healthPath: '/healthz',
+          runtime: 'node',
+          steps: [
+            { run: 'npx prisma migrate deploy', kind: 'migrate', enabled: true },
+            { run: 'npm ci', kind: 'install', enabled: true },
+            { run: 'npm run build', kind: 'build', enabled: true },
+            { run: 'npm run lint', kind: 'custom', enabled: false },
+          ],
+          persist: ['uploads', 'data'],
+        },
         hasSharedData: true,
         domain: 'api.example.com',
         env: { DATABASE_URL: 'postgres://app:secret@127.0.0.1:5432/store', NODE_ENV: 'production' },
@@ -225,7 +237,21 @@ function seed(): { apps: MockApp[]; hook: DeployHook } {
           { id: workerRuns[1].releaseId, sha: workerRuns[1].sha, ref: 'main', startable: true, current: true, previous: false },
         ],
       }),
-      baseApp('landing', { branch: 'production' }),
+      baseApp('landing', {
+        branch: 'production',
+        settings: {
+          port: 3000,
+          healthPath: '/',
+          runtime: 'node',
+          start: 'npm start',
+          steps: [
+            { run: 'npm ci', kind: 'install', enabled: true },
+            { run: 'npm run build', kind: 'build', enabled: true },
+            { run: 'npm run lint', kind: 'custom', enabled: false },
+            { run: 'npx prisma migrate deploy', kind: 'migrate', enabled: false },
+          ],
+        },
+      }),
       baseApp('edge-gateway', {
         settings: { port: 8100, healthPath: '/healthz', start: 'node dist/index.js' },
         ezJson: { execMode: 'cluster', instances: 4 },
@@ -244,7 +270,15 @@ function seed(): { apps: MockApp[]; hook: DeployHook } {
         ],
       }),
       baseApp('webhook-relay', {
-        settings: { port: 4300, healthPath: '/ready', start: 'node server.js' },
+        // An app still stored in the old format: the form shows these as steps.
+        settings: {
+          port: 4300,
+          healthPath: '/ready',
+          install: 'npm ci',
+          build: 'npm run build',
+          migrate: 'npx prisma migrate deploy',
+          start: 'node server.js',
+        },
         runs: relayRuns,
         releases: [
           { id: relayOlder.releaseId, sha: relayOlder.sha, ref: 'main', startable: true, current: true, previous: false },
@@ -304,7 +338,8 @@ function configuredInstances(app: MockApp, settings: DeployApp['settings']): Non
 
 function appWarnings(app: MockApp): string[] {
   const mode = configuredMode(app, app.settings);
-  return mode === 'cluster' ? [STATELESS_WARNING] : [];
+  const order = stepOrderWarnings(stepsFromSettings(app.settings));
+  return [...order, ...(mode === 'cluster' ? [STATELESS_WARNING] : [])];
 }
 
 function listView(app: MockApp): DeployApp {
@@ -337,6 +372,21 @@ function listView(app: MockApp): DeployApp {
 
 /** The server's own checks, so the mock answers 400 the way the real API does. */
 function checkMode(app: MockApp, settings: DeployApp['settings']): void {
+  if (settings.runtime !== undefined && settings.runtime !== 'node') {
+    fail(400, 'runtime must be "node". It is the only runtime available today.');
+  }
+  if (settings.steps !== undefined) {
+    if (!Array.isArray(settings.steps) || settings.steps.length > 5) {
+      fail(400, 'steps must be a list of at most 5 steps.');
+    }
+    if (
+      settings.steps.some(
+        (step) => !step.run.trim() || !['install', 'build', 'migrate', 'custom'].includes(step.kind)
+      )
+    ) {
+      fail(400, 'Every step needs a non-empty "run" and a kind of install, build, migrate or custom.');
+    }
+  }
   const mode = configuredMode(app, settings);
   if (mode !== 'fork' && mode !== 'cluster') {
     fail(400, 'execMode must be "fork" or "cluster".');
@@ -455,8 +505,9 @@ export function handleDeployments(method: HttpMethod, path: string, body: Record
       ezFileLocations: ['ez.json', 'deploy/ez.json', '.deploy/ez.json'],
       deployDir: '/home/ops/.config/easy-devops/ez_deploys',
       channels: [
-        { id: 'ch-discord', name: 'Ops Discord', type: 'discord' },
-        { id: 'ch-telegram', name: 'On-call', type: 'telegram' },
+        { id: 'ch-discord-ops', name: 'Ops Discord', type: 'discord', lastTest: 'passed' },
+        { id: 'ch-telegram-oncall', name: 'On-call Telegram', type: 'telegram', lastTest: 'failed' },
+        { id: 'ch-discord-builds', name: 'Builds Discord', type: 'discord', lastTest: null },
       ],
       domains: [
         { name: 'app.example.com', enabled: true, ssl: true },
@@ -534,7 +585,13 @@ export function handleDeployments(method: HttpMethod, path: string, body: Record
     if (body.authType !== undefined) app.authType = body.authType as DeployApp['authType'];
     if (body.token) app.hasToken = true;
     if (body.settings !== undefined) {
-      const next = body.settings as DeployApp['settings'];
+      const next = { ...(body.settings as DeployApp['settings']) };
+      // Saving steps drops the old fields, exactly as the real server does.
+      if (next.steps !== undefined) {
+        delete next.install;
+        delete next.build;
+        delete next.migrate;
+      }
       checkMode(app, next);
       app.settings = next;
       syncMode(app);
@@ -566,6 +623,17 @@ export function handleDeployments(method: HttpMethod, path: string, body: Record
 
   if (sub === 'domain' && method === 'PUT') {
     const name = String(body.domain ?? '').trim().toLowerCase();
+    const rawOpId = body.opId;
+    if (
+      rawOpId !== undefined &&
+      (typeof rawOpId !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(rawOpId))
+    ) {
+      fail(400, 'invalid_opId', {
+        detail: 'opId must be 8-64 characters of A-Z, a-z, 0-9, "_" or "-".',
+      });
+    }
+    const opId =
+      typeof rawOpId === 'string' ? rawOpId : `ssl_mock_${Math.random().toString(36).slice(2, 12)}`;
     const rawSsl = body.ssl;
     const sslInput =
       rawSsl === true ? { mode: 'issue' } : rawSsl && typeof rawSsl === 'object' ? (rawSsl as { mode: string; certName?: string }) : { mode: 'none' };
@@ -590,8 +658,17 @@ export function handleDeployments(method: HttpMethod, path: string, body: Record
       ssl = { mode: 'existing', ok: true, detail: `Using the certificate in ${sslInput.certName}.`, certName: sslInput.certName };
     }
     const redirect = sslInput.mode === 'none' ? false : body.redirect !== false;
-    return {
+    const mode =
+      sslInput.mode === 'issue' || sslInput.mode === 'existing' ? sslInput.mode : 'none';
+    // The PUT publishes the same ssl:progress stages the server does, with the
+    // dialog's opId and the linked name, and answers after the last frame.
+    return playMockLinkProgress(opId, name, {
+      mode,
+      issued: ssl?.ok ?? false,
+      behindCloudflare,
+    }).then(() => ({
       ok: true,
+      opId,
       domain: name,
       created: !['app.example.com', 'api.example.com', 'legacy.example.com'].includes(name),
       port: app.settings.port,
@@ -600,7 +677,7 @@ export function handleDeployments(method: HttpMethod, path: string, body: Record
       redirect,
       nginxReloaded: true,
       ssl,
-    };
+    }));
   }
 
   if (sub === 'domain' && method === 'DELETE') {

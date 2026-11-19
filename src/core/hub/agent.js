@@ -18,7 +18,7 @@ import { getStatus, start as nginxStart, stop as nginxStop, restart as nginxRest
 import { publish } from '../jobs/bus.js';
 import { getLastDomainHealth, probeDomains, DOMAIN_HEALTH_POLL_MS } from '../jobs/monitors.js';
 import { isWindows, platformName, isDevDataDir } from '../platform.js';
-import { listAllCerts } from '../cert-reader.js';
+import { listAllCerts, getCertExpiry } from '../cert-reader.js';
 import { backgroundServiceState } from '../service/index.js';
 import * as runner from '../runner.js';
 import { loadChannels } from '../notifier.js';
@@ -159,11 +159,60 @@ async function pushDomainHealth() {
   } catch { /* non-fatal */ }
 }
 
+/**
+ * Adds the certificate state the dashboard already knows to each domain.
+ *
+ * Only the status and its label travel — never a path or a certificate body.
+ * A configured domain whose certificate directory does not exist yet reports
+ * `not_issued`, which is what the Hub needs to say "Not issued yet" instead of
+ * showing an error.
+ */
+async function domainsWithCertState(domains) {
+  if (!Array.isArray(domains)) return domains;
+
+  const certByName = new Map();
+  try {
+    for (const cert of await listAllCerts({ includeUnusable: true })) {
+      certByName.set(cert.domain, cert);
+    }
+  } catch { /* an unreadable certificate directory is not fatal */ }
+
+  const out = [];
+  for (const domain of domains) {
+    if (!domain || typeof domain !== 'object') {
+      out.push(domain);
+      continue;
+    }
+
+    const known = certByName.get(domain.name);
+    let certStatus = known?.status ?? null;
+    let certLabel = known?.label ?? null;
+
+    if (!known && domain.name) {
+      try {
+        const info = await getCertExpiry(domain.name);
+        if (info.state === 'not_issued') {
+          certStatus = 'not_issued';
+          certLabel = 'Not issued yet';
+        } else if (info.state === 'unreadable') {
+          certStatus = 'unreadable';
+        }
+      } catch { /* no certificate information for this name */ }
+    }
+
+    const next = { ...domain };
+    if (certStatus) next.certStatus = certStatus;
+    if (certLabel) next.certLabel = certLabel;
+    out.push(next);
+  }
+  return out;
+}
+
 async function pushDomainConfigs() {
   if (!socket?.connected) return;
   try {
     const domains = dbGet('domains') || [];
-    socket.emit('domain:configs', domains);
+    socket.emit('domain:configs', await domainsWithCertState(domains));
   } catch { /* non-fatal */ }
 }
 
@@ -249,11 +298,13 @@ async function pushProcesses() {
 async function pushCertExpiry() {
   if (!socket?.connected) return;
   try {
-    const certs = await listAllCerts();
+    const certs = await listAllCerts({ includeUnusable: true });
     socket.emit('cert:expiry', certs.map(c => ({
       domain: c.domain,
       expiresAt: c.expiry ?? null,
       daysLeft: c.daysLeft ?? null,
+      status: c.status ?? null,
+      label: c.label ?? null,
     })));
   } catch { /* non-fatal */ }
 }
@@ -287,15 +338,19 @@ const PROGRESS_DETAIL_MAX = 300;
 const PROGRESS_STATUSES = new Set(['running', 'ok', 'failed', 'skipped']);
 
 /**
- * Builds the `onProgress(step, status, detail)` handed to a command handler.
+ * Builds the `onProgress(step, status, detail, domain?)` handed to a command
+ * handler.
  *
  * Bound to one requestId. It is a no-op when there is no requestId (nothing to
  * correlate the event with) or when the socket is down, and it never throws:
  * progress is a convenience, and a broken listener must not fail the command
  * that is doing the real work.
  *
+ * `domain` is optional and names which domain an SSL stage belongs to; it is
+ * what lets renewAll show per-domain progress. Other commands omit it.
+ *
  * @param {string|null} requestId
- * @returns {(step: string, status: 'running'|'ok'|'failed'|'skipped', detail?: string) => void}
+ * @returns {(step: string, status: 'running'|'ok'|'failed'|'skipped', detail?: string, domain?: string) => void}
  */
 export function createCommandProgress(requestId) {
   if (!requestId) return () => {};
@@ -333,7 +388,7 @@ export function createCommandProgress(requestId) {
     } catch { /* never throw from a timer */ }
   };
 
-  return function onProgress(step, status, detail) {
+  return function onProgress(step, status, detail, domain) {
     try {
       if (!socket?.connected) return;
       if (!PROGRESS_STATUSES.has(status)) return;
@@ -350,6 +405,9 @@ export function createCommandProgress(requestId) {
           ? detail.slice(0, PROGRESS_DETAIL_MAX)
           : detail;
       }
+      if (typeof domain === 'string' && domain.trim()) {
+        payload.domain = domain.trim();
+      }
 
       if (sentInWindow < PROGRESS_MAX_PER_WINDOW) {
         sentInWindow += 1;
@@ -358,7 +416,9 @@ export function createCommandProgress(requestId) {
       }
 
       // Over the limit: remember only the newest event for this step.
-      deferred.set(payload.step, payload);
+      // renewAll sends the same step for several domains, so the key includes
+      // the domain; otherwise one domain's stage would replace another's.
+      deferred.set(`${payload.step}\u0000${payload.domain ?? ''}`, payload);
       if (!timer) {
         timer = setTimeout(flush, Math.max(10, windowStartedAt + PROGRESS_WINDOW_MS - now));
       }
@@ -580,7 +640,9 @@ async function handleManageDomain(payload, ack) {
 async function handleManageSSL(payload, ack) {
   return runCommand('hub:manageSSL', payload, async (p) => {
     const { handleHubSslCommand } = await import('../cert-operations.js');
-    const result = await handleHubSslCommand(p);
+    const result = await handleHubSslCommand(p, {
+      onProgress: createCommandProgress(p?.requestId),
+    });
     if (result && result.ok === false) throw new Error(result.error || 'ssl command failed');
 
     pushCertExpiry();

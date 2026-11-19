@@ -6,6 +6,7 @@ import type {
   DeployAppInput,
   DeployAuthType,
   DeployKeyInfo,
+  DeployRuntime,
   DeploymentsResponse,
 } from '../../lib/types';
 import {
@@ -16,18 +17,25 @@ import {
   fromSettingsDraft,
   isClusterCapable,
   isSshUrl,
+  isStepOrderWarning,
   parseEnvText,
   toSettingsDraft,
+  toStepDrafts,
   validateAppId,
   type SettingsDraft,
 } from '../../lib/deployments';
 import { validatePort } from '../../lib/validation';
+import { useConfirm } from '../../hooks/useResource';
 import { Button } from '../ui/Button';
 import { Checkbox, FormGrid, Select, Switch, TagInput, TextArea, TextInput } from '../ui/Field';
 import { Modal } from '../ui/Modal';
 import { InlineAlert } from '../ui/States';
 import { useToast } from '../ui/Toast';
+import { ChannelPicker } from '../notifications/ChannelPicker';
 import { DeployKeyPanel } from './DeployKeyPanel';
+import { PresetCards, matchPreset, presetCommands, presetLabel, sameCommands } from './PresetCards';
+import { RuntimeCards } from './RuntimeCards';
+import { StepsEditor } from './StepsEditor';
 
 interface Draft {
   id: string;
@@ -100,15 +108,20 @@ function OverrideRow({
   overridden,
   note,
   onClear,
+  onOverride,
+  overrideLabel = 'Override',
 }: {
   overridden: boolean;
   note: ReactNode;
   onClear: () => void;
+  /** Offered when the value is not overridden yet. */
+  onOverride?: () => void;
+  overrideLabel?: string;
 }) {
   return (
     <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-2xs text-faint">
       <span>{overridden ? <>Override — {note}</> : note}</span>
-      {overridden && (
+      {overridden ? (
         <button
           type="button"
           onClick={onClear}
@@ -116,7 +129,15 @@ function OverrideRow({
         >
           Use ez.json / default
         </button>
-      )}
+      ) : onOverride ? (
+        <button
+          type="button"
+          onClick={onOverride}
+          className="rounded-sm font-medium text-accent-text underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/50"
+        >
+          {overrideLabel}
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -153,6 +174,7 @@ export function AppFormModal({
   onRefresh?: () => void;
 }) {
   const toast = useToast();
+  const confirm = useConfirm();
   const editing = app !== null;
   const [draft, setDraft] = useState<Draft>(() => emptyDraft(meta.limits.keepReleasesDefault));
   const [touched, setTouched] = useState(false);
@@ -160,10 +182,13 @@ export function AppFormModal({
   const [formError, setFormError] = useState<string | null>(null);
   const [created, setCreated] = useState<{ app: DeployApp; key: DeployKeyInfo | null; keyError: string | null } | null>(null);
   const [deploying, setDeploying] = useState(false);
+  const [presetId, setPresetId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
-    setDraft(app ? draftFrom(app) : emptyDraft(meta.limits.keepReleasesDefault));
+    const nextDraft = app ? draftFrom(app) : emptyDraft(meta.limits.keepReleasesDefault);
+    setDraft(nextDraft);
+    setPresetId(matchPreset(nextDraft.settings.steps, nextDraft.settings.start));
     setCreated(null);
     setTouched(false);
     setFormError(null);
@@ -181,8 +206,53 @@ export function AppFormModal({
     setDraft((current) => ({ ...current, settings: { ...current.settings, ...patch } }));
   };
 
-  const clearMigrateOverride = () =>
-    setSettings({ migrate: '', migrateOff: false, migrateOverride: false });
+  const applyCommands = (id: string) => {
+    const commands = presetCommands(id);
+    setSettings({
+      steps: toStepDrafts(commands.steps),
+      stepsOverride: true,
+      start: commands.start,
+      startOverride: true,
+    });
+    setPresetId(id);
+  };
+
+  /** Choosing a card confirms only when the form no longer matches the baseline. */
+  const choosePreset = async (id: string) => {
+    const baseline = presetId ? presetCommands(presetId) : { start: '', steps: [] };
+    const modified = !sameCommands(
+      draft.settings.steps,
+      draft.settings.start,
+      baseline.steps,
+      baseline.start
+    );
+    if (id === presetId && !modified) return;
+    if (modified) {
+      const ok = await confirm({
+        title: 'Replace the current steps?',
+        body: `Your edited steps will be replaced by the ${presetLabel(id) ?? 'Custom'} preset.`,
+        confirmLabel: 'Replace',
+        cancelLabel: 'Keep my steps',
+        tone: 'accent',
+      });
+      if (!ok) return;
+    }
+    applyCommands(id);
+  };
+
+  const presetBaseline = presetId ? presetCommands(presetId) : null;
+  const presetModified =
+    presetBaseline !== null &&
+    !sameCommands(
+      draft.settings.steps,
+      draft.settings.start,
+      presetBaseline.steps,
+      presetBaseline.start
+    );
+
+  const clearStepsOverride = () => setSettings({ steps: [], stepsOverride: false });
+  const clearStartOverride = () => setSettings({ start: '', startOverride: false });
+  const clearRuntimeOverride = () => setSettings({ runtime: 'node', runtimeOverride: false });
   const clearExecModeOverride = () =>
     setSettings({ execMode: app?.execMode ?? 'fork', execModeOverride: false });
   const clearInstancesOverride = () =>
@@ -214,6 +284,10 @@ export function AppFormModal({
       draft.settings.healthPath.trim() && !draft.settings.healthPath.trim().startsWith('/')
         ? 'Must start with "/".'
         : null,
+    start:
+      draft.settings.startOverride && !draft.settings.start.trim()
+        ? 'A start command is required while this app overrides it.'
+        : null,
     env: parsedEnv.error,
     keepReleases:
       !Number.isInteger(keep) ||
@@ -229,7 +303,10 @@ export function AppFormModal({
         : 'A whole number from 1 to this server’s CPU count, or "max".';
     })(),
   };
-  const invalid = Object.values(errors).some(Boolean);
+  const stepErrors = draft.settings.stepsOverride
+    ? draft.settings.steps.map((step) => (step.run.trim() ? null : 'A command is required.'))
+    : [];
+  const invalid = Object.values(errors).some(Boolean) || stepErrors.some(Boolean);
 
   // The server enforces both rules; these are the form's own hints.
   const clusterAllowed = isClusterCapable(draft.settings.start);
@@ -238,8 +315,16 @@ export function AppFormModal({
     draft.settings.execMode === 'fork' && Number(draft.settings.instances) > 1;
   const serverWarnings = (app?.warnings ?? []).filter(
     (warning) =>
+      !isStepOrderWarning(warning) &&
       !(draft.settings.execMode === 'cluster' && warning === CLUSTER_STATELESS_WARNING)
   );
+  const apiStepWarnings = (app?.warnings ?? []).filter(isStepOrderWarning);
+  const legacyCommands =
+    editing &&
+    app.settings.steps === undefined &&
+    (app.settings.install !== undefined ||
+      app.settings.build !== undefined ||
+      app.settings.migrate !== undefined);
 
   const submit = async () => {
     if (saving) return;
@@ -478,9 +563,9 @@ export function AppFormModal({
 
         <section className="space-y-4 border-t border-line pt-5">
           <div>
-            <h3 className="text-sm font-semibold text-ink">How it runs</h3>
+            <h3 className="text-sm font-semibold text-ink">Port and health</h3>
             <p className="mt-0.5 text-xs text-muted">
-              All optional. An empty field is read from the repository’s{' '}
+              Optional. An empty field is read from the repository’s{' '}
               <code className="font-mono">ez.json</code>, and failing that from{' '}
               <code className="font-mono">package.json</code>.
             </p>
@@ -516,147 +601,193 @@ export function AppFormModal({
               spellCheck={false}
             />
           </FormGrid>
-          <TextInput
-            label="Start command"
-            optional
-            value={draft.settings.start}
-            onChange={(event) => setSettings({ start: event.target.value })}
-            hint="The long-running process. Any language: node server.js, python app.py, ./server."
-            placeholder="from ez.json, or npm start"
-            className="font-mono"
-            spellCheck={false}
+        </section>
+
+        <section className="space-y-4 border-t border-line pt-5">
+          <div>
+            <h3 className="text-sm font-semibold text-ink">Runtime</h3>
+            <p className="mt-0.5 text-xs text-muted">
+              What runs the app. Node.js is the only runtime Easy DevOps can supervise today;
+              the others are shown so the plan is clear.
+            </p>
+          </div>
+          <RuntimeCards
+            value={draft.settings.runtime}
+            onChange={(runtime) =>
+              setSettings({ runtime: runtime as DeployRuntime, runtimeOverride: true })
+            }
           />
-          <FormGrid>
-            <div className="space-y-2">
-              <TextInput
-                label="Install command"
-                optional
-                value={draft.settings.install}
-                onChange={(event) => setSettings({ install: event.target.value })}
-                disabled={draft.settings.skipInstall}
-                placeholder="from ez.json, or npm ci"
-                className="font-mono"
-                spellCheck={false}
-              />
-              <Checkbox
-                label="Skip the install step"
-                checked={draft.settings.skipInstall}
-                onChange={(checked) => setSettings({ skipInstall: checked })}
-              />
-            </div>
-            <div className="space-y-2">
-              <TextInput
-                label="Build command"
-                optional
-                value={draft.settings.build}
-                onChange={(event) => setSettings({ build: event.target.value })}
-                disabled={draft.settings.skipBuild}
-                placeholder="from ez.json, or npm run build"
-                className="font-mono"
-                spellCheck={false}
-              />
-              <Checkbox
-                label="Skip the build step"
-                checked={draft.settings.skipBuild}
-                onChange={(checked) => setSettings({ skipBuild: checked })}
-              />
-            </div>
-          </FormGrid>
+          {draft.settings.runtime === 'node' && (
+            <PresetCards
+              value={presetId}
+              modifiedFrom={presetModified && presetId ? presetLabel(presetId) : null}
+              onSelect={(id) => void choosePreset(id)}
+              onReset={() => {
+                if (presetId) applyCommands(presetId);
+              }}
+            />
+          )}
+          <OverrideRow
+            overridden={draft.settings.runtimeOverride}
+            note={
+              draft.settings.runtimeOverride
+                ? 'the runtime is saved on this app instead of ez.json.'
+                : 'No override — the runtime comes from ez.json, else Node.js.'
+            }
+            onClear={clearRuntimeOverride}
+          />
+        </section>
+
+        <section className="space-y-4 border-t border-line pt-5">
+          <div>
+            <h3 className="text-sm font-semibold text-ink">Commands</h3>
+            <p className="mt-0.5 text-xs text-muted">
+              The start command and the steps run in a new release, in this order. Steps are one
+              field: saving them replaces the repository’s list, and clearing the override goes
+              back to <code className="font-mono">ez.json</code>.
+            </p>
+          </div>
+          {legacyCommands && (
+            <InlineAlert tone="info" title="Saved in the old format">
+              These commands came from the separate install, build and migrate fields. Saving the
+              app stores them as one ordered steps list.
+            </InlineAlert>
+          )}
           <div className="space-y-1">
             <TextInput
-              label="Migrate command(s)"
-              optional
-              value={draft.settings.migrate}
+              label="Start command"
+              value={draft.settings.start}
               onChange={(event) =>
-                setSettings({ migrate: event.target.value, migrateOff: false, migrateOverride: true })
+                setSettings({ start: event.target.value, startOverride: true })
               }
-              hint="Runs after build, before the new release starts. Forward-only: a rollback does not undo a migration."
-              placeholder="from ez.json, e.g. npx prisma migrate deploy"
+              error={show('start')}
+              hint="The long-running process. Any language: node server.js, python app.py, ./server."
+              placeholder="from ez.json, or npm start"
               className="font-mono"
               spellCheck={false}
             />
             <OverrideRow
-              overridden={draft.settings.migrateOverride}
+              overridden={draft.settings.startOverride}
               note={
-                draft.settings.migrateOverride
-                  ? draft.settings.migrateOff
-                    ? 'the migrate step is off for this app.'
-                    : 'saved on this app instead of ez.json.'
-                  : 'No override — read from ez.json (nothing runs when ez.json has no migrate).'
+                draft.settings.startOverride
+                  ? 'the start command is saved on this app instead of ez.json.'
+                  : 'No override — read from ez.json, else package.json’s start script.'
               }
-              onClear={clearMigrateOverride}
+              onClear={clearStartOverride}
             />
           </div>
-          <FormGrid>
-            <Select
-              label="Process mode"
-              value={draft.settings.execMode}
-              onChange={(event) =>
-                setSettings({
-                  execMode: event.target.value as SettingsDraft['execMode'],
-                  execModeOverride: true,
-                })
-              }
-              hint="Cluster runs one worker per instance. It needs a start command of the form node <file>."
-            >
-              <option value="fork">Fork — one process</option>
-              <option value="cluster" disabled={clusterAllowed === false}>
-                Cluster — several workers
-              </option>
-            </Select>
-            <TextInput
-              label="Instances"
-              optional
-              value={draft.settings.instances}
-              onChange={(event) =>
-                setSettings({ instances: event.target.value, instancesOverride: true })
-              }
-              error={show('instances')}
-              hint="A whole number up to this server’s CPU count, or “max”. Leave empty for 1."
-              placeholder="1"
-            />
-          </FormGrid>
-          <OverrideRow
-            overridden={draft.settings.execModeOverride}
-            note={
-              draft.settings.execModeOverride
-                ? 'the process mode is saved on this app instead of ez.json.'
-                : editing
-                  ? 'No override — the effective mode comes from ez.json, else the default.'
-                  : 'No override yet — fork is the default.'
-            }
-            onClear={clearExecModeOverride}
-          />
-          <OverrideRow
-            overridden={draft.settings.instancesOverride}
-            note={
-              draft.settings.instancesOverride
-                ? 'the instance count is saved on this app instead of ez.json.'
-                : editing
-                  ? 'No override — the effective count comes from ez.json, else the default (1).'
-                  : 'No override yet — one instance is the default.'
-            }
-            onClear={clearInstancesOverride}
-          />
-          {clusterBlocked && (
-            <InlineAlert tone="warning">
-              Cluster mode needs a start command that runs a JS file directly, such as{' '}
-              <code className="font-mono">node dist/index.js</code> — not an npm script or another
-              language. Change the start command, or choose Fork.
-            </InlineAlert>
-          )}
-          {draft.settings.execMode === 'cluster' && (
-            <InlineAlert tone="warning" title="Cluster mode">
-              {CLUSTER_STATELESS_WARNING}
-            </InlineAlert>
-          )}
-          {forkWithInstances && (
-            <InlineAlert tone="warning">
-              Fork mode starts one process. Several forked copies would all bind the same port —
-              choose Cluster for {draft.settings.instances} instances.
-            </InlineAlert>
+          {draft.settings.stepsOverride ? (
+            <div className="space-y-2">
+              <StepsEditor
+                steps={draft.settings.steps}
+                onChange={(steps) => setSettings({ steps })}
+                errors={touched ? stepErrors : undefined}
+                apiWarnings={apiStepWarnings}
+              />
+              <OverrideRow
+                overridden
+                note="the steps are saved on this app instead of ez.json."
+                onClear={clearStepsOverride}
+              />
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <p className="rounded-md border border-dashed border-line bg-raised/30 px-3 py-4 text-xs text-muted">
+                No steps are saved on this app. Its install, build and migrate commands come from{' '}
+                <code className="font-mono">ez.json</code>, or from{' '}
+                <code className="font-mono">package.json</code>.
+              </p>
+              <OverrideRow
+                overridden={false}
+                note="No override — the steps come from ez.json."
+                onClear={clearStepsOverride}
+                onOverride={() => setSettings({ stepsOverride: true })}
+                overrideLabel="Override steps"
+              />
+            </div>
           )}
         </section>
+
+        {draft.settings.runtime === 'node' && (
+          <section className="space-y-4 border-t border-line pt-5">
+            <div>
+              <h3 className="text-sm font-semibold text-ink">Process mode</h3>
+              <p className="mt-0.5 text-xs text-muted">
+                Fork runs one process. Cluster runs one worker per instance, and needs a start
+                command of the form <code className="font-mono">node &lt;file&gt;</code>.
+              </p>
+            </div>
+            <FormGrid>
+              <Select
+                label="Process mode"
+                value={draft.settings.execMode}
+                onChange={(event) =>
+                  setSettings({
+                    execMode: event.target.value as SettingsDraft['execMode'],
+                    execModeOverride: true,
+                  })
+                }
+                hint="Cluster runs one worker per instance. It needs a start command of the form node <file>."
+              >
+                <option value="fork">Fork — one process</option>
+                <option value="cluster" disabled={clusterAllowed === false}>
+                  Cluster — several workers
+                </option>
+              </Select>
+              <TextInput
+                label="Instances"
+                optional
+                value={draft.settings.instances}
+                onChange={(event) =>
+                  setSettings({ instances: event.target.value, instancesOverride: true })
+                }
+                error={show('instances')}
+                hint="A whole number up to this server’s CPU count, or “max”. Leave empty for 1."
+                placeholder="1"
+              />
+            </FormGrid>
+            <OverrideRow
+              overridden={draft.settings.execModeOverride}
+              note={
+                draft.settings.execModeOverride
+                  ? 'the process mode is saved on this app instead of ez.json.'
+                  : editing
+                    ? 'No override — the effective mode comes from ez.json, else the default.'
+                    : 'No override yet — fork is the default.'
+              }
+              onClear={clearExecModeOverride}
+            />
+            <OverrideRow
+              overridden={draft.settings.instancesOverride}
+              note={
+                draft.settings.instancesOverride
+                  ? 'the instance count is saved on this app instead of ez.json.'
+                  : editing
+                    ? 'No override — the effective count comes from ez.json, else the default (1).'
+                    : 'No override yet — one instance is the default.'
+              }
+              onClear={clearInstancesOverride}
+            />
+            {clusterBlocked && (
+              <InlineAlert tone="warning">
+                Cluster mode needs a start command that runs a JS file directly, such as{' '}
+                <code className="font-mono">node dist/index.js</code> — not an npm script or another
+                language. Change the start command, or choose Fork.
+              </InlineAlert>
+            )}
+            {draft.settings.execMode === 'cluster' && (
+              <InlineAlert tone="warning" title="Cluster mode">
+                {CLUSTER_STATELESS_WARNING}
+              </InlineAlert>
+            )}
+            {forkWithInstances && (
+              <InlineAlert tone="warning">
+                Fork mode starts one process. Several forked copies would all bind the same port —
+                choose Cluster for {draft.settings.instances} instances.
+              </InlineAlert>
+            )}
+          </section>
+        )}
 
         <section className="space-y-4 border-t border-line pt-5">
           <div>
@@ -732,27 +863,14 @@ export function AppFormModal({
               hint="Older ones are deleted. The live release and the one before it are always kept."
             />
           </FormGrid>
-          {meta.channels.length > 0 && (
-            <div>
-              <div className="mb-1.5 text-xs font-medium text-ink">Notify on every deployment</div>
-              <div className="space-y-1.5">
-                {meta.channels.map((channel) => (
-                  <Checkbox
-                    key={channel.id}
-                    label={`${channel.name} (${channel.type})`}
-                    checked={draft.notifyChannelIds.includes(channel.id)}
-                    onChange={(checked) =>
-                      set({
-                        notifyChannelIds: checked
-                          ? [...draft.notifyChannelIds, channel.id]
-                          : draft.notifyChannelIds.filter((id) => id !== channel.id),
-                      })
-                    }
-                  />
-                ))}
-              </div>
-            </div>
-          )}
+          <ChannelPicker
+            channels={meta.channels}
+            value={draft.notifyChannelIds}
+            onChange={(ids) => set({ notifyChannelIds: ids })}
+            label="Notify on every deployment"
+            emptyHref="/notifications"
+            disabled={saving}
+          />
         </section>
       </form>
     </Modal>

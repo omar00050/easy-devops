@@ -25,6 +25,7 @@ import ora from 'ora';
 import { dbGet, dbSet } from '../../core/db.js';
 import { loadConfig } from '../../core/config.js';
 import { getDashboardStatus, startDashboard, stopDashboard } from '../../core/dashboardProcess.js';
+import { page, pause } from '../ui/page.js';
 
 
 // ─── Recover interrupted update ───────────────────────────────────────────────
@@ -150,15 +151,29 @@ async function warnStaleDaemon(targetVersion) {
  *
  * @param {Object} [opts]
  * @param {boolean} [opts.yes] Skip the confirmation
+ * @param {boolean} [opts.heading] Print the "Update Easy DevOps" heading
  * @returns {Promise<number>} Process exit code
  */
-export async function updateCommand({ yes = false } = {}) {
+export async function updateCommand({ yes = false, heading = true } = {}) {
+  const code = await runUpdate({ yes, heading });
+
+  // A long operation's outcome is read, not scrolled past. No-op without a
+  // TTY, so `ezz update` in a script is unaffected. A dismissed confirmation
+  // (code 2) ran nothing and has nothing to read.
+  if (code !== 2) await pause();
+
+  return code;
+}
+
+async function runUpdate({ yes = false, heading = true } = {}) {
   const updater = await import('../../core/updater.js');
 
-  console.log();
-  console.log('  ' + chalk.bold('Update Easy DevOps'));
-  console.log('  ' + chalk.gray('-'.repeat(58)));
-  console.log();
+  if (heading) {
+    console.log();
+    console.log('  ' + chalk.bold('Update Easy DevOps'));
+    console.log('  ' + chalk.gray('-'.repeat(58)));
+    console.log();
+  }
 
   const spinner = ora('Checking the registry...').start();
   const check = await updater.checkForUpdate();
@@ -282,18 +297,13 @@ export default async function updateMenu() {
   // A crashed previous update is finished before another one is offered.
   await recoverIfNeeded();
 
-  let code;
+  page(['Update']);
+
   try {
-    code = await updateCommand();
+    // The page header is the heading; the command's own title would repeat it.
+    await updateCommand({ heading: false });
   } catch (err) {
     if (err.name === 'ExitPromptError') return;
     throw err;
   }
-
-  // Dismissed at the confirmation prompt: nothing ran, nothing to read.
-  if (code === 2) return;
-
-  try {
-    await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
-  } catch { /* ExitPromptError on the pause */ }
 }

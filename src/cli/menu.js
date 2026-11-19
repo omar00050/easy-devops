@@ -15,11 +15,13 @@ import ora from 'ora';
 import inquirer from 'inquirer';
 import { runDetection, showSystemStatus, formatStatusLine } from '../core/detector.js';
 import { getDataDir, isDevDataDir } from '../core/platform.js';
+import { page, EXIT } from './ui/page.js';
 
 import nodejsMenu from './menus/nodejs.js';
 import nginxMenu from './menus/nginx.js';
 import sslMenu from './menus/ssl.js';
 import domainsMenu from './menus/domains.js';
+import hubMenu from './menus/hub.js';
 import dashboardMenu from './menus/dashboard.js';
 import settingsMenu from './menus/settings.js';
 import updateMenu from './menus/update.js';
@@ -93,10 +95,11 @@ async function showMainMenu() {
       '🌐 Nginx Manager',
       '🔒 SSL Manager',
       '🔗 Domain Manager',
+      '🔌 Hub',
       '🎛️ Open Dashboard',
       '⚙️ Settings',
       '🔄 Check for Updates',
-      '✖ Exit',
+      EXIT,
     ],
   }]);
   return answers.choice;
@@ -108,15 +111,18 @@ async function dispatch(choice) {
     case '🌐 Nginx Manager': await nginxMenu(); break;
     case '🔒 SSL Manager': await sslMenu(); break;
     case '🔗 Domain Manager': await domainsMenu(); break;
+    case '🔌 Hub': await hubMenu(); break;
     case '🎛️ Open Dashboard': await dashboardMenu(); break;
     case '⚙️ Settings': await settingsMenu(); break;
     case '🔄 Check for Updates': await updateMenu(); break;
-    case '✖ Exit': process.exit(0);
+    case EXIT: process.exit(0);
   }
 }
 
 async function main() {
   while (true) {
+    page(['Main Menu']);
+
     const spinner = ora('Checking system…').start();
     await runDetectionIfStale();
     spinner.stop();

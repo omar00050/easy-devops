@@ -17,6 +17,7 @@ import { run, runLive, runInteractive } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { ensureNginxInclude } from '../../core/nginx-conf-generator.js';
 import { isWindows, isNginxTestOk } from '../../core/platform.js';
+import { page, pause, BACK } from '../ui/page.js';
 import path from 'path';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -409,10 +410,11 @@ async function installNginx() {
 
 export async function showNginxManager() {
   while (true) {
+    page(['Nginx']);
+
     const { nginxDir } = loadConfig();
     const status = await getNginxStatus(nginxDir);
 
-    console.log(chalk.bold('\n  Nginx Manager'));
     console.log(chalk.gray('  ' + '─'.repeat(40)));
 
     if (status.version) {
@@ -438,7 +440,7 @@ export async function showNginxManager() {
       choices.push('Install nginx', new inquirer.Separator());
     }
 
-    choices.push('← Back');
+    choices.push(BACK);
 
     let choice;
     try {
@@ -455,18 +457,23 @@ export async function showNginxManager() {
 
     switch (choice) {
       case 'Reload nginx':
+        page(['Nginx', 'Reload']);
         await reloadNginx(status.nginxExe, status.nginxDir);
         break;
       case 'Restart nginx':
+        page(['Nginx', 'Restart']);
         await restartNginx(status.nginxExe, status.nginxDir);
         break;
       case 'Start nginx':
+        page(['Nginx', 'Start']);
         await startNginx(status.nginxExe, status.nginxDir);
         break;
       case 'Stop nginx':
+        page(['Nginx', 'Stop']);
         await stopNginx(status.nginxDir);
         break;
       case 'Test config': {
+        page(['Nginx', 'Test config']);
         const result = await testConfig(status.nginxExe, status.nginxDir);
         console.log(
           '\n  Config test: ' +
@@ -477,17 +484,19 @@ export async function showNginxManager() {
         break;
       }
       case 'View error log':
+        page(['Nginx', 'Error log']);
         await viewErrorLog(status.logPath);
         break;
       case 'Install nginx':
+        page(['Nginx', 'Install']);
         await installNginx();
         break;
-      case '← Back':
+      case BACK:
         return;
     }
 
-    if (choice !== '← Back') {
-      await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
+    if (choice !== BACK) {
+      await pause();
     }
   }
 }

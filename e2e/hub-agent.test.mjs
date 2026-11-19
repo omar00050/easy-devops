@@ -30,6 +30,9 @@ import { TEST_DATA_DIR, assertInsideTestDataDir } from './lib/guard.mjs';
 
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
+import { promises as dnsPromises } from 'node:dns';
+import { createRequire } from 'module';
 import { createServer } from 'http';
 import { spawn } from 'child_process';
 import { once } from 'events';
@@ -48,6 +51,35 @@ function check(label, passed, detail = '') {
 
 const srcUrl = (rel) => pathToFileURL(path.join(ROOT, 'src', rel)).href;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const require = createRequire(import.meta.url);
+
+/** Writes a real, parseable certificate with `daysLeft` remaining. */
+function writeTestCert(sslDir, domain, daysLeft) {
+  const forge = require('node-forge');
+  const dir = path.join(sslDir, domain);
+  assertInsideTestDataDir(dir, `write a test certificate for ${domain}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  });
+  const expiry = new Date(Date.now() + daysLeft * 86_400_000 + 43_200_000);
+  const cert = forge.pki.createCertificate();
+  cert.publicKey = forge.pki.publicKeyFromPem(publicKey);
+  cert.serialNumber = '01';
+  cert.validity.notBefore = new Date(expiry.getTime() - 90 * 86_400_000);
+  cert.validity.notAfter = expiry;
+  const subject = [{ name: 'commonName', value: domain }];
+  cert.setSubject(subject);
+  cert.setIssuer(subject);
+  cert.setExtensions([{ name: 'subjectAltName', altNames: [{ type: 2, value: domain }] }]);
+  cert.sign(forge.pki.privateKeyFromPem(privateKey), forge.md.sha256.create());
+  fs.writeFileSync(path.join(dir, 'fullchain.pem'), forge.pki.certificateToPem(cert));
+  fs.writeFileSync(path.join(dir, 'privkey.pem'), privateKey);
+  return dir;
+}
 
 async function waitUntil(fn, { timeoutMs = 8_000, everyMs = 100 } = {}) {
   const deadline = Date.now() + timeoutMs;
@@ -76,7 +108,7 @@ async function startTestHub() {
   const io = new Server(http);
   const ns = io.of('/agent-socket');
 
-  const state = { connects: 0, evictions: 0, rejections: [], events: [], results: [], progress: [], socket: null };
+  const state = { connects: 0, evictions: 0, rejections: [], events: [], results: [], progress: [], domainConfigs: [], socket: null };
   const agentSockets = new Map();
 
   ns.use((socket, next) => {
@@ -106,6 +138,7 @@ async function startTestHub() {
     // can assert on what the agent actually reported.
     socket.on('command:result', (payload) => state.results.push(payload));
     socket.on('command:progress', (payload) => state.progress.push(payload));
+    socket.on('domain:configs', (payload) => state.domainConfigs.push(payload));
 
     socket.on('disconnect', () => {
       if (agentSockets.get(socket.serverId) === socket) agentSockets.delete(socket.serverId);
@@ -886,6 +919,261 @@ async function testCommandProgress() {
   }
 }
 
+// ─── 11. Hub SSL renew emits stages, and only for its requestId ─────────────
+
+/**
+ * A `hub:manageSSL { action: "renew" }` goes through cert-operations →
+ * renewCertificate → issueCertificate. DNS is stubbed to NXDOMAIN so the
+ * preflight fails before any ACME request, which is enough to prove the
+ * `requestId → createCommandProgress → onProgress → command:progress` path
+ * without touching DNS, Let's Encrypt or nginx.
+ */
+async function testSslCommandProgress() {
+  setGroup('11. manageSSL renew emits command:progress for its requestId only');
+
+  const hub = await startTestHub();
+  const dataDir = scratch('ssl-command-progress');
+
+  const agent = await import(srcUrl('core/hub/agent.js'));
+  const { saveHubLink, clearHubLink, saveHubPermissions } = await import(srcUrl('core/hubLink.js'));
+  const { dbSet } = await import(srcUrl('core/db.js'));
+
+  dbSet('config', {
+    nginxDir: path.join(dataDir, 'nginx'),
+    sslDir: path.join(dataDir, 'ssl'),
+    dashboardPort: 0,
+    dashboardAuth: 'none',
+    dashboardBindAddress: '127.0.0.1',
+    dashboardUi: 'new',
+    dashboardUiMigrated: true,
+    acmeEmail: 'ops@example.com',
+    os: process.platform,
+  });
+  dbSet('domains', []);
+  saveHubPermissions({ 'ssl.renew': true });
+  saveHubLink({ hubUrl: hub.url, serverId: SERVER_ID, secret: SECRET });
+
+  const REQUEST_ID = 'req-ssl-progress-1';
+  const original = {
+    resolve4: dnsPromises.resolve4,
+    resolve6: dnsPromises.resolve6,
+    resolveAny: dnsPromises.resolveAny,
+  };
+  const nxdomain = async () => {
+    const err = new Error('queryA ENOTFOUND progress-ssl.example.com');
+    err.code = 'ENOTFOUND';
+    throw err;
+  };
+
+  try {
+    dnsPromises.resolve4 = nxdomain;
+    dnsPromises.resolve6 = nxdomain;
+    dnsPromises.resolveAny = nxdomain;
+
+    agent.initHubAgent();
+    check('the agent connects', await waitUntil(() => hub.live() === 1), `live: ${hub.live()}`);
+
+    hub.state.socket.emit('hub:manageSSL', {
+      action: 'renew',
+      domain: 'progress-ssl.example.com',
+      requestId: REQUEST_ID,
+    });
+
+    const answered = await waitUntil(
+      () => hub.state.results.some((r) => r.requestId === REQUEST_ID),
+      { timeoutMs: 15_000 },
+    );
+    check('the SSL renew is answered with its requestId', answered,
+      `${hub.state.results.length} result(s)`);
+
+    check('it emitted progress frames', hub.state.progress.length > 0,
+      `${hub.state.progress.length} frame(s)`);
+    check('every frame carries that requestId',
+      hub.state.progress.every((p) => p.requestId === REQUEST_ID),
+      hub.state.progress.map((p) => String(p.requestId)).join(', '));
+    check('every SSL frame names its domain',
+      hub.state.progress.every((p) => p.domain === 'progress-ssl.example.com'),
+      hub.state.progress.map((p) => String(p.domain)).join(', '));
+    check('the stage names are SSL stages',
+      hub.state.progress.every((p) => typeof p.step === 'string'
+        && ['preflight', 'account and order', 'challenge ready',
+          'waiting for validation', 'certificate received', 'files written',
+          'nginx config test', 'nginx reload', 'https verified'].includes(p.step)),
+      hub.state.progress.map((p) => p.step).join(', '));
+    check('preflight is reported as running and then failed',
+      hub.state.progress.some((p) => p.step === 'preflight' && p.status === 'running')
+      && hub.state.progress.some((p) => p.step === 'preflight' && p.status === 'failed'));
+    check('every frame has a valid status and an ISO timestamp',
+      hub.state.progress.every((p) =>
+        ['running', 'ok', 'failed', 'skipped'].includes(p.status)
+        && typeof p.at === 'string' && !Number.isNaN(Date.parse(p.at))));
+
+    const wire = JSON.stringify(hub.state.progress);
+    check('no private key, key path or certificate body is in a frame',
+      !wire.includes('PRIVATE KEY')
+      && !wire.includes('privkey.pem')
+      && !wire.includes('fullchain.pem')
+      && !wire.includes('MIIE'));
+
+    const before = hub.state.progress.length;
+    hub.state.socket.emit('hub:manageSSL', {
+      action: 'renew',
+      domain: 'progress-ssl-no-id.example.com',
+    });
+    await sleep(1_200);
+
+    check('a command without a requestId emits no progress frame',
+      hub.state.progress.length === before,
+      `${hub.state.progress.length - before} extra frame(s)`);
+  } finally {
+    dnsPromises.resolve4 = original.resolve4;
+    dnsPromises.resolve6 = original.resolve6;
+    dnsPromises.resolveAny = original.resolveAny;
+    agent.stopHubAgent();
+    clearHubLink();
+    await hub.close();
+  }
+}
+
+// ─── 12. renewAll progress is per domain ────────────────────────────────────
+
+async function testRenewAllProgressDomains() {
+  setGroup('12. renewAll progress names each domain');
+
+  const hub = await startTestHub();
+  const dataDir = scratch('ssl-renewall-progress');
+  const sslDir = path.join(dataDir, 'ssl');
+  fs.mkdirSync(sslDir, { recursive: true });
+  writeTestCert(sslDir, 'renew-a.example.com', 5);
+  writeTestCert(sslDir, 'renew-b.example.com', 5);
+
+  const agent = await import(srcUrl('core/hub/agent.js'));
+  const { saveHubLink, clearHubLink, saveHubPermissions } = await import(srcUrl('core/hubLink.js'));
+  const { dbSet } = await import(srcUrl('core/db.js'));
+
+  dbSet('config', {
+    nginxDir: path.join(dataDir, 'nginx'),
+    sslDir,
+    dashboardPort: 0,
+    dashboardAuth: 'none',
+    dashboardBindAddress: '127.0.0.1',
+    dashboardUi: 'new',
+    dashboardUiMigrated: true,
+    acmeEmail: 'ops@example.com',
+    os: process.platform,
+  });
+  dbSet('domains', []);
+  saveHubPermissions({ 'ssl.renewAll': true });
+  saveHubLink({ hubUrl: hub.url, serverId: SERVER_ID, secret: SECRET });
+
+  const REQUEST_ID = 'req-renewall-progress-1';
+  const original = {
+    resolve4: dnsPromises.resolve4,
+    resolve6: dnsPromises.resolve6,
+    resolveAny: dnsPromises.resolveAny,
+  };
+  const nxdomain = async () => {
+    const err = new Error('queryA ENOTFOUND renew.example.com');
+    err.code = 'ENOTFOUND';
+    throw err;
+  };
+
+  try {
+    dnsPromises.resolve4 = nxdomain;
+    dnsPromises.resolve6 = nxdomain;
+    dnsPromises.resolveAny = nxdomain;
+
+    agent.initHubAgent();
+    check('the agent connects', await waitUntil(() => hub.live() === 1), `live: ${hub.live()}`);
+
+    hub.state.socket.emit('hub:manageSSL', {
+      action: 'renewAll',
+      requestId: REQUEST_ID,
+    });
+
+    const answered = await waitUntil(
+      () => hub.state.results.some((r) => r.requestId === REQUEST_ID),
+      { timeoutMs: 20_000 },
+    );
+    check('the renewAll command is answered', answered, `${hub.state.results.length} result(s)`);
+
+    const frames = hub.state.progress;
+    const names = [...new Set(frames.map((frame) => frame.domain))].sort();
+    check('frames are emitted for both domains',
+      frames.length > 0 && names.includes('renew-a.example.com') && names.includes('renew-b.example.com'),
+      names.join(', '));
+    check('every renewAll frame names its domain and requestId',
+      frames.every((frame) => typeof frame.domain === 'string' && frame.domain
+        && frame.requestId === REQUEST_ID));
+    check('each domain reports its own preflight failure',
+      ['renew-a.example.com', 'renew-b.example.com'].every((name) =>
+        frames.some((frame) => frame.domain === name && frame.step === 'preflight' && frame.status === 'failed')));
+  } finally {
+    dnsPromises.resolve4 = original.resolve4;
+    dnsPromises.resolve6 = original.resolve6;
+    dnsPromises.resolveAny = original.resolveAny;
+    agent.stopHubAgent();
+    clearHubLink();
+    await hub.close();
+  }
+}
+
+// ─── 13. domain:configs carries the certificate state ───────────────────────
+
+async function testDomainCertStatus() {
+  setGroup('13. domain:configs carries certStatus and certLabel');
+
+  const hub = await startTestHub();
+  const dataDir = scratch('domain-cert-status');
+  const sslDir = path.join(dataDir, 'ssl');
+  fs.mkdirSync(sslDir, { recursive: true });
+  writeTestCert(sslDir, 'valid.example.com', 60);
+
+  const agent = await import(srcUrl('core/hub/agent.js'));
+  const { saveHubLink, clearHubLink } = await import(srcUrl('core/hubLink.js'));
+  const { dbSet } = await import(srcUrl('core/db.js'));
+
+  dbSet('config', {
+    nginxDir: path.join(dataDir, 'nginx'),
+    sslDir,
+    dashboardPort: 0,
+    dashboardAuth: 'none',
+    dashboardBindAddress: '127.0.0.1',
+    dashboardUi: 'new',
+    dashboardUiMigrated: true,
+    acmeEmail: 'ops@example.com',
+    os: process.platform,
+  });
+  dbSet('domains', [
+    { name: 'valid.example.com', port: 3000, enabled: true },
+    { name: 'missing.example.com', port: 3001, enabled: true },
+  ]);
+  saveHubLink({ hubUrl: hub.url, serverId: SERVER_ID, secret: SECRET });
+
+  try {
+    agent.initHubAgent();
+    check('the agent connects', await waitUntil(() => hub.live() === 1), `live: ${hub.live()}`);
+    const pushed = await waitUntil(() => hub.state.domainConfigs.length > 0);
+    check('the agent pushes domain:configs', pushed);
+
+    const domains = hub.state.domainConfigs.at(-1) ?? [];
+    const of = (name) => domains.find((domain) => domain.name === name);
+    check('a domain with a readable certificate reports its status',
+      of('valid.example.com')?.certStatus === 'valid');
+    check('a domain with no certificate reports not_issued and its label',
+      of('missing.example.com')?.certStatus === 'not_issued'
+      && of('missing.example.com')?.certLabel === 'Not issued yet');
+    check('the domain payload carries no certificate path or contents',
+      !JSON.stringify(domains).includes('privkey.pem')
+      && !JSON.stringify(domains).includes('fullchain.pem')
+      && !JSON.stringify(domains).includes('PRIVATE KEY'));
+  } finally {
+    agent.stopHubAgent();
+    clearHubLink();
+    await hub.close();
+  }
+}
+
 // ─── main ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -902,6 +1190,9 @@ async function main() {
   await testSaveConfigDispatch();
   await testCommandAcknowledgement();
   await testCommandProgress();
+  await testSslCommandProgress();
+  await testRenewAllProgressDomains();
+  await testDomainCertStatus();
   await testHandoverIsExclusive();
 
   const failed = results.filter((r) => !r.passed);

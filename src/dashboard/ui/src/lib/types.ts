@@ -106,7 +106,13 @@ export interface DomainDeleteResult {
 
 // ─── SSL ─────────────────────────────────────────────────────────────────────
 
-export type CertStatus = 'valid' | 'expiring' | 'expired' | 'error';
+/**
+ * `not_issued` (2.16.0) is a certificate directory with no certificate file;
+ * `unreadable` (2.16.0) is a file neither Node nor openssl can parse. `error`
+ * is what a backend older than 2.16.0 called the unreadable case and is kept
+ * so an older server still type-checks.
+ */
+export type CertStatus = 'valid' | 'expiring' | 'expired' | 'not_issued' | 'unreadable' | 'error';
 
 /**
  * What the background job intends for a certificate.
@@ -122,6 +128,8 @@ export interface Certificate {
   expiry: string | null;
   daysLeft: number | null;
   status: CertStatus;
+  /** "Not issued yet" for `not_issued`; null for an unreadable file. */
+  label?: string | null;
   /** Optional: absent on a backend older than contract 2.3.0. */
   autoRenew?: CertAutoRenew;
   autoRenewDays?: number;
@@ -162,16 +170,52 @@ export type SslSuggestion =
   | { found: false }
   | { found: true; match: SslSuggestionMatch; certificate: SslSuggestionCertificate };
 
+/** One preflight check (`core/ssl/preflight.js`): id is `dns:<name>`, `a:…`, `aaaa:…` or `http:…`. */
+export type PreflightCheckStatus = 'ok' | 'warn' | 'fail' | 'skipped';
+
+export interface PreflightCheck {
+  id: string;
+  status: PreflightCheckStatus;
+  message: string;
+  /** The one-line next step; present when there is something to do. */
+  fix?: string;
+}
+
+/** What `/api/ssl` checks before it spends a Let's Encrypt attempt (normalised view). */
+export interface PreflightResult {
+  ok: boolean;
+  detail?: string;
+  results: PreflightCheck[];
+  /** A Cloudflare address answered for at least one name. */
+  proxied?: boolean;
+  /** The public HTTP probe reached this server. */
+  reachesUs?: boolean;
+}
+
+/**
+ * The wire shape since 2.16.0: `POST /api/ssl/create`, `renew/:domain` and every
+ * renew-all entry carry the checks as a plain array (or null when the request
+ * stopped before preflight ran). An older body wrapped them as
+ * `{ ok, results }`; `preflightFrom()` accepts either.
+ */
+export type PreflightPayload = PreflightCheck[] | PreflightResult;
+
 export interface IssuanceFailure {
   step?: string;
   cause?: string;
   consequence?: string;
+  /** The stage that failed, when the server names it (2.16.0). */
+  stage?: string;
+  /** The one-line remedy (2.16.0). */
+  fix?: string;
   nginxRunning?: boolean;
   configSaved?: boolean;
 }
 
 export interface IssuanceSuccess {
   success: true;
+  /** The client's correlation id, echoed by the server. */
+  opId?: string;
   certPath: string;
   keyPath: string;
   /** 'proxy' when nginx answered the challenge, 'standalone' when it stopped. */
@@ -180,10 +224,13 @@ export interface IssuanceSuccess {
   nginxDownMs?: number;
   staging?: boolean;
   summary?: string;
+  preflight?: PreflightPayload | null;
 }
 
 export interface DnsChallengePending {
   status: 'waiting_dns';
+  /** The client's correlation id, echoed by the 202. */
+  opId?: string;
   domain: string;
   txtName: string;
   txtValue: string;
@@ -192,6 +239,8 @@ export interface DnsChallengePending {
 
 export interface RenewAllResult {
   domain: string;
+  /** The one id shared by every item in a renew-all request. */
+  opId?: string;
   success: boolean;
   certPath: string | null;
   keyPath: string | null;
@@ -199,9 +248,11 @@ export interface RenewAllResult {
   fellBack?: boolean;
   nginxDownMs?: number;
   configRegenerated?: boolean;
+  nginxReloaded?: boolean | null;
   summary?: string;
   error?: string | IssuanceFailure;
   detail?: string;
+  preflight?: PreflightPayload | null;
 }
 
 export interface SslCreateInput {
@@ -209,6 +260,31 @@ export interface SslCreateInput {
   www?: boolean;
   validationMethod: 'http' | 'dns';
   email?: string | null;
+  /** Optional client correlation id, `/^[A-Za-z0-9_-]{8,64}$/`. */
+  opId?: string;
+}
+
+// ─── SSL live progress ───────────────────────────────────────────────────────
+
+/** The nine stages of API-CONTRACT.md §2.3 / §3.5, in order. */
+export type SslStageStatus = 'running' | 'ok' | 'failed' | 'skipped';
+
+/**
+ * One `ssl:progress` frame. Published while issue, renew and renew-all run and
+ * deliberately NOT replayed on reconnect: a stage is a moment, not state.
+ */
+export interface SslProgressEvent {
+  /** Correlates every frame with the request that started the operation. */
+  opId: string;
+  domain: string;
+  /** A stage id from `core/ssl/progress.js` (e.g. `waiting for validation`). */
+  stage: string;
+  status: SslStageStatus;
+  /** At most 300 characters; never a key or file contents. */
+  detail?: string;
+  /** Measured from the start of the operation. */
+  elapsedMs: number;
+  at: string;
 }
 
 // ─── Nginx ───────────────────────────────────────────────────────────────────
@@ -543,6 +619,8 @@ export interface NotificationChannel {
   botToken?: string;
   chatId?: string;
   message?: string;
+  /** The last test result, when the server reports one; absent older servers do not. */
+  lastTest?: 'passed' | 'failed' | null;
 }
 
 export interface ChannelInput {
@@ -660,6 +738,7 @@ export interface ServerEvents {
   'local:changed': LocalChangeEvent;
   'service:changed': BackgroundServiceEvent;
   'hub:agentState': HubAgentStateEvent;
+  'ssl:progress': SslProgressEvent;
   connect: undefined;
   disconnect: undefined;
   connect_error: Error;
@@ -680,8 +759,28 @@ export type DeployExecMode = 'fork' | 'cluster';
 /** A whole number 1..CPU count, or "max" (one per CPU). */
 export type DeployInstances = number | 'max';
 
+/** The runtime an app runs on. Only Node.js exists today. */
+export type DeployRuntime = 'node';
+
+/** What one ordered step is for. `custom` is a free-form command. */
+export type DeployStepKind = 'install' | 'build' | 'migrate' | 'custom';
+
+/** One step in the ordered list run after checkout and before start (max 5). */
+export interface DeployStep {
+  /** One non-empty command line. */
+  run: string;
+  kind: DeployStepKind;
+  /** Defaults to true; a disabled step is skipped and logged as skipped. */
+  enabled?: boolean;
+}
+
 /** Per-app overrides. Absent means "use ez.json, then package.json". */
 export interface DeploySettings {
+  /** The ordered command list. One field: it replaces ez.json's list, and [] clears it. */
+  steps?: DeployStep[];
+  /** The runtime. Absent means ez.json's runtime, else "node". */
+  runtime?: DeployRuntime;
+  /** Legacy fields, still read by the server as the equivalent steps. */
   install?: DeployCommands;
   build?: DeployCommands;
   /** Runs after build, before the new release starts. Forward-only. */
@@ -877,7 +976,12 @@ export interface DeploymentsResponse {
   ezFileLocations: string[];
   /** Where a new app would be created. Absent before contract 2.6.0. */
   deployDir?: string;
-  channels: Array<{ id: string; name: string; type: string }>;
+  channels: Array<{
+    id: string;
+    name: string;
+    type: string;
+    lastTest?: 'passed' | 'failed' | null;
+  }>;
   domains: Array<{ name: string; enabled: boolean; ssl: boolean }>;
 }
 
@@ -932,10 +1036,14 @@ export interface DeployDomainLinkInput {
   ssl?: { mode: DeploySslMode; certName?: string };
   redirect?: boolean;
   behindCloudflare?: boolean;
+  /** Optional client correlation id for the live `ssl:progress` stages. */
+  opId?: string;
 }
 
 export interface DeployDomainLink {
   ok?: boolean;
+  /** The client's correlation id, echoed by the server. */
+  opId?: string;
   domain: string;
   created: boolean;
   port: number;
@@ -967,6 +1075,8 @@ export interface ApiErrorPayload {
   detail?: string;
   hint?: string;
   output?: string;
+  /** SSL failures (2.16.0): every check that ran, or null before preflight. */
+  preflight?: PreflightPayload | null;
   /** Service lifecycle failures: elevation_required / not_installed / action_failed. */
   action?: ServiceAction;
   message?: string;

@@ -20,8 +20,51 @@ import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { issueCertificate, describeIssuance } from '../../core/ssl-issuer.js';
 import { renewCertificate, describeRenewal, failureReason } from '../../core/cert-renewal.js';
+import { getCertExpiry } from '../../core/cert-reader.js';
+import { page, pause, BACK } from '../ui/page.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const STAGE_LABELS = {
+  'preflight': 'Checking DNS and port 80',
+  'account and order': "Preparing the Let's Encrypt account and order",
+  'challenge ready': 'Making the challenge ready',
+  'waiting for validation': "Waiting for Let's Encrypt validation",
+  'certificate received': "Certificate received from Let's Encrypt",
+  'files written': 'Certificate files written',
+  'nginx config test': 'Testing the nginx configuration',
+  'nginx reload': 'Reloading nginx',
+  'https verified': 'Verifying HTTPS',
+};
+
+/** The one-line status text for a progress event. */
+function stageText(event) {
+  const base = STAGE_LABELS[event.stage] ?? event.stage;
+  if (event.stage === 'waiting for validation' && event.status === 'running') {
+    const seconds = Math.max(0, Math.round((event.elapsedMs ?? 0) / 1000));
+    return `${base} (${seconds}s)`;
+  }
+  if (event.status === 'ok' && event.stage === 'https verified') {
+    return `${base} — ${event.domain} is serving the new certificate`;
+  }
+  return base;
+}
+
+/** Updates an ora spinner with each stage; never throws. */
+function spinnerProgress(spinner) {
+  return (event) => {
+    try {
+      if (!spinner) return;
+      if (event.status === 'failed') {
+        spinner.fail(event.detail ? `${stageText(event)}: ${event.detail}` : stageText(event));
+      } else if (event.status === 'ok' && event.stage === 'files written') {
+        spinner.text = stageText(event);
+      } else if (event.status === 'running') {
+        spinner.text = stageText(event);
+      }
+    } catch { /* progress must never break the command */ }
+  };
+}
 
 function getSslDir() {
   const { sslDir } = loadConfig();
@@ -73,18 +116,19 @@ async function listCerts(liveDir) {
     // Skip hidden directories like .account
     if (domain.startsWith('.')) continue;
 
-    const certPath = path.join(liveDir, domain, 'fullchain.pem');
-
-    let status = 'error';
+    let status = 'unreadable';
     let expiryDate = null;
     let daysLeft = null;
 
     try {
-      await fs.stat(certPath);
-      const expiry = await parseCertExpiry(certPath);
-      if (expiry !== null) {
-        expiryDate = expiry.expiryDate;
-        daysLeft = expiry.daysLeft;
+      const info = await getCertExpiry(domain, { sslDir: liveDir });
+      if (info.state === 'not_issued') {
+        status = 'not_issued';
+      } else if (info.state === 'unreadable' || info.daysLeft === null) {
+        status = 'unreadable';
+      } else {
+        expiryDate = info.expiry;
+        daysLeft = info.daysLeft;
         if (daysLeft > 30) {
           status = 'healthy';
         } else if (daysLeft >= 10) {
@@ -94,7 +138,7 @@ async function listCerts(liveDir) {
         }
       }
     } catch {
-      status = 'error';
+      status = 'unreadable';
     }
 
     certs.push({ domain, status, expiryDate, daysLeft });
@@ -106,8 +150,13 @@ async function listCerts(liveDir) {
 function renderCertRow(cert) {
   const domainPadded = cert.domain.padEnd(35);
 
-  if (cert.status === 'error') {
-    console.log(` ${chalk.gray('❌')} ${chalk.gray(domainPadded)} ${chalk.gray('ERROR')}`);
+  if (cert.status === 'not_issued') {
+    console.log(` ${chalk.gray('○')} ${chalk.gray(domainPadded)} ${chalk.gray('Not issued yet')}`);
+    return;
+  }
+
+  if (cert.status === 'unreadable' || cert.status === 'error') {
+    console.log(` ${chalk.gray('❌')} ${chalk.gray(domainPadded)} ${chalk.gray('UNREADABLE')}`);
     return;
   }
 
@@ -152,7 +201,7 @@ export async function issueCert(domainName, options = {}) {
  * than silently replaced by a single-name HTTP-01 certificate.
  */
 export async function renewCert(domainName, options = {}) {
-  return renewCertificate(domainName, { email: options.email ?? null, mode: options.mode ?? null });
+  return renewCertificate(domainName, options);
 }
 
 /**
@@ -164,7 +213,13 @@ export async function renewExpiring(certs, options = {}) {
 
   const results = [];
   for (const cert of expiring) {
-    const result = await renewCert(cert.domain, options);
+    const spinner = ora(`Renewing certificate for ${cert.domain}…`).start();
+    const result = await renewCert(cert.domain, {
+      ...options,
+      onEvent: spinnerProgress(spinner),
+    });
+    if (result.success) spinner.succeed(`Renewed certificate for ${cert.domain}`);
+    else if (spinner.isSpinning) spinner.stop();
     results.push({
       domain: cert.domain,
       success: result.success,
@@ -182,13 +237,14 @@ export async function renewExpiring(certs, options = {}) {
 
 export async function showSslManager() {
   while (true) {
+    page(['SSL']);
+
     const liveDir = getLiveDir();
 
     const spinner = ora('Loading certificates…').start();
     const certs = await listCerts(liveDir);
     spinner.stop();
 
-    console.log(chalk.bold('\n SSL Manager'));
     console.log(chalk.gray(' ' + '─'.repeat(40)));
 
     if (certs.length === 0) {
@@ -205,7 +261,7 @@ export async function showSslManager() {
       'Renew a certificate',
       'Renew all expiring (< 30 days)',
       new inquirer.Separator(),
-      '← Back',
+      BACK,
     ];
 
     let choice;
@@ -223,6 +279,7 @@ export async function showSslManager() {
 
     switch (choice) {
       case 'Create new certificate': {
+        page(['SSL', 'Issue']);
         const config = loadConfig();
 
         // Prompt for email if not configured
@@ -297,6 +354,9 @@ export async function showSslManager() {
             validationMethod: 'dns',
             email: acmeEmail,
             onDnsChallenge,
+            onEvent: (event) => {
+              if (event.status === 'running') console.log(chalk.gray(` ${stageText(event)}…`));
+            },
           });
         } else {
           const spinner = ora(`Creating certificate for ${domainInput.trim()}…`).start();
@@ -304,8 +364,10 @@ export async function showSslManager() {
             www: wwwInput,
             validationMethod: 'http',
             email: acmeEmail,
+            onEvent: spinnerProgress(spinner),
           });
-          spinner.stop();
+          if (result.success) spinner.succeed(`Certificate created for ${domainInput.trim()}`);
+          else if (spinner.isSpinning) spinner.stop();
         }
 
         if (result.success) {
@@ -331,6 +393,7 @@ export async function showSslManager() {
       }
 
       case 'Renew a certificate': {
+        page(['SSL', 'Renew']);
         if (certs.length === 0) {
           console.log(chalk.gray('\n No certificates found to renew\n'));
           break;
@@ -351,8 +414,12 @@ export async function showSslManager() {
 
         const config = loadConfig();
         const spinner = ora(`Renewing certificate for ${selectedDomain}…`).start();
-        const result = await renewCert(selectedDomain, { email: config.acmeEmail });
-        spinner.stop();
+        const result = await renewCert(selectedDomain, {
+          email: config.acmeEmail,
+          onEvent: spinnerProgress(spinner),
+        });
+        if (result.success) spinner.succeed(`Renewed certificate for ${selectedDomain}`);
+        else if (spinner.isSpinning) spinner.stop();
 
         if (result.success) {
           console.log(chalk.green('\n ✓ Renewed successfully'));
@@ -373,6 +440,7 @@ export async function showSslManager() {
       }
 
       case 'Renew all expiring (< 30 days)': {
+        page(['SSL', 'Renew all']);
         const config = loadConfig();
         const results = await renewExpiring(certs, { email: config.acmeEmail });
         if (results.length === 0) {
@@ -393,17 +461,12 @@ export async function showSslManager() {
         break;
       }
 
-      case '← Back':
+      case BACK:
         return;
     }
 
-    if (choice !== '← Back') {
-      try {
-        await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
-      } catch (err) {
-        if (err.name === 'ExitPromptError') return;
-        throw err;
-      }
+    if (choice !== BACK) {
+      await pause();
     }
   }
 }

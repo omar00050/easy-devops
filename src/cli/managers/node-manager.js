@@ -13,6 +13,7 @@
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import { run, runLive } from '../../core/shell.js';
+import { page, pause, BACK } from '../ui/page.js';
 
 const isWindows = process.platform === 'win32';
 
@@ -32,6 +33,8 @@ async function getCurrentVersions() {
 // ─── switchVersion ────────────────────────────────────────────────────────────
 
 async function switchVersion() {
+  page(['Node.js', 'Switch version']);
+
   // Verify nvm is present
   const nvmCheck = await run(isWindows ? 'nvm version' : 'nvm --version');
   if (!nvmCheck.success) {
@@ -43,7 +46,7 @@ async function switchVersion() {
       console.log(chalk.gray('  Install nvm: https://github.com/nvm-sh/nvm#installing-and-updating'));
     }
     console.log();
-    await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
+    await pause();
     return;
   }
 
@@ -84,7 +87,7 @@ async function switchVersion() {
 
   if (versions.length === 0) {
     console.log(chalk.red('\n  Could not fetch available versions. Check your internet connection.\n'));
-    await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
+    await pause();
     return;
   }
 
@@ -110,7 +113,7 @@ async function switchVersion() {
 
   await runLive(switchCmd, { timeout: 60000 });
 
-  await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
+  await pause();
 }
 
 // ─── listGlobalPackages ───────────────────────────────────────────────────────
@@ -124,7 +127,7 @@ async function listGlobalPackages() {
     console.log(chalk.red('  Failed to list global packages.'));
     if (result.stderr) console.log(chalk.gray('  ' + result.stderr));
   }
-  await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
+  await pause();
 }
 
 // ─── installGlobalPackage ─────────────────────────────────────────────────────
@@ -147,7 +150,7 @@ async function installGlobalPackage() {
   } else {
     console.log(chalk.red(`\n  ✗ Installation failed (exit code ${exitCode})`));
   }
-  await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
+  await pause();
 }
 
 // ─── uninstallGlobalPackage ───────────────────────────────────────────────────
@@ -164,7 +167,7 @@ async function uninstallGlobalPackage() {
 
   if (packages.length === 0) {
     console.log(chalk.yellow('\n  No removable global packages found.\n'));
-    await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
+    await pause();
     return;
   }
 
@@ -187,7 +190,7 @@ async function uninstallGlobalPackage() {
   } else {
     console.log(chalk.red(`\n  ✗ Uninstall failed (exit code ${exitCode})`));
   }
-  await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
+  await pause();
 }
 
 // ─── updateNpm ────────────────────────────────────────────────────────────────
@@ -202,16 +205,17 @@ async function updateNpm() {
   } else {
     console.log(chalk.red(`\n  ✗ Update failed (exit code ${exitCode})`));
   }
-  await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
+  await pause();
 }
 
 // ─── showNodeManager ──────────────────────────────────────────────────────────
 
 export async function showNodeManager() {
   while (true) {
+    page(['Node.js']);
+
     const versions = await getCurrentVersions();
 
-    console.log(chalk.bold('\n  Node.js Manager'));
     console.log(chalk.gray('  ' + '─'.repeat(40)));
     console.log(`  Current: ${chalk.green('Node ' + versions.node)} | ${chalk.yellow('npm v' + versions.npm)}`);
     console.log();
@@ -228,7 +232,7 @@ export async function showNodeManager() {
           new inquirer.Separator(),
           'Update npm',
           new inquirer.Separator(),
-          '← Back',
+          BACK,
         ],
       }]));
     } catch (err) {
@@ -240,7 +244,7 @@ export async function showNodeManager() {
       case 'Switch Node version':    await switchVersion();          break;
       case 'Manage global packages': await manageGlobalPackages();   break;
       case 'Update npm':             await updateNpm();              break;
-      case '← Back':                 return;
+      case BACK:                     return;
     }
   }
 }
@@ -248,6 +252,8 @@ export async function showNodeManager() {
 // ─── manageGlobalPackages ─────────────────────────────────────────────────────
 
 async function manageGlobalPackages() {
+  page(['Node.js', 'Global packages']);
+
   let choice;
   try {
     ({ choice } = await inquirer.prompt([{
@@ -258,7 +264,7 @@ async function manageGlobalPackages() {
         'List global packages',
         'Install global package',
         'Uninstall global package',
-        '← Back',
+        BACK,
       ],
     }]));
   } catch (err) {
@@ -270,6 +276,6 @@ async function manageGlobalPackages() {
     case 'List global packages':      await listGlobalPackages();      break;
     case 'Install global package':    await installGlobalPackage();    break;
     case 'Uninstall global package':  await uninstallGlobalPackage();  break;
-    case '← Back':                    return;
+    case BACK:                        return;
   }
 }

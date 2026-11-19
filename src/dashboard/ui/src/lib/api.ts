@@ -241,9 +241,16 @@ export const api = {
       request<IssuanceSuccess>('/ssl/create-confirm', { method: 'POST', body: { domain } }),
     cancelDns: (domain: string) =>
       request<{ cancelled: true }>('/ssl/create-cancel', { method: 'POST', body: { domain } }),
-    renew: (domain: string) =>
-      request<IssuanceSuccess>(`/ssl/renew/${enc(domain)}`, { method: 'POST' }),
-    renewAll: () => request<RenewAllResult[]>('/ssl/renew-all', { method: 'POST' }),
+    renew: (domain: string, opId?: string) =>
+      request<IssuanceSuccess>(`/ssl/renew/${enc(domain)}`, {
+        method: 'POST',
+        body: opId ? { opId } : {},
+      }),
+    renewAll: (opId?: string) =>
+      request<RenewAllResult[]>('/ssl/renew-all', {
+        method: 'POST',
+        body: opId ? { opId } : {},
+      }),
     remove: (domain: string) =>
       request<CertificateDeleteResult>(`/ssl/${enc(domain)}`, { method: 'DELETE' }),
   },

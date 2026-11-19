@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 import { cn } from '../../lib/cn';
 import { IconButton } from './Button';
+import { isTopDialog, useDialogStack } from './dialogStack';
 
 const SIZES = {
   sm: 'sm:max-w-sm',
@@ -40,6 +41,8 @@ export function Modal({
 }: ModalProps) {
   const titleId = useId();
   const descriptionId = useId();
+  // Only the topmost dialog in the document handles Escape and Tab.
+  const { id: dialogId, isTop } = useDialogStack(open);
   const panelRef = useRef<HTMLDivElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   // Refs keep the focus/keydown effect from re-running (and re-stealing focus)
@@ -64,7 +67,12 @@ export function Modal({
     }, 0);
 
     const onKeyDown = (event: KeyboardEvent) => {
+      // A confirm or a second modal above this one owns the keyboard.
+      if (!isTopDialog(dialogId)) return;
       if (event.key === 'Escape' && !preventCloseRef.current) {
+        // A widget inside the dialog can own Escape (a live drag cancels with
+        // it) by marking the event handled; the dialog then stays open.
+        if (event.defaultPrevented) return;
         event.stopPropagation();
         onCloseRef.current();
         return;
@@ -101,7 +109,7 @@ export function Modal({
       document.body.style.overflow = previousOverflow;
       restoreFocusRef.current?.focus();
     };
-  }, [open]);
+  }, [open, dialogId]);
 
   if (!open) return null;
 
@@ -109,13 +117,14 @@ export function Modal({
     <div
       className="fade-enter fixed inset-0 z-[60] flex items-end justify-center bg-[var(--ez-overlay)] p-0 backdrop-blur-[2px] sm:items-center sm:p-6"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget && !preventClose) onClose();
+        if (event.target !== event.currentTarget || !isTop) return;
+        if (!preventClose) onClose();
       }}
     >
       <div
         ref={panelRef}
         role="dialog"
-        aria-modal="true"
+        aria-modal={isTop || undefined}
         aria-labelledby={titleId}
         aria-describedby={description ? descriptionId : undefined}
         tabIndex={-1}

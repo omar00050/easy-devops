@@ -19,6 +19,7 @@ import ora from 'ora';
 import { isWindows } from '../../core/platform.js';
 import * as runtimeUpdate from '../../core/service/runtimeUpdate.js';
 import * as service from '../../core/service/index.js';
+import { page, pause } from '../ui/page.js';
 
 const ACTIONS = ['status', 'update'];
 
@@ -128,6 +129,17 @@ async function showStatus() {
 }
 
 async function doUpdate({ yes = false } = {}) {
+  // `ezz runtime status` stays a plain command page: it is read-only output
+  // that people pipe. Moving the runtime is an operation, so it gets a page of
+  // its own and its outcome is held until Enter (a no-op without a TTY).
+  page(['Runtime', 'Update']);
+
+  const code = await runUpdate({ yes });
+  await pause();
+  return code;
+}
+
+async function runUpdate({ yes = false } = {}) {
   const targets = await loadAndPrint();
 
   // Nothing is installed to update: say so rather than offering to re-pin a

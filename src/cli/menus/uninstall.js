@@ -18,6 +18,7 @@ import { getDataDir } from '../../core/platform.js';
 import { loadConfig } from '../../core/config.js';
 import * as purgeCore from '../../core/purge.js';
 import { humanBytes } from '../../core/cleanup.js';
+import { page, pause } from '../ui/page.js';
 
 /**
  * @param {Object} [opts]
@@ -25,10 +26,18 @@ import { humanBytes } from '../../core/cleanup.js';
  * @param {boolean} [opts.yes]
  * @returns {Promise<number>} Process exit code
  */
-export async function uninstallCommand({ purge = false, yes = false } = {}) {
+export async function uninstallCommand(options = {}) {
+  const code = await runUninstall(options);
+
+  // Purging is the long operation: hold its outcome (and the one command left
+  // to run) until Enter. A no-op without a TTY.
+  if (options.purge) await pause();
+  return code;
+}
+
+async function runUninstall({ purge = false, yes = false } = {}) {
   if (!purge) {
-    console.log();
-    console.log('  ' + chalk.bold('Uninstall'));
+    page(['Uninstall'], { clear: false });
     console.log('  ' + chalk.gray('-'.repeat(58)));
     console.log();
     console.log('  ' + chalk.white('Two different things are called "uninstall":'));
@@ -53,8 +62,7 @@ export async function uninstallCommand({ purge = false, yes = false } = {}) {
   const dataDir = getDataDir();
   const config = loadConfig();
 
-  console.log();
-  console.log('  ' + chalk.bold('Remove Easy DevOps'));
+  page(['Uninstall', 'Purge'], { clear: false });
   console.log('  ' + chalk.gray('-'.repeat(58)));
   console.log();
 

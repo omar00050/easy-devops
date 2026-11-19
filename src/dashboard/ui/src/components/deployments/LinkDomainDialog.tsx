@@ -1,6 +1,17 @@
-import { useEffect, useState } from 'react';
-import { Globe2, ShieldCheck } from 'lucide-react';
-import { api, ApiError } from '../../lib/api';
+import { useEffect, useMemo, useState } from 'react';
+import { Loader2, ShieldCheck } from 'lucide-react';
+import { api } from '../../lib/api';
+import { useRealtime } from '../../app/RealtimeProvider';
+import { useSslProgress } from '../../hooks/useSslProgress';
+import {
+  LINK_DOMAIN_EXISTING_STAGES,
+  LINK_DOMAIN_ISSUE_STAGES,
+  LINK_DOMAIN_NO_SSL_STAGES,
+  linkResultStages,
+  newSslOpId,
+  preflightFrom,
+  sslFailureFrom,
+} from '../../lib/sslProgress';
 import type {
   DeployAppDetail,
   DeployDomainLink,
@@ -14,11 +25,8 @@ import { Checkbox, Switch, TextInput } from '../ui/Field';
 import { Modal } from '../ui/Modal';
 import { InlineAlert } from '../ui/States';
 import { useToast } from '../ui/Toast';
-
-function errorText(error: unknown, fallback: string): string {
-  if (error instanceof ApiError) return error.message;
-  return error instanceof Error ? error.message : fallback;
-}
+import { PreflightResult } from '../ssl/PreflightResult';
+import { StageList } from '../ssl/StageList';
 
 const NAME_RE = /^(\*\.)?[a-z0-9-]+(\.[a-z0-9-]+)+$/;
 
@@ -50,6 +58,12 @@ export function LinkDomainDialog({
   onLinked: () => void;
 }) {
   const toast = useToast();
+  const { connected } = useRealtime();
+  // The id exists before the first render and useSslProgress subscribes on
+  // mount, so the first `ssl:progress` frame cannot be missed (it is not
+  // replayed). The server echoes this value in the link response.
+  const [opId] = useState(() => newSslOpId());
+  const progress = useSslProgress(opId);
   const [name, setName] = useState('');
   const [www, setWww] = useState(false);
   const [mode, setMode] = useState<DeploySslMode>('issue');
@@ -58,8 +72,40 @@ export function LinkDomainDialog({
   const [suggestion, setSuggestion] = useState<SslSuggestion | null>(null);
   const [suggesting, setSuggesting] = useState(false);
   const [linking, setLinking] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [result, setResult] = useState<DeployDomainLink | null>(null);
+
+  const domain = name.trim().toLowerCase();
+  const wildcard = domain.startsWith('*.');
+  const validName = NAME_RE.test(domain);
+  const found = suggestion?.found === true ? suggestion : null;
+
+  // The contract's link-domain stages; which ones exist depends on the SSL
+  // choice. The PUT publishes `ssl:progress` with this opId and the linked
+  // name, so every frame here belongs to this dialog.
+  const stageDefs =
+    mode === 'issue'
+      ? LINK_DOMAIN_ISSUE_STAGES
+      : mode === 'existing'
+        ? LINK_DOMAIN_EXISTING_STAGES
+        : LINK_DOMAIN_NO_SSL_STAGES;
+  const clearProgress = progress.clear;
+  const domainStages = progress.byDomain[domain] ?? {};
+  const heard = connected && Object.keys(domainStages).length > 0;
+  const liveStages = heard ? domainStages : null;
+  const finalStages = useMemo(
+    () => (result ? linkResultStages(result, stageDefs) : null),
+    [result, stageDefs]
+  );
+  const linkFailure = error != null ? sslFailureFrom(error) : null;
+  const linkErrorText =
+    linkFailure?.message ??
+    (error instanceof Error ? error.message : null) ??
+    (error != null ? 'Nothing was changed.' : null);
+  const preflight = useMemo(
+    () => preflightFrom(error) ?? preflightFrom(result),
+    [error, result]
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -72,12 +118,8 @@ export function LinkDomainDialog({
     setLinking(false);
     setError(null);
     setResult(null);
-  }, [open, app.id]);
-
-  const domain = name.trim().toLowerCase();
-  const wildcard = domain.startsWith('*.');
-  const validName = NAME_RE.test(domain);
-  const found = suggestion?.found === true ? suggestion : null;
+    clearProgress();
+  }, [open, app.id, clearProgress]);
 
   // Look up a certificate for the typed name only while "existing" is chosen;
   // typing a name should not send a request on every keystroke. A leading `*.`
@@ -126,8 +168,10 @@ export function LinkDomainDialog({
 
   const link = async () => {
     if (!canLink || linking) return;
+    clearProgress();
     setLinking(true);
     setError(null);
+    setResult(null);
     try {
       const answer = await api.deployments.linkDomain(app.id, {
         domain,
@@ -140,6 +184,7 @@ export function LinkDomainDialog({
               : { mode: 'none' },
         redirect: mode === 'none' ? undefined : redirect,
         behindCloudflare,
+        opId,
       });
       setResult(answer);
       onLinked();
@@ -151,7 +196,7 @@ export function LinkDomainDialog({
         toast.success('Domain linked', `${answer.domain} now proxies to port ${answer.port}.`);
       }
     } catch (err) {
-      setError(errorText(err, 'Nothing was changed.'));
+      setError(err);
     } finally {
       setLinking(false);
     }
@@ -197,6 +242,7 @@ export function LinkDomainDialog({
             setName(event.target.value);
             setResult(null);
             setError(null);
+            clearProgress();
           }}
           placeholder="app.example.com"
           list="link-domain-options"
@@ -338,16 +384,39 @@ export function LinkDomainDialog({
           </InlineAlert>
         ) : null}
 
-        {busyText ? (
-          <p className="flex items-center gap-2 text-xs text-muted" aria-live="polite">
-            <Globe2 className="size-3.5 animate-pulse" aria-hidden="true" />
-            {busyText}.
+        {liveStages ? (
+          <StageList
+            stages={stageDefs}
+            states={liveStages}
+            ariaLabel={`Linking stages for ${domain}`}
+            failure={linkFailure}
+            timedOut={linkFailure?.stage === 'timeout'}
+          />
+        ) : busyText ? (
+          <p className="flex items-start gap-2 text-xs text-muted" aria-live="polite">
+            <Loader2 className="spin mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+            <span>
+              {busyText}.{' '}
+              {connected
+                ? 'The live stage list appears when the server reports its stages; the result is shown here when it finishes.'
+                : 'This finishes in one request; the result appears here.'}
+            </span>
           </p>
         ) : null}
 
-        {error ? (
+        {!liveStages && finalStages ? (
+          <StageList
+            stages={stageDefs}
+            states={finalStages}
+            ariaLabel={`Link result stages for ${domain}`}
+          />
+        ) : null}
+
+        {preflight && <PreflightResult preflight={preflight} />}
+
+        {error && !liveStages && !finalStages ? (
           <InlineAlert tone="danger" title="The domain was not linked">
-            {error}
+            {linkErrorText}
           </InlineAlert>
         ) : null}
 

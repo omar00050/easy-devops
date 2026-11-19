@@ -27,13 +27,14 @@ import { socketRequireAuth } from './lib/requireAuth.js';
 import { socketRequireLocalRequest } from './lib/localRequest.js';
 import { loadConfig } from '../core/config.js';
 import { nginxLogPath } from '../core/platform.js';
-import { subscribeAll } from '../core/jobs/bus.js';
+import { subscribe, subscribeAll } from '../core/jobs/bus.js';
 
 let connectedClients = 0;
 const activeTails = new Map();
 
 let ioServer = null;
 let unsubscribeBus = null;
+let unsubscribeSslProgress = null;
 
 /**
  * The most recent payload for each replayable event.
@@ -107,6 +108,15 @@ function initSocket(httpServer, sessionMiddleware, getBinding) {
   unsubscribeBus = subscribeAll((event, payload) => {
     if (REPLAYABLE.includes(event)) lastKnown.set(event, payload);
     if (connectedClients > 0) io.emit(event, payload);
+  });
+
+  // `ssl:progress` is a moment in one certificate operation, never state, so
+  // it is forwarded but deliberately not replayed. It is subscribed here
+  // rather than added to JOB_EVENTS until API-CONTRACT.md documents it: the
+  // contract check compares that list with the document, and the contract is
+  // updated in its own change.
+  unsubscribeSslProgress = subscribe('ssl:progress', (payload) => {
+    if (connectedClients > 0) io.emit('ssl:progress', payload);
   });
 
   io.on('connection', (socket) => {
@@ -199,6 +209,11 @@ async function stopSocket() {
   if (unsubscribeBus) {
     unsubscribeBus();
     unsubscribeBus = null;
+  }
+
+  if (unsubscribeSslProgress) {
+    unsubscribeSslProgress();
+    unsubscribeSslProgress = null;
   }
 
   // Kill the tail/Get-Content children; stopTail() removes each map entry.

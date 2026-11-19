@@ -19,6 +19,7 @@ import {
   mockServiceSnapshot,
   subscribeMockServiceChanges,
 } from './index';
+import { subscribeMockSslProgress } from './ssl';
 
 type Handler = (payload: unknown) => void;
 
@@ -55,6 +56,7 @@ export async function createMockSocket(): Promise<RealtimeClient> {
   let logTimer: ReturnType<typeof setInterval> | null = null;
   let lineIndex = 0;
   let unsubscribeService: (() => void) | null = null;
+  let unsubscribeSsl: (() => void) | null = null;
 
   const fire = <K extends keyof ServerEvents>(event: K, payload: ServerEvents[K]): void => {
     for (const handler of handlers.get(event) ?? []) handler(payload);
@@ -151,6 +153,10 @@ export async function createMockSocket(): Promise<RealtimeClient> {
           unsubscribeService = subscribeMockServiceChanges((payload) => {
             if (connected) fire('service:changed', payload);
           });
+          unsubscribeSsl?.();
+          unsubscribeSsl = subscribeMockSslProgress((payload) => {
+            if (connected) fire('ssl:progress', payload);
+          });
         }, 120),
         setTimeout(() => {
           fire(
@@ -210,6 +216,8 @@ export async function createMockSocket(): Promise<RealtimeClient> {
       stopTimers();
       unsubscribeService?.();
       unsubscribeService = null;
+      unsubscribeSsl?.();
+      unsubscribeSsl = null;
       fire('disconnect', undefined);
     },
   };

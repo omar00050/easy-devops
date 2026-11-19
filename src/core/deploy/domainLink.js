@@ -19,7 +19,7 @@ import { loadConfig } from '../config.js';
 import { findDomain, handleHubDomainCommand } from '../domains-db.js';
 import { validateDomainName, validateBoolean, validateBehindCloudflare } from '../validators.js';
 import { findCertificateForDomain, normalizeForMatch, wildcardCovers } from '../cert-suggest.js';
-import { issueCertificate, prepareDomainForHttpChallenge, reloadNginx, describeIssuance } from '../ssl-issuer.js';
+import { issueCertificate, prepareDomainForHttpChallenge, reloadNginx, describeIssuance, verifyServedCertificate } from '../ssl-issuer.js';
 
 import { getApp, setAppDomain } from './apps.js';
 import { readState, releaseDir } from './store.js';
@@ -146,6 +146,7 @@ export async function linkDomain(appId, input = {}, deps = {}) {
     issue = issueCertificate,
     prepare = prepareDomainForHttpChallenge,
     suggest = findCertificateForDomain,
+    verify = verifyServedCertificate,
     onProgress = null,
   } = deps;
   const progress = typeof onProgress === 'function' ? onProgress : () => {};
@@ -244,18 +245,33 @@ export async function linkDomain(appId, input = {}, deps = {}) {
   if (sslMode === 'issue') {
     // The HTTP config must be live before the ACME challenge is attempted.
     // This reload belongs to the certificate step; the final one is reported
-    // as its own `reload` step below.
+    // as its own `nginx reload` stage below.
     reloaded = await reload();
     sslResult = await requestCertificate(name, {
       www, redirect, domainCommand, issue, prepare, onProgress: progress,
     });
 
-    progress('reload', 'running');
+    progress('nginx config test', 'running');
     if (sslResult.ok) reloaded = await reload();
-    progress('reload', reloaded?.ok ? 'ok' : 'failed', reloaded?.ok ? undefined : 'nginx reload failed');
-  } else {
-    progress('certificate', 'skipped');
+    const reloadDetail = reloaded?.ok ? undefined : 'nginx reload failed';
+    progress('nginx config test', reloaded?.ok ? 'ok' : 'failed', reloadDetail);
+    progress('nginx reload', 'running');
+    progress('nginx reload', reloaded?.ok ? 'ok' : 'failed', reloadDetail);
 
+    if (!sslResult.ok) {
+      progress('https verified', 'skipped', 'no new certificate to verify');
+    } else if (behindCloudflare || sslResult.preflight?.proxied) {
+      progress('https verified', 'skipped', "served by Cloudflare's edge");
+    } else {
+      progress('https verified', 'running');
+      try {
+        const checked = await verify(name, sslResult.certPath);
+        progress('https verified', checked?.ok ? 'ok' : 'failed', checked?.ok ? undefined : checked?.message);
+      } catch (err) {
+        progress('https verified', 'failed', String(err.message).split('\n')[0]);
+      }
+    }
+  } else {
     if (existingCertificate) {
       progress('https', 'running');
       sslResult = {
@@ -263,15 +279,33 @@ export async function linkDomain(appId, input = {}, deps = {}) {
         ok: true,
         detail: `Using the existing certificate "${existingCertificate.domain}".`,
         certName: existingCertificate.domain,
+        certPath: existingCertificate.certPath,
       };
       progress('https', 'ok', sslResult.detail);
     } else {
       progress('https', 'skipped');
     }
 
-    progress('reload', 'running');
+    progress('nginx config test', 'running');
     reloaded = await reload();
-    progress('reload', reloaded?.ok ? 'ok' : 'failed', reloaded?.ok ? undefined : 'nginx reload failed');
+    const reloadDetail = reloaded?.ok ? undefined : 'nginx reload failed';
+    progress('nginx config test', reloaded?.ok ? 'ok' : 'failed', reloadDetail);
+    progress('nginx reload', 'running');
+    progress('nginx reload', reloaded?.ok ? 'ok' : 'failed', reloadDetail);
+
+    if (!existingCertificate) {
+      progress('https verified', 'skipped', 'no certificate was requested');
+    } else if (behindCloudflare) {
+      progress('https verified', 'skipped', "served by Cloudflare's edge");
+    } else {
+      progress('https verified', 'running');
+      try {
+        const checked = await verify(name, existingCertificate.certPath);
+        progress('https verified', checked?.ok ? 'ok' : 'failed', checked?.ok ? undefined : checked?.message);
+      } catch (err) {
+        progress('https verified', 'failed', String(err.message).split('\n')[0]);
+      }
+    }
   }
 
   return {
@@ -295,27 +329,32 @@ async function requestCertificate(name, { www, redirect, domainCommand, issue, p
   const config = loadConfig();
   if (!config.acmeEmail) {
     const detail = 'No certificate was requested: set an ACME email in Settings first.';
-    progress('certificate', 'failed', detail);
+    progress('account and order', 'failed', detail);
     progress('https', 'skipped');
     return { mode: 'issue', ok: false, detail };
   }
 
-  let stage = 'certificate';
+  let stage = 'challenge ready';
   try {
-    progress('certificate', 'running', "Requesting a certificate from Let's Encrypt");
-
     const record = findDomain(name);
     const prepared = await prepare(record);
     if (!prepared.ok) {
-      progress('certificate', 'failed', `Could not prepare nginx for the challenge: ${prepared.error}`);
+      progress('challenge ready', 'failed', `Could not prepare nginx for the challenge: ${prepared.error}`);
       progress('https', 'skipped');
       return { mode: 'issue', ok: false, detail: `Could not prepare nginx for the challenge: ${prepared.error}` };
     }
 
-    const issued = await issue(name, { validationMethod: 'http', email: config.acmeEmail, www: Boolean(www) });
+    const issued = await issue(name, {
+      validationMethod: 'http',
+      email: config.acmeEmail,
+      www: Boolean(www),
+      // The link reports nginx test/reload/verify itself, after the domain
+      // record has been switched to the new certificate paths.
+      manageNginx: false,
+      onProgress: progress,
+    });
     if (!issued.success) {
       const cause = String(issued.error?.cause ?? 'The certificate could not be issued.').split('\n')[0];
-      progress('certificate', 'failed', cause);
       progress('https', 'skipped');
       return {
         mode: 'issue',
@@ -323,7 +362,6 @@ async function requestCertificate(name, { www, redirect, domainCommand, issue, p
         detail: `${cause} The domain works over HTTP; issue the certificate from the SSL page once its DNS points here.`,
       };
     }
-    progress('certificate', 'ok', describeIssuance(issued) || 'Certificate issued.');
 
     stage = 'https';
     progress('https', 'running');
@@ -346,12 +384,15 @@ async function requestCertificate(name, { www, redirect, domainCommand, issue, p
       ok: true,
       detail: describeIssuance(issued) || 'Certificate issued.',
       certName: name,
+      certPath: issued.certPath,
+      keyPath: issued.keyPath,
+      preflight: issued.preflight,
     };
   } catch (err) {
     if (stage === 'https') {
       progress('https', 'failed', err.message);
     } else {
-      progress('certificate', 'failed', err.message);
+      progress('challenge ready', 'failed', err.message);
       progress('https', 'skipped');
     }
     return { mode: 'issue', ok: false, detail: `The certificate could not be issued: ${err.message}` };

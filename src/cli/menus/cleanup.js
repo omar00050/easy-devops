@@ -16,6 +16,7 @@ import inquirer from 'inquirer';
 import ora from 'ora';
 
 import * as cleanup from '../../core/cleanup.js';
+import { page } from '../ui/page.js';
 
 /** How each group is introduced, and whether it is safe to preselect. */
 const GROUP_INFO = {
@@ -73,8 +74,9 @@ export async function cleanupCommand({ days, yes = false } = {}) {
     spinner.stop();
   }
 
-  console.log();
-  console.log('  ' + chalk.bold('Cleanup'));
+  // A command, not a menu screen: the breadcrumb is printed, the screen is
+  // never cleared and nothing waits for Enter, so `ezz cleanup` stays pipeable.
+  page(['Cleanup'], { clear: false });
   console.log('  ' + chalk.gray('-'.repeat(58)));
   console.log('  ' + chalk.gray(`data directory: ${report.dataDir}`));
   console.log('  ' + chalk.gray(`logs older than ${report.days} days count as reclaimable (--days N)`));

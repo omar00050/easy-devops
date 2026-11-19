@@ -19,9 +19,18 @@
 
 import fs from 'fs/promises';
 import path from 'path';
+import tls from 'node:tls';
+import { X509Certificate } from 'node:crypto';
 import * as acme from 'acme-client';
 
 import { loadConfig } from './config.js';
+import { runPreflight, summarizePreflight, fixForAcmeError } from './ssl/preflight.js';
+import {
+  createSslProgress,
+  isValidOpId,
+  newOpId,
+  sanitizeDetail,
+} from './ssl/progress.js';
 import { run as defaultRun } from './shell.js';
 import {
   isDevDataDir,
@@ -37,10 +46,9 @@ import {
 import {
   getConfDDir,
   hasChallengeLocation,
-  parseListenAddresses,
   DEFAULT_ACME_CHALLENGE_PORT,
 } from './nginx-conf-generator.js';
-import { withChallengeServer, preflight, resolveProbeHosts } from './acme-challenge.js';
+import { withChallengeServer } from './acme-challenge.js';
 
 /**
  * Written next to fullchain.pem after every successful issuance. It records
@@ -56,15 +64,6 @@ export const CHALLENGE_MODES = Object.freeze({
   PROXY: 'proxy',
   STANDALONE: 'standalone',
 });
-
-/** Advice shown when neither mode could complete the challenge. */
-const EXTERNAL_CAUSE_HINT = [
-  'Both challenge modes failed locally, which usually means the cause is outside Easy DevOps:',
-  '  • the domain\'s DNS A record does not point at this server',
-  '  • port 80 is blocked by a firewall or security group',
-  '  • an AAAA/IPv6 record points somewhere else (Let\'s Encrypt prefers IPv6)',
-  '  • a CDN or proxy in front of the server forces HTTPS or intercepts the path',
-].join('\n');
 
 /**
  * One-line human summary of how an issuance went, for the CLI, the dashboard
@@ -99,8 +98,8 @@ export function describeIssuance(result) {
 }
 
 /** ACME directory for the configured environment. */
-function directoryUrl(staging) {
-  return staging ? acme.directory.letsencrypt.staging : acme.directory.letsencrypt.production;
+function directoryUrl(staging, acmeLib = acme) {
+  return staging ? acmeLib.directory.letsencrypt.staging : acmeLib.directory.letsencrypt.production;
 }
 
 /**
@@ -186,13 +185,13 @@ async function ensureCertDir(certDir) {
 }
 
 /** Loads or creates the persistent ACME account key. */
-async function getAccountKey(sslDir) {
+async function getAccountKey(sslDir, acmeLib = acme) {
   const keyPath = path.join(sslDir, '.account', 'account.key');
   await fs.mkdir(path.dirname(keyPath), { recursive: true });
   try {
     return await fs.readFile(keyPath);
   } catch {
-    const key = await acme.crypto.createPrivateKey();
+    const key = await acmeLib.crypto.createPrivateKey();
     await fs.writeFile(keyPath, key);
     return key;
   }
@@ -267,6 +266,199 @@ export async function prepareDomainForHttpChallenge(domain, run = defaultRun) {
   };
 }
 
+/** The whole operation is bounded, so a stuck ACME server cannot hang a job. */
+export const ISSUANCE_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * The stages every certificate operation reports, in order. Exported so the
+ * tests and the documentation cannot drift from the implementation.
+ */
+export const ISSUANCE_STAGES = Object.freeze([
+  'preflight',
+  'account and order',
+  'challenge ready',
+  'waiting for validation',
+  'certificate received',
+  'files written',
+  'nginx config test',
+  'nginx reload',
+  'https verified',
+]);
+
+function firstLine(value) {
+  return String(value ?? '').split('\n')[0].trim();
+}
+
+function timeoutError(ms, stage) {
+  const seconds = Math.max(1, Math.round(ms / 1000));
+  const err = new Error(`The certificate operation timed out after ${seconds}s while ${stage}.`);
+  err.code = 'EZ_TIMEOUT';
+  err.stage = stage;
+  return err;
+}
+
+/**
+ * Rejects if `promise` does not settle in time. The stage may be a function so
+ * the message names the stage that was actually running when the clock ran out.
+ */
+function withTimeout(promise, ms, stage) {
+  if (!Number.isFinite(ms) || ms <= 0) return promise;
+  const stageName = () => (typeof stage === 'function' ? stage() : stage);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(timeoutError(ms, stageName()));
+    }, ms);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+/** A one-second-granularity "still waiting" heartbeat, throttled downstream. */
+function startValidationHeartbeat(report) {
+  const startedAt = Date.now();
+  const timer = setInterval(() => {
+    const seconds = Math.round((Date.now() - startedAt) / 1000);
+    report(
+      'waiting for validation',
+      'running',
+      `Waiting for Let's Encrypt validation (${seconds}s)`,
+    );
+  }, 2000);
+  if (timer && typeof timer.unref === 'function') timer.unref();
+  return timer;
+}
+
+function stopHeartbeat(timer) {
+  if (timer) clearInterval(timer);
+}
+
+/**
+ * Compares the certificate nginx serves with the file just written.
+ *
+ * A missing file, a refused connection or a timeout is reported as a skipped
+ * check rather than a failed issuance: the certificate exists either way.
+ *
+ * @returns {Promise<{ ok: boolean, message: string }>}
+ */
+export async function verifyServedCertificate(domainName, certPath, { timeoutMs = 5000, deps = {} } = {}) {
+  const readFile = deps.readFile ?? fs.readFile;
+  const connect = deps.tlsConnect ?? tls.connect;
+
+  try {
+    const localPem = deps.localCertificate ?? await readFile(certPath, 'utf8');
+    const local = new X509Certificate(localPem);
+    const expected = local.fingerprint256.replace(/:/g, '').toLowerCase();
+
+    const peer = await new Promise((resolve, reject) => {
+      let settled = false;
+      const socket = connect({
+        host: deps.host ?? domainName,
+        port: deps.port ?? 443,
+        servername: domainName,
+        timeout: timeoutMs,
+        rejectUnauthorized: false,
+      });
+      const finish = (err, value) => {
+        if (settled) return;
+        settled = true;
+        try { socket.destroy(); } catch { /* already gone */ }
+        if (err) reject(err);
+        else resolve(value);
+      };
+      socket.once('secureConnect', () => finish(null, socket.getPeerCertificate(true)));
+      socket.once('timeout', () => finish(new Error('timed out')));
+      socket.once('error', (err) => finish(err));
+    });
+
+    if (!peer?.raw) return { ok: false, message: 'the server did not present a certificate' };
+    const served = new X509Certificate(peer.raw);
+    const actual = served.fingerprint256.replace(/:/g, '').toLowerCase();
+    if (actual !== expected) {
+      return {
+        ok: false,
+        message: 'the server is not serving the new certificate yet (nginx may not have reloaded)',
+      };
+    }
+    return { ok: true, message: 'the server is serving the new certificate' };
+  } catch (err) {
+    return { ok: false, message: `could not verify HTTPS: ${firstLine(err.message)}` };
+  }
+}
+
+/**
+ * The stages after the certificate files exist: test, reload, and verify.
+ * Failures here are reported but do not turn a certificate that was issued
+ * into "no certificate": the files are already on disk for the next retry.
+ */
+async function applyNginxAndVerify({
+  report, run, domainName, certPath, mode, preflightInfo, behindCloudflare,
+  manageNginx, remaining, deps,
+}) {
+  let nginxReloaded = null;
+  let httpsVerified = null;
+
+  if (mode === 'dns-01') {
+    report('nginx config test', 'skipped', 'DNS-01 leaves nginx untouched');
+    report('nginx reload', 'skipped', 'DNS-01 leaves nginx untouched');
+  } else if (manageNginx) {
+    report('nginx config test', 'running');
+
+    let reloaded;
+    try {
+      reloaded = await withTimeout(reloadNginx(run), remaining(), 'nginx reload');
+    } catch (err) {
+      reloaded = { ok: false, output: err.message };
+    }
+
+    const detail = reloaded.ok ? undefined : firstLine(reloaded.output) || 'nginx did not reload';
+    report('nginx config test', reloaded.ok ? 'ok' : 'failed', detail);
+    report('nginx reload', 'running');
+    report('nginx reload', reloaded.ok ? 'ok' : 'failed', detail);
+    nginxReloaded = Boolean(reloaded.ok);
+  }
+
+  const proxied = Boolean(behindCloudflare || preflightInfo?.proxied);
+  if (proxied) {
+    report('https verified', 'skipped', "served by Cloudflare's edge");
+  } else if (!certPath) {
+    report('https verified', 'skipped', 'no certificate file to compare');
+  } else {
+    report('https verified', 'running');
+    let verified;
+    try {
+      const verify = deps.verifyHttps ?? verifyServedCertificate;
+      verified = await withTimeout(
+        verify(domainName, certPath, deps.https ?? {}),
+        remaining(),
+        'https verified',
+      );
+    } catch (err) {
+      verified = { ok: false, message: firstLine(err.message) };
+    }
+    httpsVerified = Boolean(verified?.ok);
+    report('https verified', verified?.ok ? 'ok' : 'failed', verified?.ok ? undefined : verified?.message);
+  }
+
+  return { nginxReloaded, httpsVerified };
+}
+
 /**
  * Issues or renews a certificate.
  *
@@ -280,16 +472,25 @@ export async function prepareDomainForHttpChallenge(domain, run = defaultRun) {
  * @param {'auto'|'proxy'|'standalone'} [options.mode] Overrides sslChallengeMode
  * @param {boolean} [options.staging] Overrides the staging setting
  * @param {Function} [options.run] Injected shell runner (testing only)
+ * @param {string} [options.opId] Client operation id (validated, generated when absent)
+ * @param {(event: Object) => void} [options.onEvent] Full progress payload
+ * @param {(stage: string, status: string, detail?: string) => void} [options.onProgress]
+ * @param {boolean} [options.manageNginx] Run the test/reload/verify stages here
+ * @param {number} [options.timeoutMs] Overall bound (testing only)
+ * @param {Object} [options.deps] Injected collaborators (testing only)
  * @returns {Promise<{
  *   success: boolean,
+ *   opId: string,
  *   certPath: string|null,
  *   keyPath: string|null,
  *   mode: string|null,
  *   fellBack: boolean,
  *   nginxDownMs: number,
  *   staging: boolean,
- *   preflight: { ok: boolean, detail: string }|null,
+ *   preflight: { ok: boolean, detail: string, results?: Array<Object>, proxied?: boolean }|null,
  *   configRegenerated: boolean,
+ *   nginxReloaded: boolean|null,
+ *   httpsVerified: boolean|null,
  *   error: object|null
  * }>}
  */
@@ -303,7 +504,33 @@ export async function issueCertificate(domainName, options = {}) {
     mode: modeOverride = null,
     staging: stagingOverride,
     run = defaultRun,
+    opId: rawOpId = null,
+    onEvent = null,
+    onProgress = null,
+    manageNginx = true,
+    timeoutMs = ISSUANCE_TIMEOUT_MS,
+    deps = {},
   } = options;
+
+  const acmeLib = deps.acme ?? acme;
+  const preflightFn = deps.preflight ?? runPreflight;
+  const challengeServer = deps.withChallengeServer ?? withChallengeServer;
+  const now = deps.now ?? Date.now;
+  const opId = isValidOpId(rawOpId) ? rawOpId : newOpId();
+  const progress = createSslProgress({
+    opId, domain: domainName, onEvent, onProgress, now,
+    ...(deps.progress ?? {}),
+  });
+
+  const startedAt = now();
+  const deadlineAt = Number.isFinite(timeoutMs) && timeoutMs > 0 ? startedAt + timeoutMs : Infinity;
+  const remaining = () => (deadlineAt === Infinity ? Infinity : Math.max(1, deadlineAt - now()));
+
+  let currentStage = 'preflight';
+  const report = (stage, status, detail) => {
+    currentStage = stage;
+    progress.report(stage, status, detail);
+  };
 
   const config = loadConfig();
   const sslDir = config.sslDir;
@@ -313,6 +540,8 @@ export async function issueCertificate(domainName, options = {}) {
 
   const base = {
     success: false,
+    opId,
+    domain: domainName,
     certPath: null,
     keyPath: null,
     mode: null,
@@ -321,7 +550,24 @@ export async function issueCertificate(domainName, options = {}) {
     staging,
     preflight: null,
     configRegenerated: false,
+    nginxReloaded: null,
+    httpsVerified: null,
     error: null,
+  };
+
+  const fail = (stage, err, consequence, extra = {}) => {
+    const cause = sanitizeDetail(err?.message || String(err ?? 'Certificate request failed.'));
+    return {
+      ...base,
+      ...extra,
+      error: buildError(stage, cause, consequence, {
+        stage,
+        fix: fixForAcmeError(cause, domainName),
+        nginxRunning: true,
+        configSaved: false,
+        ...extra,
+      }),
+    };
   };
 
   const acmeEmail = email || config.acmeEmail;
@@ -349,17 +595,104 @@ export async function issueCertificate(domainName, options = {}) {
     };
   }
 
+  // ─── Preflight: nothing below this may run if a check fails ────────────────
+  let nginxUp = false;
+  if (validationMethod !== 'dns') {
+    try { nginxUp = await nginxRunning(run); } catch { nginxUp = false; }
+  }
+  const requestedMode = modeOverride || config.sslChallengeMode || CHALLENGE_MODES.AUTO;
+  const wantProxy = validationMethod !== 'dns'
+    && (requestedMode === CHALLENGE_MODES.PROXY
+      || (requestedMode === CHALLENGE_MODES.AUTO && nginxUp));
+  const preflightMode = validationMethod === 'dns'
+    ? 'dns'
+    : (wantProxy ? CHALLENGE_MODES.PROXY : CHALLENGE_MODES.STANDALONE);
+
+  report('preflight', 'running', 'Checking DNS and port 80');
+
+  let pre;
+  try {
+    pre = await withTimeout(
+      preflightFn(domainName, {
+        www: Boolean(www),
+        validationMethod,
+        mode: preflightMode,
+        challengePort,
+        deps: deps.preflightDeps ?? {},
+      }),
+      remaining(),
+      'preflight',
+    );
+  } catch (err) {
+    report('preflight', 'failed', firstLine(err.message));
+    return {
+      ...base,
+      mode: validationMethod === 'dns' ? 'dns-01' : preflightMode,
+      preflight: { ok: false, detail: firstLine(err.message), results: [] },
+      error: buildError('preflight', err.message, "No certificate was requested, so Let's Encrypt rate limits are untouched.", {
+        stage: 'preflight',
+        fix: fixForAcmeError(err.message, domainName),
+        nginxRunning: true,
+        configSaved: false,
+      }),
+    };
+  }
+
+  const preflightInfo = {
+    ok: Boolean(pre?.ok),
+    detail: summarizePreflight(pre),
+    results: Array.isArray(pre?.results) ? pre.results : [],
+    proxied: Boolean(pre?.proxied),
+    reachesUs: Boolean(pre?.reachesUs),
+  };
+
+  if (!preflightInfo.ok) {
+    const summary = preflightInfo.detail || 'A preflight check failed.';
+    const failedCheck = preflightInfo.results.find((entry) => entry.status === 'fail');
+    report('preflight', 'failed', firstLine(summary));
+    return {
+      ...base,
+      mode: validationMethod === 'dns' ? 'dns-01' : preflightMode,
+      preflight: preflightInfo,
+      error: buildError('preflight', summary, "No certificate was requested, so Let's Encrypt rate limits are untouched.", {
+        stage: 'preflight',
+        fix: failedCheck?.fix || fixForAcmeError(summary, domainName),
+        nginxRunning: true,
+        configSaved: false,
+      }),
+    };
+  }
+
+  report(
+    'preflight',
+    'ok',
+    preflightInfo.results.some((entry) => entry.status === 'warn')
+      ? 'Checks passed with warnings'
+      : 'All checks passed',
+  );
+
+  // ─── Account, order and key material ──────────────────────────────────────
+  let client;
+  let csr;
+  let domainKey;
+  let altNames;
+  try {
+    report('account and order', 'running', "Preparing the Let's Encrypt account and order");
+    await ensureCertDir(path.join(sslDir, domainName));
+    const accountKey = await getAccountKey(sslDir, acmeLib);
+    client = new acmeLib.Client({ directoryUrl: directoryUrl(staging, acmeLib), accountKey });
+
+    altNames = wildcard
+      ? [domainName, `*.${domainName}`]
+      : (www ? [domainName, `www.${domainName}`] : [domainName]);
+    [domainKey, csr] = await acmeLib.crypto.createCsr({ commonName: domainName, altNames });
+    report('account and order', 'ok', 'ACME account ready');
+  } catch (err) {
+    report('account and order', 'failed', firstLine(err.message));
+    return fail('account and order', err, 'No certificate was issued.');
+  }
+
   const certDir = path.join(sslDir, domainName);
-  await ensureCertDir(certDir);
-
-  const accountKey = await getAccountKey(sslDir);
-  const client = new acme.Client({ directoryUrl: directoryUrl(staging), accountKey });
-
-  const altNames = wildcard
-    ? [domainName, `*.${domainName}`]
-    : (www ? [domainName, `www.${domainName}`] : [domainName]);
-  const [domainKey, csr] = await acme.crypto.createCsr({ commonName: domainName, altNames });
-
   const writeCert = async (cert) => {
     const certPath = path.join(certDir, 'fullchain.pem');
     const keyPath = path.join(certDir, 'privkey.pem');
@@ -385,82 +718,69 @@ export async function issueCertificate(domainName, options = {}) {
     return { certPath, keyPath };
   };
 
-  // ─── DNS-01 (wildcards) — unchanged, nginx is never touched ────────────────
+  // ─── DNS-01 (wildcards) — nginx is never touched ──────────────────────────
   if (validationMethod === 'dns') {
+    let phase = 'challenge ready';
+    let heartbeat = null;
+    report('challenge ready', 'running', 'Waiting for the DNS TXT record');
     try {
-      const cert = await client.auto({
+      const cert = await withTimeout(client.auto({
         csr,
         email: acmeEmail,
         termsOfServiceAgreed: true,
         challengePriority: ['dns-01'],
         challengeCreateFn: async (authz, challenge, keyAuthorization) => {
           if (onDnsChallenge) await onDnsChallenge(`_acme-challenge.${domainName}`, keyAuthorization);
+          report('challenge ready', 'ok', 'The DNS TXT record is ready');
+          phase = 'waiting for validation';
+          report('waiting for validation', 'running', "Waiting for Let's Encrypt validation");
+          heartbeat = startValidationHeartbeat(report);
         },
         challengeRemoveFn: async () => { /* TXT cleanup is the user's */ },
-      });
+      }), remaining(), () => phase);
+
+      stopHeartbeat(heartbeat);
+      report('waiting for validation', 'ok', "Let's Encrypt validated the DNS record");
+      report('certificate received', 'ok', "Certificate received from Let's Encrypt");
+
+      report('files written', 'running');
       const paths = await writeCert(cert);
-      return { ...base, success: true, mode: 'dns-01', ...paths };
+      report('files written', 'ok', 'Certificate and key saved');
+
+      const finish = manageNginx
+        ? await applyNginxAndVerify({
+          report, run, domainName, certPath: paths.certPath, mode: 'dns-01',
+          preflightInfo, behindCloudflare: Boolean(options.behindCloudflare), manageNginx,
+          remaining, deps,
+        })
+        : {};
+
+      return { ...base, success: true, mode: 'dns-01', preflight: preflightInfo, ...paths, ...finish };
     } catch (err) {
-      return {
-        ...base,
-        mode: 'dns-01',
-        error: buildError(
-          'ACME validation',
-          err.message || 'DNS-01 challenge failed.',
-          'No certificate was issued. nginx was not touched.',
-          { nginxRunning: true, configSaved: false }
-        ),
-      };
+      stopHeartbeat(heartbeat);
+      const stage = err?.code === 'EZ_TIMEOUT' ? 'timeout' : phase;
+      report(phase, 'failed', firstLine(err.message));
+      return fail(stage, err, 'No certificate was issued. nginx was not touched.', {
+        mode: 'dns-01', preflight: preflightInfo,
+      });
     }
   }
 
   // ─── HTTP-01 ───────────────────────────────────────────────────────────────
-  const requestedMode = modeOverride || config.sslChallengeMode || CHALLENGE_MODES.AUTO;
-  const nginxUp = await nginxRunning(run);
-
-  let result = { ...base };
-
-  // Proxy mode is viable only when nginx is actually serving port 80.
-  const wantProxy =
-    requestedMode === CHALLENGE_MODES.PROXY ||
-    (requestedMode === CHALLENGE_MODES.AUTO && nginxUp);
+  const shared = {
+    client, csr, acmeEmail, domainName, nginxDir, challengePort, run, writeCert, base,
+    report, preflightInfo, behindCloudflare: Boolean(options.behindCloudflare),
+    manageNginx, remaining, deps, challengeServer, fail,
+  };
 
   if (wantProxy) {
-    result = await issueViaProxy({
-      client, csr, acmeEmail, domainName, nginxDir, challengePort, run, writeCert, base,
-    });
-
-    if (result.success) return result;
-
-    // Only a FAILED LOCAL PREFLIGHT may trigger the fallback. A Let's Encrypt
-    // failure must not, or a broken DNS record would cost two attempts.
-    const preflightFailed = result.preflight && result.preflight.ok === false;
-    const mayFallBack = requestedMode === CHALLENGE_MODES.AUTO && preflightFailed;
-
-    if (!mayFallBack) return result;
+    return issueViaProxy(shared);
   }
 
-  // ─── Standalone fallback ───────────────────────────────────────────────────
-  if (requestedMode === CHALLENGE_MODES.PROXY) return result;
-
-  const standalone = await issueViaStandalone({
-    client, csr, acmeEmail, nginxDir, run, writeCert, base, nginxWasRunning: nginxUp,
+  return issueViaStandalone({
+    ...shared,
+    nginxWasRunning: nginxUp,
   });
-
-  standalone.fellBack = wantProxy;
-  standalone.preflight = result.preflight ?? null;
-
-  if (!standalone.success && wantProxy) {
-    const seen = result.preflight?.detail ? `\n\nPreflight saw: ${result.preflight.detail}` : '';
-    standalone.error = buildError(
-      standalone.error?.step ?? 'ACME validation',
-      `${standalone.error?.cause ?? 'Challenge failed.'}\n\n${EXTERNAL_CAUSE_HINT}${seen}`,
-      standalone.error?.consequence ?? 'No certificate was issued.',
-      { nginxRunning: standalone.error?.nginxRunning ?? true, configSaved: false }
-    );
-  }
-
-  return standalone;
 }
 
 /**
@@ -468,93 +788,88 @@ export async function issueCertificate(domainName, options = {}) {
  */
 async function issueViaProxy({
   client, csr, acmeEmail, domainName, nginxDir, challengePort, run, writeCert, base,
+  report, preflightInfo, behindCloudflare, manageNginx, remaining, deps, challengeServer, fail,
 }) {
   // Flow 1: a config generated before this feature has no challenge location.
   const { confPath, text } = await readDomainConf(nginxDir, domainName);
   let configRegenerated = false;
 
   if (text !== null && !hasChallengeLocation(text)) {
+    const detail =
+      `${confPath} has no ACME challenge location (it predates this feature). ` +
+      'Regenerate the domain config first — saving the domain does this.';
+    report('challenge ready', 'failed', detail);
     return {
       ...base,
       mode: CHALLENGE_MODES.PROXY,
       configRegenerated: false,
-      preflight: {
-        ok: false,
-        detail:
-          `${confPath} has no ACME challenge location (it predates this feature). ` +
-          'Regenerate the domain config first — saving the domain does this.',
-      },
+      preflight: preflightInfo,
       error: buildError(
         'challenge configuration',
         `The nginx config for ${domainName} does not forward ${'/.well-known/acme-challenge/'} to Easy DevOps.`,
         'No certificate was issued. Save the domain once to regenerate its config, then retry.',
-        { nginxRunning: true, configSaved: false }
+        { stage: 'challenge ready', fix: 'Save the domain once to regenerate its nginx config, then retry.', nginxRunning: true, configSaved: false }
       ),
     };
   }
 
-  // Adjustment 3: probe the address nginx actually listens on.
-  const listens = text !== null ? parseListenAddresses(text, 80) : [];
-  const probeHosts = resolveProbeHosts(listens);
-
-  const pre = await preflight({ domain: domainName, challengePort, probeHosts });
-
-  if (!pre.ok) {
-    const bound = listens.length > 0
-      ? ` The config binds: ${listens.map((l) => `${l.host}:${l.port}`).join(', ')}.`
-      : '';
-    return {
-      ...base,
-      mode: CHALLENGE_MODES.PROXY,
-      configRegenerated,
-      preflight: pre,
-      error: buildError(
-        'local preflight',
-        `nginx did not return the challenge token on ${pre.triedHosts.join(', ')}.${bound} ${pre.detail}`,
-        "No certificate was requested, so Let's Encrypt rate limits are untouched.",
-        { nginxRunning: true, configSaved: false }
-      ),
-    };
-  }
+  let phase = 'challenge ready';
+  let heartbeat = null;
+  report('challenge ready', 'running', 'Starting the ACME challenge listener');
 
   try {
-    const cert = await withChallengeServer(challengePort, async ({ setToken, removeToken }) => {
-      return client.auto({
+    const cert = await challengeServer(challengePort, async ({ setToken, removeToken }) => {
+      return withTimeout(client.auto({
         csr,
         email: acmeEmail,
         termsOfServiceAgreed: true,
         challengePriority: ['http-01'],
         challengeCreateFn: async (authz, challenge, keyAuthorization) => {
           setToken(challenge.token, keyAuthorization);
+          report('challenge ready', 'ok', 'The challenge token is being served over HTTP');
+          phase = 'waiting for validation';
+          report('waiting for validation', 'running', "Waiting for Let's Encrypt validation");
+          heartbeat = startValidationHeartbeat(report);
         },
         challengeRemoveFn: async (authz, challenge) => {
           removeToken(challenge.token);
         },
-      });
+      }), remaining(), () => phase);
     });
 
+    stopHeartbeat(heartbeat);
+    report('waiting for validation', 'ok', "Let's Encrypt accepted the challenge");
+    report('certificate received', 'ok', "Certificate received from Let's Encrypt");
+
+    report('files written', 'running');
     const paths = await writeCert(cert);
+    report('files written', 'ok', 'Certificate and key saved');
+
+    const finish = manageNginx
+      ? await applyNginxAndVerify({
+        report, run, domainName, certPath: paths.certPath, mode: CHALLENGE_MODES.PROXY,
+        preflightInfo, behindCloudflare, manageNginx, remaining, deps,
+      })
+      : {};
+
     return {
       ...base,
       success: true,
       mode: CHALLENGE_MODES.PROXY,
       configRegenerated,
-      preflight: pre,
+      preflight: preflightInfo,
       ...paths,
+      ...finish,
     };
   } catch (err) {
-    return {
-      ...base,
+    stopHeartbeat(heartbeat);
+    const stage = err?.code === 'EZ_TIMEOUT' ? 'timeout' : phase;
+    report(phase, 'failed', firstLine(err.message));
+    return fail(stage, err, 'No certificate was issued. nginx kept running throughout.', {
       mode: CHALLENGE_MODES.PROXY,
       configRegenerated,
-      preflight: pre,
-      error: buildError(
-        'ACME validation',
-        err.message || 'HTTP-01 challenge failed.',
-        'No certificate was issued. nginx kept running throughout.',
-        { nginxRunning: true, configSaved: false }
-      ),
-    };
+      preflight: preflightInfo,
+    });
   }
 }
 
@@ -563,14 +878,13 @@ async function issueViaProxy({
  * back the way it was found.
  */
 async function issueViaStandalone({
-  client, csr, acmeEmail, nginxDir, run, writeCert, base, nginxWasRunning,
+  client, csr, acmeEmail, domainName, nginxDir, run, writeCert, base, nginxWasRunning,
+  report, preflightInfo, behindCloudflare, manageNginx, remaining, deps, challengeServer,
 }) {
   let stoppedAt = null;
-
-  // The result is built up in place so the finally block can record how long
-  // nginx was down — a `return { ...base }` would have been evaluated before
-  // finally ran, and the timing would never reach the caller.
   const outcome = { ...base, mode: CHALLENGE_MODES.STANDALONE, nginxRestored: !nginxWasRunning };
+  let phase = 'challenge ready';
+  let heartbeat = null;
 
   try {
     if (nginxWasRunning) {
@@ -578,34 +892,50 @@ async function issueViaStandalone({
       await run(nginxServiceStopCmd(nginxDir), { cwd: nginxDir });
     }
 
-    const cert = await withChallengeServer(80, async ({ setToken, removeToken }) => {
-      return client.auto({
+    report('challenge ready', 'running', 'Starting the ACME challenge listener on port 80');
+
+    const cert = await challengeServer(80, async ({ setToken, removeToken }) => {
+      return withTimeout(client.auto({
         csr,
         email: acmeEmail,
         termsOfServiceAgreed: true,
         challengePriority: ['http-01'],
         challengeCreateFn: async (authz, challenge, keyAuthorization) => {
           setToken(challenge.token, keyAuthorization);
+          report('challenge ready', 'ok', 'The challenge token is being served on port 80');
+          phase = 'waiting for validation';
+          report('waiting for validation', 'running', "Waiting for Let's Encrypt validation");
+          heartbeat = startValidationHeartbeat(report);
         },
         challengeRemoveFn: async (authz, challenge) => {
           removeToken(challenge.token);
         },
-      });
+      }), remaining(), () => phase);
     });
 
+    stopHeartbeat(heartbeat);
+    report('waiting for validation', 'ok', "Let's Encrypt accepted the challenge");
+    report('certificate received', 'ok', "Certificate received from Let's Encrypt");
+
+    report('files written', 'running');
     const paths = await writeCert(cert);
+    report('files written', 'ok', 'Certificate and key saved');
+
     outcome.success = true;
     outcome.certPath = paths.certPath;
     outcome.keyPath = paths.keyPath;
-    return outcome;
+    outcome.preflight = preflightInfo;
   } catch (err) {
-    outcome.error = buildError(
-      'ACME validation',
-      err.message || 'HTTP-01 challenge failed in standalone mode.',
-      'No certificate was issued.',
-      { nginxRunning: true, configSaved: false }
-    );
-    return outcome;
+    stopHeartbeat(heartbeat);
+    const stage = err?.code === 'EZ_TIMEOUT' ? 'timeout' : phase;
+    report(phase, 'failed', firstLine(err.message));
+    outcome.error = buildError(stage, err.message || 'HTTP-01 challenge failed in standalone mode.', 'No certificate was issued.', {
+      stage,
+      fix: fixForAcmeError(err.message, domainName),
+      nginxRunning: true,
+      configSaved: false,
+    });
+    outcome.preflight = preflightInfo;
   } finally {
     // Restore nginx no matter how we leave this block — success, failure, or
     // an exception thrown past the catch.
@@ -638,4 +968,14 @@ async function issueViaStandalone({
       }
     }
   }
+
+  if (outcome.success && manageNginx) {
+    const finish = await applyNginxAndVerify({
+      report, run, domainName: base.domain, certPath: outcome.certPath,
+      mode: CHALLENGE_MODES.STANDALONE, preflightInfo, behindCloudflare, manageNginx, remaining, deps,
+    });
+    Object.assign(outcome, finish);
+  }
+
+  return outcome;
 }

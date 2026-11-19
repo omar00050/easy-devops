@@ -64,12 +64,22 @@ async function prepare(domainName) {
 /**
  * Handles a hub:manageSSL command.
  *
- * @param {Object} payload { action, domain?, www? }
+ * @param {Object} payload { action, domain?, www?, opId? }
+ * @param {Object} [options]
+ * @param {(step: string, status: string, detail?: string) => void} [options.onProgress]
+ *   Live command progress from core/hub/agent.js. Step is the SSL stage name.
  * @returns {Promise<Object>} { ok, error, ... }
  */
-export async function handleHubSslCommand(payload) {
+export async function handleHubSslCommand(payload, options = {}) {
   const { action, domain } = payload ?? {};
+  const { onProgress = null } = options ?? {};
   const config = loadConfig();
+
+  // Every SSL stage belongs to a name; the Hub needs that to show renewAll
+  // per domain. The agent's onProgress accepts it as its fourth argument.
+  const progressFor = (name) => (typeof onProgress === 'function'
+    ? (step, status, detail) => onProgress(step, status, detail, name)
+    : null);
 
   switch (action) {
     // ── Renew one ─────────────────────────────────────────────────────────
@@ -80,7 +90,11 @@ export async function handleHubSslCommand(payload) {
       // renewCertificate() keeps the names the certificate already covers
       // (a `www` certificate stays a `www` certificate), prepares the nginx
       // config, and reloads nginx afterwards.
-      const result = await renewCertificate(domain, { email: config.acmeEmail });
+      const result = await renewCertificate(domain, {
+        email: config.acmeEmail,
+        opId: payload?.opId,
+        onProgress: progressFor(domain),
+      });
       const out = renewalResult(domain, result);
       if (out.ok) bumpHubRevision();
       console.log('[hubAgent] ssl renew:', domain, out.ok ? 'OK' : 'FAILED', '—', out.summary || out.error);
@@ -98,7 +112,11 @@ export async function handleHubSslCommand(payload) {
       const renewed = [];
 
       for (const cert of expiring) {
-        const result = await renewCertificate(cert.domain, { email: config.acmeEmail });
+        const result = await renewCertificate(cert.domain, {
+          email: config.acmeEmail,
+          opId: payload?.opId,
+          onProgress: progressFor(cert.domain),
+        });
         renewed.push(renewalResult(cert.domain, result));
       }
 
@@ -132,6 +150,8 @@ export async function handleHubSslCommand(payload) {
         www: Boolean(payload?.www),
         validationMethod: 'http',
         email: config.acmeEmail,
+        opId: payload?.opId,
+        onProgress: progressFor(domain),
       });
 
       const out = issuanceResult(domain, result);

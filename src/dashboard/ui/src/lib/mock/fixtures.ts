@@ -162,7 +162,11 @@ export function seedCertificates(): Certificate[] {
     { domain: 'app.example.com', expiry: isoDaysFromNow(95), daysLeft: 95, status: 'valid', autoRenew: 'auto', autoRenewDays: 7 },
     { domain: 'api.example.com', expiry: isoDaysFromNow(12), daysLeft: 12, status: 'expiring', autoRenew: 'manual', autoRenewDays: 7 },
     { domain: 'legacy.example.com', expiry: isoDaysFromNow(-3), daysLeft: -3, status: 'expired' },
-    { domain: 'broken.example.com', expiry: null, daysLeft: null, status: 'error' },
+    // The certificate directory exists but no certificate file was ever
+    // written: a neutral "Not issued yet" with an Issue action, not an error.
+    { domain: 'pending.example.com', expiry: null, daysLeft: null, status: 'not_issued', label: 'Not issued yet' },
+    // A real unreadable file: Node and openssl both refuse it.
+    { domain: 'broken.example.com', expiry: null, daysLeft: null, status: 'unreadable', label: null },
     // Exists but no domain serves it yet — the "offer these paths" case for
     // blog.example.com, which was added without SSL.
     { domain: 'blog.example.com', expiry: isoDaysFromNow(64), daysLeft: 64, status: 'valid', autoRenew: 'unused', autoRenewDays: 7 },
@@ -177,6 +181,7 @@ export function seedChannels(): NotificationChannel[] {
       type: 'discord',
       webhookUrl: 'https://discord.com/api/webhooks/123456789012345678/example-token',
       message: 'Easy DevOps alert',
+      lastTest: 'passed',
     },
     {
       id: 'ch-telegram-oncall',
@@ -184,6 +189,21 @@ export function seedChannels(): NotificationChannel[] {
       type: 'telegram',
       botToken: '7123456789:AAExampleTokenForMockOnly',
       chatId: '-1001234567890',
+      lastTest: 'failed',
+    },
+    {
+      id: 'ch-discord-builds',
+      name: 'Builds Discord',
+      type: 'discord',
+      webhookUrl: 'https://discord.com/api/webhooks/987654321098765432/example-token',
+      lastTest: null,
+    },
+    {
+      id: 'ch-telegram-releases',
+      name: 'Releases Telegram',
+      type: 'telegram',
+      botToken: '7987654321:AAExampleTokenForMockOnly',
+      chatId: '-1009876543210',
     },
   ];
 }

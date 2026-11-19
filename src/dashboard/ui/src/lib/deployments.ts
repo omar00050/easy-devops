@@ -11,7 +11,10 @@ import type {
   DeployInstances,
   DeployRun,
   DeployRunStatus,
+  DeployRuntime,
   DeploySettings,
+  DeployStep,
+  DeployStepKind,
 } from './types';
 import type { Tone } from '../components/ui/Badge';
 
@@ -84,27 +87,206 @@ export function envToText(env: Record<string, string>): string {
     .join('\n');
 }
 
-/** A command override as the single line the form edits. */
-export function commandsToText(value: DeployCommands | undefined): string {
-  if (value === undefined || value === false) return '';
-  return Array.isArray(value) ? value.join(' && ') : value;
+/** A step in the form: the API shape plus a stable key for React and focus. */
+export interface StepDraft extends DeployStep {
+  key: string;
+}
+
+let stepKeySeq = 0;
+function nextStepKey(): string {
+  stepKeySeq += 1;
+  return `step-${stepKeySeq}`;
+}
+
+export function toStepDrafts(steps: DeployStep[]): StepDraft[] {
+  return steps.map((step) => ({
+    key: nextStepKey(),
+    run: step.run,
+    kind: step.kind,
+    enabled: step.enabled !== false,
+  }));
+}
+
+/** The API shape, with empty rows dropped (the form validates them first). */
+export function stepsFromDraft(steps: StepDraft[]): DeployStep[] {
+  return steps
+    .filter((step) => step.run.trim())
+    .map((step) => ({
+      run: step.run.trim(),
+      kind: step.kind,
+      enabled: step.enabled !== false,
+    }));
+}
+
+/**
+ * The steps an app stores: the new list, or the equivalent list from the old
+ * install/build/migrate fields. Absent means "read from ez.json".
+ */
+export function stepsFromSettings(settings: DeploySettings): DeployStep[] {
+  if (Array.isArray(settings.steps)) {
+    return settings.steps.map((step) => ({
+      run: step.run,
+      kind: step.kind,
+      enabled: step.enabled !== false,
+    }));
+  }
+
+  const steps: DeployStep[] = [];
+  for (const kind of ['install', 'build', 'migrate'] as const) {
+    const value = settings[kind];
+    if (typeof value === 'string' && value.trim()) {
+      steps.push({ run: value.trim(), kind, enabled: true });
+      continue;
+    }
+    for (const run of Array.isArray(value) ? value : []) {
+      if (run.trim()) steps.push({ run, kind, enabled: true });
+    }
+  }
+  return steps;
+}
+
+/** Whether the app stores any command override, in either format. */
+export function hasCommandOverride(settings: DeploySettings): boolean {
+  return (
+    settings.steps !== undefined ||
+    settings.install !== undefined ||
+    settings.build !== undefined ||
+    settings.migrate !== undefined
+  );
+}
+
+export const MAX_DEPLOY_STEPS = 5;
+
+export const STEP_KINDS: Array<{ value: DeployStepKind; label: string }> = [
+  { value: 'install', label: 'Install' },
+  { value: 'build', label: 'Build' },
+  { value: 'migrate', label: 'Migrate' },
+  { value: 'custom', label: 'Custom' },
+];
+
+/**
+ * The same advisory checks as `stepOrderWarnings()` on the server
+ * (core/deploy/ezfile.js), word for word, so the form can answer before a save.
+ * Disabled steps do not count.
+ */
+export function stepOrderWarnings(steps: Array<{ kind: DeployStepKind; enabled?: boolean }>): string[] {
+  const first: Partial<Record<DeployStepKind, number>> = {};
+  steps.forEach((step, index) => {
+    if (step.enabled === false) return;
+    if (first[step.kind] === undefined) first[step.kind] = index;
+  });
+
+  const warnings: string[] = [];
+  const before = (a: DeployStepKind, b: DeployStepKind, advice: string) => {
+    const aAt = first[a];
+    const bAt = first[b];
+    if (aAt !== undefined && bAt !== undefined && aAt < bAt) warnings.push(advice);
+  };
+
+  before(
+    'migrate',
+    'install',
+    'The "migrate" step is listed before "install", but dependencies are not installed yet. Put "install" before "migrate".'
+  );
+  before(
+    'build',
+    'install',
+    'The "build" step is listed before "install", but dependencies are not installed yet. Put "install" before "build".'
+  );
+  before(
+    'migrate',
+    'build',
+    'The "migrate" step is listed before "build". Build first, then migrate, so the migration runs against the release that is about to start.'
+  );
+  return warnings;
+}
+
+/** True for a warning that is about the order of the steps. */
+export function isStepOrderWarning(warning: string): boolean {
+  return warning.startsWith('The "');
+}
+
+/** A ready-made command set for a known kind of Node project. */
+export interface DeployPreset {
+  id: string;
+  label: string;
+  description: string;
+  start: string;
+  steps: DeployStep[];
+}
+
+export const DEPLOY_PRESETS: DeployPreset[] = [
+  {
+    id: 'node',
+    label: 'Default Node app',
+    description: 'npm ci, then npm start',
+    start: 'npm start',
+    steps: [{ run: 'npm ci', kind: 'install', enabled: true }],
+  },
+  {
+    id: 'next',
+    label: 'Next.js',
+    description: 'npm ci and npm run build, then npm start',
+    start: 'npm start',
+    steps: [
+      { run: 'npm ci', kind: 'install', enabled: true },
+      { run: 'npm run build', kind: 'build', enabled: true },
+    ],
+  },
+  {
+    id: 'nest',
+    label: 'NestJS',
+    description: 'npm ci and npm run build, then node dist/main.js',
+    start: 'node dist/main.js',
+    steps: [
+      { run: 'npm ci', kind: 'install', enabled: true },
+      { run: 'npm run build', kind: 'build', enabled: true },
+    ],
+  },
+  {
+    id: 'express',
+    label: 'Express / Fastify',
+    description: 'npm ci, then node server.js',
+    start: 'node server.js',
+    steps: [{ run: 'npm ci', kind: 'install', enabled: true }],
+  },
+  {
+    id: 'nuxt',
+    label: 'Nuxt',
+    description: 'npm ci and npm run build, then the Node server',
+    start: 'node .output/server/index.mjs',
+    steps: [
+      { run: 'npm ci', kind: 'install', enabled: true },
+      { run: 'npm run build', kind: 'build', enabled: true },
+    ],
+  },
+];
+
+/**
+ * A preset's steps, plus the optional ones it offers switched OFF: they appear
+ * in the list so they are easy to enable, and the server skips them until then.
+ */
+export function presetSteps(preset: DeployPreset): DeployStep[] {
+  return [
+    ...preset.steps,
+    { run: 'npm run lint', kind: 'custom', enabled: false },
+    { run: 'npx prisma migrate deploy', kind: 'migrate', enabled: false },
+  ];
 }
 
 export interface SettingsDraft {
-  install: string;
-  build: string;
-  migrate: string;
+  steps: StepDraft[];
   start: string;
+  runtime: DeployRuntime;
   port: string;
   healthPath: string;
   persist: string[];
-  skipInstall: boolean;
-  skipBuild: boolean;
   execMode: DeployExecMode;
   instances: string;
   /** True when the value is saved as an override; false leaves ez.json in charge. */
-  migrateOverride: boolean;
-  migrateOff: boolean;
+  stepsOverride: boolean;
+  startOverride: boolean;
+  runtimeOverride: boolean;
   execModeOverride: boolean;
   instancesOverride: boolean;
 }
@@ -120,10 +302,9 @@ export function toSettingsDraft(
   effective?: { execMode?: DeployExecMode; instances?: DeployInstances }
 ): SettingsDraft {
   return {
-    install: commandsToText(settings.install),
-    build: commandsToText(settings.build),
-    migrate: commandsToText(settings.migrate),
+    steps: toStepDrafts(stepsFromSettings(settings)),
     start: settings.start ?? '',
+    runtime: settings.runtime ?? 'node',
     port: settings.port ? String(settings.port) : '',
     healthPath: settings.healthPath ?? '',
     persist: Array.isArray(settings.persist)
@@ -131,16 +312,15 @@ export function toSettingsDraft(
       : settings.persist
         ? [settings.persist]
         : [],
-    skipInstall: settings.install === false || (Array.isArray(settings.install) && settings.install.length === 0),
-    skipBuild: settings.build === false || (Array.isArray(settings.build) && settings.build.length === 0),
     execMode: settings.execMode ?? effective?.execMode ?? 'fork',
     instances: settings.instances !== undefined
       ? String(settings.instances)
       : effective?.instances !== undefined
         ? String(effective.instances)
         : '',
-    migrateOverride: settings.migrate !== undefined,
-    migrateOff: settings.migrate === false,
+    stepsOverride: hasCommandOverride(settings),
+    startOverride: settings.start !== undefined,
+    runtimeOverride: settings.runtime !== undefined,
     execModeOverride: settings.execMode !== undefined,
     instancesOverride: settings.instances !== undefined,
   };
@@ -196,15 +376,9 @@ export function checkPersistAddition(raw: string, current: string[]): { path: st
 /** Builds the `settings` override object: an untouched inherited value is omitted. */
 export function fromSettingsDraft(draft: SettingsDraft): DeploySettings {
   const settings: DeploySettings = {};
-  if (draft.skipInstall) settings.install = false;
-  else if (draft.install.trim()) settings.install = draft.install.trim();
-  if (draft.skipBuild) settings.build = false;
-  else if (draft.build.trim()) settings.build = draft.build.trim();
-  if (draft.migrateOverride) {
-    if (draft.migrateOff) settings.migrate = false;
-    else if (draft.migrate.trim()) settings.migrate = draft.migrate.trim();
-  }
-  if (draft.start.trim()) settings.start = draft.start.trim();
+  if (draft.stepsOverride) settings.steps = stepsFromDraft(draft.steps);
+  if (draft.startOverride && draft.start.trim()) settings.start = draft.start.trim();
+  if (draft.runtimeOverride) settings.runtime = draft.runtime;
   if (draft.port.trim()) settings.port = Number(draft.port);
   if (draft.healthPath.trim()) settings.healthPath = draft.healthPath.trim();
   if (draft.persist.length > 0) settings.persist = [...draft.persist];
@@ -366,13 +540,24 @@ export function buildEzJson(settings: DeploySettings): string {
     return value && value.trim() ? value : fallback;
   };
 
-  const file: Record<string, unknown> = {
-    install: one(settings.install, 'npm ci'),
-    build: one(settings.build, 'npm run build'),
-    start: settings.start?.trim() || 'npm start',
-    port: settings.port ?? 3000,
-    health: settings.healthPath?.trim() || '/',
-  };
+  const file: Record<string, unknown> = {};
+  if (settings.steps !== undefined) {
+    // The new list is one field: write it instead of the old install/build/migrate.
+    file.steps = settings.steps.map((step) => ({
+      run: step.run,
+      kind: step.kind,
+      ...(step.enabled === false ? { enabled: false } : {}),
+    }));
+  } else {
+    file.install = one(settings.install, 'npm ci');
+    file.build = one(settings.build, 'npm run build');
+    const migrate = one(settings.migrate, '');
+    if (migrate && migrate !== '') file.migrate = migrate;
+  }
+  file.start = settings.start?.trim() || 'npm start';
+  file.runtime = settings.runtime ?? 'node';
+  file.port = settings.port ?? 3000;
+  file.health = settings.healthPath?.trim() || '/';
 
   const persist = Array.isArray(settings.persist)
     ? settings.persist
@@ -381,8 +566,6 @@ export function buildEzJson(settings: DeploySettings): string {
       : [];
   if (persist.length > 0) file.persist = persist;
 
-  const migrate = one(settings.migrate, '');
-  if (migrate && migrate !== '') file.migrate = migrate;
   if (settings.execMode) file.execMode = settings.execMode;
   if (settings.instances !== undefined) file.instances = settings.instances;
 
@@ -412,9 +595,11 @@ export const EZ_JSON_PYTHON = `${JSON.stringify(
 )}\n`;
 
 export const EZ_JSON_FIELDS: Array<{ name: string; meaning: string; without: string }> = [
-  { name: 'install', meaning: 'Run first, in a fresh checkout. A command, a list of commands, or false to skip.', without: 'npm ci (yarn and pnpm are detected from the lockfile)' },
-  { name: 'build', meaning: 'Run after install. Same forms.', without: 'the "build" script, if package.json has one' },
-  { name: 'migrate', meaning: 'Run after build, before the new release starts. Same forms. Forward-only: a rollback does not undo a migration.', without: 'nothing is run' },
+  { name: 'steps', meaning: 'An ordered list of at most 5 steps, each { run, kind, enabled? }, where kind is install, build, migrate or custom. One field: it replaces the list below, and [] clears it. Disabled steps are skipped.', without: 'the equivalent install/build/migrate list below' },
+  { name: 'runtime', meaning: 'The runtime. "node" is the only one today; cluster mode is Node-only.', without: '"node"' },
+  { name: 'install', meaning: 'Old format: a command, a list of commands, or false to skip. Read as an install step.', without: 'npm ci (yarn and pnpm are detected from the lockfile)' },
+  { name: 'build', meaning: 'Old format: run after install. Same forms. Read as a build step.', without: 'the "build" script, if package.json has one' },
+  { name: 'migrate', meaning: 'Old format: run after build, before the new release starts. Same forms. Forward-only: a rollback does not undo a migration.', without: 'nothing is run' },
   { name: 'start', meaning: 'The long-running process. One command, any language.', without: 'the "start" script, else node <main>' },
   { name: 'execMode', meaning: '"fork" (one process) or "cluster" (one worker per instance). Cluster needs a start command of the form node <file>.', without: '"fork"' },
   { name: 'instances', meaning: 'How many copies to run: a whole number up to the CPU count, or "max".', without: '1' },

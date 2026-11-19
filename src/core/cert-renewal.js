@@ -54,7 +54,9 @@ import {
   issueCertificate,
   prepareDomainForHttpChallenge,
   reloadNginx,
+  verifyServedCertificate,
 } from './ssl-issuer.js';
+import { createSslProgress, isValidOpId, newOpId } from './ssl/progress.js';
 
 /** Renew this many days before expiry unless the setting says otherwise. */
 export const DEFAULT_AUTO_RENEW_DAYS = 7;
@@ -197,6 +199,10 @@ export function failureReason(result) {
   return String(cause).split('\n')[0].trim();
 }
 
+function firstLine(value) {
+  return String(value ?? '').split('\n')[0].trim();
+}
+
 /**
  * Renews one certificate, keeping the names it already covers, and reloads
  * nginx when nginx was left running so the new certificate is actually served.
@@ -215,7 +221,11 @@ export function failureReason(result) {
  * @returns {Promise<Object>}
  */
 export async function renewCertificate(domainName, options = {}) {
-  const { email = null, mode = null, unattended = false, deps = {} } = options;
+  const {
+    email = null, mode = null, unattended = false, deps = {},
+    opId: rawOpId = null, onEvent = null, onProgress = null,
+    behindCloudflare = false,
+  } = options;
   const {
     issue = issueCertificate,
     prepare = prepareDomainForHttpChallenge,
@@ -223,7 +233,15 @@ export async function renewCertificate(domainName, options = {}) {
     nginxStatus = getStatus,
     describe = describeCertificate,
     lookupDomain = findDomain,
+    verify = verifyServedCertificate,
   } = deps;
+
+  const opId = isValidOpId(rawOpId) ? rawOpId : newOpId();
+  const progress = createSslProgress({
+    opId, domain: domainName, onEvent, onProgress,
+    ...(deps.progress ?? {}),
+  });
+  const report = (stage, status, detail) => progress.report(stage, status, detail);
 
   const config = loadConfig();
   const info = await describe(domainName);
@@ -287,6 +305,11 @@ export async function renewCertificate(domainName, options = {}) {
     www: info.www,
     validationMethod: 'http',
     email: email || config.acmeEmail,
+    opId,
+    onEvent,
+    onProgress,
+    // This caller reports the nginx stages itself, so they appear exactly once.
+    manageNginx: false,
     ...(chosenMode ? { mode: chosenMode } : {}),
   });
 
@@ -294,14 +317,46 @@ export async function renewCertificate(domainName, options = {}) {
   // Proxy mode leaves it running with the old one in memory.
   let nginxReloaded = null;
   let reloadDetail = null;
-  if (result?.success && result.mode === CHALLENGE_MODES.PROXY) {
-    try {
-      const reloaded = await reload();
-      nginxReloaded = Boolean(reloaded?.ok);
-      if (!nginxReloaded) reloadDetail = reloaded?.output ?? null;
-    } catch (err) {
-      nginxReloaded = false;
-      reloadDetail = err.message;
+  let httpsVerified = null;
+
+  if (result?.success) {
+    if (result.mode === CHALLENGE_MODES.PROXY) {
+      report('nginx config test', 'running');
+      try {
+        const reloaded = await reload();
+        nginxReloaded = Boolean(reloaded?.ok);
+        if (!nginxReloaded) reloadDetail = reloaded?.output ?? null;
+      } catch (err) {
+        nginxReloaded = false;
+        reloadDetail = err.message;
+      }
+      const detail = nginxReloaded ? undefined : (firstLine(reloadDetail) || 'nginx did not reload');
+      report('nginx config test', nginxReloaded ? 'ok' : 'failed', detail);
+      report('nginx reload', 'running');
+      report('nginx reload', nginxReloaded ? 'ok' : 'failed', detail);
+    } else if (result.mode === 'dns-01') {
+      report('nginx config test', 'skipped', 'DNS-01 leaves nginx untouched');
+      report('nginx reload', 'skipped', 'DNS-01 leaves nginx untouched');
+    } else {
+      report('nginx config test', 'skipped', 'standalone mode restarted nginx');
+      report('nginx reload', 'skipped', 'standalone mode restarted nginx');
+    }
+
+    const proxied = Boolean(behindCloudflare || result.preflight?.proxied);
+    if (proxied) {
+      report('https verified', 'skipped', "served by Cloudflare's edge");
+    } else if (!result.certPath) {
+      report('https verified', 'skipped', 'no certificate file to compare');
+    } else {
+      report('https verified', 'running');
+      try {
+        const checked = await verify(domainName, result.certPath);
+        httpsVerified = Boolean(checked?.ok);
+        report('https verified', checked?.ok ? 'ok' : 'failed', checked?.ok ? undefined : checked?.message);
+      } catch (err) {
+        httpsVerified = false;
+        report('https verified', 'failed', firstLine(err.message));
+      }
     }
   }
 
@@ -313,6 +368,7 @@ export async function renewCertificate(domainName, options = {}) {
     configRegenerated: Boolean(result?.configRegenerated || prepared?.regenerated),
     nginxReloaded,
     reloadDetail,
+    httpsVerified,
   };
 }
 

@@ -20,8 +20,16 @@ import ora from 'ora';
 import { isWindows, isDevDataDir, getDataDir } from '../../core/platform.js';
 import * as service from '../../core/service/index.js';
 import { describeLegacy } from '../../core/service/legacy.js';
+import { page, pause } from '../ui/page.js';
 
 const ACTIONS = ['install', 'uninstall', 'status', 'start', 'stop', 'restart', 'logs', 'repair'];
+
+/**
+ * Actions that change something, as opposed to read-only ones (`status`,
+ * `logs`). Only these get a page heading and hold their result until Enter;
+ * the read-only pair must stay pipeable, so it does neither.
+ */
+const MUTATING_ACTIONS = new Set(['install', 'uninstall', 'start', 'stop', 'restart', 'repair']);
 
 /**
  * Entry point for the `service` command.
@@ -37,17 +45,21 @@ export async function serviceCommand(action) {
     return 1;
   }
 
+  let code;
   switch (action) {
-    case 'status': return showStatus();
-    case 'install': return doInstall();
-    case 'uninstall': return doUninstall();
-    case 'start': return doStart();
-    case 'stop': return doStop();
-    case 'restart': return doRestart();
-    case 'logs': return showLogs();
-    case 'repair': return doRepair();
-    default: return 1;
+    case 'status': code = await showStatus(); break;
+    case 'install': code = await doInstall(); break;
+    case 'uninstall': code = await doUninstall(); break;
+    case 'start': code = await doStart(); break;
+    case 'stop': code = await doStop(); break;
+    case 'restart': code = await doRestart(); break;
+    case 'logs': code = await showLogs(); break;
+    case 'repair': code = await doRepair(); break;
+    default: code = 1;
   }
+
+  if (MUTATING_ACTIONS.has(action)) await pause();
+  return code;
 }
 
 // ─── Shared rendering ─────────────────────────────────────────────────────────
@@ -206,6 +218,7 @@ function describeBoot(enabled) {
 // ─── install ──────────────────────────────────────────────────────────────────
 
 async function doInstall() {
+  page(['Service', 'Install']);
   console.log();
   console.log('  ' + chalk.bold('Install the Easy DevOps background service'));
   console.log('  ' + chalk.gray('─'.repeat(58)));
@@ -421,6 +434,7 @@ async function offerToStart() {
 // ─── uninstall ────────────────────────────────────────────────────────────────
 
 async function doUninstall() {
+  page(['Service', 'Uninstall']);
   const current = await service.status().catch(() => null);
 
   console.log();
@@ -587,6 +601,7 @@ async function doUninstall() {
 // ─── stop / start ─────────────────────────────────────────────────────────────
 
 async function doStop() {
+  page(['Service', 'Stop']);
   const spinner = ora('Stopping the background service…').start();
   const lines = [];
 
@@ -626,6 +641,7 @@ async function doStop() {
 }
 
 async function doStart() {
+  page(['Service', 'Start']);
   const spinner = ora('Starting the background service…').start();
   const lines = [];
 
@@ -667,6 +683,7 @@ async function doStart() {
 // ─── restart ──────────────────────────────────────────────────────────────────
 
 async function doRestart() {
+  page(['Service', 'Restart']);
   const spinner = ora('Restarting the service…').start();
 
   let result;
@@ -722,6 +739,7 @@ async function showLogs() {
 // ─── repair ───────────────────────────────────────────────────────────────────
 
 async function doRepair() {
+  page(['Service', 'Repair']);
   console.log();
   console.log('  ' + chalk.bold('Repair the Easy DevOps service'));
   console.log('  ' + chalk.gray('─'.repeat(58)));

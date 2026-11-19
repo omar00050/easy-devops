@@ -162,7 +162,7 @@ function buildIssues(
   }
 
   for (const cert of certs) {
-    if (cert.status === 'error') {
+    if (cert.status === 'unreadable' || cert.status === 'error') {
       issues.push({
         id: `cert-error-${cert.domain}`,
         tone: 'bad',
@@ -271,7 +271,9 @@ export function OverviewPage() {
 
   const enabledDomains = domains.filter((domain) => domain.enabled).length;
   const expiring = certs.filter((cert) => cert.status === 'expiring');
-  const badCerts = certs.filter((cert) => cert.status === 'expired' || cert.status === 'error');
+  const badCerts = certs.filter(
+    (cert) => cert.status === 'expired' || cert.status === 'unreadable' || cert.status === 'error'
+  );
   const issues = data ? buildIssues(nginx, domains, certs, health) : [];
   const critical = issues.filter((issue) => issue.tone === 'bad').length;
   const healthy = data !== null && nginx?.running === true && issues.length === 0;

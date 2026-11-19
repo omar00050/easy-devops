@@ -127,6 +127,8 @@ Commands:
   runtime <action>  The Node runtime the service is pinned to.
                     Actions: status, update
   update            Update Easy DevOps itself, then restart the service.
+  hub <action>      Pair this server with an Easy DevOps Hub.
+                    Actions: connect <link-or-ezops-string>, status, unlink
   cleanup           List reclaimable files (runtime backups, old logs, stale
                     locks, nginx .bak files) and remove the ones you choose.
   uninstall         Remove Easy DevOps. Needs --purge to do anything.
@@ -165,6 +167,9 @@ Examples:
   ezz runtime status        Show the pinned Node and the available LTS versions
   ezz runtime update        Move the service to a newer Node, with rollback
   ezz update                Update Easy DevOps and restart the service
+  ezz hub connect <link>    Pair with a Hub using the command from its "From the CLI" option
+  ezz hub status            Show the Hub origin, server id and agent state
+  ezz hub unlink --yes      Remove the pairing (the Hub keeps the server, offline)
   ezz cleanup               Show what can be reclaimed (nothing is deleted)
   ezz dashboard setup-code  Issue a new first-run setup code
   npm run dev               Interactive menu against .dev-data
@@ -242,6 +247,9 @@ if (flags.has('dash')) {
 } else if (command === 'update') {
   const { updateCommand } = await import('./menus/update.js');
   process.exit(await updateCommand({ yes: flags.has('yes') }));
+} else if (command === 'hub') {
+  const { hubCommand } = await import('./menus/hub.js');
+  process.exit(await hubCommand(args[0] ?? 'status', args.slice(1), { yes: flags.has('yes') }));
 } else if (command === 'cleanup') {
   const { cleanupCommand } = await import('./menus/cleanup.js');
   process.exit(await cleanupCommand({ days: options.days, yes: flags.has('yes') }));

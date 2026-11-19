@@ -125,6 +125,7 @@ npx easy-devops
   🌐 Nginx Manager
   🔒 SSL Manager
   🔗 Domain Manager
+  🔌 Hub
   🎛️ Open Dashboard
   ⚙️ Settings
   🔄 Check for Updates

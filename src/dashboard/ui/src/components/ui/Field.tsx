@@ -351,6 +351,7 @@ export function Switch({
   checked,
   onChange,
   label,
+  ariaLabel,
   description,
   disabled,
   className,
@@ -358,6 +359,8 @@ export function Switch({
   checked: boolean;
   onChange: (checked: boolean) => void;
   label: string;
+  /** When set, this is the accessible name instead of the visible label. */
+  ariaLabel?: string;
   description?: ReactNode;
   disabled?: boolean;
   className?: string;
@@ -375,7 +378,8 @@ export function Switch({
         type="button"
         role="switch"
         aria-checked={checked}
-        aria-labelledby={id}
+        aria-labelledby={ariaLabel ? undefined : id}
+        aria-label={ariaLabel}
         disabled={disabled}
         onClick={() => onChange(!checked)}
         className={cn(

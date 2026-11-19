@@ -7,15 +7,16 @@
  *
  *   1. fetch     a fresh checkout into releases/<id> — never over the live one
  *   2. settings  ez.json + package.json + the app's overrides (ezfile.js)
- *   3. pre hook → install → build → migrate   all in the new directory
+ *   3. pre hook → the steps list (install/build/migrate/custom) in order
  *   4. switch    stop the old process, start the new one under PM2
  *   5. health    the app must answer (or stay up) before it counts
  *   6. post hook, save the PM2 list, prune old releases
  *
- * `migrate` runs in the new release with the build's environment, after build
- * and before anything is started. It is forward-only: rolling the code back
- * does not undo a migration that already ran, which is why the hint on a
+ * Every step runs in the new release with the build's environment, before
+ * anything is started. `migrate` keeps its forward-only hint: rolling the code
+ * back does not undo a migration that already ran, which is why the hint on a
  * failure says to fix the migration rather than expect the rollback to undo it.
+ * A disabled step is logged as skipped.
  *
  * Nothing before step 4 touches what is running, so a broken build or a failed
  * migration costs nothing. If step 4 or 5 fails and there is a previous
@@ -1128,9 +1129,15 @@ async function executeDeployment(app, run, d) {
 
     const { settings, sources } = project;
     log.line(project.ezLocation ? `ez.json found at ${project.ezLocation}` : 'no ez.json — using package.json defaults');
-    for (const field of ['install', 'build', 'migrate', 'start', 'port', 'healthPath', 'execMode', 'instances']) {
+    for (const field of ['install', 'build', 'migrate', 'start', 'runtime', 'port', 'healthPath', 'execMode', 'instances']) {
       const value = Array.isArray(settings[field]) ? (settings[field].join(' && ') || '(none)') : (settings[field] ?? '(none)');
       log.line(`  ${field.padEnd(10)} ${value}   [${sources[field]}]`);
+    }
+    if (settings.steps.length > 0) {
+      const shown = settings.steps
+        .map((s, i) => `${i + 1}.${s.kind}${s.enabled === false ? ' (disabled)' : ''}: ${s.run}`)
+        .join(' | ');
+      log.line(`  steps      ${shown}   [${sources.steps}]`);
     }
     if (settings.persist.length > 0) {
       log.line(`  persist    ${settings.persist.join(', ')}   [${sources.persist}]`);
@@ -1145,17 +1152,31 @@ async function executeDeployment(app, run, d) {
     const env = appEnvironment(app, settings, run.releaseId);
     const strict = sources.healthPath !== 'default';
 
-    // ── 3. pre → install → build → migrate ──────────────────────────────────
+    // ── 3. pre → steps (install/build/migrate/custom) ───────────────────────
     await userCommands('pre', 'Pre-deploy hook', settings.pre, env);
-    await userCommands('install', 'Install', settings.install, env);
-    await userCommands('build', 'Build', settings.build, env);
+    for (let i = 0; i < settings.steps.length; i++) {
+      const step = settings.steps[i];
+      const number = i + 1;
+      if (step.enabled === false) {
+        log.line(`Skipping step ${number} (${step.kind}): disabled.`);
+        continue;
+      }
+      // The run record's `step` is the kind for the three steps that have
+      // special behaviour, and "step N" for a custom one.
+      const stepId = step.kind === 'custom' ? `step ${number}` : step.kind;
+      const title = step.kind === 'install'
+        ? 'Install'
+        : step.kind === 'build'
+          ? 'Build'
+          : step.kind === 'migrate'
+            ? 'Migrate'
+            : `Step ${number}`;
+      await userCommands(stepId, title, [step.run], env, {
+        hint: step.kind === 'migrate' ? MIGRATE_HINT : null,
+        includeOutput: step.kind === 'migrate',
+      });
+    }
     verifyPersistentLinks(app.id, dir, settings.persist);
-    // Forward-only, and before anything is started: a migration that fails
-    // leaves the release that is running exactly as it was.
-    await userCommands('migrate', 'Migrate', settings.migrate, env, {
-      hint: MIGRATE_HINT,
-      includeOutput: true,
-    });
 
     // ── 4. switch ───────────────────────────────────────────────────────────
     setStep('start', 'Starting the new release');

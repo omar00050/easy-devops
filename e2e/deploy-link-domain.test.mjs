@@ -62,6 +62,8 @@ async function main() {
   const store = await import(srcUrl('core/deploy/store.js'));
   const config = await import(srcUrl('core/config.js'));
   const generator = await import(srcUrl('core/nginx-conf-generator.js'));
+  const bus = await import(srcUrl('core/jobs/bus.js'));
+  const deploymentsControllerModule = await import(srcUrl('dashboard/controllers/deploymentsController.js'));
 
   const { createDomain, saveDomains, findDomain } = db;
 
@@ -298,6 +300,25 @@ async function main() {
       };
     };
     const sequence = (r) => r.events.map((e) => `${e.step}:${e.status}`);
+    const verifyOk = async () => ({ ok: true, message: 'ok' });
+
+    /** The stages the real issuer reports through the link's onProgress hook. */
+    const emitIssueStages = (onProgress, { fail = false } = {}) => {
+      if (typeof onProgress !== 'function') return;
+      for (const stage of ['preflight', 'account and order', 'challenge ready']) {
+        onProgress(stage, 'running');
+        onProgress(stage, 'ok');
+      }
+      onProgress('waiting for validation', 'running');
+      if (fail) {
+        onProgress('waiting for validation', 'failed', 'DNS problem: NXDOMAIN');
+        return;
+      }
+      onProgress('waiting for validation', 'ok');
+      onProgress('certificate received', 'ok');
+      onProgress('files written', 'running');
+      onProgress('files written', 'ok');
+    };
 
     config.saveConfig({ ...config.loadConfig(), acmeEmail: 'ops@example.com' });
 
@@ -310,25 +331,36 @@ async function main() {
     }, {
       ...noNginx,
       ...issueDomain,
+      verify: verifyOk,
       prepare: async () => ({ ok: true }),
-      issue: async () => ({
-        success: true,
-        certPath: '/srv/ssl/progress/fullchain.pem',
-        keyPath: '/srv/ssl/progress/privkey.pem',
-        mode: 'proxy',
-      }),
+      issue: async (name, options) => {
+        emitIssueStages(options.onProgress);
+        return {
+          success: true,
+          certPath: '/srv/ssl/progress/fullchain.pem',
+          keyPath: '/srv/ssl/progress/privkey.pem',
+          mode: 'proxy',
+        };
+      },
       onProgress: issueProgress.onProgress,
     });
-    check('an issuing link reports domain → certificate → https → reload, each running then ok',
+    check('an issuing link reports domain, every certificate stage, https and the nginx stages',
       JSON.stringify(sequence(issueProgress))
         === JSON.stringify([
           'domain:running', 'domain:ok',
-          'certificate:running', 'certificate:ok',
+          'preflight:running', 'preflight:ok',
+          'account and order:running', 'account and order:ok',
+          'challenge ready:running', 'challenge ready:ok',
+          'waiting for validation:running', 'waiting for validation:ok',
+          'certificate received:ok',
+          'files written:running', 'files written:ok',
           'https:running', 'https:ok',
-          'reload:running', 'reload:ok',
+          'nginx config test:running', 'nginx config test:ok',
+          'nginx reload:running', 'nginx reload:ok',
+          'https verified:running', 'https verified:ok',
         ]), sequence(issueProgress).join(', '));
-    check('the certificate step says what is being requested',
-      /Let's Encrypt/.test(issueProgress.events.find((e) => e.step === 'certificate' && e.status === 'running')?.detail ?? ''));
+    check('the certificate stages come from the issuer, not the link',
+      issueProgress.events.some((e) => e.step === 'waiting for validation' && e.status === 'running'));
     check('the final result is unchanged by progress reporting',
       issued.ok === true && issued.ssl?.ok === true && issued.nginxReloaded === true);
 
@@ -342,16 +374,24 @@ async function main() {
       ...noNginx,
       ...failDomain,
       prepare: async () => ({ ok: true }),
-      issue: async () => ({ success: false, error: { cause: 'DNS problem: NXDOMAIN' } }),
+      issue: async (name, options) => {
+        emitIssueStages(options.onProgress, { fail: true });
+        return { success: false, error: { cause: 'DNS problem: NXDOMAIN' } };
+      },
       onProgress: failProgress.onProgress,
     });
-    check('an issue failure reports certificate failed and https skipped',
+    check('an issue failure reports the failed stage, https skipped and the reload',
       JSON.stringify(sequence(failProgress))
         === JSON.stringify([
           'domain:running', 'domain:ok',
-          'certificate:running', 'certificate:failed',
+          'preflight:running', 'preflight:ok',
+          'account and order:running', 'account and order:ok',
+          'challenge ready:running', 'challenge ready:ok',
+          'waiting for validation:running', 'waiting for validation:failed',
           'https:skipped',
-          'reload:running', 'reload:ok',
+          'nginx config test:running', 'nginx config test:ok',
+          'nginx reload:running', 'nginx reload:ok',
+          'https verified:skipped',
         ]), sequence(failProgress).join(', '));
     check('and the link still stands over HTTP with the same result shape',
       failedIssue.ok === true && failedIssue.ssl?.ok === false
@@ -368,12 +408,14 @@ async function main() {
       ...noneDomain,
       onProgress: noneProgress.onProgress,
     });
-    check('ssl none reports certificate and https as skipped',
+    check('ssl none reports https skipped and still applies the nginx stages',
       JSON.stringify(sequence(noneProgress))
         === JSON.stringify([
           'domain:running', 'domain:ok',
-          'certificate:skipped', 'https:skipped',
-          'reload:running', 'reload:ok',
+          'https:skipped',
+          'nginx config test:running', 'nginx config test:ok',
+          'nginx reload:running', 'nginx reload:ok',
+          'https verified:skipped',
         ]), sequence(noneProgress).join(', '));
     check('and still links successfully', noSsl.ok === true && noSsl.ssl === null);
 
@@ -385,6 +427,77 @@ async function main() {
     }, { ...noNginx, ...noHookDomain });
     check('without onProgress the command works exactly as before',
       noHook.ok === true && findDomain('progress-nohook.example.com').port === 4100);
+  }
+
+  // ── 4c. Dashboard link-domain publishes ssl:progress with its opId ───────
+  setGroup('Dashboard linkDomain publishes ssl:progress');
+  {
+    const previous = config.loadConfig();
+    const blockerRoot = path.join(TEST_DATA_DIR, 'scratch', 'link-progress-blocker');
+    fs.mkdirSync(blockerRoot, { recursive: true });
+    const blocker = path.join(blockerRoot, 'not-a-directory');
+    fs.writeFileSync(blocker, 'not a directory', 'utf8');
+
+    config.saveConfig({
+      ...previous,
+      nginxDir: path.join(blocker, 'nginx'),
+      sslDir: path.join(blockerRoot, 'ssl'),
+      acmeEmail: 'ops@example.com',
+    });
+    saveDomains([]);
+    apps.createApp({ id: 'link-progress', repoUrl: 'https://github.com/me/link-progress.git', settings: { port: 4102 } });
+
+    const frames = [];
+    const off = bus.subscribe('ssl:progress', (event) => frames.push(event));
+    const controller = new deploymentsControllerModule.default();
+    const fakeRes = () => {
+      const out = { statusCode: 200, body: null };
+      out.status = (code) => { out.statusCode = code; return out; };
+      out.json = (body) => { out.body = body; return out; };
+      return out;
+    };
+    const next = (err) => { throw err; };
+
+    try {
+      const res = fakeRes();
+      await controller.linkDomain({
+        params: { id: 'link-progress' },
+        body: {
+          domain: 'link-progress.example.com',
+          ssl: { mode: 'none' },
+          opId: 'link-op-12345',
+        },
+      }, res, next);
+
+      check('the link response carries the client opId', res.body?.opId === 'link-op-12345');
+      check('the link publishes ssl:progress frames', frames.length > 0, `${frames.length} frame(s)`);
+      check('every frame carries the opId and the linked domain',
+        frames.every((event) => event.opId === 'link-op-12345'
+          && event.domain === 'link-progress.example.com'));
+      check('the domain stage is reported running and then failed',
+        frames.some((event) => event.stage === 'domain' && event.status === 'running')
+        && frames.some((event) => event.stage === 'domain' && event.status === 'failed'));
+      check('every frame has elapsedMs and an ISO timestamp',
+        frames.every((event) => typeof event.elapsedMs === 'number'
+          && typeof event.at === 'string' && !Number.isNaN(Date.parse(event.at))));
+      check('a link without a client opId still returns one, generated server-side',
+        /^[A-Za-z0-9_-]{8,64}$/.test((await controller.linkDomain({
+          params: { id: 'link-progress' },
+          body: { domain: 'link-progress-no-id.example.com', ssl: { mode: 'none' } },
+        }, fakeRes(), next)).body?.opId ?? ''));
+
+      const invalid = fakeRes();
+      await controller.linkDomain({
+        params: { id: 'link-progress' },
+        body: { domain: 'link-progress.example.com', opId: 'not valid' },
+      }, invalid, next);
+      check('an invalid opId is refused before anything is written',
+        invalid.statusCode === 400 && invalid.body?.error === 'invalid_opId');
+    } finally {
+      off();
+      config.saveConfig(previous);
+      saveDomains([]);
+    }
   }
 
   // ── 5. hub:manageDeploy run redacts the log the same way ---------------

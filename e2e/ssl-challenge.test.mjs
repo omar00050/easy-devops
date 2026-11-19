@@ -305,6 +305,20 @@ async function main() {
     mode: 'proxy',
     staging: true,
     run: fakeRun,
+    // The point of this section is which nginx commands the proxy path issues.
+    // Preflight is stubbed so the suite never resolves real DNS or contacts
+    // Let's Encrypt; a failed preflight stops before any network call.
+    deps: {
+      preflight: async () => ({
+        ok: false,
+        results: [{
+          id: 'dns:never-stops.test',
+          status: 'fail',
+          message: 'never-stops.test has no DNS record',
+          fix: 'Add an A record.',
+        }],
+      }),
+    },
   });
 
   check('proxy mode did not succeed without a real ACME server', res.success === false);

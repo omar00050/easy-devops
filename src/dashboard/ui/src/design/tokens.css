@@ -46,6 +46,13 @@
   --ez-info: #6db5ff;
   --ez-info-soft: rgba(109, 181, 255, 0.13);
 
+  /* Notification channel types — indigo (Discord) and sky (Telegram), each
+     with its own soft background. Text on the soft fill is ≥ 4.5:1. */
+  --ez-discord: #a5b0ff;
+  --ez-discord-soft: rgba(114, 128, 255, 0.16);
+  --ez-telegram: #5cc8f5;
+  --ez-telegram-soft: rgba(42, 171, 238, 0.15);
+
   /* Elevation */
   --ez-shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.025), 0 10px 28px rgba(0, 0, 0, 0.24);
   --ez-shadow-pop: 0 22px 56px rgba(0, 0, 0, 0.55);
@@ -83,6 +90,11 @@
   --ez-bad-soft: rgba(189, 44, 58, 0.09);
   --ez-info: #1e66d0;
   --ez-info-soft: rgba(30, 102, 208, 0.09);
+
+  --ez-discord: #4651c8;
+  --ez-discord-soft: rgba(88, 101, 242, 0.10);
+  --ez-telegram: #0b6f9e;
+  --ez-telegram-soft: rgba(34, 158, 217, 0.10);
 
   --ez-shadow-card: 0 1px 2px rgba(16, 24, 40, 0.05), 0 4px 16px rgba(16, 24, 40, 0.04);
   --ez-shadow-pop: 0 20px 48px rgba(16, 24, 40, 0.18);
@@ -161,6 +173,10 @@
   --color-bad-soft: var(--ez-bad-soft);
   --color-info: var(--ez-info);
   --color-info-soft: var(--ez-info-soft);
+  --color-discord: var(--ez-discord);
+  --color-discord-soft: var(--ez-discord-soft);
+  --color-telegram: var(--ez-telegram);
+  --color-telegram-soft: var(--ez-telegram-soft);
 
   --font-sans: var(--ez-font-sans);
   --font-mono: var(--ez-font-mono);

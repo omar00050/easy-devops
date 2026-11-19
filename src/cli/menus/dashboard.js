@@ -8,6 +8,7 @@ import {
   stopDashboard,
 } from '../../core/dashboardProcess.js';
 import { run } from '../../core/shell.js';
+import { page, pause, BACK } from '../ui/page.js';
 
 // ─── Browser ──────────────────────────────────────────────────────────────────
 
@@ -109,6 +110,8 @@ export async function dashboardCommand(action) {
 
 export default async function dashboardMenu() {
   while (true) {
+    page(['Dashboard']);
+
     const spinner = ora('Checking dashboard status...').start();
     const status = await getDashboardStatus();
 
@@ -125,7 +128,6 @@ export default async function dashboardMenu() {
 
     const url = `http://localhost:${status.port}`;
 
-    console.log(chalk.bold('\n  Dashboard'));
     console.log(chalk.gray('  ' + '─'.repeat(40)));
 
     if (status.running) {
@@ -146,8 +148,8 @@ export default async function dashboardMenu() {
     console.log();
 
     const choices = status.running
-      ? ['Open in browser', 'Stop dashboard', 'How to use', new inquirer.Separator(), '← Back']
-      : ['Start dashboard', 'How to use', new inquirer.Separator(), '← Back'];
+      ? ['Open in browser', 'Stop dashboard', 'How to use', new inquirer.Separator(), BACK]
+      : ['Start dashboard', 'How to use', new inquirer.Separator(), BACK];
 
     let choice;
     try {
@@ -164,6 +166,7 @@ export default async function dashboardMenu() {
 
     switch (choice) {
       case 'Start dashboard': {
+        page(['Dashboard', 'Start']);
         const portToUse = await findFreePort(status.configPort);
 
         if (portToUse !== status.configPort) {
@@ -182,6 +185,7 @@ export default async function dashboardMenu() {
       }
 
       case 'Stop dashboard': {
+        page(['Dashboard', 'Stop']);
         const sp = ora('Stopping dashboard...').start();
         await stopDashboard(status.pid);
         sp.succeed('Dashboard stopped');
@@ -189,25 +193,22 @@ export default async function dashboardMenu() {
       }
 
       case 'Open in browser':
+        page(['Dashboard', 'Open']);
         openBrowser(url);
         console.log(chalk.gray(`\n  Opening ${url} ...\n`));
         break;
 
       case 'How to use':
+        page(['Dashboard', 'How to use']);
         showUsageInfo();
         break;
 
-      case '← Back':
+      case BACK:
         return;
     }
 
-    if (choice !== '← Back') {
-      try {
-        await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
-      } catch (err) {
-        if (err.name === 'ExitPromptError') return;
-        throw err;
-      }
+    if (choice !== BACK) {
+      await pause();
     }
   }
 }

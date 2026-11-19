@@ -1,7 +1,9 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, type ReactNode } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   CheckCircle2,
+  ChevronDown,
+  Loader2,
   Plus,
   RefreshCw,
   ShieldCheck,
@@ -9,11 +11,20 @@ import {
   XCircle,
 } from 'lucide-react';
 import { api, ApiError } from '../lib/api';
+import { useRealtime } from '../app/RealtimeProvider';
+import { useSslProgress } from '../hooks/useSslProgress';
+import {
+  SSL_ISSUANCE_STAGES,
+  newSslOpId,
+  preflightFrom,
+  sslFailureFrom,
+} from '../lib/sslProgress';
 import type {
   Certificate,
   CertConfigReference,
   CertStatus,
   Domain,
+  IssuanceSuccess,
   RenewAllResult,
 } from '../lib/types';
 import { formatDate, formatDaysLeft, pluralize } from '../lib/format';
@@ -40,16 +51,26 @@ import {
 import { useToast } from '../components/ui/Toast';
 import {
   IssuanceFailurePanel,
+  IssuanceSuccessPanel,
   formatDurationMs,
 } from '../components/ssl/IssuancePanels';
 import { IssueCertificateModal } from '../components/ssl/IssueCertificateModal';
+import { PreflightResult } from '../components/ssl/PreflightResult';
+import { StageList } from '../components/ssl/StageList';
 
 const CERT_STATUS: Record<CertStatus, { label: string; tone: Tone }> = {
   valid: { label: 'Valid', tone: 'ok' },
   expiring: { label: 'Expiring', tone: 'warn' },
   expired: { label: 'Expired', tone: 'bad' },
+  not_issued: { label: 'Not issued yet', tone: 'neutral' },
+  unreadable: { label: 'Unreadable', tone: 'bad' },
+  // A backend older than contract 2.16.0 reported "unreadable" as "error".
   error: { label: 'Unreadable', tone: 'bad' },
 };
+
+function isUnreadable(status: CertStatus): boolean {
+  return status === 'unreadable' || status === 'error';
+}
 
 function daysTone(days: number | null): string {
   if (days === null) return 'text-faint';
@@ -81,13 +102,47 @@ function renewFailureValue(entry: RenewAllResult): unknown {
   return entry.detail ?? 'No certificate was issued.';
 }
 
+/** The socket fallback every live stage list shares. */
+function BusyLine({ children }: { children: ReactNode }) {
+  return (
+    <p
+      role="status"
+      className="flex items-start gap-2 rounded-md border border-line bg-raised/40 px-3 py-2.5 text-xs text-muted"
+    >
+      <Loader2 className="spin mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+      <span className="break-words">{children}</span>
+    </p>
+  );
+}
+
+interface RenewRun {
+  domain: string;
+  done: boolean;
+  result?: IssuanceSuccess;
+  error?: unknown;
+}
+
+interface RenewAllRun {
+  domains: string[];
+  done: boolean;
+  results: RenewAllResult[] | null;
+  error?: unknown;
+}
+
 export function SslPage() {
   useDocumentTitle('SSL certificates');
   const toast = useToast();
   const confirm = useConfirm();
   const navigate = useNavigate();
+  const { connected } = useRealtime();
   const resource = useResource<Certificate[]>((signal) => api.ssl.list(signal));
   const [params, setParams] = useSearchParams();
+
+  // One id for the page's own renew/renew-all operations. It is created before
+  // the subscription below, and `ssl:progress` is never replayed, so the
+  // listener is already attached when a request starts.
+  const [opId] = useState(() => newSslOpId());
+  const progress = useSslProgress(opId);
 
   const issueOpen = params.get('new') === '1' || Boolean(params.get('domain'));
   const prefillDomain = params.get('domain') ?? '';
@@ -97,11 +152,9 @@ export function SslPage() {
 
   const [renewing, setRenewing] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
-  const [renewFailure, setRenewFailure] = useState<{
-    domain: string | null;
-    error: unknown;
-  } | null>(null);
-  const [renewAllResults, setRenewAllResults] = useState<RenewAllResult[] | null>(null);
+  const [renewRun, setRenewRun] = useState<RenewRun | null>(null);
+  const [renewAllRun, setRenewAllRun] = useState<RenewAllRun | null>(null);
+  const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
   const [blockedDelete, setBlockedDelete] = useState<{
     domain: string;
     directory: string | null;
@@ -123,7 +176,8 @@ export function SslPage() {
       expired: list.filter(
         (cert) => cert.status === 'expired' || (cert.daysLeft !== null && cert.daysLeft < 0)
       ).length,
-      error: list.filter((cert) => cert.status === 'error').length,
+      unreadable: list.filter((cert) => isUnreadable(cert.status)).length,
+      notIssued: list.filter((cert) => cert.status === 'not_issued').length,
     };
   }, [certs]);
 
@@ -132,21 +186,28 @@ export function SslPage() {
     [certs]
   );
 
-  const attention =
-    counts.expiring > 0 || counts.expired > 0 || counts.error > 0;
+  const attention = counts.expiring > 0 || counts.expired > 0 || counts.unreadable > 0;
 
   const closeIssue = () => setParams({}, { replace: true });
   const openIssue = () => setParams({ new: '1' });
+  const openIssueFor = (domain: string) => setParams({ domain });
+
+  const stagesFor = (domain: string) => progress.byDomain[domain] ?? {};
+  const heardFor = (domain: string) =>
+    connected && Object.keys(progress.byDomain[domain] ?? {}).length > 0;
 
   const renewOne = async (cert: Certificate) => {
     if (renewing || removing) return;
+    progress.clear(cert.domain);
     setRenewing(cert.domain);
+    setRenewRun({ domain: cert.domain, done: false });
     try {
-      const result = await api.ssl.renew(cert.domain);
+      const result = await api.ssl.renew(cert.domain, opId);
+      setRenewRun({ domain: cert.domain, done: true, result });
       toast.success(`${cert.domain} renewed`, renewalSummary(result));
       resource.reload();
     } catch (error) {
-      setRenewFailure({ domain: cert.domain, error });
+      setRenewRun({ domain: cert.domain, done: true, error });
     } finally {
       setRenewing(null);
     }
@@ -198,10 +259,14 @@ export function SslPage() {
     });
     if (!ok) return;
 
+    const targets = renewable.map((cert) => cert.domain);
+    progress.clear();
+    setCollapsedRows({});
     setRenewing('all');
+    setRenewAllRun({ domains: targets, done: false, results: null });
     try {
-      const results = await api.ssl.renewAll();
-      setRenewAllResults(results);
+      const results = await api.ssl.renewAll(opId);
+      setRenewAllRun({ domains: targets, done: true, results });
       const failed = results.filter((entry) => !entry.success).length;
       if (results.length === 0) {
         toast.info('Nothing to renew', 'No certificate expires within 30 days.');
@@ -218,14 +283,29 @@ export function SslPage() {
       }
       resource.reload();
     } catch (error) {
-      setRenewFailure({ domain: null, error });
+      setRenewAllRun({ domains: targets, done: true, results: null, error });
     } finally {
       setRenewing(null);
     }
   };
 
+  const renewRunFailure = renewRun?.error ? sslFailureFrom(renewRun.error) : null;
+  const renewRunPreflight = renewRun?.error
+    ? preflightFrom(renewRun.error)
+    : renewRun?.result
+      ? preflightFrom(renewRun.result)
+      : null;
   const renewEmailRequired =
-    renewFailure?.error instanceof ApiError && renewFailure.error.code === 'email_required';
+    renewRun?.error instanceof ApiError && renewRun.error.code === 'email_required';
+
+  const renewAllDomains = renewAllRun
+    ? Array.from(
+        new Set([
+          ...renewAllRun.domains,
+          ...(renewAllRun.results ?? []).map((entry) => entry.domain),
+        ])
+      )
+    : [];
 
   return (
     <>
@@ -236,6 +316,7 @@ export function SslPage() {
           certs ? (
             <span className="text-2xs text-faint">
               {pluralize(counts.total, 'certificate')} · {counts.valid} valid
+              {counts.notIssued > 0 ? ` · ${counts.notIssued} not issued` : ''}
             </span>
           ) : undefined
         }
@@ -274,14 +355,14 @@ export function SslPage() {
 
       {attention && (
         <InlineAlert
-          tone={counts.expired > 0 || counts.error > 0 ? 'danger' : 'warning'}
+          tone={counts.expired > 0 || counts.unreadable > 0 ? 'danger' : 'warning'}
           title="Certificates need attention"
           className="mb-4"
         >
           {[
             counts.expired > 0 ? `${counts.expired} expired` : null,
             counts.expiring > 0 ? `${counts.expiring} expiring within 30 days` : null,
-            counts.error > 0 ? `${counts.error} unreadable` : null,
+            counts.unreadable > 0 ? `${counts.unreadable} unreadable` : null,
           ]
             .filter(Boolean)
             .join(' · ')}
@@ -338,6 +419,8 @@ export function SslPage() {
                   tone: 'neutral' as Tone,
                 };
                 const busyHere = renewing === cert.domain;
+                const unreadable = isUnreadable(cert.status);
+                const notIssued = cert.status === 'not_issued';
                 return (
                   <li
                     key={cert.domain}
@@ -354,8 +437,10 @@ export function SslPage() {
                           {cert.domain}
                         </div>
                         <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs text-muted">
-                          {cert.status === 'error' ? (
-                            <span>Certificate files are missing or unreadable</span>
+                          {unreadable ? (
+                            <span>Certificate files are unreadable</span>
+                          ) : notIssued ? (
+                            <span>No certificate has been issued for this domain yet</span>
                           ) : (
                             <>
                               <span>Expires {formatDate(cert.expiry)}</span>
@@ -407,16 +492,27 @@ export function SslPage() {
                     </div>
 
                     <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5 pl-7 sm:pl-0">
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        loading={busyHere}
-                        disabled={renewing !== null || removing !== null}
-                        onClick={() => renewOne(cert)}
-                      >
-                        Renew
-                      </Button>
-                      {cert.status === 'error' && (
+                      {notIssued ? (
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          disabled={renewing !== null || removing !== null}
+                          onClick={() => openIssueFor(cert.domain)}
+                        >
+                          Issue
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          loading={busyHere}
+                          disabled={renewing !== null || removing !== null}
+                          onClick={() => renewOne(cert)}
+                        >
+                          Renew
+                        </Button>
+                      )}
+                      {unreadable && (
                         <Button
                           variant="dangerGhost"
                           size="sm"
@@ -448,57 +544,108 @@ export function SslPage() {
       )}
 
       <Modal
-        open={renewFailure !== null}
-        onClose={() => setRenewFailure(null)}
+        open={renewRun !== null}
+        onClose={() => setRenewRun(null)}
         title={
-          renewFailure?.domain ? `${renewFailure.domain} was not renewed` : 'Renewal failed'
+          renewRun
+            ? renewRun.done && renewRun.error
+              ? `${renewRun.domain} was not renewed`
+              : renewRun.done
+                ? `${renewRun.domain} renewed`
+                : `Renewing ${renewRun.domain}`
+            : 'Renewing'
         }
-        description="The certificate already on disk was not replaced."
+        description={
+          renewRun?.done && renewRun.error
+            ? 'The certificate already on disk was not replaced.'
+            : undefined
+        }
         size="md"
+        preventClose={Boolean(renewRun && !renewRun.done)}
         footer={
           <>
             {renewEmailRequired && (
               <Button
                 variant="secondary"
                 onClick={() => {
-                  setRenewFailure(null);
+                  setRenewRun(null);
                   navigate('/settings');
                 }}
               >
                 Open settings
               </Button>
             )}
-            <Button variant="primary" onClick={() => setRenewFailure(null)}>
+            <Button
+              variant="primary"
+              disabled={Boolean(renewRun && !renewRun.done)}
+              onClick={() => setRenewRun(null)}
+            >
               Close
             </Button>
           </>
         }
       >
-        {renewFailure && (
-          <IssuanceFailurePanel
-            value={renewFailure.error}
-            title="The certificate could not be renewed"
-          />
+        {renewRun && (
+          <div className="space-y-3">
+            {heardFor(renewRun.domain) ? (
+              <StageList
+                stages={SSL_ISSUANCE_STAGES}
+                states={stagesFor(renewRun.domain)}
+                ariaLabel={`Renewal stages for ${renewRun.domain}`}
+                failure={renewRunFailure}
+                timedOut={renewRunFailure?.stage === 'timeout'}
+              />
+            ) : renewRun.done ? null : (
+              <BusyLine>
+                Renewing <span className="font-mono text-ink">{renewRun.domain}</span>. The live
+                stage list needs the dashboard’s connection; the result appears here when it
+                finishes.
+              </BusyLine>
+            )}
+
+            {renewRunPreflight && <PreflightResult preflight={renewRunPreflight} />}
+
+            {renewRun.done &&
+              (renewRun.error ? (
+                !heardFor(renewRun.domain) && (
+                  <IssuanceFailurePanel
+                    value={renewRun.error}
+                    title="The certificate could not be renewed"
+                  />
+                )
+              ) : (
+                renewRun.result && (
+                  <IssuanceSuccessPanel result={renewRun.result} title="Certificate renewed" />
+                )
+              ))}
+          </div>
         )}
       </Modal>
 
       <Modal
-        open={renewAllResults !== null}
-        onClose={() => setRenewAllResults(null)}
-        title="Renewal results"
+        open={renewAllRun !== null}
+        onClose={() => setRenewAllRun(null)}
+        title={renewAllRun?.done ? 'Renewal results' : 'Renewing expiring certificates'}
         description={
-          renewAllResults
-            ? `${renewAllResults.filter((entry) => entry.success).length} of ${renewAllResults.length} certificates renewed.`
+          renewAllRun
+            ? renewAllRun.results
+              ? `${renewAllRun.results.filter((entry) => entry.success).length} of ${renewAllRun.results.length} certificates renewed.`
+              : `${pluralize(renewAllRun.domains.length, 'certificate')} queued, one at a time.`
             : undefined
         }
         size="lg"
+        preventClose={Boolean(renewAllRun && !renewAllRun.done)}
         footer={
-          <Button variant="secondary" onClick={() => setRenewAllResults(null)}>
+          <Button
+            variant="secondary"
+            disabled={Boolean(renewAllRun && !renewAllRun.done)}
+            onClick={() => setRenewAllRun(null)}
+          >
             Close
           </Button>
         }
       >
-        {renewAllResults && renewAllResults.length === 0 ? (
+        {renewAllRun && renewAllRun.done && renewAllRun.results?.length === 0 ? (
           <EmptyState
             icon={<ShieldCheck className="size-5" aria-hidden="true" />}
             title="Nothing to renew"
@@ -506,43 +653,123 @@ export function SslPage() {
           />
         ) : (
           <ul className="space-y-2.5">
-            {(renewAllResults ?? []).map((entry) => (
-              <li
-                key={entry.domain}
-                className="rounded-md border border-line bg-raised/30 px-3.5 py-3"
-              >
-                <div className="flex items-start gap-2.5">
-                  {entry.success ? (
-                    <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-ok" aria-hidden="true" />
-                  ) : (
-                    <XCircle className="mt-0.5 size-4 shrink-0 text-bad" aria-hidden="true" />
-                  )}
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate font-mono text-sm font-medium text-ink">
-                      {entry.domain}
-                    </div>
-                    {entry.success ? (
-                      <>
-                        <p className="mt-0.5 text-xs text-muted">{renewalSummary(entry)}</p>
-                        {entry.configRegenerated && (
-                          <p className="mt-1 text-2xs text-faint">
-                            The nginx config was regenerated so it can answer the ACME challenge.
-                          </p>
+            {renewAllDomains.map((domain) => {
+              const entry = renewAllRun?.results?.find((item) => item.domain === domain) ?? null;
+              const domainStages = stagesFor(domain);
+              const heard = heardFor(domain);
+              const running = connected && Object.values(domainStages).some((state) => state.status === 'running');
+              const busy = Boolean(renewAllRun && !renewAllRun.done && !entry && !running);
+              const failure = entry && !entry.success ? sslFailureFrom(entry) : null;
+              const preflight = entry ? preflightFrom(entry) : null;
+              const expanded = !collapsedRows[domain];
+              const summary = entry
+                ? entry.success
+                  ? renewalSummary(entry)
+                  : failure?.message ?? 'Not renewed'
+                : running
+                  ? 'Renewing…'
+                  : busy
+                    ? 'Waiting for its turn'
+                    : 'Not started';
+
+              return (
+                <li
+                  key={domain}
+                  className="rounded-md border border-line bg-raised/30 px-3.5 py-3"
+                >
+                  <button
+                    type="button"
+                    aria-expanded={expanded}
+                    onClick={() =>
+                      setCollapsedRows((current) => ({ ...current, [domain]: !current[domain] }))
+                    }
+                    className="flex w-full items-start gap-2.5 text-left"
+                  >
+                    <span className="mt-0.5 shrink-0">
+                      {entry ? (
+                        entry.success ? (
+                          <CheckCircle2 className="size-4 text-ok" aria-hidden="true" />
+                        ) : (
+                          <XCircle className="size-4 text-bad" aria-hidden="true" />
+                        )
+                      ) : running ? (
+                        <Loader2 className="spin size-4 text-accent-text" aria-hidden="true" />
+                      ) : (
+                        <StatusDot tone="neutral" className="mt-1.5" />
+                      )}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                        <span className="truncate font-mono text-sm font-medium text-ink">
+                          {domain}
+                        </span>
+                        {entry && (
+                          <Badge tone={entry.success ? 'ok' : 'bad'}>
+                            {entry.success ? 'Renewed' : 'Failed'}
+                          </Badge>
                         )}
-                      </>
-                    ) : (
-                      <div className="mt-2">
-                        <IssuanceFailurePanel
-                          value={renewFailureValue(entry)}
-                          title={`${entry.domain} was not renewed`}
+                      </span>
+                      <span className="mt-0.5 block break-words text-xs text-muted">
+                        {summary}
+                      </span>
+                    </span>
+                    <ChevronDown
+                      className={cn(
+                        'mt-0.5 size-4 shrink-0 text-faint transition-transform duration-[var(--ez-motion-fast)]',
+                        expanded && 'rotate-180'
+                      )}
+                      aria-hidden="true"
+                    />
+                  </button>
+
+                  {expanded && (
+                    <div className="mt-2.5 border-t border-line pt-2.5">
+                      {heard ? (
+                        <StageList
+                          stages={SSL_ISSUANCE_STAGES}
+                          states={domainStages}
+                          ariaLabel={`Renewal stages for ${domain}`}
+                          failure={failure}
+                          timedOut={failure?.stage === 'timeout'}
                         />
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </li>
-            ))}
+                      ) : entry ? (
+                        entry.success ? (
+                          <p className="text-xs text-muted">{renewalSummary(entry)}</p>
+                        ) : null
+                      ) : renewAllRun && !renewAllRun.done ? (
+                        <BusyLine>
+                          Renewing <span className="font-mono text-ink">{domain}</span>. The live
+                          stage list needs the dashboard’s connection.
+                        </BusyLine>
+                      ) : null}
+
+                      {preflight && <PreflightResult preflight={preflight} className="mt-2.5" />}
+
+                      {entry && !entry.success && !heard && (
+                        <div className="mt-2.5">
+                          <IssuanceFailurePanel
+                            value={renewFailureValue(entry)}
+                            title={`${entry.domain} was not renewed`}
+                          />
+                        </div>
+                      )}
+
+                      {entry?.success && entry.configRegenerated && (
+                        <p className="mt-2 text-2xs text-faint">
+                          The nginx config was regenerated so it can answer the ACME challenge.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
           </ul>
+        )}
+        {renewAllRun?.error != null && (
+          <div className="mt-3">
+            <IssuanceFailurePanel value={renewAllRun.error} title="The renewal run failed" />
+          </div>
         )}
       </Modal>
 

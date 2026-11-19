@@ -36,6 +36,8 @@ import {
 import { startDeployment, startRollback, removeRelease, removeApp, moveApp } from '../../core/deploy/engine.js';
 import { readRun, readLogTail, isId, deployRoot } from '../../core/deploy/store.js';
 import { linkDomain, unlinkDomain } from '../../core/deploy/domainLink.js';
+import { resolveOpId, createSslProgress } from '../../core/ssl/progress.js';
+import { publish } from '../../core/jobs/bus.js';
 import { describeApps, describeAppDetail } from '../../core/deploy/status.js';
 import { hookSettings } from '../../core/deploy/hookServer.js';
 import { hookUrl } from '../../core/deploy/github.js';
@@ -177,18 +179,31 @@ class DeploymentsController {
    */
   async linkDomain(req, res, next) {
     try {
-      // Issuing is synchronous here, exactly like POST /api/ssl/create: the
-      // dashboard's own SSL flow has no background progress to reuse.
+      const { opId, error } = resolveOpId(req.body?.opId);
+      if (error) return res.status(400).json({ error: 'invalid_opId', detail: error });
+
+      const domainName = String(req.body?.domain ?? '').trim().toLowerCase();
+      const progress = createSslProgress({
+        opId,
+        domain: domainName,
+        onEvent: (event) => publish('ssl:progress', event),
+      });
+
+      // Issuing is synchronous here, exactly like POST /api/ssl/create, but the
+      // same stage feed reaches the dialog through ssl:progress while it runs.
       const result = await linkDomain(req.params.id, {
         domain: req.body?.domain,
         www: req.body?.www,
         ssl: req.body?.ssl,
         redirect: req.body?.redirect,
         behindCloudflare: req.body?.behindCloudflare,
+      }, {
+        onProgress: (stage, status, detail) => progress.report(stage, status, detail),
       });
-      if (!result.ok) return res.status(result.status).json({ error: result.error });
+      if (!result.ok) return res.status(result.status).json({ error: result.error, opId });
       return res.json({
         ok: result.ok,
+        opId,
         domain: result.domain,
         created: result.created,
         port: result.port,

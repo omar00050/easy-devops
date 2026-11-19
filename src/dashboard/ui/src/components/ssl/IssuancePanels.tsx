@@ -8,8 +8,10 @@ interface FailureView {
   title: string;
   summary?: string;
   step?: string;
+  stage?: string;
   cause?: string;
   consequence?: string;
+  fix?: string;
   detail?: string;
   nginxRunning?: boolean;
 }
@@ -21,8 +23,10 @@ function normalizeFailure(value: unknown, fallbackTitle: string): FailureView {
       return {
         title: fallbackTitle,
         step: inner.step,
+        stage: inner.stage,
         cause: inner.cause,
         consequence: inner.consequence,
+        fix: inner.fix ?? (typeof value.payload.hint === 'string' ? value.payload.hint : undefined),
         nginxRunning: inner.nginxRunning,
       };
     }
@@ -46,8 +50,10 @@ function normalizeFailure(value: unknown, fallbackTitle: string): FailureView {
     return {
       title: failure.step === 'email configuration' ? 'ACME email is not configured' : fallbackTitle,
       step: failure.step,
+      stage: failure.stage,
       cause: failure.cause,
       consequence: failure.consequence,
+      fix: failure.fix,
       nginxRunning: failure.nginxRunning,
     };
   }
@@ -92,7 +98,7 @@ export function IssuanceFailurePanel({
           {view.step && (
             <>
               <dt className="text-faint">Step</dt>
-              <dd className="text-muted">{view.step}</dd>
+              <dd className="text-muted">{view.stage ?? view.step}</dd>
             </>
           )}
           {view.cause && (
@@ -111,6 +117,11 @@ export function IssuanceFailurePanel({
       )}
       {view.nginxRunning === false && (
         <p className="mt-2 text-2xs">nginx is not running right now.</p>
+      )}
+      {view.fix && (
+        <p className="mt-2 break-words rounded border border-warn/25 bg-warn-soft px-2 py-1 text-2xs text-warn">
+          <span className="font-medium">Fix:</span> {view.fix}
+        </p>
       )}
       {view.detail && (
         <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-2xs text-muted">

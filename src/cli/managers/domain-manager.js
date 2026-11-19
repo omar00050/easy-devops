@@ -23,6 +23,7 @@ import { writeConfWithTest, findBackslashCertPaths } from '../../core/nginx-appl
 import { prepareDomainForHttpChallenge, describeIssuance } from '../../core/ssl-issuer.js';
 import { issueCert } from './ssl-manager.js';
 import { isWindows, nginxTestCmd, nginxReloadCmd, combineOutput, isNginxTestOk } from '../../core/platform.js';
+import { page, pause, BACK } from '../ui/page.js';
 
 // ─── List Domains ───────────────────────────────────────────────────────
 
@@ -235,7 +236,19 @@ async function addDomainAction() {
           }
         }
 
-        const result = await issueCert(basic.name, { www: basic.www, wildcard: basic.wildcard, validationMethod: basic.wildcard ? 'dns' : 'http' });
+        const result = await issueCert(basic.name, {
+          www: basic.www,
+          wildcard: basic.wildcard,
+          validationMethod: basic.wildcard ? 'dns' : 'http',
+          onEvent: (event) => {
+            try {
+              if (event.status !== 'running') return;
+              spinner.text = event.stage === 'waiting for validation'
+                ? `Waiting for Let's Encrypt validation (${Math.max(0, Math.round((event.elapsedMs ?? 0) / 1000))}s)…`
+                : `${event.stage}…`;
+            } catch { /* progress must never break the command */ }
+          },
+        });
         spinner.stop();
 
         if (result.success) {
@@ -600,9 +613,10 @@ async function toggleDomainAction() {
 
 export async function showDomainManager() {
   while (true) {
+    page(['Domains']);
+
     const domains = getDomains();
 
-    console.log(chalk.bold('\n Domain Manager'));
     console.log(chalk.gray(' ' + '─'.repeat(40)));
     console.log(` ${chalk.blue(domains.length)} domain${domains.length !== 1 ? 's' : ''} configured`);
     console.log();
@@ -614,7 +628,7 @@ export async function showDomainManager() {
       'Enable / Disable Domain',
       'Delete Domain',
       new inquirer.Separator(),
-      '← Back',
+      BACK,
     ];
 
     let choice;
@@ -632,26 +646,31 @@ export async function showDomainManager() {
 
     switch (choice) {
       case 'List Domains':
+        page(['Domains', 'List']);
         await listDomainsAction();
         break;
       case 'Add Domain':
+        page(['Domains', 'Add']);
         await addDomainAction();
         break;
       case 'Edit Domain':
+        page(['Domains', 'Edit']);
         await editDomainAction();
         break;
       case 'Enable / Disable Domain':
+        page(['Domains', 'Enable / Disable']);
         await toggleDomainAction();
         break;
       case 'Delete Domain':
+        page(['Domains', 'Delete']);
         await deleteDomainAction();
         break;
-      case '← Back':
+      case BACK:
         return;
     }
 
-    if (choice !== '← Back') {
-      await inquirer.prompt([{ type: 'input', name: '_', message: 'Press Enter to continue...' }]);
+    if (choice !== BACK) {
+      await pause();
     }
   }
 }

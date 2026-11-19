@@ -33,12 +33,15 @@ import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
 import { once } from 'events';
+import { createRequire } from 'module';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { issueSetupCode } from './lib/firstRun.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const REAL_LEGACY_DB = path.join(ROOT, 'data', 'easy-devops.sqlite');
+const require = createRequire(import.meta.url);
+const crypto = require('crypto');
 
 /** Throwaway, for a throwaway install in a temp directory. */
 const PASSWORD = 'suggest-e2e-password';
@@ -147,11 +150,36 @@ async function req(method, pathname, { body, cookie } = {}) {
   return { status: res.status, body: json, cookie: setCookie ? setCookie.split(';')[0] : null };
 }
 
-/** A certificate folder the way issuance leaves it: PEM plus optional meta. */
-function makeCert(name, { meta, pem = 'dummy' } = {}) {
+/** A certificate folder the way issuance leaves it: certificate PEM plus optional meta. */
+function makeCert(name, { meta, broken = false } = {}) {
   const dir = path.join(sslDir, name);
   fs.mkdirSync(dir, { recursive: true });
-  if (pem !== null) fs.writeFileSync(path.join(dir, 'fullchain.pem'), pem);
+
+  if (!broken) {
+    // A real, parseable certificate: cert-reader no longer guesses expiry
+    // from mtime, and an unreadable file must never be offered.
+    const forge = require('node-forge');
+    const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    });
+    const expiry = new Date(Date.now() + 60 * 86_400_000 + 43_200_000);
+    const cert = forge.pki.createCertificate();
+    cert.publicKey = forge.pki.publicKeyFromPem(publicKey);
+    cert.serialNumber = '01';
+    cert.validity.notBefore = new Date(expiry.getTime() - 90 * 86_400_000);
+    cert.validity.notAfter = expiry;
+    const names = meta?.altNames?.length ? meta.altNames : [name];
+    const subject = [{ name: 'commonName', value: names[0] }];
+    cert.setSubject(subject);
+    cert.setIssuer(subject);
+    cert.setExtensions([{ name: 'subjectAltName', altNames: names.map((value) => ({ type: 2, value })) }]);
+    cert.sign(forge.pki.privateKeyFromPem(privateKey), forge.md.sha256.create());
+    fs.writeFileSync(path.join(dir, 'fullchain.pem'), forge.pki.certificateToPem(cert));
+    fs.writeFileSync(path.join(dir, 'privkey.pem'), privateKey);
+  }
+
   if (meta) fs.writeFileSync(path.join(dir, 'ez-cert.json'), JSON.stringify(meta));
 }
 
@@ -170,7 +198,7 @@ async function main() {
   makeCert('new.devxor.team');                                      // exact
   makeCert('devxor.team', { meta: { altNames: ['devxor.team', 'api.devxor.team'] } }); // SAN
   makeCert('wild', { meta: { altNames: ['*.example.org'] } });      // wildcard
-  makeCert('broken', { pem: null });                                // unreadable
+  makeCert('broken', { broken: true });                              // no certificate file
 
   assertTempDataDir('import core/cert-suggest.js');
   const suggest = await import(

@@ -1,0 +1,1 @@
+[![Architecture diagram of omar00050/easy-devops](https://gitdiagram.com/omar00050/easy-devops/diagram.png)](https://gitdiagram.com/omar00050/easy-devops?utm_source=readme&utm_medium=picture)

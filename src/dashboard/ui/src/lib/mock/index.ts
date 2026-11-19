@@ -23,6 +23,17 @@
 import { ApiError } from '../errors';
 import { handleDeployments } from './deployments';
 import {
+  CHALLENGE_STEPS,
+  PRELUDE_STEPS,
+  TAIL_STEPS,
+  emitSslProgress,
+  failMockPreflight,
+  isCloudflareRedirectExample,
+  mockOpId,
+  mockPreflight,
+  playMockStages,
+} from './ssl';
+import {
   COMING_SOON_IDS,
   PERMISSION_TREE,
   defaultNotifications,
@@ -133,7 +144,10 @@ interface MockState {
   permissionsConfigured: boolean;
   hub: HubStatus;
   update: MockUpdateState;
-  pendingDns: Record<string, { txtName: string; txtValue: string }>;
+  pendingDns: Record<
+    string,
+    { txtName: string; txtValue: string; opId?: string; startedAt?: number }
+  >;
 }
 
 function readScenario(): MockScenario {
@@ -485,7 +499,7 @@ function normaliseNotifications(input: unknown): DomainNotifications {
 }
 
 function certStatus(daysLeft: number | null): Certificate['status'] {
-  if (daysLeft === null) return 'error';
+  if (daysLeft === null) return 'unreadable';
   if (daysLeft <= 0) return 'expired';
   if (daysLeft < 30) return 'expiring';
   return 'valid';
@@ -825,7 +839,7 @@ function handle(
     // and the mock has no SAN metadata, so only the exact folder name matches.
     // A leading `*.` is ignored, as `findCertificateForDomain` does.
     const bare = name.startsWith('*.') ? name.slice(2) : name;
-    const cert = s.certs.find((candidate) => candidate.domain === bare && candidate.status !== 'error');
+    const cert = s.certs.find((candidate) => candidate.domain === bare && candidate.status !== 'unreadable' && candidate.status !== 'not_issued');
     if (!cert) return { found: false };
 
     const base = s.settings.sslDir
@@ -922,16 +936,33 @@ function handle(
     const input = data as unknown as SslCreateInput;
     const name = String(input.domain ?? '').trim();
     if (!name) fail(400, 'domain is required');
+    const opId = mockOpId(input.opId);
+    const startedAt = Date.now();
 
     if (input.validationMethod === 'dns') {
       const token = Math.random().toString(36).slice(2, 12);
       s.pendingDns[name] = {
         txtName: `_acme-challenge.${name.replace(/^\*\./, '')}`,
         txtValue: `${token}${token.split('').reverse().join('')}`,
+        opId,
+        startedAt,
       };
       persist();
+      // The server reports the stages up to the paused challenge, then waits
+      // for the TXT record. The 202 itself arrives immediately.
+      void playMockStages(opId, name, startedAt, PRELUDE_STEPS).then(() =>
+        emitSslProgress(
+          opId,
+          name,
+          startedAt,
+          'challenge ready',
+          'running',
+          'Waiting for the DNS TXT record'
+        )
+      );
       return {
         status: 'waiting_dns',
+        opId,
         domain: name,
         txtName: s.pendingDns[name].txtName,
         txtValue: s.pendingDns[name].txtValue,
@@ -939,39 +970,76 @@ function handle(
       };
     }
 
-    upsertCertificate(s, name, 90);
-    persist();
-    return {
-      success: true,
-      certPath: `/etc/easy-devops/ssl/${name}/fullchain.pem`,
-      keyPath: `/etc/easy-devops/ssl/${name}/privkey.pem`,
-      mode: 'proxy',
-      fellBack: false,
-      nginxDownMs: 0,
-      staging: false,
-      summary:
-        'The HTTP-01 challenge was answered through nginx, so nginx stayed running for the whole issuance.',
-    };
+    if (isCloudflareRedirectExample(name)) {
+      return failMockPreflight(opId, name, startedAt);
+    }
+
+    return playMockStages(opId, name, startedAt, [...PRELUDE_STEPS, ...CHALLENGE_STEPS, ...TAIL_STEPS])
+      .then(() => {
+        upsertCertificate(s, name, 90);
+        persist();
+        return {
+          success: true,
+          opId,
+          certPath: `/etc/easy-devops/ssl/${name}/fullchain.pem`,
+          keyPath: `/etc/easy-devops/ssl/${name}/privkey.pem`,
+          mode: 'proxy',
+          fellBack: false,
+          nginxDownMs: 0,
+          staging: false,
+          preflight: mockPreflight(name),
+          summary:
+            'The HTTP-01 challenge was answered through nginx, so nginx stayed running for the whole issuance.',
+        };
+      });
   }
 
   if (path === '/ssl/create-confirm' && method === 'POST') {
     const name = String(data.domain ?? '').trim();
-    if (!s.pendingDns[name]) {
+    const pending = s.pendingDns[name];
+    if (!pending) {
       fail(404, 'No DNS challenge is pending for this domain. Start a new certificate issuance.', {
         error: 'no_pending_challenge',
       });
     }
+    const opId = pending.opId ?? mockOpId(undefined);
+    const startedAt = pending.startedAt ?? Date.now();
     delete s.pendingDns[name];
-    upsertCertificate(s, name, 90);
     persist();
-    return {
-      success: true,
-      certPath: `/etc/easy-devops/ssl/${name}/fullchain.pem`,
-      keyPath: `/etc/easy-devops/ssl/${name}/privkey.pem`,
-      mode: 'dns',
-      staging: false,
-      summary: 'The DNS TXT record was found and the certificate was issued.',
-    };
+    return playMockStages(opId, name, startedAt, [
+      {
+        stage: 'challenge ready',
+        status: 'ok',
+        detail: 'The DNS TXT record is ready',
+        wait: 120,
+      },
+      {
+        stage: 'waiting for validation',
+        status: 'running',
+        detail: "Waiting for Let's Encrypt validation",
+        wait: 320,
+      },
+      {
+        stage: 'waiting for validation',
+        status: 'ok',
+        detail: "Let's Encrypt validated the DNS record",
+        wait: 260,
+      },
+      ...TAIL_STEPS,
+    ]).then(() => {
+      upsertCertificate(s, name, 90);
+      persist();
+      return {
+        success: true,
+        opId,
+        certPath: `/etc/easy-devops/ssl/${name}/fullchain.pem`,
+        keyPath: `/etc/easy-devops/ssl/${name}/privkey.pem`,
+        mode: 'dns',
+        staging: false,
+        preflight: mockPreflight(name),
+        summary: 'The DNS TXT record was found and the certificate was issued.',
+      };
+    });
   }
 
   if (path === '/ssl/create-cancel' && method === 'POST') {
@@ -988,39 +1056,69 @@ function handle(
   if (renewMatch && method === 'POST') {
     const name = decodeURIComponent(renewMatch[1]);
     if (!s.certs.some((c) => c.domain === name)) fail(404, `Domain '${name}' not found`);
-    upsertCertificate(s, name, 90);
-    persist();
-    return {
-      success: true,
-      certPath: `/etc/easy-devops/ssl/${name}/fullchain.pem`,
-      keyPath: `/etc/easy-devops/ssl/${name}/privkey.pem`,
-      mode: 'proxy',
-      fellBack: false,
-      nginxDownMs: 0,
-      staging: false,
-      summary: 'Renewed over HTTP-01 with nginx serving the challenge.',
-    };
-  }
-
-  if (path === '/ssl/renew-all' && method === 'POST') {
-    const expiring = s.certs.filter((c) => c.daysLeft !== null && c.daysLeft < 30);
-    const results = expiring.map((cert) => {
-      const days = cert.daysLeft !== null && cert.daysLeft < 0 ? 90 : 90;
-      upsertCertificate(s, cert.domain, days);
+    const opId = mockOpId(data.opId);
+    const startedAt = Date.now();
+    // Renewal plays the same nine stages; the mock keeps it a little shorter.
+    return playMockStages(
+      opId,
+      name,
+      startedAt,
+      [...PRELUDE_STEPS, ...CHALLENGE_STEPS, ...TAIL_STEPS],
+      0.6
+    ).then(() => {
+      upsertCertificate(s, name, 90);
+      persist();
       return {
-        domain: cert.domain,
         success: true,
-        certPath: `/etc/easy-devops/ssl/${cert.domain}/fullchain.pem`,
-        keyPath: `/etc/easy-devops/ssl/${cert.domain}/privkey.pem`,
+        opId,
+        certPath: `/etc/easy-devops/ssl/${name}/fullchain.pem`,
+        keyPath: `/etc/easy-devops/ssl/${name}/privkey.pem`,
         mode: 'proxy',
         fellBack: false,
         nginxDownMs: 0,
-        configRegenerated: false,
+        staging: false,
+        preflight: mockPreflight(name),
         summary: 'Renewed over HTTP-01 with nginx serving the challenge.',
       };
     });
-    persist();
-    return results;
+  }
+
+  if (path === '/ssl/renew-all' && method === 'POST') {
+    const opId = mockOpId(data.opId);
+    const startedAt = Date.now();
+    const expiring = s.certs.filter((c) => c.daysLeft !== null && c.daysLeft < 30);
+
+    // One domain at a time, exactly like the server: every frame shares the
+    // request's opId and is told apart by its domain.
+    return (async () => {
+      const results = [];
+      for (const cert of expiring) {
+        await playMockStages(
+          opId,
+          cert.domain,
+          startedAt,
+          [...PRELUDE_STEPS, ...CHALLENGE_STEPS, ...TAIL_STEPS],
+          0.35
+        );
+        upsertCertificate(s, cert.domain, 90);
+        persist();
+        results.push({
+          domain: cert.domain,
+          opId,
+          success: true,
+          certPath: `/etc/easy-devops/ssl/${cert.domain}/fullchain.pem`,
+          keyPath: `/etc/easy-devops/ssl/${cert.domain}/privkey.pem`,
+          mode: 'proxy',
+          fellBack: false,
+          nginxDownMs: 0,
+          configRegenerated: false,
+          nginxReloaded: true,
+          preflight: mockPreflight(cert.domain),
+          summary: 'Renewed over HTTP-01 with nginx serving the challenge.',
+        });
+      }
+      return results;
+    })();
   }
 
   const deleteSslMatch = /^\/ssl\/([^/]+)$/.exec(path);
@@ -1581,7 +1679,7 @@ export async function mockRequest<T>(
 ): Promise<T> {
   const slow = path.startsWith('/ssl/') || path === '/settings/restore';
   await delay(slow ? 650 + Math.random() * 400 : undefined);
-  const result = handle(method, path, body, query ?? {});
+  const result = await Promise.resolve(handle(method, path, body, query ?? {}));
   return clone(result) as T;
 }
 

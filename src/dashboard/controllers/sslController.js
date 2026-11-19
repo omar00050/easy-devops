@@ -9,6 +9,8 @@ import {
   autoRenewPlan,
 } from '../../core/cert-renewal.js';
 import { describeIssuance, prepareDomainForHttpChallenge } from '../../core/ssl-issuer.js';
+import { resolveOpId } from '../../core/ssl/progress.js';
+import { publish } from '../../core/jobs/bus.js';
 import { findDomain, getDomains } from '../../core/domains-db.js';
 import { loadConfig } from '../../core/config.js';
 import { isWindows } from '../../core/platform.js';
@@ -36,6 +38,35 @@ const dnsSweepTimer = setInterval(() => {
     }
   }
 }, 60000);
+
+/**
+ * Validates or generates the operation id for a request and wires the live
+ * `ssl:progress` event onto the bus. The socket manager forwards it; it is
+ * deliberately not cached, because a stage is a moment, not a state.
+ *
+ * @returns {{ opId: string, onEvent: Function } | { error: string }}
+ */
+function progressForRequest(req) {
+  const { opId, error } = resolveOpId(req.body?.opId);
+  if (error) return { error };
+  return {
+    opId,
+    onEvent: (event) => publish('ssl:progress', event),
+  };
+}
+
+/**
+ * The per-check preflight results for an API body.
+ *
+ * `issueCertificate()` keeps them as `preflight.results`; clients render them
+ * as the PreflightResult list, so a failure body must carry the checks rather
+ * than only the one-line cause. A request that stopped before preflight ran
+ * (missing email, wildcard over HTTP) has no array and answers `null`.
+ */
+export function preflightChecks(result) {
+  const checks = result?.preflight?.results;
+  return Array.isArray(checks) ? checks : null;
+}
 
 /**
  * Stops the DNS-challenge sweep and rejects anything still pending.
@@ -131,6 +162,10 @@ class SslController {
       }
 
       const domainKey = domain.trim();
+      const progress = progressForRequest(req);
+      if (progress.error) {
+        return res.status(400).json({ error: 'invalid_opId', detail: progress.error });
+      }
       const config = loadConfig();
       const acmeEmail = email || config.acmeEmail;
 
@@ -152,6 +187,7 @@ class SslController {
           responseSent = true;
           pendingDnsChallenges.set(domainKey, {
             domain: domainKey,
+            opId: progress.opId,
             txtName,
             txtValue,
             confirmDeferred: { resolve: confirmResolve, reject: confirmReject },
@@ -161,6 +197,7 @@ class SslController {
 
           res.status(202).json({
             status: 'waiting_dns',
+            opId: progress.opId,
             domain: domainKey,
             txtName,
             txtValue,
@@ -172,20 +209,38 @@ class SslController {
         };
 
         // Run issueCert in the background — it will call onDnsChallenge which sends 202 and pauses.
-        issueCert(domainKey, { www: !!www, validationMethod: 'dns', email: acmeEmail, onDnsChallenge })
+        issueCert(domainKey, {
+          www: !!www,
+          validationMethod: 'dns',
+          email: acmeEmail,
+          onDnsChallenge,
+          opId: progress.opId,
+          onEvent: progress.onEvent,
+        })
           .then(result => {
             resultResolve(result);
             pendingDnsChallenges.delete(domainKey);
             if (!responseSent) {
               responseSent = true;
               if (result.success) {
-                return res.json({ success: true, certPath: result.certPath, keyPath: result.keyPath });
+                return res.json({
+                  success: true,
+                  opId: progress.opId,
+                  certPath: result.certPath,
+                  keyPath: result.keyPath,
+                  preflight: preflightChecks(result),
+                });
               }
               const { step } = result.error ?? {};
               if (step === 'email configuration') {
-                return res.status(400).json({ error: 'email_required', hint: 'Configure acmeEmail in settings or provide email parameter.' });
+                return res.status(400).json({ error: 'email_required', opId: progress.opId, preflight: preflightChecks(result), hint: 'Configure acmeEmail in settings or provide email parameter.' });
               }
-              return res.status(500).json({ success: false, error: result.error });
+              return res.status(500).json({
+                success: false,
+                opId: progress.opId,
+                error: result.error,
+                preflight: preflightChecks(result),
+              });
             }
           })
           .catch(err => {
@@ -205,7 +260,7 @@ class SslController {
             pendingDnsChallenges.delete(domainKey);
             if (!responseSent) {
               responseSent = true;
-              return res.status(500).json({ success: false, error: errResult.error });
+              return res.status(500).json({ success: false, opId: progress.opId, error: errResult.error, preflight: null });
             }
           });
 
@@ -226,25 +281,35 @@ class SslController {
         if (!prepared.ok) {
           return res.status(500).json({
             error: 'challenge_setup_failed',
+            opId: progress.opId,
+            preflight: null,
             detail: prepared.error,
             hint: 'nginx could not be prepared to answer the ACME challenge. Check the nginx config and try again.',
           });
         }
       }
 
-      const result = await issueCert(domainKey, { www: !!www, validationMethod: 'http', email: acmeEmail });
+      const result = await issueCert(domainKey, {
+        www: !!www,
+        validationMethod: 'http',
+        email: acmeEmail,
+        opId: progress.opId,
+        onEvent: progress.onEvent,
+      });
 
       if (result.success) {
         // Tell the UI how the challenge ran: proxy (nginx stayed up), or a
         // standalone fallback with how long nginx was stopped.
         return res.json({
           success: true,
+          opId: progress.opId,
           certPath: result.certPath,
           keyPath: result.keyPath,
           mode: result.mode,
           fellBack: result.fellBack,
           nginxDownMs: result.nginxDownMs,
           staging: result.staging,
+          preflight: preflightChecks(result),
           summary: describeIssuance(result),
         });
       }
@@ -253,17 +318,26 @@ class SslController {
       if (step === 'email configuration') {
         return res.status(400).json({
           error: 'email_required',
+          opId: progress.opId,
+          preflight: preflightChecks(result),
           hint: 'Configure acmeEmail in settings or provide email parameter.',
         });
       }
       if (step === 'port 80 check') {
         return res.status(409).json({
           error: 'port_busy',
+          opId: progress.opId,
+          preflight: preflightChecks(result),
           detail: result.error.cause,
           hint: 'Stop the process using port 80 and try again.',
         });
       }
-      return res.status(500).json({ success: false, error: result.error });
+      return res.status(500).json({
+        success: false,
+        opId: progress.opId,
+        error: result.error,
+        preflight: preflightChecks(result),
+      });
     } catch (error) {
       next(error);
     }
@@ -314,16 +388,23 @@ class SslController {
         // standalone fallback with how long nginx was stopped.
         return res.json({
           success: true,
+          opId: state.opId ?? null,
           certPath: result.certPath,
           keyPath: result.keyPath,
           mode: result.mode,
           fellBack: result.fellBack,
           nginxDownMs: result.nginxDownMs,
           staging: result.staging,
+          preflight: preflightChecks(result),
           summary: describeIssuance(result),
         });
       }
-      return res.status(500).json({ success: false, error: result.error });
+      return res.status(500).json({
+        success: false,
+        opId: state.opId ?? null,
+        error: result.error,
+        preflight: preflightChecks(result),
+      });
     } catch (error) {
       next(error);
     }
@@ -354,7 +435,7 @@ class SslController {
 
   async list(req, res, next) {
     try {
-      const certs = await listAllCerts();
+      const certs = await listAllCerts({ includeUnusable: true });
 
       // Additive: what the background job intends for each certificate, so the
       // UI can show "auto-renews" / "manual renewal" instead of leaving the
@@ -367,8 +448,10 @@ class SslController {
       const withPlan = await Promise.all(certs.map(async (cert) => {
         let plan = 'off';
         try {
-          const info = await describeCertificate(cert.domain);
-          plan = autoRenewPlan({ certDomain: cert.domain, info, settings, domains, sslDir: config.sslDir });
+          if (cert.status !== 'not_issued' && cert.status !== 'unreadable') {
+            const info = await describeCertificate(cert.domain);
+            plan = autoRenewPlan({ certDomain: cert.domain, info, settings, domains, sslDir: config.sslDir });
+          }
         } catch { /* unreadable certificate: report it as not handled */ }
 
         const last = state[cert.domain] ?? null;
@@ -438,10 +521,15 @@ class SslController {
     try {
       const domain = req.params.domain;
       const config = loadConfig();
+      const progress = progressForRequest(req);
+      if (progress.error) {
+        return res.status(400).json({ error: 'invalid_opId', detail: progress.error });
+      }
 
       if (!config.acmeEmail) {
         return res.status(400).json({
           error: 'email_required',
+          opId: progress.opId,
           hint: 'Configure acmeEmail in settings first.',
         });
       }
@@ -449,20 +537,25 @@ class SslController {
       const certs = await listAllCerts();
       const found = certs.find(cert => cert.domain === domain);
       if (!found) {
-        return res.status(404).json({ error: `Domain '${domain}' not found` });
+        return res.status(404).json({ error: `Domain '${domain}' not found`, opId: progress.opId });
       }
 
       // renewCertificate() is the one renewal path (core/cert-renewal.js): it
       // regenerates a config that predates the ACME challenge location, keeps
       // the names the certificate already covers, and reloads nginx so the new
       // certificate is the one being served.
-      const result = await renewCertificate(domain, { email: config.acmeEmail });
+      const result = await renewCertificate(domain, {
+        email: config.acmeEmail,
+        opId: progress.opId,
+        onEvent: progress.onEvent,
+      });
 
       if (result.success) {
         // Tell the UI how the challenge ran: proxy (nginx stayed up), or a
         // standalone fallback with how long nginx was stopped.
         return res.json({
           success: true,
+          opId: progress.opId,
           certPath: result.certPath,
           keyPath: result.keyPath,
           mode: result.mode,
@@ -470,6 +563,7 @@ class SslController {
           nginxDownMs: result.nginxDownMs,
           staging: result.staging,
           nginxReloaded: result.nginxReloaded,
+          preflight: preflightChecks(result),
           summary: describeRenewal(result),
         });
       }
@@ -477,6 +571,8 @@ class SslController {
       if (result.skipped === 'manual') {
         return res.status(409).json({
           error: 'manual_renewal_required',
+          opId: progress.opId,
+          preflight: preflightChecks(result),
           detail: result.error.cause,
           hint: 'Create the certificate again from the SSL page using the DNS method.',
         });
@@ -486,6 +582,8 @@ class SslController {
       if (step === 'challenge setup') {
         return res.status(500).json({
           error: 'challenge_setup_failed',
+          opId: progress.opId,
+          preflight: preflightChecks(result),
           detail: result.error.cause,
           hint: 'nginx could not be prepared to answer the ACME challenge.',
         });
@@ -493,11 +591,18 @@ class SslController {
       if (step === 'port 80 check') {
         return res.status(409).json({
           error: 'port_busy',
+          opId: progress.opId,
+          preflight: preflightChecks(result),
           detail: result.error.cause,
           hint: 'Stop the process using port 80 and try again.',
         });
       }
-      return res.status(500).json({ success: false, error: result.error });
+      return res.status(500).json({
+        success: false,
+        opId: progress.opId,
+        error: result.error,
+        preflight: preflightChecks(result),
+      });
     } catch (error) {
       next(error);
     }
@@ -506,10 +611,15 @@ class SslController {
   async renewAll(req, res, next) {
     try {
       const config = loadConfig();
+      const progress = progressForRequest(req);
+      if (progress.error) {
+        return res.status(400).json({ error: 'invalid_opId', detail: progress.error });
+      }
 
       if (!config.acmeEmail) {
         return res.status(400).json({
           error: 'email_required',
+          opId: progress.opId,
           hint: 'Configure acmeEmail in settings first.',
         });
       }
@@ -519,16 +629,22 @@ class SslController {
       const results = [];
 
       for (const cert of expiring) {
-        const result = await renewCertificate(cert.domain, { email: config.acmeEmail });
+        const result = await renewCertificate(cert.domain, {
+          email: config.acmeEmail,
+          opId: progress.opId,
+          onEvent: progress.onEvent,
+        });
 
         if (!result.success && result.error?.step === 'challenge setup') {
           results.push({
             domain: cert.domain,
+            opId: progress.opId,
             success: false,
             certPath: null,
             keyPath: null,
             error: 'challenge_setup_failed',
             detail: result.error.cause,
+            preflight: preflightChecks(result),
           });
           continue;
         }
@@ -536,17 +652,20 @@ class SslController {
         if (result.skipped === 'manual') {
           results.push({
             domain: cert.domain,
+            opId: progress.opId,
             success: false,
             certPath: null,
             keyPath: null,
             error: 'manual_renewal_required',
             detail: result.error.cause,
+            preflight: preflightChecks(result),
           });
           continue;
         }
 
         results.push({
           domain: cert.domain,
+          opId: progress.opId,
           success: result.success,
           certPath: result.certPath,
           keyPath: result.keyPath,
@@ -555,6 +674,7 @@ class SslController {
           nginxDownMs: result.nginxDownMs,
           configRegenerated: Boolean(result.configRegenerated),
           nginxReloaded: result.nginxReloaded,
+          preflight: preflightChecks(result),
           summary: describeRenewal(result),
         });
       }

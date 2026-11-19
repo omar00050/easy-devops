@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ArrowRight, KeyRound, ShieldCheck } from 'lucide-react';
+import { ArrowRight, KeyRound, Loader2, ShieldCheck } from 'lucide-react';
 import { api, ApiError } from '../../lib/api';
+import { useRealtime } from '../../app/RealtimeProvider';
+import { useSslProgress } from '../../hooks/useSslProgress';
+import {
+  SSL_ISSUANCE_STAGES,
+  newSslOpId,
+  preflightFrom,
+  sslFailureFrom,
+} from '../../lib/sslProgress';
 import type { DnsChallengePending, Domain, IssuanceSuccess } from '../../lib/types';
 import { validateDomainName, validateEmail } from '../../lib/validation';
 import { cn } from '../../lib/cn';
@@ -13,6 +21,8 @@ import { Modal } from '../ui/Modal';
 import { InlineAlert } from '../ui/States';
 import { useToast } from '../ui/Toast';
 import { IssuanceFailurePanel, IssuanceSuccessPanel } from './IssuancePanels';
+import { PreflightResult } from './PreflightResult';
+import { StageList } from './StageList';
 
 type Phase = 'form' | 'dns' | 'success';
 
@@ -58,6 +68,13 @@ export function IssueCertificateModal({
   const toast = useToast();
   const confirm = useConfirm();
   const navigate = useNavigate();
+  const { connected } = useRealtime();
+
+  // The id exists before the first render, and useSslProgress subscribes on
+  // mount, so the `ssl:progress` frames cannot be missed: the contract does not
+  // replay them.
+  const [opId] = useState(() => newSslOpId());
+  const progress = useSslProgress(opId);
 
   const [domain, setDomain] = useState(initialDomain);
   const [email, setEmail] = useState('');
@@ -73,8 +90,17 @@ export function IssueCertificateModal({
   const [issued, setIssued] = useState<{ result: IssuanceSuccess; domain: string } | null>(
     null
   );
+  /** The name the current operation is about; the form may be edited after a failure. */
+  const [activeDomain, setActiveDomain] = useState('');
 
   const wildcard = domain.trim().startsWith('*.');
+
+  const stages = activeDomain ? progress.byDomain[activeDomain] ?? {} : {};
+  const failureView = sslFailureFrom(failure);
+  const preflight = preflightFrom(failure);
+  const successPreflight = issued ? preflightFrom(issued.result) : null;
+  const showStages = connected && progress.heard && activeDomain !== '';
+  const liveStages = showStages ? stages : {};
 
   useEffect(() => {
     if (!wildcard) return;
@@ -104,12 +130,15 @@ export function IssueCertificateModal({
     setDnsMismatch(null);
     setIssuing(true);
     const target = domain.trim();
+    setActiveDomain(target);
+    progress.clear();
     try {
       const result = await api.ssl.create({
         domain: target,
         www: wildcard ? false : www,
         validationMethod: wildcard ? 'dns' : method,
         email: email.trim() || undefined,
+        opId,
       });
       if (isDnsPending(result)) {
         setDnsPending(result);
@@ -167,6 +196,8 @@ export function IssueCertificateModal({
     } finally {
       setDnsPending(null);
       setDnsMismatch(null);
+      setActiveDomain('');
+      progress.clear();
       setPhase('form');
       setDnsConfirming(false);
     }
@@ -181,6 +212,8 @@ export function IssueCertificateModal({
     setFailure(null);
     setDnsMismatch(null);
     setIssued(null);
+    setActiveDomain('');
+    progress.clear();
     setPhase('form');
   };
 
@@ -277,9 +310,37 @@ export function IssueCertificateModal({
     >
       {phase === 'form' && (
         <div className="space-y-4">
+          {activeDomain && (issuing || failure != null) && (
+            <div className="space-y-2.5">
+              {showStages ? (
+                <StageList
+                  stages={SSL_ISSUANCE_STAGES}
+                  states={liveStages}
+                  ariaLabel={`Certificate stages for ${activeDomain}`}
+                  failure={failure != null ? failureView : null}
+                  timedOut={failureView?.stage === 'timeout'}
+                />
+              ) : issuing ? (
+                <p
+                  role="status"
+                  className="flex items-start gap-2 rounded-md border border-line bg-raised/40 px-3 py-2.5 text-xs text-muted"
+                >
+                  <Loader2 className="spin mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+                  <span className="break-words">
+                    Issuing the certificate for{' '}
+                    <span className="font-mono text-ink">{activeDomain}</span>. The live stage
+                    list needs the dashboard’s connection; the result appears here when it
+                    finishes.
+                  </span>
+                </p>
+              ) : null}
+              {preflight && <PreflightResult preflight={preflight} />}
+            </div>
+          )}
+
           {failure != null && (
             <div className="space-y-2">
-              <IssuanceFailurePanel value={failure} />
+              {!(showStages && failureView) && <IssuanceFailurePanel value={failure} />}
               {emailRequired && (
                 <Button
                   variant="secondary"
@@ -413,6 +474,13 @@ export function IssueCertificateModal({
 
       {phase === 'dns' && dnsPending && (
         <div className="space-y-4">
+          {showStages && (
+            <StageList
+              stages={SSL_ISSUANCE_STAGES}
+              states={liveStages}
+              ariaLabel={`Certificate stages for ${activeDomain || dnsPending.domain}`}
+            />
+          )}
           <InlineAlert tone="warning" title="Add this DNS TXT record">
             Create the record at your DNS provider, then confirm. The challenge waits up to ten
             minutes; nothing is written to nginx while it waits.
@@ -446,7 +514,15 @@ export function IssueCertificateModal({
 
       {phase === 'success' && issued && (
         <div className="space-y-4">
+          {showStages && (
+            <StageList
+              stages={SSL_ISSUANCE_STAGES}
+              states={liveStages}
+              ariaLabel={`Certificate stages for ${issued.domain}`}
+            />
+          )}
           <IssuanceSuccessPanel result={issued.result} title={`Certificate issued for ${issued.domain}`} />
+          {successPreflight && <PreflightResult preflight={successPreflight} />}
           <div className="flex items-start gap-2 text-xs text-muted">
             <ArrowRight className="mt-0.5 size-3.5 shrink-0 text-faint" aria-hidden="true" />
             <p>

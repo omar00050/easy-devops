@@ -210,6 +210,27 @@ async function main() {
       badMeta.source === 'certificate' && badMeta.validationMethod === 'http');
   }
 
+  // ── 2b. Not issued yet vs unreadable ────────────────────────────────────────
+  setGroup('2b. Certificates that do not exist yet');
+  {
+    const reader = await import(srcUrl('core/cert-reader.js'));
+    const readDir = path.join(TEST_DATA_DIR, 'scratch', 'ssl-states');
+    fs.mkdirSync(readDir, { recursive: true });
+    fs.mkdirSync(path.join(readDir, 'new.example.com'), { recursive: true });
+    fs.mkdirSync(path.join(readDir, 'bad.example.com'), { recursive: true });
+    fs.writeFileSync(path.join(readDir, 'bad.example.com', 'fullchain.pem'), 'not a certificate');
+    writeCert(readDir, 'valid.example.com', ['valid.example.com'], 60);
+
+    const certs = await reader.listAllCerts({ sslDir: readDir, includeUnusable: true });
+    const of = (name) => certs.find((cert) => cert.domain === name);
+    check('a missing certificate is not_issued with the "Not issued yet" label',
+      of('new.example.com')?.status === 'not_issued' && of('new.example.com')?.label === 'Not issued yet');
+    check('an unparseable certificate file stays unreadable',
+      of('bad.example.com')?.status === 'unreadable');
+    check('a valid certificate still reads normally',
+      of('valid.example.com')?.status === 'valid' && of('valid.example.com')?.daysLeft >= 59);
+  }
+
   // ── 3. In use? ──────────────────────────────────────────────────────────────
   setGroup('3. Which certificates are in use');
   {

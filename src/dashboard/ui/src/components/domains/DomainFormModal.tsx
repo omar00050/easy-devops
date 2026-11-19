@@ -1,12 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useId,
-  useRef,
-  useState,
-  type ReactNode,
-} from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import {
   Bell,
   ChevronDown,
@@ -16,7 +8,6 @@ import {
   Lock,
   ShieldAlert,
   ShieldCheck,
-  Settings2,
   Sparkles,
   type LucideIcon,
 } from 'lucide-react';
@@ -60,6 +51,8 @@ import {
 } from '../ui/Field';
 import { InlineAlert, Skeleton } from '../ui/States';
 import { useToast } from '../ui/Toast';
+import { ChannelPicker } from '../notifications/ChannelPicker';
+import { EventToggles } from '../notifications/EventToggles';
 
 const DEFAULT_GZIP_TYPES =
   'text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript';
@@ -323,36 +316,6 @@ function FormSection({
   );
 }
 
-function ChannelChip({
-  channel,
-  checked,
-  onChange,
-}: {
-  channel: NotificationChannel;
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-}) {
-  return (
-    <label
-      className={cn(
-        'flex cursor-pointer items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs transition-colors duration-[var(--ez-motion-fast)]',
-        checked
-          ? 'border-accent/50 bg-accent-soft/50 text-ink'
-          : 'border-line text-muted hover:border-line-strong hover:text-ink'
-      )}
-    >
-      <input
-        type="checkbox"
-        checked={checked}
-        onChange={(event) => onChange(event.target.checked)}
-        className="size-3.5 shrink-0 accent-[var(--ez-accent)]"
-      />
-      <span className="font-medium">{channel.name}</span>
-      <span className="text-2xs text-faint">{channel.type}</span>
-    </label>
-  );
-}
-
 const numeric = (value: number): number | '' => (Number.isFinite(value) && value !== 0 ? value : '');
 
 function CertificateIssuance({
@@ -603,7 +566,6 @@ export function DomainFormModal({
   const editing = editor.mode === 'edit' ? editor.domain : null;
   const toast = useToast();
   const confirm = useConfirm();
-  const navigate = useNavigate();
   const formId = useId();
 
   const [form, setForm] = useState<DomainInput>(() =>
@@ -733,21 +695,6 @@ export function DomainFormModal({
         [type]: { ...current.notifications[type], ...patch },
       },
     }));
-  }
-  function toggleChannel(type: DomainEventType, channelId: string, checked: boolean) {
-    setForm((current) => {
-      const routing = current.notifications[type];
-      const channelIds = checked
-        ? Array.from(new Set([...routing.channelIds, channelId]))
-        : routing.channelIds.filter((id) => id !== channelId);
-      return {
-        ...current,
-        notifications: {
-          ...current.notifications,
-          [type]: { ...routing, channelIds },
-        },
-      };
-    });
   }
 
   const expandSection = (id: string) =>
@@ -991,14 +938,6 @@ export function DomainFormModal({
   const stableClose = useCallback(() => {
     void closeRef.current();
   }, []);
-
-  const goToSettings = async () => {
-    if (busy) return;
-    if (!(await confirmDiscard())) return;
-    abandonDns();
-    onClose();
-    navigate('/settings');
-  };
 
   return (
     <Modal
@@ -1525,58 +1464,55 @@ export function DomainFormModal({
                 {channels.error.message}
               </InlineAlert>
             ) : (channels.data ?? []).length === 0 ? (
-              <InlineAlert tone="info" title="No notification channels configured">
-                Add a Discord or Telegram channel in Settings first; this domain's alerts are
-                recorded either way.
-                <div className="mt-2">
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    icon={<Settings2 className="size-3.5" aria-hidden="true" />}
-                    onClick={goToSettings}
-                  >
-                    Open settings
-                  </Button>
-                </div>
-              </InlineAlert>
+              <ChannelPicker
+                channels={[]}
+                value={[]}
+                onChange={() => undefined}
+                label="Channels"
+                emptyHref="/notifications"
+                disabled={busy}
+              />
             ) : (
-              <div className="space-y-3">
-                {NOTIFICATION_EVENTS.map((event) => {
+              <EventToggles
+                label="Events"
+                disabled={busy}
+                items={NOTIFICATION_EVENTS.map((event) => ({
+                  ...event,
+                  enabled: form.notifications[event.id].enabled,
+                }))}
+                onChange={(id, enabled) => setNotification(id, { enabled })}
+                onToggleAll={(enabled) => {
+                  for (const event of NOTIFICATION_EVENTS) {
+                    setNotification(event.id, { enabled });
+                  }
+                }}
+              >
+                {(event) => {
                   const routing = form.notifications[event.id];
                   return (
-                    <div
-                      key={event.id}
-                      className="rounded-md border border-line bg-raised/30 p-3.5"
-                    >
-                      <Switch
-                        checked={routing.enabled}
-                        onChange={(checked) => setNotification(event.id, { enabled: checked })}
-                        label={event.label}
-                        description={event.description}
-                      />
-                      {routing.enabled && (
-                        <div className="mt-3 flex flex-wrap gap-1.5 border-t border-line pt-3">
-                          {(channels.data ?? []).map((channel) => (
-                            <ChannelChip
-                              key={channel.id}
-                              channel={channel}
-                              checked={routing.channelIds.includes(channel.id)}
-                              onChange={(checked) =>
-                                toggleChannel(event.id, channel.id, checked)
-                              }
-                            />
-                          ))}
-                        </div>
-                      )}
-                      {routing.enabled && routing.channelIds.length === 0 && (
+                    <>
+                      <div className="mt-3 border-t border-line pt-3">
+                        <ChannelPicker
+                          channels={channels.data ?? []}
+                          value={routing.channelIds}
+                          onChange={(channelIds) =>
+                            setNotification(event.id, { channelIds })
+                          }
+                          label={`${event.label} channels`}
+                          emptyHref="/notifications"
+                          compact
+                          disabled={busy}
+                        />
+                      </div>
+                      {routing.channelIds.length === 0 && (
                         <p className="mt-2 text-2xs text-faint">
                           No channels selected — the event is recorded but not delivered.
                         </p>
                       )}
-                    </div>
+                    </>
                   );
-                })}
-              </div>
+                }}
+              </EventToggles>
             )}
           </FormSection>
         )}
