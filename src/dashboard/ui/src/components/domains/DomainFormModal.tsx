@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import {
   Bell,
-  ChevronDown,
   Code2,
   Gauge,
   Globe2,
@@ -39,6 +38,7 @@ import {
 } from '../../lib/validation';
 import { useConfirm, useResource } from '../../hooks/useResource';
 import { Modal } from '../ui/Modal';
+import { Collapsible } from '../ui/Collapsible';
 import { Button } from '../ui/Button';
 import { CopyButton } from '../ui/CopyButton';
 import {
@@ -282,37 +282,23 @@ function FormSection({
   children: ReactNode;
 }) {
   return (
-    <section className="border-b border-line last:border-b-0">
-      <h3>
-        <button
-          type="button"
-          aria-expanded={open}
-          aria-controls={`section-${id}`}
-          onClick={onToggle}
-          className="group flex w-full items-center gap-3 px-5 py-3.5 text-left transition-colors duration-[var(--ez-motion-fast)] hover:bg-raised/50"
-        >
-          <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-inset text-muted transition-colors group-hover:text-ink">
-            <Icon className="size-3.5" aria-hidden="true" />
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="block text-sm font-medium text-ink">{title}</span>
-            <span className="mt-0.5 block text-xs text-muted">{description}</span>
-          </span>
-          <ChevronDown
-            className={cn(
-              'size-4 shrink-0 text-faint transition-transform duration-[var(--ez-motion-fast)]',
-              open && 'rotate-180'
-            )}
-            aria-hidden="true"
-          />
-        </button>
-      </h3>
-      {open && (
-        <div id={`section-${id}`} className="px-5 pb-5 pt-1">
-          {children}
-        </div>
-      )}
-    </section>
+    <Collapsible
+      id={id}
+      title={title}
+      description={description}
+      open={open}
+      onOpenChange={onToggle}
+      className="border-b border-line last:border-b-0"
+      headerClassName="px-5 py-3.5"
+      contentClassName="px-5 pb-5 pt-1"
+      icon={
+        <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-inset text-muted transition-colors group-hover:text-ink">
+          <Icon className="size-3.5" aria-hidden="true" />
+        </span>
+      }
+    >
+      {children}
+    </Collapsible>
   );
 }
 

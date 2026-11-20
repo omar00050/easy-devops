@@ -426,6 +426,24 @@ export function createCommandProgress(requestId) {
   };
 }
 
+/**
+ * An Error carrying a handler's own { ok: false, ... } result as `data`, so a
+ * refusal reaches the Hub with its details (the failed stage, the domains that
+ * still use a certificate) instead of only a message. Handlers build that
+ * result from fields meant for the Hub; nothing secret goes in it.
+ *
+ * @param {Object} result
+ * @param {string} fallback
+ */
+function refusalError(result, fallback) {
+  const message = typeof result?.error === 'string'
+    ? result.error
+    : (result?.error?.cause || fallback);
+  const err = new Error(message);
+  err.data = result;
+  return err;
+}
+
 /** Emits the acknowledgement the Hub and its browser clients wait for. */
 function sendResult(requestId, ok, { error = null, data = null } = {}, ack = null) {
   if (!requestId) return;
@@ -488,7 +506,9 @@ async function runCommand(command, payload, fn, ack = null) {
   } catch (err) {
     console.error('[hubAgent]', command, 'failed:', err.message);
     logCommandTiming(command, startedAt, false);
-    sendResult(requestId, false, { error: err.message }, ack);
+    // A handler may attach a structured refusal (refusalError above) so the
+    // Hub can show it as well as the message.
+    sendResult(requestId, false, { error: err.message, data: err.data ?? null }, ack);
   }
 }
 
@@ -627,7 +647,7 @@ async function handleManageDomain(payload, ack) {
   return runCommand('hub:manageDomain', payload, async (p) => {
     const { handleHubDomainCommand } = await import('../domains-db.js');
     const result = await handleHubDomainCommand(p);
-    if (result && result.ok === false) throw new Error(result.error || 'domain command failed');
+    if (result && result.ok === false) throw refusalError(result, 'domain command failed');
 
     // Re-sync to the hub and refresh any open local dashboard tab.
     pushDomainHealth();
@@ -643,7 +663,7 @@ async function handleManageSSL(payload, ack) {
     const result = await handleHubSslCommand(p, {
       onProgress: createCommandProgress(p?.requestId),
     });
-    if (result && result.ok === false) throw new Error(result.error || 'ssl command failed');
+    if (result && result.ok === false) throw refusalError(result, 'ssl command failed');
 
     pushCertExpiry();
     pushDomainConfigs();

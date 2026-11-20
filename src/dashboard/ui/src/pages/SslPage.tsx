@@ -2,7 +2,6 @@ import { useMemo, useState, type ReactNode } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   CheckCircle2,
-  ChevronDown,
   Loader2,
   Plus,
   RefreshCw,
@@ -38,6 +37,7 @@ import {
 import { useLocalChange } from '../hooks/useLocalChange';
 import { PageHeader } from '../components/layout/PageHeader';
 import { Card } from '../components/ui/Card';
+import { Collapsible } from '../components/ui/Collapsible';
 import { Badge, StatusDot, type Tone } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
 import { Modal } from '../components/ui/Modal';
@@ -673,32 +673,32 @@ export function SslPage() {
                     : 'Not started';
 
               return (
-                <li
-                  key={domain}
-                  className="rounded-md border border-line bg-raised/30 px-3.5 py-3"
-                >
-                  <button
-                    type="button"
-                    aria-expanded={expanded}
-                    onClick={() =>
-                      setCollapsedRows((current) => ({ ...current, [domain]: !current[domain] }))
+                <li key={domain}>
+                  <Collapsible
+                    id={`renew-${domain}`}
+                    className="rounded-md border border-line bg-raised/30"
+                    headerClassName="px-3.5 py-3"
+                    contentClassName="px-3.5 pb-3"
+                    open={expanded}
+                    onOpenChange={(next) =>
+                      setCollapsedRows((current) => ({ ...current, [domain]: !next }))
                     }
-                    className="flex w-full items-start gap-2.5 text-left"
-                  >
-                    <span className="mt-0.5 shrink-0">
-                      {entry ? (
-                        entry.success ? (
-                          <CheckCircle2 className="size-4 text-ok" aria-hidden="true" />
+                    icon={
+                      <span className="shrink-0">
+                        {entry ? (
+                          entry.success ? (
+                            <CheckCircle2 className="size-4 text-ok" aria-hidden="true" />
+                          ) : (
+                            <XCircle className="size-4 text-bad" aria-hidden="true" />
+                          )
+                        ) : running ? (
+                          <Loader2 className="spin size-4 text-accent-text" aria-hidden="true" />
                         ) : (
-                          <XCircle className="size-4 text-bad" aria-hidden="true" />
-                        )
-                      ) : running ? (
-                        <Loader2 className="spin size-4 text-accent-text" aria-hidden="true" />
-                      ) : (
-                        <StatusDot tone="neutral" className="mt-1.5" />
-                      )}
-                    </span>
-                    <span className="min-w-0 flex-1">
+                          <StatusDot tone="neutral" />
+                        )}
+                      </span>
+                    }
+                    title={
                       <span className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
                         <span className="truncate font-mono text-sm font-medium text-ink">
                           {domain}
@@ -709,20 +709,9 @@ export function SslPage() {
                           </Badge>
                         )}
                       </span>
-                      <span className="mt-0.5 block break-words text-xs text-muted">
-                        {summary}
-                      </span>
-                    </span>
-                    <ChevronDown
-                      className={cn(
-                        'mt-0.5 size-4 shrink-0 text-faint transition-transform duration-[var(--ez-motion-fast)]',
-                        expanded && 'rotate-180'
-                      )}
-                      aria-hidden="true"
-                    />
-                  </button>
-
-                  {expanded && (
+                    }
+                    description={summary}
+                  >
                     <div className="mt-2.5 border-t border-line pt-2.5">
                       {heard ? (
                         <StageList
@@ -760,7 +749,7 @@ export function SslPage() {
                         </p>
                       )}
                     </div>
-                  )}
+                  </Collapsible>
                 </li>
               );
             })}

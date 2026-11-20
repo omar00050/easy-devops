@@ -82,7 +82,9 @@ export function Modal({
       const panel = panelRef.current;
       if (!panel) return;
       const focusable = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
-        (element) => element.offsetParent !== null
+        // `inert` content (a collapsed Collapsible) stays in the DOM but must
+        // not take the wrap-around focus.
+        (element) => element.offsetParent !== null && !element.closest('[inert]')
       );
       if (focusable.length === 0) {
         event.preventDefault();

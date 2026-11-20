@@ -8,6 +8,11 @@ import { loadConfig } from './config.js';
 import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk } from './platform.js';
 import { saveDomainNotifConfig } from './domainNotifier.js';
 import { bumpHubRevision } from './hubLink.js';
+import { missingCertFiles, CERT_MISSING_HINT } from './cert-usage.js';
+import {
+  validateDomainName, validatePort, validateUpstreamType,
+  validateMaxBodySize, validateBehindCloudflare,
+} from './validators.js';
 
 // Re-export DOMAIN_DEFAULTS for consumers
 export { DOMAIN_DEFAULTS, migrateDomain };
@@ -71,6 +76,48 @@ export function createDomain(partial) {
 // Called by hubAgent when the hub dispatches a hub:manageDomain event.
 // Payload shape: { action: 'create'|'update'|'delete'|'toggle'|'reload', name?, domain? }
 
+/**
+ * The checks the dashboard's domain controller runs, applied to a Hub payload.
+ * On update only the fields present are checked, as the dashboard does.
+ *
+ * @param {Object} input The payload's `domain`
+ * @param {{ creating: boolean, existing?: Object }} options
+ * @returns {string|null} The first problem, or null
+ */
+function hubDomainInputError(input, { creating, existing = null }) {
+  if (creating) {
+    const nameError = validateDomainName(input.name);
+    if (nameError) return nameError;
+  }
+
+  const backendIsUrl = /^https?:\/\//i.test(input.backendHost ?? existing?.backendHost ?? '');
+  if ((creating || input.port !== undefined) && !backendIsUrl) {
+    const portError = validatePort(input.port);
+    if (portError) return portError;
+  }
+  if (input.upstreamType !== undefined) {
+    const upstreamError = validateUpstreamType(input.upstreamType);
+    if (upstreamError) return upstreamError;
+  }
+  if (input.performance?.maxBodySize !== undefined) {
+    const sizeError = validateMaxBodySize(input.performance.maxBodySize);
+    if (sizeError) return sizeError;
+  }
+  if (input.behindCloudflare !== undefined) {
+    const cloudflareError = validateBehindCloudflare(input.behindCloudflare);
+    if (cloudflareError) return cloudflareError;
+  }
+  return null;
+}
+
+/**
+ * The dashboard's 422 `cert_missing`, as a Hub refusal: the resolved paths
+ * and the hint travel to the Hub as the command's data.
+ */
+function certMissingResult({ certPath, keyPath }) {
+  return { ok: false, code: 'cert_missing', certPath, keyPath, hint: CERT_MISSING_HINT, error: CERT_MISSING_HINT };
+}
+
 export async function handleHubDomainCommand(payload) {
   const { action, name, domain, deleteCert } = payload ?? {};
   const { nginxDir } = loadConfig();
@@ -79,6 +126,10 @@ export async function handleHubDomainCommand(payload) {
 
     case 'create': {
       if (!domain?.name) return { ok: false, error: 'domain.name is required' };
+      // The same checks the dashboard runs. The name becomes a config file
+      // name, so it must be a plain hostname before anything is written.
+      const invalid = hubDomainInputError(domain, { creating: true });
+      if (invalid) return { ok: false, error: invalid };
       if (findDomain(domain.name)) return { ok: false, error: `Domain ${domain.name} already exists` };
 
       const newDomain = createDomain({
@@ -95,6 +146,11 @@ export async function handleHubDomainCommand(payload) {
         security: { ...DOMAIN_DEFAULTS.security, ...domain.security },
         advanced: { ...DOMAIN_DEFAULTS.advanced, ...domain.advanced },
       });
+
+      // Same refusal as the dashboard: never point nginx at certificate files
+      // that are not on disk. The Hub offers Create certificate on this code.
+      const missingNew = await missingCertFiles(newDomain);
+      if (missingNew) return certMissingResult(missingNew);
 
       // Shared core apply (same path as the CLI and the dashboard API).
       const created = await writeConfWithTest(newDomain);
@@ -120,7 +176,12 @@ export async function handleHubDomainCommand(payload) {
       const existing = targetName ? findDomain(targetName) : null;
       if (!existing) return { ok: false, error: `Domain ${targetName} not found` };
 
-      const updates = domain ?? {};
+      // Fields the agent owns are never taken from the Hub: the config path is
+      // derived from the name, and enabling is hub:manageDomain toggle, which
+      // has its own permission.
+      const { configFile: _cf, enabled: _en, createdAt: _ca, ...updates } = domain ?? {};
+      const invalid = hubDomainInputError(updates, { creating: false, existing });
+      if (invalid) return { ok: false, error: invalid };
       const updatedDomain = {
         ...existing,
         ...updates,
@@ -131,6 +192,11 @@ export async function handleHubDomainCommand(payload) {
         advanced: { ...existing.advanced, ...updates.advanced },
         updatedAt: new Date().toISOString(),
       };
+
+      // Same refusal as the dashboard: never point nginx at certificate files
+      // that are not on disk. The Hub offers Create certificate on this code.
+      const missingUpdated = await missingCertFiles(updatedDomain);
+      if (missingUpdated) return certMissingResult(missingUpdated);
 
       // Shared core apply — restores the previous config exactly if it fails,
       // so the .bak dance is no longer needed here.

@@ -7,6 +7,46 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [1.4.2] — 2026-11-20
+
+### Added
+
+- The Hub can issue and delete certificates. The server already offered
+  `ssl.issue` and `ssl.delete` under Settings → Hub, but the Hub's SSL page only
+  had Renew. It now has New certificate (HTTP-01; DNS-01 and wildcards stay on
+  the server's own dashboard, and the Hub says why) with the preflight result,
+  the nine live stages, and the failed stage with its cause and fix, plus Delete,
+  which is refused while a domain still uses the certificate and names those
+  domains.
+- The Hub's domain form now matches the dashboard's, including "No certificate
+  paths set" and Create certificate. It no longer pre-fills guessed certificate
+  paths or claims to "auto-generate certificates if left blank" — it never did.
+- Collapsible sections in the dashboard and the Hub open and close with a short
+  height animation (instant with reduced motion), and are keyboard and screen
+  reader friendly.
+
+### Fixed
+
+- **Security:** the agent's `hub:manageSSL delete` built the directory to
+  remove from the name the Hub sent, so a name such as `..` could remove a
+  directory outside the certificate folder. It now looks the name up among the
+  certificates that exist, like the dashboard always did, and deletes through
+  the same check (`core/cert-usage.js`).
+- **Security:** `hub:manageDomain create` did no input validation, so the Hub
+  could create a domain whose name escaped the nginx config folder. It now runs
+  the dashboard's checks, and `update` ignores `configFile`, `enabled` and
+  `createdAt` from the Hub.
+- A Hub domain saved with SSL on and no certificate on disk failed at
+  `nginx -t` with nginx's raw error. The agent now refuses first with
+  `cert_missing` and the resolved paths, like the dashboard, and the Hub offers
+  Create certificate.
+- A refused Hub command now carries its details (the failed stage, the domains
+  that use a certificate) instead of only a message. Requires Hub backend 0.2.2
+  for quick commands.
+- The dashboard's certificate delete also refuses while an enabled domain uses
+  the certificate (`usedBy` in the 409), and can delete a certificate folder
+  that is unreadable or not yet issued (it answered 404 before).
+
 ## [1.4.1] — 2026-11-19
 
 ### Fixed
@@ -31,6 +71,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   racing it.
 - After a failed Server-mode install, Server mode stays enabled with the
   migrated data, and running `ezz service install` again resumes from there.
+- Windows: commands used `sc`, which in PowerShell is the alias for
+  Set-Content, so 1.4.0 wrote stray files named query, qc, stop, start or
+  delete (content "EasyDevOps") into the folder the command ran from,
+  `ezz service status` showed "Running: no (unknown)" and "Start on boot:
+  unknown", and `ezz service stop`/`start` reported success without touching
+  the service. Every call now uses sc.exe; the stray files are harmless and
+  can be deleted.
+- Status asks Windows whether the service exists: a record without a
+  registration (sc.exe query: 1060) is reported as such, with "run ezz service
+  install"; status agrees with sc.exe query and with the daemon heartbeat.
+- The restart count no longer counts the "Starting WinSW in console mode" line
+  every command writes; only real process starts count, and a
+  stopped-and-restarted service is not called a crash loop (3 unclean restarts
+  in 10 minutes are).
+- Install waits up to 45 s for the daemon, with progress lines; if the time
+  runs out while Windows reports the service running, it says "started, still
+  initialising" instead of "Install failed". The install is recorded as soon
+  as registration and permissions succeed.
+- `ezz service repair` no longer fails with EBUSY on runtime\node.exe while the
+  service runs: it stops the service, waits until it has stopped, replaces the
+  runtime copy, starts it, and restores the previous copy if the daemon does
+  not come up. `ezz update` and `ezz runtime update` also wait for a real stop
+  now (their stop used `sc` too).
+- `ezz hub status` / `ezz hub connect` in Server mode now show the agent state:
+  the CLI could not open the service's named pipe, so the daemon also writes
+  its agent state (no secrets) to the data directory.
+- Server mode checks elevation for real before copying or migrating anything,
+  and stops with "Open PowerShell with Run as administrator and run the command
+  again" — no more UAC "Unknown publisher" prompt half way through. When
+  elevation cannot be determined, one line first explains the prompt (WinSW,
+  verified by SHA-256, not code-signed).
+- Elevation messages suggested `ezz service stopping`; they now name the real
+  command.
 
 ### Changed
 
@@ -39,6 +112,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   RDP stops it (disconnecting keeps it), and it does not start at boot.
   Personal mode is refused, with the steps to move the data back, while the
   machine is already in Server mode.
+
+### Documentation
+
+- A Troubleshooting page
+  (https://easy-devops.devxor.team/docs/troubleshooting): logs per mode,
+  checking the state, clean stop versus crash, known problems and fixes,
+  recovery, and what to send when asking for help. Linked from the service,
+  installation and maintenance pages and from the CLI's error messages.
 
 ## [1.4.0] — 2026-11-19
 

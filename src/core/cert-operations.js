@@ -9,7 +9,6 @@
  * command with command:result instead of leaving the Hub guessing.
  */
 
-import fs from 'fs/promises';
 import path from 'path';
 import { loadConfig } from './config.js';
 import { describeIssuance, issueCertificate, prepareDomainForHttpChallenge } from './ssl-issuer.js';
@@ -17,7 +16,9 @@ import { renewCertificate, describeRenewal, failureReason } from './cert-renewal
 import { bumpHubRevision } from './hubLink.js';
 import { listAllCerts } from './cert-reader.js';
 import { findCertificateForDomain } from './cert-suggest.js';
-import { getDomains, findDomain } from './domains-db.js';
+import { findDomain } from './domains-db.js';
+import { deleteCertificate } from './cert-usage.js';
+import { validateDomainName } from './validators.js';
 
 /** Shape shared by every SSL result so the Hub can render it uniformly. */
 function issuanceResult(domain, result) {
@@ -31,6 +32,47 @@ function issuanceResult(domain, result) {
     staging: Boolean(result?.staging),
     summary: describeIssuance(result),
   };
+}
+
+/**
+ * The failed stage, the real cause, the one-line fix and what it left
+ * behind — the same four things the dashboard shows. Nothing else from the
+ * internal error is passed on.
+ */
+function failureDetail(result) {
+  const err = result?.error;
+  if (!err || typeof err !== 'object') return null;
+  return {
+    stage: err.stage ?? err.step ?? null,
+    cause: err.cause ?? 'Certificate operation failed',
+    fix: err.fix ?? null,
+    consequence: err.consequence ?? null,
+  };
+}
+
+/**
+ * A new certificate's result: the common shape, plus the preflight checks and
+ * the paths on success (the Hub's domain form fills them in), or the failure
+ * detail. On failure `error` is the object; the agent puts its `cause` in the
+ * command's top-level error string, which is all an older Hub reads.
+ */
+function newCertificateResult(domain, result) {
+  const out = issuanceResult(domain, result);
+  out.preflight = result?.preflight
+    ? {
+      ok: Boolean(result.preflight.ok),
+      detail: result.preflight.detail ?? '',
+      results: Array.isArray(result.preflight.results) ? result.preflight.results : [],
+      proxied: Boolean(result.preflight.proxied),
+    }
+    : null;
+  if (out.ok) {
+    out.certPath = result.certPath ?? null;
+    out.keyPath = result.keyPath ?? null;
+  } else {
+    out.error = failureDetail(result) ?? { stage: null, cause: out.error, fix: null, consequence: null };
+  }
+  return out;
 }
 
 /**
@@ -132,7 +174,6 @@ export async function handleHubSslCommand(payload, options = {}) {
     // ── Issue a new certificate ───────────────────────────────────────────
     case 'issue': {
       if (!domain) return { ok: false, error: 'domain is required' };
-      if (!config.acmeEmail) return { ok: false, error: 'No acmeEmail configured on this server.' };
 
       // Wildcards need a DNS TXT record the operator adds by hand, so they
       // cannot be driven from the Hub — ssl.issueDns is marked comingSoon.
@@ -141,6 +182,15 @@ export async function handleHubSslCommand(payload, options = {}) {
           ok: false,
           error: 'Wildcard certificates need DNS-01 validation, which cannot be completed from the Hub yet. Issue it from the server’s own dashboard.',
         };
+      }
+
+      // The name becomes a directory under sslDir, so it must be a plain
+      // hostname before anything is written.
+      const nameError = validateDomainName(domain);
+      if (nameError) return { ok: false, error: `Invalid domain name: ${nameError}` };
+
+      if (!config.acmeEmail) {
+        return { ok: false, error: 'No acmeEmail configured on this server. Set it in the server’s dashboard: Settings → General.' };
       }
 
       const prep = await prepare(domain);
@@ -154,7 +204,7 @@ export async function handleHubSslCommand(payload, options = {}) {
         onProgress: progressFor(domain),
       });
 
-      const out = issuanceResult(domain, result);
+      const out = newCertificateResult(domain, result);
       if (out.ok) bumpHubRevision();
       console.log('[hubAgent] ssl issue:', domain, out.ok ? 'OK' : 'FAILED', '—', out.summary || out.error);
       return out;
@@ -170,50 +220,41 @@ export async function handleHubSslCommand(payload, options = {}) {
     }
 
     // ── Delete a certificate ──────────────────────────────────────────────
+    // core/cert-usage.js resolves the directory from listAllCerts(), never
+    // from this payload, and refuses while an enabled domain or any nginx
+    // config still uses it — the same function the dashboard deletes with.
     case 'delete': {
       if (!domain) return { ok: false, error: 'domain is required' };
 
-      // Refuse while an enabled domain still points at it: deleting would
-      // leave nginx referencing a missing file and fail its next reload.
-      const inUse = getDomains().filter(
-        (d) => d.enabled !== false && d.ssl?.enabled && certBelongsTo(d, domain, config.sslDir)
-      );
-
-      if (inUse.length > 0) {
+      const outcome = await deleteCertificate(domain);
+      if (outcome.code === 'cert_not_found') {
+        return { ok: false, code: 'cert_not_found', domain: outcome.domain, error: `No certificate named ${outcome.domain} on this server.` };
+      }
+      if (outcome.code === 'cert_in_use') {
+        const names = outcome.usedBy.length ? outcome.usedBy.join(', ') : 'an nginx config';
         return {
           ok: false,
+          code: 'cert_in_use',
+          domain: outcome.domain,
+          usedBy: outcome.usedBy,
+          // File names and line numbers only: the Hub never receives config
+          // contents or full paths.
+          references: outcome.references.map((r) => ({ file: path.basename(r.file), line: r.line })),
           error:
-            `Certificate for ${domain} is still used by ${inUse.map((d) => d.name).join(', ')}. ` +
+            `Certificate for ${outcome.domain} is still used by ${names}. ` +
             'Disable SSL on those domains (or disable the domains) before deleting it.',
         };
       }
-
-      const certDir = path.join(config.sslDir, domain);
-      try {
-        await fs.rm(certDir, { recursive: true, force: true });
-      } catch (err) {
-        return { ok: false, error: `Could not delete ${certDir}: ${err.message}` };
+      if (outcome.code === 'delete_failed') {
+        return { ok: false, code: 'delete_failed', domain: outcome.domain, error: outcome.detail };
       }
 
       bumpHubRevision();
-      console.log('[hubAgent] ssl delete:', domain, 'OK');
-      return { ok: true, domain, deleted: certDir };
+      console.log('[hubAgent] ssl delete:', outcome.domain, 'OK');
+      return { ok: true, domain: outcome.domain, deleted: true };
     }
 
     default:
       return { ok: false, error: `Unknown SSL action: ${action}` };
   }
-}
-
-/**
- * True when a domain's configured certificate lives in the directory for
- * `certDomain`. Compares with forward slashes so Windows paths match whichever
- * separator style they were stored with.
- */
-function certBelongsTo(domain, certDomain, sslDir) {
-  if (domain.name === certDomain) return true;
-
-  const norm = (p) => String(p ?? '').replace(/\\/g, '/').toLowerCase();
-  const dir = norm(path.join(sslDir, certDomain));
-  return norm(domain.ssl?.certPath).startsWith(dir) || norm(domain.ssl?.keyPath).startsWith(dir);
 }

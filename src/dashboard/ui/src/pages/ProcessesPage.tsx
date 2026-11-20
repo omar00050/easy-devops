@@ -33,6 +33,7 @@ import {
 import { useService } from '../app/ServiceProvider';
 import { PageHeader } from '../components/layout/PageHeader';
 import { Card, CardBody, CardHeader } from '../components/ui/Card';
+import { Collapsible } from '../components/ui/Collapsible';
 import { Badge, StatusDot, type Tone } from '../components/ui/Badge';
 import { Button, IconButton } from '../components/ui/Button';
 import { CopyButton } from '../components/ui/CopyButton';
@@ -553,6 +554,7 @@ export function ProcessesPage() {
   const [serviceBusy, setServiceBusy] = useState<ServiceAction | null>(null);
   const [serviceGuidance, setServiceGuidance] = useState<ServiceGuidance | null>(null);
   const [view, setView] = useState<ProcessView>(readStoredView);
+  const [installOpen, setInstallOpen] = useState(false);
 
   const changeView = (next: ProcessView) => {
     setView(next);
@@ -988,26 +990,29 @@ export function ProcessesPage() {
                     </InlineAlert>
                   )}
 
-                  <details className="rounded-md border border-line bg-canvas/40 px-3.5 py-3">
-                    <summary className="cursor-pointer select-none text-xs font-medium text-ink">
-                      Install or repair the service
-                    </summary>
-                    <div className="mt-3 space-y-2.5">
-                      <InstallCommand
-                        command={serviceView.installCommand}
-                        guidance={serviceView.installGuidance}
-                      />
-                      <p className="text-2xs text-faint">
-                        The command is run in a terminal, not from this dashboard.{' '}
-                        {serviceView.startsAt === 'logon'
-                          ? 'It starts the service at logon.'
-                          : serviceView.startsAt === 'boot'
-                            ? 'It starts the service at boot.'
-                            : 'It sets the service up to start automatically.'}{' '}
-                        It never asks for an account password.
-                      </p>
-                    </div>
-                  </details>
+                  <Collapsible
+                    id="service-install"
+                    title="Install or repair the service"
+                    open={installOpen}
+                    onOpenChange={setInstallOpen}
+                    className="rounded-md border border-line bg-canvas/40"
+                    headerClassName="px-3.5 py-3"
+                    contentClassName="space-y-2.5 px-3.5 pb-3"
+                  >
+                    <InstallCommand
+                      command={serviceView.installCommand}
+                      guidance={serviceView.installGuidance}
+                    />
+                    <p className="text-2xs text-faint">
+                      The command is run in a terminal, not from this dashboard.{' '}
+                      {serviceView.startsAt === 'logon'
+                        ? 'It starts the service at logon.'
+                        : serviceView.startsAt === 'boot'
+                          ? 'It starts the service at boot.'
+                          : 'It sets the service up to start automatically.'}{' '}
+                      It never asks for an account password.
+                    </p>
+                  </Collapsible>
                 </>
               )}
             </CardBody>

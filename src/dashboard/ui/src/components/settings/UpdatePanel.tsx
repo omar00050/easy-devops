@@ -8,6 +8,7 @@ import { useConfirm, useResource } from '../../hooks/useResource';
 import { Card, CardBody, CardFooter, CardHeader } from '../ui/Card';
 import { Badge, type Tone } from '../ui/Badge';
 import { Button } from '../ui/Button';
+import { Collapsible } from '../ui/Collapsible';
 import {
   ErrorState,
   InlineAlert,
@@ -161,6 +162,7 @@ export function UpdatePanel() {
   const [run, setRun] = useState<UpdateRun | null>(null);
   const [starting, setStarting] = useState(false);
   const [catchingUp, setCatchingUp] = useState(false);
+  const [logOpen, setLogOpen] = useState(false);
   const finalised = useRef<string | null>(null);
   const reloadCheck = check.reload;
 
@@ -367,14 +369,18 @@ export function UpdatePanel() {
             </div>
             <RunResult run={run} />
             {run.logTail.length > 0 && (
-              <details className="text-xs text-muted">
-                <summary className="cursor-pointer select-none font-medium text-ink">
-                  Update log
-                </summary>
+              <Collapsible
+                id="update-log"
+                title="Update log"
+                open={logOpen}
+                onOpenChange={setLogOpen}
+                headerClassName="py-1"
+                contentClassName="pb-1"
+              >
                 <pre className="mt-2 max-h-48 overflow-auto rounded-sm bg-inset/70 px-3 py-2 font-mono text-2xs text-muted">
 {run.logTail.join('\n')}
                 </pre>
-              </details>
+              </Collapsible>
             )}
           </div>
         )}

@@ -380,12 +380,15 @@ recursively, over `*.conf` and `*.conf.disabled` files including the main
 
 - `200` `{ "deleted": "broken.example.com", "directory": "/etc/easy-devops/ssl/broken.example.com" }`.
 - `404` `{ "error": "Certificate '<domain>' not found" }` when the certificate
-  directory does not exist.
+  directory does not exist. The name is looked up among the direct children of
+  `sslDir` (unreadable and not-yet-issued directories included), never joined
+  from the URL, so a traversal name is simply not found (1.4.2).
 - `409` when a config still references the certificate; nothing is deleted:
   ```json
   {
     "error": "cert_in_use",
     "directory": "/etc/easy-devops/ssl/app.example.com",
+    "usedBy": ["app.example.com"],
     "references": [
       {
         "file": "/etc/nginx/conf.d/app.example.com.conf",
@@ -397,7 +400,10 @@ recursively, over `*.conf` and `*.conf.disabled` files including the main
   }
   ```
   Disable SSL on the referencing domain (or remove the lines) first; this is
-  what keeps a delete from leaving nginx pointing at missing files.
+  what keeps a delete from leaving nginx pointing at missing files. `usedBy`
+  (1.4.2) lists the enabled domains with SSL on whose certificate lives in that
+  directory; either a non-empty `usedBy` or any reference refuses the delete.
+  The Hub agent deletes through the same check (`core/cert-usage.js`).
 
 **Renewal behaviour (2.3.0).** `renew/:domain`, `renew-all`, the CLI, the Hub
 command and the background job all go through `renewCertificate()` in
@@ -1597,6 +1603,27 @@ and `404` for anyone else's id. See `hub_backend/ARCHITECTURE.md` ("Commands").
 through `command:progress` while they run; the frames use the stages and rules
 in §3.5. No command or payload field is added: the correlation key remains the
 existing `requestId`.
+
+A refused command (1.4.2) answers `ok: false` with the message in `error` and,
+for `hub:manageSSL` and `hub:manageDomain`, the handler's own result in
+`data` (it was always `null` before). A quick command's `422 AGENT_ERROR` body
+carries it as `data`, and the stored result keeps it:
+
+- `hub:manageSSL { action: "issue", domain, www? }` — the name must pass
+  `validateDomainName` and must not be a wildcard (DNS-01 is server-only).
+  Success data: `{ ok, domain, certPath, keyPath, mode, fellBack, nginxDownMs,
+  staging, summary, preflight }`. Failure data: `{ ok: false, domain,
+  error: { stage, cause, fix, consequence }, preflight }`, `preflight` being
+  `{ ok, detail, results: [{ id, status, message, fix? }], proxied }` or `null`.
+- `hub:manageSSL { action: "delete", domain }` — success `{ ok: true, domain,
+  deleted: true }`; refusals `{ code: "cert_in_use", domain, usedBy: [names],
+  references: [{ file: <basename>, line }] }`, `{ code: "cert_not_found" }` and
+  `{ code: "delete_failed" }`. Same rules as `DELETE /api/ssl/:domain`.
+- `hub:manageDomain { action: "create" | "update" }` — the dashboard's field
+  checks, then `{ code: "cert_missing", certPath, keyPath, hint }` when SSL is
+  on and either file is missing (blank paths resolve to `<sslDir>/<name>/`),
+  the same refusal as the dashboard's `422 cert_missing`. `update` ignores
+  `configFile`, `enabled` and `createdAt` from the payload.
 
 | Command | Payload | Permission |
 |---|---|---|
