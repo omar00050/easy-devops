@@ -29,7 +29,8 @@ import crypto from 'crypto';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
-import { getDataDir } from '../../core/platform.js';
+import { getDataDir, isWindows, isServerMode } from '../../core/platform.js';
+import { isElevated } from '../../core/service/windowsService.js';
 import { loadConfig } from '../../core/config.js';
 import { checkForUpdate, currentVersion } from '../../core/updater.js';
 import { detectInstallSource } from '../../core/installSource.js';
@@ -69,6 +70,26 @@ function spawnWorker({ args, logPath, dataDir }) {
 	}
 }
 
+/** The command and shell to name when this dashboard cannot run the update itself. */
+const ELEVATED_UPDATE = Object.freeze({ command: 'ezz update', shell: 'Administrator PowerShell' });
+
+/**
+ * Whether an update started from this dashboard would be refused for want of
+ * elevation.
+ *
+ * Windows Server mode keeps the service's runtime copy administrator-only on
+ * purpose, and a dashboard started from a normal terminal is not elevated —
+ * so the worker would stop at its first check. Saying so up front beats
+ * starting a run that can only fail. Elevation cannot change during this
+ * process's life, so it is asked of Windows once.
+ */
+let elevatedOnce = null;
+async function defaultElevationRequired() {
+	if (!isWindows || !isServerMode()) return false;
+	elevatedOnce ??= isElevated({}).catch(() => null);
+	return (await elevatedOnce) === false;
+}
+
 function describeSource(source) {
 	return {
 		kind: source.kind,
@@ -89,6 +110,13 @@ class UpdateController {
 		this.spawnWorker = deps.spawnWorker ?? spawnWorker;
 		this.runId = deps.runId ?? (() => `${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`);
 		this.now = deps.now ?? (() => Date.now());
+		this.elevationRequired = deps.elevationRequired ?? defaultElevationRequired;
+	}
+
+	/** `{ required, command, shell }` for the response, from elevationRequired(). */
+	async describeElevation() {
+		const required = await this.elevationRequired();
+		return required ? { required: true, ...ELEVATED_UPDATE } : { required: false, command: null, shell: null };
 	}
 
 	/**
@@ -105,6 +133,7 @@ class UpdateController {
 				reachable: check.reachable,
 				updateAvailable: check.updateAvailable,
 				source: describeSource(this.detectInstallSource()),
+				elevation: await this.describeElevation(),
 				run: describeRun(this.readStatus(dataDir)),
 			});
 		} catch {
@@ -144,6 +173,18 @@ class UpdateController {
 				res.status(409).json({
 					error: `This copy is ${source.reason}, so npm cannot update it in place.`,
 					source: describeSource(source),
+				});
+				return;
+			}
+
+			const elevation = await this.describeElevation();
+			if (elevation.required) {
+				res.status(403).json({
+					error: 'elevation_required',
+					message: 'Updating this server replaces the runtime copy the service runs, which only administrators '
+						+ 'can change. Run `ezz update` from PowerShell opened with "Run as administrator".',
+					command: elevation.command,
+					shell: elevation.shell,
 				});
 				return;
 			}

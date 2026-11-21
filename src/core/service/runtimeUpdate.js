@@ -48,7 +48,7 @@ import { run } from '../shell.js';
 import { isWindows, getDataDir, quoteExe } from '../platform.js';
 import { detectInstallSource } from '../installSource.js';
 import * as windowsPersonal from './windowsPersonal.js';
-import { canWriteProgramData } from './windowsService.js';
+import { canWriteProgramData, isElevated } from './windowsService.js';
 import {
   runtimeDir,
   runtimeNodePath,
@@ -682,6 +682,24 @@ export async function update({
 } = {}) {
   const mech = deps.mechanism ?? resolveMechanism();
   const service = deps.service ?? (await import('./index.js'));
+
+  // 0. Windows Server mode: the runtime folder is administrator-only on
+  // purpose. Asked of Windows before anything is installed or stopped — the
+  // write probe alone is not enough once the installing user may write the
+  // data directory around it.
+  if (isWindows && mech.mode === MODES.SERVER) {
+    const elevated = await (deps.isElevated ?? isElevated)({});
+    if (elevated === false) {
+      return {
+        ok: false,
+        step: 'elevation',
+        needsElevation: true,
+        untouched: true,
+        reason: 'Moving the service to another Node version replaces node.exe in an administrator-only folder. '
+          + 'Run `ezz runtime update` from PowerShell opened with "Run as administrator". No password is needed.',
+      };
+    }
+  }
 
   // 1. The target has to be installable and allowed.
   if (!target?.version) return { ok: false, step: 'target', reason: 'no target version was chosen' };

@@ -146,6 +146,7 @@ async function main() {
   const apps = await import(srcUrl('core/deploy/apps.js'));
   const store = await import(srcUrl('core/deploy/store.js'));
   const engine = await import(srcUrl('core/deploy/engine.js'));
+  const stages = await import(srcUrl('core/deploy/stages.js'));
   const hub = await import(srcUrl('core/deploy/hubCommands.js'));
   const { dbSet } = await import(srcUrl('core/db.js'));
 
@@ -524,10 +525,108 @@ async function main() {
         hubSaved.settings.steps[0].run === 'npm ci' && !('build' in hubStored) && !('install' in hubStored),
         Object.keys(hubStored).join());
     }
+    // ── 8. The canonical stage bar ──────────────────────────────────────────
+    setGroup('8. The canonical stage bar');
+    {
+      check('RUN_STAGES is the ordered bar and is frozen',
+        stages.RUN_STAGES.join(',') === 'fetch,settings,pre,install,build,migrate,start,health,post,finish'
+        && Object.isFrozen(stages.RUN_STAGES), stages.RUN_STAGES.join(','));
+
+      check('a canonical step is its own stage',
+        ['fetch', 'settings', 'pre', 'install', 'build', 'migrate', 'start', 'health', 'post', 'finish']
+          .every((id) => stages.stageForStep(id, null) === id));
+      check('done maps to done', stages.stageForStep('done', 'finish') === 'done');
+      check('a custom step continues an install/build/migrate stage',
+        stages.stageForStep('step 2', 'install') === 'install'
+        && stages.stageForStep('step 3', 'migrate') === 'migrate');
+      check('a custom step with nothing to continue counts as build',
+        stages.stageForStep('step 1', 'pre') === 'build'
+        && stages.stageForStep('step 2', null) === 'build'
+        && stages.stageForStep('step 4', 'start') === 'build');
+
+      const skipped = (settings) => stages.plannedSkippedStages(settings);
+      check('with pre and post hooks and install and build steps, only migrate is skipped',
+        skipped({
+          pre: ['echo pre'],
+          post: ['echo post'],
+          steps: [{ run: 'npm ci', kind: 'install', enabled: true }, { run: 'npm run build', kind: 'build', enabled: true }],
+        }).join(',') === 'migrate');
+      check('no pre or post hook and no migrate step gives pre, migrate, post',
+        skipped({
+          pre: [],
+          post: [],
+          steps: [{ run: 'a', kind: 'install' }, { run: 'b', kind: 'build' }],
+        }).join(',') === 'pre,migrate,post');
+      check('a disabled migrate step counts as skipped',
+        skipped({
+          pre: ['echo pre'],
+          post: ['echo post'],
+          steps: [
+            { run: 'a', kind: 'install' },
+            { run: 'b', kind: 'build' },
+            { run: 'c', kind: 'migrate', enabled: false },
+          ],
+        }).join(',') === 'migrate');
+      check('a custom step only uses build, so install and migrate are skipped',
+        skipped({
+          pre: ['echo pre'], post: ['echo post'], steps: [{ run: 'x', kind: 'custom' }],
+        }).join(',') === 'install,migrate');
+      check('a custom step after an install step keeps install used and build skipped',
+        skipped({
+          pre: ['echo pre'], post: ['echo post'],
+          steps: [{ run: 'a', kind: 'install' }, { run: 'b', kind: 'custom' }],
+        }).join(',') === 'build,migrate');
+      check('no steps at all skips all three command stages',
+        skipped({ pre: [], post: [], steps: [] }).join(',') === 'pre,install,build,migrate,post');
+    }
+
+    // ── 9. A run records its stage and skipped stages ───────────────────────
+    setGroup('9. A run records its stage and skipped stages');
+    {
+      register('stage-app');
+      git.setFiles(files('v1', {
+        ez: {
+          hooks: { pre: 'echo pre', post: 'echo post' },
+          steps: [
+            { run: 'npm ci', kind: 'install' },
+            { run: 'npm run build', kind: 'build' },
+          ],
+        },
+      }));
+
+      const first = await deploy('stage-app');
+      check('a successful run ends at stage done',
+        first.status === 'success' && first.step === 'done' && first.stage === 'done',
+        `${first.status} ${first.step} ${first.stage}`);
+      check('it records the stages it does not perform',
+        JSON.stringify(first.skippedStages) === JSON.stringify(['migrate']), JSON.stringify(first.skippedStages));
+      const stored = store.readRun('stage-app', first.id);
+      check('the record on disk carries both fields',
+        stored?.stage === 'done' && JSON.stringify(stored?.skippedStages) === JSON.stringify(['migrate']),
+        JSON.stringify({ stage: stored?.stage, skippedStages: stored?.skippedStages }));
+
+      git.setFiles(files('v2', {
+        ez: {
+          hooks: { pre: 'echo pre', post: 'echo post' },
+          steps: [
+            { run: 'npm ci', kind: 'install' },
+            { run: 'npm run build', kind: 'build' },
+          ],
+        },
+      }));
+      commands.fail('npm run build', 'deliberate build failure');
+
+      const failed = await deploy('stage-app');
+      check('a failed build records stage build',
+        failed.status === 'failed' && failed.step === 'build' && failed.stage === 'build',
+        `${failed.status} ${failed.step} ${failed.stage}`);
+      check('the failed run keeps the skipped stages it planned',
+        JSON.stringify(failed.skippedStages) === JSON.stringify(['migrate']), JSON.stringify(failed.skippedStages));
+      commands.clearFailures();
+    }
   } catch (err) {
     check('the suite completed without an unexpected error', false, err?.message ?? String(err));
   }
-
   // ─── Summary ────────────────────────────────────────────────────────────────
   const failed = results.filter((r) => !r.passed);
   process.stdout.write(`\n${'─'.repeat(62)}\n`);

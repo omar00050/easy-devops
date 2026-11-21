@@ -65,6 +65,7 @@ import {
   EZ_FILE_LOCATIONS, parseEzFile, resolveSettings, parseStartCommand,
 } from './ezfile.js';
 import { LAUNCHER_FILE, LAUNCHER_SOURCE, LAUNCHER_COMMAND_ENV } from './launcher.js';
+import { RUN_STAGES, plannedSkippedStages, stageForStep } from './stages.js';
 import {
   acquireLock, appPaths, ensureAppDirs, isId, listReleases, logFile, newReleaseId, pathsIn, pruneReleases, pruneRuns,
   readRun, readState, releaseDir, validateDeployDir, writeRun, writeState,
@@ -1002,6 +1003,10 @@ export function startDeployment(appId, { trigger = 'manual', ref = null, actor =
     releaseId: runId,
     status: RUN_STATUS.RUNNING,
     step: 'fetch',
+    /** The canonical stage `step` maps to (see stages.js), for the stage bar. */
+    stage: 'fetch',
+    /** Stages this run will not perform; filled in once the settings are read. */
+    skippedStages: [],
     startedAt: d.now(),
     finishedAt: null,
     error: null,
@@ -1041,6 +1046,8 @@ async function executeDeployment(app, run, d) {
 
   const setStep = (step, title) => {
     run.step = step;
+    // A custom step is "step N" in `step`; the stage it continues goes in `stage`.
+    run.stage = stageForStep(step, run.stage);
     writeRun(run);
     log.step(title);
   };
@@ -1152,6 +1159,11 @@ async function executeDeployment(app, run, d) {
     const env = appEnvironment(app, settings, run.releaseId);
     const strict = sources.healthPath !== 'default';
 
+    // Which stages this run will not perform is known as soon as the settings
+    // are, and the bar should show them as skipped from the start.
+    run.skippedStages = plannedSkippedStages(settings);
+    writeRun(run);
+
     // ── 3. pre → steps (install/build/migrate/custom) ───────────────────────
     await userCommands('pre', 'Pre-deploy hook', settings.pre, env);
     for (let i = 0; i < settings.steps.length; i++) {
@@ -1248,6 +1260,9 @@ async function executeDeployment(app, run, d) {
     const bootCrash = err?.bootCrash === true;
     run.error = err?.message ?? String(err);
     run.step = err?.step ?? run.step;
+    // The stage stays where the failure happened. A custom step is "step N",
+    // which has no stage of its own, so only a canonical step moves `stage`.
+    if (RUN_STAGES.includes(run.step)) run.stage = run.step;
     run.reason = err?.reason ?? null;
     log.line(`ERROR: ${run.error}`);
     run.status = RUN_STATUS.FAILED;
@@ -1315,7 +1330,10 @@ async function executeDeployment(app, run, d) {
   }
 
   run.finishedAt = d.now();
-  if (run.status !== RUN_STATUS.RUNNING) run.step = run.status === RUN_STATUS.SUCCESS ? 'done' : run.step;
+  if (run.status === RUN_STATUS.SUCCESS) {
+    run.step = 'done';
+    run.stage = stageForStep('done', run.stage);
+  }
   writeRun(run);
   try { pruneRuns(app.id); } catch { /* ignore */ }
   await notify(app, run, d);
@@ -1367,6 +1385,9 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
     releaseId: target,
     status: RUN_STATUS.RUNNING,
     step: 'start',
+    /** A rollback starts nothing and builds nothing: only start > health. */
+    stage: 'start',
+    skippedStages: ['fetch', 'settings', 'pre', 'install', 'build', 'migrate', 'post'],
     startedAt: d.now(),
     finishedAt: null,
     error: null,
@@ -1394,6 +1415,7 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
       if (!started.ok) throw new StepError('start', 'PM2 could not start that release.');
 
       run.step = 'health';
+      run.stage = stageForStep('health', run.stage);
       writeRun(run);
       log.step('Checking that the app is healthy');
       const health = await waitHealthy({
@@ -1407,12 +1429,14 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
       await d.runner.save({ run: d.run, pm2Path });
       run.status = RUN_STATUS.SUCCESS;
       run.step = 'done';
+      run.stage = stageForStep('done', run.stage);
       log.line('Rollback succeeded.');
     } catch (err) {
       run.status = RUN_STATUS.FAILED;
       run.error = err?.message ?? String(err);
       run.reason = err?.reason ?? null;
       run.step = err?.step ?? run.step;
+      if (RUN_STAGES.includes(run.step)) run.stage = run.step;
       log.line(`ERROR: ${run.error}`);
 
       // Put back what was running, so a failed rollback is not also an outage.

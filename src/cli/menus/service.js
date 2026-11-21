@@ -17,10 +17,11 @@ import chalk from 'chalk';
 import inquirer from 'inquirer';
 import ora from 'ora';
 
-import { isWindows, isDevDataDir, getDataDir } from '../../core/platform.js';
+import { isWindows, isDevDataDir, getDataDir, isServerMode } from '../../core/platform.js';
 import * as service from '../../core/service/index.js';
 import { describeLegacy } from '../../core/service/legacy.js';
 import { page, pause } from '../ui/page.js';
+import { requireElevation, offerRelaunchFor } from '../elevation.js';
 
 const ACTIONS = ['install', 'uninstall', 'status', 'start', 'stop', 'restart', 'logs', 'repair'];
 
@@ -187,6 +188,18 @@ export async function showStatus() {
   console.log(`  Data directory ${chalk.gray(s.dataDir)}${s.serverMode ? chalk.gray('  (server mode)') : ''}`);
   console.log(`  Dashboard UI   ${chalk.gray(s.dashboardUi ?? 'unknown')}`);
 
+  // Server mode: who may start/stop it and use the data without elevation.
+  if (s.mode === service.MODES.SERVER && s.service.installed) {
+    const op = s.operator;
+    if (!op) {
+      console.log(`  Without admin  ${dot(false)} nobody ${chalk.gray('(ezz service repair as administrator allows your account)')}`);
+    } else {
+      const rights = [op.serviceControl && 'start/stop/restart', op.dataDir && 'data'].filter(Boolean).join(', ') || 'nothing';
+      console.log(`  Without admin  ${dot(op.serviceControl && op.dataDir)} ${op.name ?? op.sid}: ${rights}`
+        + chalk.gray(op.verified ? '  (checked on the service)' : ''));
+    }
+  }
+
   // Runtime: the service's pinned Node next to the one in this shell.
   const rt = s.runtime;
   console.log();
@@ -302,6 +315,13 @@ async function doInstall() {
         ],
       }]);
       mode = chosen;
+    }
+
+    // Before anything else is asked or changed: Server mode registers a
+    // service and writes under ProgramData, and a normal terminal cannot.
+    if (mode === service.MODES.SERVER) {
+      const gate = await requireElevation({ args: ['service', 'install'], what: 'Installing in Server mode' });
+      if (!gate.proceed) return gate.code;
     }
 
     if (mode === service.MODES.SERVER) {
@@ -480,6 +500,12 @@ async function offerToStart() {
 
 async function doUninstall() {
   page(['Service', 'Uninstall']);
+
+  if (isWindows && isServerMode()) {
+    const gate = await requireElevation({ args: ['service', 'uninstall'], what: 'Removing the Windows service' });
+    if (!gate.proceed) return gate.code;
+  }
+
   const current = await service.status().catch(() => null);
 
   console.log();
@@ -663,6 +689,9 @@ async function doStop() {
 
   if (!result.ok) {
     console.log();
+    // An install from before 1.4.3 has no start/stop grant for this account.
+    const handed = await offerRelaunchFor(result, ['service', 'stop']);
+    if (handed !== null) return handed;
     console.log('  ' + chalk.red('Could not stop it.'));
     console.log(String(result.reason).split('\n').map((l) => `  ${l}`).join('\n'));
     console.log();
@@ -709,6 +738,8 @@ async function doStart() {
       console.log();
       return 0;
     }
+    const handed = await offerRelaunchFor(result, ['service', 'start']);
+    if (handed !== null) return handed;
     console.log('  ' + chalk.red('Could not start it.'));
     console.log(String(result.reason).split('\n').map((l) => `  ${l}`).join('\n'));
     if (result.needsElevation) {
@@ -743,6 +774,8 @@ async function doRestart() {
 
   if (!result.ok) {
     spinner.stop();
+    const handed = await offerRelaunchFor(result, ['service', 'restart']);
+    if (handed !== null) return handed;
     console.log();
     console.log('  ' + chalk.red('Restart failed.'));
     console.log(String(result.reason).split('\n').map((l) => `  ${l}`).join('\n'));
@@ -792,6 +825,11 @@ async function doRepair() {
   console.log('  ' + chalk.gray('─'.repeat(58)));
   console.log('  ' + chalk.gray('Re-pins the Node runtime, re-applies permissions, and restarts it.'));
   console.log();
+
+  if (isWindows && isServerMode()) {
+    const gate = await requireElevation({ args: ['service', 'repair'], what: 'Repairing the Windows service' });
+    if (!gate.proceed) return gate.code;
+  }
 
   const spinner = ora('Repairing…').start();
   const lines = [];

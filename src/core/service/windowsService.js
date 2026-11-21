@@ -41,6 +41,7 @@ import {
 } from './winsw.js';
 import { requiredGrants, applyGrants, revokeGrants, compareGrants } from './acl.js';
 import { runtimeDir, copyRuntime, verifyNativeModules } from './runtime.js';
+import { grantOperator, revokeOperator, readServiceSddl, operatorAceState, prepareProtectedDir } from './operator.js';
 
 /** Where the wrapper, its config and its logs live. Admin-writable only. */
 export function binDir() {
@@ -260,6 +261,7 @@ export async function install({
   dataDir,
   appRoot,
   config = {},
+  operator = null,
   log = () => {},
   run = shellRun,
   fetchImpl = fetch,
@@ -271,6 +273,17 @@ export async function install({
   const elevated = await (deps.isElevated ?? (() => isElevated({ run })))();
   if (elevated === false || !(deps.canWrite ?? canWriteProgramData)()) {
     return { ok: false, reason: elevationMessage(), needsElevation: true };
+  }
+
+  // ── 0. The folders the service runs code from, protected while empty ──────
+  //
+  // An earlier install may have left the installing user a grant on the data
+  // directory, which a new folder would inherit. See operator.js.
+  for (const dir of [runtimeDir(dataDir), binDir()]) {
+    const prepared = await (deps.prepareProtectedDir ?? prepareProtectedDir)({
+      dir, sid: operator?.sid ?? null, serviceAccount: false, run, log,
+    });
+    if (!prepared.ok) return { ok: false, reason: `${prepared.reason}. Nothing was registered.` };
   }
 
   // ── 1. The pinned runtime ────────────────────────────────────────────────
@@ -388,6 +401,20 @@ export async function install({
     }
   }
 
+  // ── 6b. The installing user: start/stop, and the data directory ─────────
+  //
+  // Before the first start, so the service never runs from a runtime folder
+  // that is not yet administrator-only. See operator.js.
+  log('Allowing your account to start and stop the service without elevation…');
+  const operatorGrant = await (deps.grantOperator ?? grantOperator)({
+    operator,
+    dataDir,
+    protectedDirs: [binDir(), runtimeDir(dataDir)],
+    run,
+    log,
+  });
+  for (const note of operatorGrant.notes) log(`  note: ${note}`);
+
   // ── 7. Start ─────────────────────────────────────────────────────────────
   log('Starting the service…');
   const started = await run(`& "${winswPath()}" start`, { timeout: 60_000 });
@@ -402,6 +429,7 @@ export async function install({
       // status must not report a registered service as "not installed".
       granted: acl.applied.map((g) => g.path),
       aclFailures: acl.failed,
+      operator: operatorGrant.record,
       runtime: { nodeExe: runtime.nodeExe, entry: runtime.entry, version: native.version, abi: native.abi },
     };
   }
@@ -410,6 +438,8 @@ export async function install({
     ok: true,
     granted: acl.applied.map((g) => g.path),
     aclFailures: acl.failed,
+    operator: operatorGrant.record,
+    operatorNotes: operatorGrant.notes,
     runtime: { nodeExe: runtime.nodeExe, entry: runtime.entry, version: native.version, abi: native.abi },
   };
 }
@@ -422,7 +452,7 @@ export async function install({
  * uninstall flow (decision 5), because the ProgramData directory holds the
  * live data and silently relocating it would be a surprise.
  */
-export async function uninstall({ dataDir, config = {}, log = () => {}, run = shellRun } = {}) {
+export async function uninstall({ dataDir, config = {}, operator = null, log = () => {}, run = shellRun } = {}) {
   if (!isWindows) return { ok: false, reason: 'Server mode is Windows-only' };
 
   if ((await isElevated({ run })) === false || !canWriteProgramData()) {
@@ -462,23 +492,36 @@ export async function uninstall({ dataDir, config = {}, log = () => {}, run = sh
     for (const failure of revoked.failed) notes.push(`could not clear grants on ${failure.path}`);
   }
 
+  // The installing user's data directory access. Its start/stop right was an
+  // entry on the service's own DACL, and went with the service.
+  const operatorRevoked = await revokeOperator({ operator, dataDir, run, log });
+  if (!operatorRevoked.ok) notes.push(`could not remove your account's data directory access: ${operatorRevoked.reason}`);
+
   return { ok: true, notes };
 }
 
-/** `winsw restart`. Calls the wrapper, so it needs elevation like install. */
-export async function restart({ run = shellRun } = {}) {
-  if (!fs.existsSync(winswPath())) {
-    return { ok: false, reason: 'the service is not installed' };
+/**
+ * `sc.exe stop`, then `sc.exe start`.
+ *
+ * Not `winsw restart`: the Service Control Manager's own verbs are what the
+ * installing user is allowed to call without elevation (operator.js), and
+ * "Access is denied" from them is the authoritative answer when they are not.
+ * Nothing is pre-checked here, so an allowed user is never told to elevate.
+ */
+export async function restart({ run = shellRun, stopWaitMs = 30_000 } = {}) {
+  const stopped = await stop({ run, stopWaitMs });
+  if (!stopped.ok) {
+    return stopped.needsElevation
+      ? { ok: false, needsElevation: true, reason: elevationFor('Restarting') }
+      : { ok: false, reason: stopped.reason };
   }
-  const elevated = await isElevated({ run });
-  if (elevated === false) {
-    return { ok: false, needsElevation: true, reason: elevationFor('Restarting') };
+  const started = await start({ run });
+  if (!started.ok) {
+    return started.needsElevation
+      ? { ok: false, needsElevation: true, reason: elevationFor('Restarting') }
+      : { ok: false, reason: started.reason };
   }
-  const result = await run(`& "${winswPath()}" restart`, { timeout: 90_000 });
-  return {
-    ok: result.success,
-    reason: result.success ? null : `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 400),
-  };
+  return { ok: true };
 }
 
 /**
@@ -524,10 +567,11 @@ export async function waitForState({ wanted, run = shellRun, timeoutMs = 30_000,
 function elevationFor(action) {
   // "Stopping" → `ezz service stop`. It used to print `ezz service stopping`.
   const verb = { Stopping: 'stop', Starting: 'start', Restarting: 'restart' }[action] ?? action.toLowerCase();
-  return `${action} the Windows service needs an Administrator terminal.\n\n`
-    + '  Open PowerShell with "Run as administrator" and run the command again:\n'
+  return `${action} the Windows service was refused for this account.\n\n`
+    + '  Run it from PowerShell opened with "Run as administrator":\n'
     + `    ezz service ${verb}\n\n`
-    + '  No password is needed — only elevation.';
+    + '  To let your account start, stop and restart it without elevation, run\n'
+    + '  `ezz service repair` once as administrator. No password is needed — only elevation.';
 }
 
 /**
@@ -695,7 +739,7 @@ export function countRecentRestarts({ windowMs = 10 * 60_000, now = Date.now(), 
  * @param {Object} [opts]
  * @returns {Promise<Object>}
  */
-export async function status({ dataDir, config = {}, run = shellRun, granted = [] } = {}) {
+export async function status({ dataDir, config = {}, run = shellRun, granted = [], operatorSid = null } = {}) {
   const filesPresent = fs.existsSync(winswPath()) && fs.existsSync(serviceXmlPath());
 
   // Windows is the authority on whether the service exists — not the files.
@@ -726,7 +770,10 @@ export async function status({ dataDir, config = {}, run = shellRun, granted = [
     };
   }
 
-  const config2 = await run(`${WINDOWS_SC} qc ${SERVICE_ID}`, { timeout: 20_000 });
+  const [config2, sddl] = await Promise.all([
+    run(`${WINDOWS_SC} qc ${SERVICE_ID}`, { timeout: 20_000 }),
+    operatorSid ? readServiceSddl({ run }) : Promise.resolve(null),
+  ]);
   const startType = `${config2.stdout ?? ''}`.match(/START_TYPE\s*:\s*\d+\s+([\w_]+)/i)?.[1] ?? null;
 
   const loop = countRecentRestarts();
@@ -760,6 +807,10 @@ export async function status({ dataDir, config = {}, run = shellRun, granted = [
     crashLooping: loop.crashLooping,
     crashLoopSince: loop.since,
     acl: aclCheck,
+    // Whether the recorded installing user may still start and stop it — read
+    // from the service's DACL, not from the record. null: nobody recorded, or
+    // the DACL could not be read.
+    operatorControl: operatorSid && sddl ? operatorAceState(sddl, operatorSid) : null,
     winswPath: winswPath(),
     logs: { out: outLogPath(), err: errLogPath(), wrapper: wrapperLogPath() },
   };
@@ -797,6 +848,7 @@ export async function repair({
   dataDir,
   appRoot,
   config = {},
+  operator = null,
   log = () => {},
   run = shellRun,
   waitForStart = async () => ({ alive: true }),
@@ -883,6 +935,13 @@ export async function repair({
     };
   }
 
+  // The new folder is protected while it is still empty, before anything the
+  // service will run is copied into it.
+  const prepared = await (deps.prepareProtectedDir ?? prepareProtectedDir)({
+    dir, sid: operator?.sid ?? null, run, log,
+  });
+  if (!prepared.ok) return restorePrevious(`the new runtime folder could not be protected: ${prepared.reason}`);
+
   log('Refreshing the runtime copy…');
   const runtime = (deps.copyRuntime ?? copyRuntime)({ dataDir, appRoot, log });
   if (!runtime.ok) return restorePrevious(`the new runtime copy failed: ${runtime.reason}`);
@@ -904,6 +963,18 @@ export async function repair({
   });
   const acl = await applyGrants({ grants, run, log });
 
+  // The fresh runtime folder inherits again, so it is protected again before
+  // the service starts on it; then the installing user's rights are renewed.
+  log('Allowing your account to start and stop the service without elevation…');
+  const operatorGrant = await (deps.grantOperator ?? grantOperator)({
+    operator,
+    dataDir,
+    protectedDirs: [binDir(), dir],
+    run,
+    log,
+  });
+  for (const note of operatorGrant.notes) log(`  note: ${note}`);
+
   log('Starting the service…');
   const started = await startAgain();
   if (!started.ok) return restorePrevious(`the service did not come up on the new copy: ${started.reason}`);
@@ -914,6 +985,8 @@ export async function repair({
     ok: true,
     granted: acl.applied.map((g) => g.path),
     aclFailures: acl.failed,
+    operator: operatorGrant.record,
+    operatorNotes: operatorGrant.notes,
     runtime: { version: native.version, abi: native.abi },
   };
 }

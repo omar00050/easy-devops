@@ -1,6 +1,6 @@
 {
   "name": "easy-devops",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "A unified DevOps management tool with CLI and web dashboard for managing Nginx, SSL certificates, deployment apps, and Node.js on Linux and Windows servers.",
   "keywords": [
     "devops",
@@ -29,7 +29,7 @@
   "bugs": {
     "url": "https://github.com/omar00050/Easy-DevOps/issues"
   },
-  "homepage": "https://github.com/omar00050/Easy-DevOps#readme",
+  "homepage": "https://easy-devops.devxor.team",
   "type": "module",
   "main": "src/cli/index.js",
   "bin": {

@@ -56,6 +56,7 @@ import * as windowsPersonal from './windowsPersonal.js';
 import * as legacy from './legacy.js';
 import { enableServerMode, disableServerMode, describeOriginal } from './dataDir.js';
 import { linkRuntime, inspectRuntime, runtimeNodePath } from './runtime.js';
+import { resolveOperator } from './operator.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -477,10 +478,16 @@ async function installWindowsServer({ entry, root, log, legacyResult, deps = {} 
 
   const config = loadConfig();
 
+  // Who may start and stop the service afterwards without elevation: the
+  // account that asked for the install (operator.js). Resolved here, in the
+  // elevated process, from Windows itself or from the relaunch that started it.
+  const operator = await (deps.resolveOperator ?? resolveOperator)({});
+
   const installed = await ws.install({
     dataDir,
     appRoot: root,
     config,
+    operator,
     log,
     ...(deps.windowsServiceOpts ?? {}),
   });
@@ -497,6 +504,7 @@ async function installWindowsServer({ entry, root, log, legacyResult, deps = {} 
       entry: installed.runtime?.entry ?? entry,
       dataDir,
       granted: installed.granted ?? [],
+      operator: installed.operator ?? null,
     });
   }
 
@@ -668,9 +676,14 @@ export async function uninstall({
     if (!removed.ok) return { ok: false, ...result, reason: removed.reason };
   } else if (mech.mode === MODES.SERVER) {
     const config = loadConfig();
+    const operator = (dbGet(STATE_KEY) ?? {}).operator ?? null;
     const removed = await (deps.windowsService ?? windowsService).uninstall({
       dataDir: getDataDir(),
       config,
+      // The start/stop right goes with the service. The data directory grant
+      // is removed only when the data leaves ProgramData: while the CLI keeps
+      // using it there, removing it would bring back the read-only database.
+      operator: keepServerDataLocation ? null : operator,
       log,
       ...(deps.windowsServiceOpts ?? {}),
     });
@@ -685,6 +698,12 @@ export async function uninstall({
         + 'the dashboard keep reading it. Run `ezz service uninstall` again and choose to move it '
         + 'back if you change your mind.',
       );
+      if (operator?.dataDir) {
+        result.notes.push(
+          `${operator.name ?? 'Your account'} keeps write access to ${programDataDir()} so the CLI can still use it; `
+          + 'it is removed when the data is moved back or purged.',
+        );
+      }
       result.dataDir = programDataDir();
     } else {
       log('Moving the data back to %APPDATA%…');
@@ -722,7 +741,12 @@ export async function uninstall({
   }
 
   const existing = dbGet(STATE_KEY) ?? {};
-  dbSet(STATE_KEY, { ...existing, mode: null, mechanism: null, uninstalledAt: new Date().toISOString() });
+  const keptOperator = mech.mode === MODES.SERVER && keepServerDataLocation && existing.operator?.dataDir
+    ? { ...existing.operator, serviceControl: false }
+    : null;
+  dbSet(STATE_KEY, {
+    ...existing, mode: null, mechanism: null, operator: keptOperator, uninstalledAt: new Date().toISOString(),
+  });
 
   return { ok: true, ...result };
 }
@@ -925,7 +949,7 @@ export async function restart({ log = () => {}, deps = {} } = {}) {
     if (!result.ok) return { ok: false, reason: result.reason };
   } else {
     const result = await (deps.windowsService ?? windowsService).restart(deps.windowsServiceOpts ?? {});
-    if (!result.ok) return { ok: false, reason: result.reason };
+    if (!result.ok) return { ok: false, reason: result.reason, needsElevation: result.needsElevation ?? false };
   }
 
   // A restart also ends a deliberate stop: the service is running again, so
@@ -1049,6 +1073,7 @@ export async function status({ cache = false, coldWaitMs, deps = {} } = {}) {
         dataDir,
         config,
         granted: recorded.granted ?? [],
+        operatorSid: recorded.operator?.sid ?? null,
         ...(deps.windowsServiceOpts ?? {}),
       });
     }
@@ -1087,6 +1112,36 @@ export async function status({ cache = false, coldWaitMs, deps = {} } = {}) {
 
   if (isWindows && mech.mode === MODES.SERVER && out.service.acl && !out.service.acl.ok) {
     out.warnings.push(out.service.acl.reason);
+  }
+
+  // Who may start and stop it without elevation. The record says who it was
+  // granted to; the service's DACL (read by the probe) says whether it still is.
+  if (isWindows && mech.mode === MODES.SERVER) {
+    const op = recorded.operator ?? null;
+    const control = out.service.operatorControl ?? null;
+    out.operator = op
+      ? {
+        name: op.name ?? null,
+        sid: op.sid,
+        serviceControl: control ? control.granted : Boolean(op.serviceControl),
+        dataDir: Boolean(op.dataDir),
+        grantedAt: op.grantedAt ?? null,
+        verified: Boolean(control),
+      }
+      : null;
+
+    if (out.service.installed && (!op || !op.dataDir || (control && !control.granted))) {
+      out.warnings.push(
+        'Starting and stopping the service, and writing its data, need an Administrator terminal for your '
+        + 'account. Run `ezz service repair` once from an Administrator PowerShell to allow it without elevation.',
+      );
+    }
+    if (control?.excessive) {
+      out.warnings.push(
+        `The service permissions give ${op?.name ?? op?.sid} more than start, stop and query. `
+        + 'Run `ezz service repair` from an Administrator PowerShell to reset them.',
+      );
+    }
   }
   if (isWindows && mech.mode !== MODES.SERVER) {
     out.warnings.push(...(out.service.warnings ?? []));
@@ -1247,6 +1302,8 @@ export async function repair({ log = () => {}, deps = {} } = {}) {
       dataDir,
       appRoot: appRoot(),
       config: loadConfig(),
+      // Repair is how an install from before 1.4.3 gets these rights.
+      operator: await (deps.resolveOperator ?? resolveOperator)({}),
       log,
       // Repair restores the previous runtime if the daemon does not come up,
       // and "came up" means its heartbeat — not the service manager's word.
@@ -1259,7 +1316,12 @@ export async function repair({ log = () => {}, deps = {} } = {}) {
     });
     if (result.ok) {
       const existing = dbGet(STATE_KEY) ?? {};
-      dbSet(STATE_KEY, { ...existing, granted: result.granted ?? existing.granted ?? [], repairedAt: new Date().toISOString() });
+      dbSet(STATE_KEY, {
+        ...existing,
+        granted: result.granted ?? existing.granted ?? [],
+        operator: result.operator ?? existing.operator ?? null,
+        repairedAt: new Date().toISOString(),
+      });
     }
     return { ...result, mechanism: 'winsw' };
   }

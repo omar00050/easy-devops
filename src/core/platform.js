@@ -321,6 +321,68 @@ export function windowsElevationCheckCmd() {
 }
 
 /**
+ * Command that prints `<SID>|<DOMAIN\name>` for the account this process runs as.
+ *
+ * The SID is what an ACL or a service DACL is written against; the name is only
+ * for display. Asked of Windows rather than read from %USERNAME%, which a
+ * caller can set to anything.
+ * @returns {string}
+ */
+export function windowsCurrentUserCmd() {
+  return '$i = [Security.Principal.WindowsIdentity]::GetCurrent(); "$($i.User.Value)|$($i.Name)"';
+}
+
+/** A PowerShell single-quoted literal: the only escape inside is a doubled quote. */
+function psLiteral(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+/**
+ * Command that opens a NEW elevated PowerShell window running one CLI command.
+ *
+ * Windows has exactly one way to gain elevation, and it is a UAC prompt for a
+ * new process; a running process can never elevate itself. So the elevated
+ * copy is a separate window with its own console: it shows its own output,
+ * asks its own questions, and stays open at the end (`-NoExit`) so the result
+ * can be read. No password passes through here — UAC asks Windows, not us.
+ *
+ * The script for that window is passed as `-EncodedCommand` (UTF-16LE base64),
+ * so no argument is ever re-parsed by a shell on the way: every value inside it
+ * is a single-quoted PowerShell literal, and the outer command carries only
+ * base64. `env` is limited to names matching `EZ_[A-Z_]+` and values made of
+ * SID characters — it exists to tell the elevated copy who asked for it.
+ *
+ * @param {Object} opts
+ * @param {string} opts.execPath   node.exe of this process
+ * @param {string} opts.script     The CLI entry this process runs
+ * @param {string[]} opts.args     The same arguments, unchanged
+ * @param {string} opts.cwd
+ * @param {Object<string,string>} [opts.env]
+ * @returns {string}
+ */
+export function windowsElevatedRelaunchCmd({ execPath, script, args = [], cwd, env = {} }) {
+  const lines = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (!/^EZ_[A-Z_]+$/.test(name) || !/^[A-Za-z0-9-]+$/.test(String(value))) {
+      throw new Error(`refusing to pass ${name} to an elevated process`);
+    }
+    lines.push(`$env:${name} = ${psLiteral(value)}`);
+  }
+  lines.push(
+    `Set-Location -LiteralPath ${psLiteral(cwd)}`,
+    `& ${psLiteral(execPath)} ${[script, ...args].map(psLiteral).join(' ')}`,
+    '$ezExit = $LASTEXITCODE',
+    "Write-Host ''",
+    'Write-Host "Easy DevOps finished (exit code $ezExit). This window stays open; close it when you are done."',
+  );
+
+  const encoded = Buffer.from(lines.join('\n'), 'utf16le').toString('base64');
+  return 'try { Start-Process -FilePath powershell.exe -Verb RunAs -ErrorAction Stop '
+    + `-ArgumentList '-NoExit','-NoProfile','-EncodedCommand','${encoded}'; 'relaunched' } `
+    + "catch { 'relaunch-failed: ' + $_.Exception.Message; exit 1 }";
+}
+
+/**
  * The Service Control Manager's command-line tool, always with its extension.
  *
  * Commands run through PowerShell on Windows, and there `sc` is the built-in

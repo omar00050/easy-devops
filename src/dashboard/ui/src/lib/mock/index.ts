@@ -14,6 +14,8 @@
  *   service-elevation   signed in, lifecycle actions answer 403 + sudo command
  *   service-pending     signed in, the first /api/service read has unfinished
  *                       probes (pm2 null, runtime null); the next read resolves
+ *   update-elevation    signed in, an update is available but only an
+ *                       administrator can replace the files (403 on POST)
  *   login               signed out, password set
  *   setup               first run, no password yet
  *   setupcode           first run with a setup code (mock code: 123456)
@@ -70,6 +72,7 @@ import type {
   ServiceStatus,
   Settings,
   SslCreateInput,
+  UpdateElevation,
   UpdatePhase,
   UpdateRun,
   UpdateSource,
@@ -83,6 +86,7 @@ export type MockScenario =
   | 'service-not-installed'
   | 'service-elevation'
   | 'service-pending'
+  | 'update-elevation'
   | 'login'
   | 'setup'
   | 'setupcode'
@@ -96,6 +100,7 @@ const SCENARIOS: MockScenario[] = [
   'service-not-installed',
   'service-elevation',
   'service-pending',
+  'update-elevation',
   'login',
   'setup',
   'setupcode',
@@ -111,6 +116,7 @@ interface MockUpdateState {
   reachable: boolean;
   updateAvailable: boolean;
   source: UpdateSource;
+  elevation: UpdateElevation;
   run: UpdateRun | null;
 }
 
@@ -347,6 +353,10 @@ function createState(scenario: MockScenario): MockState {
         npmUpdatable: true,
         howToUpdate: [],
       },
+      elevation:
+        scenario === 'update-elevation'
+          ? { required: true, command: 'ezz update', shell: 'Administrator PowerShell' }
+          : { required: false, command: null, shell: null },
       run: null,
     },
     pendingDns: {},
@@ -1566,6 +1576,7 @@ function handle(
       reachable: s.update.reachable,
       updateAvailable: s.update.updateAvailable,
       source: s.update.source,
+      elevation: s.update.elevation ?? { required: false, command: null, shell: null },
       run: s.update.run,
     };
   }
@@ -1581,6 +1592,16 @@ function handle(
 
   if (path === '/update' && method === 'POST') {
     advanceUpdateRun(s);
+    // The real server checks this before the source or a running run: the
+    // worker would refuse at its first file write anyway.
+    if (s.update.elevation?.required) {
+      fail(403, 'elevation_required', {
+        message:
+          'This server runs Easy DevOps as a Windows service in Server mode, so the files this dashboard runs from can only be replaced by an administrator.',
+        command: s.update.elevation.command,
+        shell: s.update.elevation.shell,
+      });
+    }
     if (!s.update.source.npmUpdatable) {
       fail(409, `This copy is ${s.update.source.reason}, so npm cannot update it in place.`, {
         source: s.update.source,

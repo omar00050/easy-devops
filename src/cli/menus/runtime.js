@@ -16,10 +16,11 @@ import chalk from 'chalk';
 import inquirer from 'inquirer';
 import ora from 'ora';
 
-import { isWindows } from '../../core/platform.js';
+import { isWindows, isServerMode } from '../../core/platform.js';
 import * as runtimeUpdate from '../../core/service/runtimeUpdate.js';
 import * as service from '../../core/service/index.js';
 import { page, pause } from '../ui/page.js';
+import { requireElevation } from '../elevation.js';
 
 const ACTIONS = ['status', 'update'];
 
@@ -133,6 +134,16 @@ async function doUpdate({ yes = false } = {}) {
   // that people pipe. Moving the runtime is an operation, so it gets a page of
   // its own and its outcome is held until Enter (a no-op without a TTY).
   page(['Runtime', 'Update']);
+
+  // Server mode: the service's node.exe lives in an administrator-only folder.
+  // Asked before anything is read or offered, so a normal terminal changes nothing.
+  if (isWindows && isServerMode()) {
+    const gate = await requireElevation({
+      args: ['runtime', 'update', ...(yes ? ['--yes'] : [])],
+      what: 'Moving the service to another Node version',
+    });
+    if (!gate.proceed) return gate.code;
+  }
 
   const code = await runUpdate({ yes });
   await pause();

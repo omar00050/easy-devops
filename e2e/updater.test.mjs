@@ -223,6 +223,9 @@ async function testServerCopyRefresh() {
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.2.1',
       inspectLock: () => ({ lock: { version: '1.3.0' } }),
+      // Server mode refuses before stopping anything unless this process is
+      // elevated; this test is about the runtime copy, not the gate.
+      isElevated: async () => true,
       copyRuntime: (opts) => { copies.push(opts); return { ok: true, dir: 'runtime' }; },
     },
   });
@@ -243,6 +246,7 @@ async function testServerCopyRefresh() {
       service: serviceStub({ installed: true, mode: 'server' }),
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.2.1',
+      isElevated: async () => true,
       copyRuntime: () => ({ ok: false, reason: 'ProgramData is not writable' }),
     },
   });

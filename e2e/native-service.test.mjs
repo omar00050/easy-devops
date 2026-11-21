@@ -1735,7 +1735,14 @@ async function testWinswLeftoverUpgrade() {
     check('no download happened', fetched === false);
 
     const registerAt = run.calls.indexOf(register);
-    const aclAt = run.calls.findIndex((c) => /icacls /.test(c));
+    // The folders the service runs code from are protected BEFORE the
+    // registration: `NT SERVICE\EasyDevOps` does not exist yet, so the
+    // preparation leaves it out and install protects again once it does.
+    // Only the service-account grants therefore have to follow the register.
+    const prepareAt = run.calls.findIndex((c) => /icacls /.test(c) && /\/setowner /.test(c));
+    const aclAt = run.calls.findIndex((c) => /icacls /.test(c) && /\/grant "/.test(c));
+    check('the folders are protected before the service is registered',
+      prepareAt !== -1 && prepareAt < registerAt, `prepare ${prepareAt}, register ${registerAt}`);
     check('the ACL grant runs after the registration', aclAt > registerAt,
       `register ${registerAt}, acl ${aclAt}`);
     check('start is the last command',

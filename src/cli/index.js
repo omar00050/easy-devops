@@ -225,43 +225,101 @@ if (flags.has('new-ui') && !flags.has('classic-ui')) {
 
 // ─── Dispatch ─────────────────────────────────────────────────────────────────
 
-if (flags.has('dash')) {
-  const { runDashboard } = await import('./dash.js');
-  await runDashboard();
-} else if (command === 'system-info') {
-  const { systemInfo } = await import('./menu.js');
-  await systemInfo();
-  process.exit(0);
-} else if (command === 'daemon') {
-  // Runs in the foreground and never returns: the service managers that start
-  // it (WinSW, systemd, the Startup supervisor) all expect a process they can
-  // watch, and one that forks into the background looks to them like a crash.
-  const { runDaemon } = await import('../core/daemon/run.js');
-  process.exit(await runDaemon());
-} else if (command === 'service') {
-  const { serviceCommand } = await import('./menus/service.js');
-  process.exit(await serviceCommand(args[0] ?? 'status'));
-} else if (command === 'runtime') {
-  const { runtimeCommand } = await import('./menus/runtime.js');
-  process.exit(await runtimeCommand(args[0] ?? 'status', { yes: flags.has('yes') }));
-} else if (command === 'update') {
-  const { updateCommand } = await import('./menus/update.js');
-  process.exit(await updateCommand({ yes: flags.has('yes') }));
-} else if (command === 'hub') {
-  const { hubCommand } = await import('./menus/hub.js');
-  process.exit(await hubCommand(args[0] ?? 'status', args.slice(1), { yes: flags.has('yes') }));
-} else if (command === 'cleanup') {
-  const { cleanupCommand } = await import('./menus/cleanup.js');
-  process.exit(await cleanupCommand({ days: options.days, yes: flags.has('yes') }));
-} else if (command === 'uninstall') {
-  const { uninstallCommand } = await import('./menus/uninstall.js');
-  process.exit(await uninstallCommand({ purge: flags.has('purge'), yes: flags.has('yes') }));
-} else if (command === 'dashboard') {
-  const { dashboardCommand } = await import('./menus/dashboard.js');
-  process.exit(await dashboardCommand(args[0] ?? 'setup-code'));
-} else {
-  // Interactive menu: Ctrl+C simply quits.
-  process.on('SIGINT', () => process.exit(0));
-  const { run } = await import('./menu.js');
-  await run();
+/**
+ * A database this account cannot write is a permissions problem, not a crash.
+ *
+ * It is what a normal terminal met in Windows Server mode before 1.4.3: the
+ * data lives in C:\ProgramData\easy-devops, created by an elevated install,
+ * and every write failed with "SqliteError: attempt to write a readonly
+ * database" and a stack trace. Install and repair now give the installing
+ * account access; this says so for an install that has not been repaired yet.
+ *
+ * @returns {Promise<boolean>} true when the error was explained
+ */
+async function explainDatabaseError(err) {
+  const code = String(err?.code ?? '');
+  const readOnly = code === 'SQLITE_READONLY' || code.startsWith('SQLITE_READONLY_')
+    || /attempt to write a readonly database/i.test(String(err?.message ?? ''));
+  if (!readOnly) return false;
+
+  const { isWindows, isServerMode, getDataDir } = await import('../core/platform.js');
+  let dir = '(unknown)';
+  try { dir = getDataDir(); } catch { /* the message still helps */ }
+
+  const lines = ['', '  Easy DevOps cannot write its database with this account:', `    ${dir}`, ''];
+  if (isWindows && isServerMode()) {
+    lines.push(
+      '  In Windows Server mode the data is shared with the service. Run this once',
+      '  from PowerShell opened with "Run as administrator":',
+      '',
+      '    ezz service repair',
+      '',
+      '  It lets your account use the data, and start, stop and restart the service,',
+      '  without elevation from then on. No password is needed. Nothing was changed.',
+    );
+  } else {
+    lines.push(
+      '  Check that your account owns that folder and can write to it, then run the',
+      '  command again. Nothing was changed.',
+    );
+  }
+  process.stderr.write(`${lines.join('\n')}\n\n`);
+  return true;
+}
+
+// Errors thrown later, from callbacks the dispatch below does not await. Not
+// for the daemon or the dashboard: they own their crash handling (releasing
+// the lock and the jobs marker), and an exit from here would pre-empt it.
+if (command !== 'daemon' && !flags.has('dash')) {
+  process.on('uncaughtException', async (err) => {
+    if (await explainDatabaseError(err)) process.exit(1);
+    process.stderr.write(`${err?.stack ?? err}\n`);
+    process.exit(1);
+  });
+}
+
+try {
+  if (flags.has('dash')) {
+    const { runDashboard } = await import('./dash.js');
+    await runDashboard();
+  } else if (command === 'system-info') {
+    const { systemInfo } = await import('./menu.js');
+    await systemInfo();
+    process.exit(0);
+  } else if (command === 'daemon') {
+    // Runs in the foreground and never returns: the service managers that start
+    // it (WinSW, systemd, the Startup supervisor) all expect a process they can
+    // watch, and one that forks into the background looks to them like a crash.
+    const { runDaemon } = await import('../core/daemon/run.js');
+    process.exit(await runDaemon());
+  } else if (command === 'service') {
+    const { serviceCommand } = await import('./menus/service.js');
+    process.exit(await serviceCommand(args[0] ?? 'status'));
+  } else if (command === 'runtime') {
+    const { runtimeCommand } = await import('./menus/runtime.js');
+    process.exit(await runtimeCommand(args[0] ?? 'status', { yes: flags.has('yes') }));
+  } else if (command === 'update') {
+    const { updateCommand } = await import('./menus/update.js');
+    process.exit(await updateCommand({ yes: flags.has('yes') }));
+  } else if (command === 'hub') {
+    const { hubCommand } = await import('./menus/hub.js');
+    process.exit(await hubCommand(args[0] ?? 'status', args.slice(1), { yes: flags.has('yes') }));
+  } else if (command === 'cleanup') {
+    const { cleanupCommand } = await import('./menus/cleanup.js');
+    process.exit(await cleanupCommand({ days: options.days, yes: flags.has('yes') }));
+  } else if (command === 'uninstall') {
+    const { uninstallCommand } = await import('./menus/uninstall.js');
+    process.exit(await uninstallCommand({ purge: flags.has('purge'), yes: flags.has('yes') }));
+  } else if (command === 'dashboard') {
+    const { dashboardCommand } = await import('./menus/dashboard.js');
+    process.exit(await dashboardCommand(args[0] ?? 'setup-code'));
+  } else {
+    // Interactive menu: Ctrl+C simply quits.
+    process.on('SIGINT', () => process.exit(0));
+    const { run } = await import('./menu.js');
+    await run();
+  }
+} catch (err) {
+  if (!(await explainDatabaseError(err))) throw err;
+  process.exit(1);
 }

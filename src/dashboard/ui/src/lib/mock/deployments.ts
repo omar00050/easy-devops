@@ -40,8 +40,10 @@ interface MockApp extends DeployApp {
   releases: DeployRelease[];
 }
 
-const STEPS = ['fetch', 'settings', 'install', 'build', 'migrate', 'start', 'health', 'finish'] as const;
+const STEPS = ['fetch', 'settings', 'install', 'build', 'start', 'health', 'finish'] as const;
 const STEP_MS = 1100;
+/** A Node app with no pre/post hooks and no migrations. */
+const SKIPPED_STAGES = ['pre', 'migrate', 'post'];
 
 const STATELESS_WARNING =
   'Cluster mode runs several copies of the app; it must be stateless (no in-memory sessions, sockets, caches or schedulers that assume one process).';
@@ -87,6 +89,7 @@ function newDeployKey(appId: string, repoUrl: string): DeployKeyInfo {
 function finishedRun(appId: string, ageMs: number, status: DeployRun['status'], extra: Partial<DeployRun> = {}): DeployRun & { log: string } {
   const runId = id(ageMs);
   const startedAt = Date.now() - ageMs;
+  const step = extra.step ?? (status === 'success' ? 'done' : 'health');
   return {
     id: runId,
     appId,
@@ -96,7 +99,9 @@ function finishedRun(appId: string, ageMs: number, status: DeployRun['status'], 
     sha: sha(),
     releaseId: runId,
     status,
-    step: status === 'success' ? 'done' : 'health',
+    step,
+    stage: extra.stage ?? step,
+    skippedStages: extra.skippedStages ?? [],
     startedAt,
     finishedAt: startedAt + 42_000,
     error: null,
@@ -140,6 +145,8 @@ function seed(): { apps: MockApp[]; hook: DeployHook } {
     finishedRun('storefront-api', 2 * 86_400_000, 'success', { trigger: 'manual', actor: 'dashboard' }),
     finishedRun('storefront-api', 5 * 86_400_000, 'failed', {
       step: 'build',
+      stage: 'build',
+      skippedStages: SKIPPED_STAGES,
       error: 'Build failed: "npm run build" — exit code 1',
     }),
   ];
@@ -307,11 +314,13 @@ function tick(app: MockApp): void {
   const index = Math.floor((Date.now() - run.startedAt) / STEP_MS);
   const reached = Math.min(index, STEPS.length - 1);
   run.step = STEPS[reached];
+  run.stage = STEPS[reached];
   run.log = STEPS.slice(0, reached + 1).map((s) => `── ${s}\n${STEP_OUTPUT[s]}`).join('\n');
 
   if (index >= STEPS.length) {
     run.status = 'success';
     run.step = 'done';
+    run.stage = 'done';
     run.finishedAt = Date.now();
     if (run.trigger !== 'rollback') {
       app.releases = [
@@ -481,6 +490,8 @@ function startRun(app: MockApp, trigger: DeployRun['trigger'], releaseId?: strin
     releaseId: releaseId ?? runId,
     status: 'running',
     step: 'fetch',
+    stage: 'fetch',
+    skippedStages: [...SKIPPED_STAGES],
     startedAt: Date.now(),
     finishedAt: null,
     error: null,

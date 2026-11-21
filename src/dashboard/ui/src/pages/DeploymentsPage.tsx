@@ -14,7 +14,7 @@ import {
 import { api, ApiError } from '../lib/api';
 import type { DeployApp, DeploymentsResponse } from '../lib/types';
 import { formatBytes, formatUptime, pluralize, timeAgo, truncateMiddle } from '../lib/format';
-import { RUN_STATUS, modeSummary, processTone, shortSha, stepLabel } from '../lib/deployments';
+import { RUN_STATUS, modeSummary, processTone, runStageLabel, shortSha } from '../lib/deployments';
 import {
   useDocumentTitle,
   usePolling,
@@ -185,7 +185,7 @@ function AppRow({
       <div className="flex flex-wrap items-center gap-2 pl-7 lg:w-56 lg:shrink-0 lg:pl-0">
         {app.deploying ? (
           <Badge tone="info" dot>
-            {run?.status === 'running' ? stepLabel(run.step) : 'Deploying'}
+            {run?.status === 'running' ? runStageLabel(run) : 'Deploying'}
           </Badge>
         ) : status && run ? (
           <>

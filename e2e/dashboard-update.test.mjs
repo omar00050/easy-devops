@@ -81,6 +81,10 @@ async function makeController(dataDir, overrides = {}) {
       calls.spawns.push(options);
       return { pid: 4242 };
     },
+    // This suite is about the run record and the hand-off. Whether an update
+    // needs elevation is decided by the real Windows check, which must not run
+    // here; the elevation answers themselves are covered by service-operator.
+    elevationRequired: async () => false,
     ...overrides,
   });
   return { controller, calls };

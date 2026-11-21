@@ -62,8 +62,8 @@ function appFor(id, env = {}, token = null) {
   };
 }
 
-function makeRun(appId, runId, { status = 'running', step = 'build' } = {}) {
-  return {
+function makeRun(appId, runId, { status = 'running', step = 'build', stage = null, skippedStages = null } = {}) {
+  const run = {
     id: runId,
     appId,
     trigger: 'manual',
@@ -82,6 +82,10 @@ function makeRun(appId, runId, { status = 'running', step = 'build' } = {}) {
     logTail: [],
     rollbackSucceeded: null,
   };
+  // Left absent by default: that is the record an older agent still writes.
+  if (stage !== null) run.stage = stage;
+  if (skippedStages !== null) run.skippedStages = skippedStages;
+  return run;
 }
 
 /** Writes the app, its run record and its lock, and returns the lock. */
@@ -294,6 +298,97 @@ async function testPartialAndTruncatedLog() {
   }
 }
 
+async function testStageBar() {
+  setGroup('5. stage and skippedStages are carried, and a change emits');
+
+  const app = appFor('stage-progress-app');
+  hubLink.saveHubPermissions({ 'deploy.logs': false });
+
+  const runId = '20261118-120004-eeeeee';
+  const run = makeRun(app.id, runId, { step: 'settings', stage: 'settings', skippedStages: [] });
+  const lock = beginRun(app, run);
+
+  const events = [];
+  progress.startDeployProgress({
+    dataDir: TEST_DATA_DIR,
+    emit: (event, payload) => events.push({ event, payload }),
+    onAppsChanged: () => {},
+  });
+
+  try {
+    const first = await waitFor(() => events[0]);
+    check('the event carries the run\'s stage', first?.payload.stage === 'settings', String(first?.payload.stage));
+    check('and its skippedStages as an array',
+      Array.isArray(first?.payload.skippedStages) && first.payload.skippedStages.length === 0,
+      JSON.stringify(first?.payload.skippedStages));
+    check('steps still come from the record\'s single `step` field',
+      JSON.stringify(first?.payload.steps) === JSON.stringify([{ name: 'settings', status: 'running' }]),
+      JSON.stringify(first?.payload.steps));
+
+    // The engine writes skippedStages right after reading the settings, while
+    // `step` is still `settings`: only those fields change here.
+    await sleep(1_100);
+    run.skippedStages = ['migrate', 'post'];
+    store.writeRun(run, TEST_DATA_DIR);
+
+    const second = await waitFor(() => events.find((e) => (e.payload.skippedStages ?? []).includes('migrate')));
+    check('a change in skippedStages alone is a new event', Boolean(second), second ? 'seen' : 'no second event');
+    check('the new event still names the same stage and step',
+      second?.payload.stage === 'settings'
+        && JSON.stringify(second?.payload.steps) === JSON.stringify([{ name: 'settings', status: 'running' }]),
+      JSON.stringify({ stage: second?.payload.stage, steps: second?.payload.steps }));
+
+    run.status = 'success';
+    run.step = 'done';
+    run.stage = 'done';
+    run.finishedAt = Date.now();
+    store.writeRun(run, TEST_DATA_DIR);
+    lock.release();
+
+    const final = await waitFor(() => events.find((e) => e.payload.done === true));
+    check('the final event carries stage done and the same skippedStages',
+      final?.payload.stage === 'done'
+        && JSON.stringify(final?.payload.skippedStages) === JSON.stringify(['migrate', 'post']),
+      JSON.stringify({ stage: final?.payload.stage, skippedStages: final?.payload.skippedStages }));
+  } finally {
+    progress.stopDeployProgress();
+    lock.release();
+  }
+}
+
+async function testRecordWithoutStageFields() {
+  setGroup('6. a record with neither field is still reported');
+
+  const app = appFor('legacy-progress-app');
+  hubLink.saveHubPermissions({ 'deploy.logs': false });
+
+  const runId = '20261118-120005-ffffff';
+  const run = makeRun(app.id, runId, { step: 'build' });
+  const lock = beginRun(app, run);
+
+  const events = [];
+  progress.startDeployProgress({
+    dataDir: TEST_DATA_DIR,
+    emit: (event, payload) => events.push({ event, payload }),
+    onAppsChanged: () => {},
+  });
+
+  try {
+    const first = await waitFor(() => events[0]);
+    check('stage falls back to null', first?.payload.stage === null, JSON.stringify(first?.payload.stage));
+    check('skippedStages falls back to an empty array',
+      Array.isArray(first?.payload.skippedStages) && first.payload.skippedStages.length === 0,
+      JSON.stringify(first?.payload.skippedStages));
+    check('steps and status are unchanged by the fallback',
+      first?.payload.status === 'running'
+        && JSON.stringify(first?.payload.steps) === JSON.stringify([{ name: 'build', status: 'running' }]),
+      JSON.stringify({ status: first?.payload.status, steps: first?.payload.steps }));
+  } finally {
+    progress.stopDeployProgress();
+    lock.release();
+  }
+}
+
 async function main() {
   process.stdout.write('\nDeployment progress: files → agent → Hub\n');
   process.stdout.write(`data dir: ${TEST_DATA_DIR}\n`);
@@ -308,6 +403,8 @@ async function main() {
     await testLogsPermission();
     await testBatchLimits();
     await testPartialAndTruncatedLog();
+    await testStageBar();
+    await testRecordWithoutStageFields();
   } finally {
     progress.stopDeployProgress();
     try { db.closeDb(); } catch { /* already closed */ }

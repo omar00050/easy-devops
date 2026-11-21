@@ -7,6 +7,65 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [1.4.3] — 2026-11-20
+
+### Added
+
+- The dashboard's app detail now shows a running deployment the way the Hub
+  does: the real current stage ("Installing", not a generic "Building") and the
+  stage bar Fetch › Settings › Pre › Install › Build › Migrate › Start › Health
+  › Post › Finish, with done, current, failed and skipped stages, updated live.
+- A stage the app does not use — no pre or post hook, no install, build or
+  migrate step, or a disabled one — is shown as skipped, the same way in the
+  dashboard and the Hub. The run record now carries `stage` and
+  `skippedStages`, and `deploy:progress` sends both; older agents send neither
+  and the bar falls back to the run's step.
+- The dashboard's app detail has the Hub's Environment tab: variable names,
+  values hidden until shown, and Edit through the app's existing form.
+
+- Windows Server mode: commands that need administrator rights (`ezz update`,
+  `ezz runtime update`, `ezz service install`, `ezz service uninstall`,
+  `ezz service repair`, `ezz uninstall --purge`) check for them before
+  changing anything and ask "This needs administrator rights. Relaunch as
+  administrator? (Y/n)". Yes opens one elevated PowerShell window (one UAC
+  prompt, no password) running the same command with the same arguments; it
+  shows its own output and stays open at the end, and the original window
+  changes nothing. In a script or CI nothing is relaunched: the command to run
+  as administrator is printed and the exit code is 3.
+- Windows Server mode: the account that installed the service can start, stop
+  and restart it without administrator rights. Install and repair grant that
+  account — by SID, never Users or Everyone — start, stop and query on the
+  EasyDevOps service and nothing else, plus write access to
+  `C:\ProgramData\easy-devops`. `ezz service status` shows it on a "Without
+  admin" line. An existing install gets it from one `ezz service repair` run as
+  administrator.
+- Settings → Update on a Windows Server-mode install no longer starts an update
+  the dashboard cannot finish: it says to run `ezz update` from an
+  Administrator PowerShell, with a copy button.
+
+### Changed
+
+- Windows Server mode: the runtime and wrapper folders
+  (`C:\ProgramData\easy-devops\runtime` and `\bin`) no longer inherit the data
+  directory's permissions. They are administrator-only to change, with read and
+  execute for the service and for users, so nobody else can replace the
+  `node.exe` the service runs.
+- `ezz service restart` in Server mode uses the Service Control Manager's stop
+  and start instead of the wrapper's restart, so it works for the installing
+  account without elevation.
+
+### Fixed
+
+- A custom step no longer sends the stage bar back to Fetch, in the dashboard
+  and the Hub.
+- Windows Server mode: `ezz hub status`, domain changes and other commands from
+  a normal PowerShell crashed with "SqliteError: attempt to write a readonly
+  database". The installing account can now write the data, and a database
+  that cannot be written prints what to run (`ezz service repair` as
+  administrator) instead of a stack trace.
+- `ezz update` in Server mode checks for elevation before it stops the
+  dashboard or the service, so a normal terminal changes nothing.
+
 ## [1.4.2] — 2026-11-20
 
 ### Added

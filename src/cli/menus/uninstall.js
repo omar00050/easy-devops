@@ -14,11 +14,12 @@ import chalk from 'chalk';
 import inquirer from 'inquirer';
 import ora from 'ora';
 
-import { getDataDir } from '../../core/platform.js';
+import { getDataDir, isWindows, isServerMode } from '../../core/platform.js';
 import { loadConfig } from '../../core/config.js';
 import * as purgeCore from '../../core/purge.js';
 import { humanBytes } from '../../core/cleanup.js';
 import { page, pause } from '../ui/page.js';
+import { requireElevation } from '../elevation.js';
 
 /**
  * @param {Object} [opts]
@@ -57,6 +58,15 @@ async function runUninstall({ purge = false, yes = false } = {}) {
     console.log('  ' + chalk.gray('Nothing was changed.'));
     console.log();
     return 0;
+  }
+
+  // Server mode: purging removes a Windows service and ProgramData folders.
+  if (isWindows && isServerMode()) {
+    const gate = await requireElevation({
+      args: ['uninstall', '--purge', ...(yes ? ['--yes'] : [])],
+      what: 'Purging a Server-mode install',
+    });
+    if (!gate.proceed) return gate.code;
   }
 
   const dataDir = getDataDir();

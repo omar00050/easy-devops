@@ -9,6 +9,7 @@ import { Card, CardBody, CardFooter, CardHeader } from '../ui/Card';
 import { Badge, type Tone } from '../ui/Badge';
 import { Button } from '../ui/Button';
 import { Collapsible } from '../ui/Collapsible';
+import { CopyButton } from '../ui/CopyButton';
 import {
   ErrorState,
   InlineAlert,
@@ -56,6 +57,27 @@ function failureText(error: unknown, fallback: string): string {
 
 function isActive(phase: UpdatePhase | undefined): boolean {
   return phase !== undefined && ACTIVE_PHASES.includes(phase);
+}
+
+interface ElevationRefusal {
+  command: string;
+  shell: string | null;
+}
+
+/**
+ * A 403 `elevation_required` names the command that works instead. Returned
+ * as data so the card can show the same note a fresh GET would produce.
+ */
+function elevationRefusal(error: unknown): ElevationRefusal | null {
+  if (!(error instanceof ApiError) || error.status !== 403) return null;
+  if (error.payload.error !== 'elevation_required') return null;
+  return {
+    command:
+      typeof error.payload.command === 'string' && error.payload.command
+        ? error.payload.command
+        : 'ezz update',
+    shell: typeof error.payload.shell === 'string' ? error.payload.shell : null,
+  };
 }
 
 function VersionFacts({ run }: { run: UpdateRun }) {
@@ -163,6 +185,8 @@ export function UpdatePanel() {
   const [starting, setStarting] = useState(false);
   const [catchingUp, setCatchingUp] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
+  // A POST refused for elevation tells an older page what the GET now says.
+  const [refusedElevation, setRefusedElevation] = useState<ElevationRefusal | null>(null);
   const finalised = useRef<string | null>(null);
   const reloadCheck = check.reload;
 
@@ -173,6 +197,9 @@ export function UpdatePanel() {
     // A run from a previous visit stays visible until the page is reloaded;
     // only the first load adopts it.
     setRun((existing) => existing ?? data.run);
+    // The 403 note is local knowledge; a server that no longer needs elevation
+    // (the dashboard was restarted as an administrator) clears it.
+    if (data.elevation?.required !== true) setRefusedElevation(null);
   }, [check.data]);
 
   const running = isActive(run?.phase);
@@ -236,6 +263,12 @@ export function UpdatePanel() {
       setRun(result.run);
       toast.success('Update started', 'The dashboard will stop for a moment and come back on its own.');
     } catch (error) {
+      const refusal = elevationRefusal(error);
+      if (refusal) {
+        setRefusedElevation(refusal);
+        check.reload();
+        return;
+      }
       toast.error(
         'Could not start the update',
         failureText(error, 'Nothing was changed.')
@@ -270,6 +303,14 @@ export function UpdatePanel() {
 
     const { source, latest, reachable, updateAvailable } = check.data;
     const activeRun = running && run;
+    const elevation = check.data.elevation;
+    const elevationRequired = elevation?.required === true || refusedElevation !== null;
+    const elevationCommand = refusedElevation?.command ?? elevation?.command ?? 'ezz update';
+    const elevationShell = refusedElevation?.shell ?? elevation?.shell ?? 'Administrator PowerShell';
+    const elevationTitle = elevationShell.startsWith('Administrator ')
+      ? `Update from an ${elevationShell}`
+      : `Update from ${elevationShell}`;
+    const needsElevation = elevationRequired && updateAvailable;
 
     return (
       <CardBody className="space-y-5">
@@ -305,6 +346,25 @@ export function UpdatePanel() {
             <pre className="mt-2 overflow-x-auto rounded-sm bg-inset/70 px-3 py-2 font-mono text-2xs text-ink">
 {source.howToUpdate.join('\n')}
             </pre>
+          </InlineAlert>
+        )}
+
+        {needsElevation && (
+          <InlineAlert tone="warning" title={elevationTitle}>
+            <p>
+              This server runs Easy DevOps as a Windows service in Server mode. Updating replaces
+              files only administrators can change, so the dashboard cannot do it.
+            </p>
+            <div className="mt-2 rounded-md border border-line bg-canvas p-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <code className="break-all font-mono text-xs text-ink">{elevationCommand}</code>
+                <CopyButton value={elevationCommand} label="Copy command" withText />
+              </div>
+            </div>
+            <p className="mt-2 text-2xs text-faint">
+              If you run it from a normal PowerShell, Easy DevOps offers to relaunch itself as
+              administrator (one Windows prompt, no password).
+            </p>
           </InlineAlert>
         )}
 
@@ -387,7 +447,7 @@ export function UpdatePanel() {
 
         {!activeRun && source.npmUpdatable && (
           <div className="flex flex-wrap items-center gap-3 border-t border-line pt-4">
-            {updateAvailable && latest ? (
+            {updateAvailable && latest && !needsElevation ? (
               <Button
                 variant="primary"
                 loading={starting}

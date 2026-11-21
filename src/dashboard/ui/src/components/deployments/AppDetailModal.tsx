@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { CheckCircle2, History, KeyRound, RotateCcw, ShieldAlert, Trash2, Wand2, XCircle } from 'lucide-react';
+import { CheckCircle2, Eye, EyeOff, History, KeyRound, RotateCcw, ShieldAlert, Trash2, Wand2, XCircle } from 'lucide-react';
 import { api, ApiError } from '../../lib/api';
 import type {
   DeployAppDetail,
@@ -20,9 +20,10 @@ import {
   modeSummary,
   rollbackOutcome,
   runDuration,
+  runStageLabel,
   runStepStates,
   shortSha,
-  stepLabel,
+  stageShortName,
 } from '../../lib/deployments';
 import { useConfirm, usePolling, useResource } from '../../hooks/useResource';
 import { Badge } from '../ui/Badge';
@@ -34,6 +35,7 @@ import { EmptyState, ErrorState, InlineAlert, Skeleton, Spinner } from '../ui/St
 import { Tabs, TabPanel } from '../ui/Tabs';
 import { useToast } from '../ui/Toast';
 import { DomainFolderTab, EzJsonTab } from './AppSetupTabs';
+import { AppFormModal } from './AppFormModal';
 import { DeployKeyPanel } from './DeployKeyPanel';
 
 function errorText(error: unknown, fallback: string): string {
@@ -43,45 +45,38 @@ function errorText(error: unknown, fallback: string): string {
 
 // ─── Activity: runs and their logs ────────────────────────────────────────────
 
-const STEP_SHORT: Record<string, string> = {
-  fetch: 'Fetch',
-  settings: 'Settings',
-  pre: 'Pre',
-  install: 'Install',
-  build: 'Build',
-  migrate: 'Migrate',
-  start: 'Start',
-  health: 'Health',
-  post: 'Post',
-  finish: 'Finish',
-};
-
 const STEP_STATE_STYLE = {
   done: 'border-ok/30 bg-ok-soft text-ok',
   active: 'border-accent/40 bg-accent-soft text-accent-text',
   failed: 'border-bad/30 bg-bad-soft text-bad',
   pending: 'border-line bg-inset/50 text-faint',
+  skipped: 'border-dashed border-line bg-transparent text-faint line-through decoration-faint/70',
 } as const;
 
-/** The contract's step chain, so migrate is a visible member of the run. */
+/** The contract's stage chain, including the stages this run does not use. */
 function RunSteps({ run }: { run: DeployRun }) {
   return (
-    <ol className="flex flex-wrap items-center gap-1" aria-label="Deployment steps">
-      {runStepStates(run).map(({ step, state }, index) => (
-        <li key={step} className="flex items-center gap-1">
-          {index > 0 && (
-            <span className="text-2xs text-faint" aria-hidden="true">
-              ›
+    <ol className="flex flex-wrap items-center gap-1" aria-label="Deployment stages">
+      {runStepStates(run).map(({ step, state }, index) => {
+        const short = stageShortName(step);
+        return (
+          <li key={step} className="flex items-center gap-1">
+            {index > 0 && (
+              <span className="text-2xs text-faint" aria-hidden="true">
+                ›
+              </span>
+            )}
+            <span
+              aria-current={state === 'active' ? 'step' : undefined}
+              aria-label={state === 'skipped' ? `${short}: skipped` : undefined}
+              title={state === 'skipped' ? `${short}: skipped` : undefined}
+              className={cn('rounded border px-1.5 py-0.5 text-2xs font-medium', STEP_STATE_STYLE[state])}
+            >
+              {short}
             </span>
-          )}
-          <span
-            aria-current={state === 'active' ? 'step' : undefined}
-            className={cn('rounded border px-1.5 py-0.5 text-2xs font-medium', STEP_STATE_STYLE[state])}
-          >
-            {STEP_SHORT[step] ?? stepLabel(step)}
-          </span>
-        </li>
-      ))}
+          </li>
+        );
+      })}
     </ol>
   );
 }
@@ -143,6 +138,11 @@ function RunLog({ appId, run }: { appId: string; run: DeployRun }) {
 
   return (
     <div className="space-y-2.5">
+      {running && (
+        <p className="text-sm font-medium text-ink" aria-live="polite">
+          {runStageLabel(current)}…
+        </p>
+      )}
       <RunSteps run={current} />
       {current.error && (
         <InlineAlert
@@ -150,7 +150,7 @@ function RunLog({ appId, run }: { appId: string; run: DeployRun }) {
           title={
             current.status === 'rolled_back'
               ? 'The new release was not healthy — the previous one is running again'
-              : `Failed while: ${stepLabel(current.step).toLowerCase()}`
+              : `Failed while: ${runStageLabel(current).toLowerCase()}`
           }
         >
           {current.error}
@@ -227,7 +227,7 @@ function ActivityTab({ app, initialRunId }: { app: DeployAppDetail; initialRunId
               >
                 <div className="flex items-center justify-between gap-2">
                   <Badge tone={status.tone} dot>
-                    {r.status === 'running' ? stepLabel(r.step) : status.label}
+                    {r.status === 'running' ? runStageLabel(r) : status.label}
                   </Badge>
                   <span className="font-mono text-2xs text-faint">{shortSha(r.sha)}</span>
                 </div>
@@ -719,6 +719,72 @@ function GithubTab({
   );
 }
 
+// ─── Environment ──────────────────────────────────────────────────────────────
+
+/** One variable: the name, the value (hidden until asked for) and its toggle. */
+function EnvRow({ name, value }: { name: string; value: string }) {
+  const [revealed, setRevealed] = useState(false);
+
+  return (
+    <li className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3.5 py-2.5">
+      <code className="min-w-0 flex-1 break-all font-mono text-xs font-semibold text-ink">{name}</code>
+      <code className={cn('min-w-0 break-all font-mono text-2xs', revealed ? 'text-muted' : 'text-faint')}>
+        {revealed ? value : '••••••••'}
+      </code>
+      <Button
+        size="sm"
+        variant="ghost"
+        icon={
+          revealed ? (
+            <EyeOff className="size-3.5" aria-hidden="true" />
+          ) : (
+            <Eye className="size-3.5" aria-hidden="true" />
+          )
+        }
+        aria-label={`${revealed ? 'Hide' : 'Show'} the value of ${name}`}
+        aria-pressed={revealed}
+        onClick={() => setRevealed((current) => !current)}
+      >
+        {revealed ? 'Hide' : 'Show'}
+      </Button>
+    </li>
+  );
+}
+
+function EnvironmentTab({ app, onEdit }: { app: DeployAppDetail; onEdit: () => void }) {
+  const names = Object.keys(app.env).sort((a, b) => a.localeCompare(b));
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h4 className="text-sm font-semibold text-ink">Environment variables</h4>
+          <p className="mt-0.5 text-xs text-muted">
+            Stored on this server only, and available to the build and the running app.
+          </p>
+        </div>
+        <Button
+          size="sm"
+          variant="secondary"
+          onClick={onEdit}
+          aria-label="Edit environment variables"
+        >
+          Edit
+        </Button>
+      </div>
+      {names.length === 0 ? (
+        <p className="text-sm text-muted">None set.</p>
+      ) : (
+        <ul className="divide-y divide-line rounded-md border border-line">
+          {names.map((name) => (
+            <EnvRow key={name} name={name} value={app.env[name]} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 // ─── The modal ────────────────────────────────────────────────────────────────
 
 export function AppDetailModal({
@@ -735,7 +801,7 @@ export function AppDetailModal({
   appId: string | null;
   hook: DeployHook;
   meta: DeploymentsResponse;
-  initialTab?: 'activity' | 'releases' | 'github' | 'setup' | 'ezjson';
+  initialTab?: 'activity' | 'releases' | 'github' | 'setup' | 'ezjson' | 'env';
   onClose: () => void;
   onConfigureHook: () => void;
   onChanged: () => void;
@@ -748,6 +814,8 @@ export function AppDetailModal({
   const [tab, setTab] = useState<string>(initialTab);
   const [acting, setActing] = useState(false);
   const [deletingRelease, setDeletingRelease] = useState<string | null>(null);
+  /** The Environment tab's Edit opens the app's existing edit form. */
+  const [editingEnv, setEditingEnv] = useState(false);
 
   const detail = useResource<DeployAppDetail>(
     (signal) => api.deployments.get(appId ?? '', signal),
@@ -757,14 +825,18 @@ export function AppDetailModal({
   const app = detail.data && detail.data.id === appId ? detail.data : null;
 
   useEffect(() => {
-    if (open) setTab(initialTab);
+    if (open) {
+      setTab(initialTab);
+      setEditingEnv(false);
+    }
   }, [open, appId, initialTab]);
 
-  // While a deployment runs, the run list (step, status) is changing. When
+  // While a deployment runs, the run list (stage, status) is changing. When
   // none is running, keep a slower watch: a deploy started elsewhere — a
   // GitHub Action, the Hub, the CLI — must appear here too.
-  usePolling(detail.reload, 2000, open && Boolean(app?.deploying));
-  usePolling(detail.reload, 8000, open && Boolean(app) && !app?.deploying);
+  const runActive = Boolean(app && (app.deploying || app.activeRunId));
+  usePolling(detail.reload, 2000, open && runActive);
+  usePolling(detail.reload, 8000, open && Boolean(app) && !runActive);
 
   const rollback = async (release: DeployRelease) => {
     if (!app || acting) return;
@@ -814,95 +886,119 @@ export function AppDetailModal({
   };
 
   return (
-    <Modal
-      open={open}
-      onClose={onClose}
-      size="xl"
-      title={
-        <span className="flex flex-wrap items-center gap-2.5">
-          <span className="font-mono">{appId}</span>
-          {app && modeSummary(app) && <Badge tone="neutral">{modeSummary(app)}</Badge>}
-          {app?.deploying && (
-            <Badge tone="info" dot>
-              Deploying
-            </Badge>
-          )}
-        </span>
-      }
-      description={app ? `${app.repoUrl} · ${app.branch}` : undefined}
-    >
-      {detail.error && !app ? (
-        <ErrorState error={detail.error} onRetry={detail.reload} />
-      ) : !app ? (
-        <div className="flex items-center gap-2.5 py-10 text-sm text-muted">
-          <Spinner /> Loading…
-        </div>
-      ) : (
-        <div className="space-y-4">
-          {app.warnings?.map((warning) => (
-            <InlineAlert key={warning} tone="warning">
-              {warning}
-            </InlineAlert>
-          ))}
-          <Tabs
-            ariaLabel="App sections"
-            value={tab}
-            onChange={setTab}
-            items={[
-              { id: 'activity', label: 'Deployments', count: app.runs.length },
-              { id: 'releases', label: 'Releases', count: app.releases.length },
-              { id: 'setup', label: 'Domain & folder' },
-              { id: 'github', label: 'GitHub Actions' },
-              { id: 'ezjson', label: 'ez.json' },
-            ]}
-          />
-          <TabPanel id="activity" value={tab}>
-            <ActivityTab app={app} initialRunId={app.activeRunId ?? null} />
-          </TabPanel>
-          <TabPanel id="releases" value={tab}>
-            <ReleasesTab
-              app={app}
-              onRollback={(r) => void rollback(r)}
-              onDelete={(r) => void removeRelease(r)}
-              deleting={deletingRelease}
-              busy={acting || Boolean(app.deploying)}
+    <>
+      <Modal
+        open={open}
+        onClose={onClose}
+        size="xl"
+        title={
+          <span className="flex flex-wrap items-center gap-2.5">
+            <span className="font-mono">{appId}</span>
+            {app && modeSummary(app) && <Badge tone="neutral">{modeSummary(app)}</Badge>}
+            {app?.deploying && (
+              <Badge tone="info" dot>
+                Deploying
+              </Badge>
+            )}
+          </span>
+        }
+        description={app ? `${app.repoUrl} · ${app.branch}` : undefined}
+      >
+        {detail.error && !app ? (
+          <ErrorState error={detail.error} onRetry={detail.reload} />
+        ) : !app ? (
+          <div className="flex items-center gap-2.5 py-10 text-sm text-muted">
+            <Spinner /> Loading…
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {app.warnings?.map((warning) => (
+              <InlineAlert key={warning} tone="warning">
+                {warning}
+              </InlineAlert>
+            ))}
+            <Tabs
+              ariaLabel="App sections"
+              value={tab}
+              onChange={setTab}
+              items={[
+                { id: 'activity', label: 'Deployments', count: app.runs.length },
+                { id: 'releases', label: 'Releases', count: app.releases.length },
+                { id: 'setup', label: 'Domain & folder' },
+                { id: 'env', label: 'Environment' },
+                { id: 'github', label: 'GitHub Actions' },
+                { id: 'ezjson', label: 'ez.json' },
+              ]}
             />
-          </TabPanel>
-          <TabPanel id="setup" value={tab}>
-            <DomainFolderTab
-              app={app}
-              meta={meta}
-              onChanged={() => {
-                detail.reload();
-                onChanged();
-              }}
-              onDelete={() => onDelete(app)}
-            />
-          </TabPanel>
-          <TabPanel id="ezjson" value={tab}>
-            <EzJsonTab app={app} locations={meta.ezFileLocations} />
-          </TabPanel>
-          <TabPanel id="github" value={tab}>
-            <GithubTab
-              app={app}
-              hook={hook}
-              onConfigureHook={onConfigureHook}
-              onChanged={() => {
-                detail.reload();
-                onChanged();
-              }}
-            />
-          </TabPanel>
-          {!hook.enabled && tab !== 'github' && app.hook.hasToken && (
-            <InlineAlert tone="warning" title="The deploy hook is switched off">
-              <span className="inline-flex items-center gap-1.5">
-                <ShieldAlert className="size-3.5" aria-hidden="true" />
-                This app has a deploy token, but nothing is listening for it.
-              </span>
-            </InlineAlert>
-          )}
-        </div>
+            <TabPanel id="activity" value={tab}>
+              <ActivityTab app={app} initialRunId={app.activeRunId ?? null} />
+            </TabPanel>
+            <TabPanel id="releases" value={tab}>
+              <ReleasesTab
+                app={app}
+                onRollback={(r) => void rollback(r)}
+                onDelete={(r) => void removeRelease(r)}
+                deleting={deletingRelease}
+                busy={acting || Boolean(app.deploying)}
+              />
+            </TabPanel>
+            <TabPanel id="setup" value={tab}>
+              <DomainFolderTab
+                app={app}
+                meta={meta}
+                onChanged={() => {
+                  detail.reload();
+                  onChanged();
+                }}
+                onDelete={() => onDelete(app)}
+              />
+            </TabPanel>
+            <TabPanel id="env" value={tab}>
+              <EnvironmentTab app={app} onEdit={() => setEditingEnv(true)} />
+            </TabPanel>
+            <TabPanel id="ezjson" value={tab}>
+              <EzJsonTab app={app} locations={meta.ezFileLocations} />
+            </TabPanel>
+            <TabPanel id="github" value={tab}>
+              <GithubTab
+                app={app}
+                hook={hook}
+                onConfigureHook={onConfigureHook}
+                onChanged={() => {
+                  detail.reload();
+                  onChanged();
+                }}
+              />
+            </TabPanel>
+            {!hook.enabled && tab !== 'github' && app.hook.hasToken && (
+              <InlineAlert tone="warning" title="The deploy hook is switched off">
+                <span className="inline-flex items-center gap-1.5">
+                  <ShieldAlert className="size-3.5" aria-hidden="true" />
+                  This app has a deploy token, but nothing is listening for it.
+                </span>
+              </InlineAlert>
+            )}
+          </div>
+        )}
+      </Modal>
+      {app && (
+        <AppFormModal
+          open={editingEnv}
+          app={app}
+          meta={meta}
+          onClose={() => setEditingEnv(false)}
+          onRefresh={() => {
+            detail.reload();
+            onChanged();
+          }}
+          onSaved={(saved) => {
+            setEditingEnv(false);
+            toast.success(`${saved.id} saved`, 'It applies to the next deployment.');
+            detail.reload();
+            onChanged();
+          }}
+        />
       )}
-    </Modal>
+    </>
   );
 }

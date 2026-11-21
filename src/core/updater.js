@@ -44,6 +44,7 @@ import { inspect as inspectLock } from './daemon/lock.js';
 import { loadConfig } from './config.js';
 import { copyRuntime, runtimeDir } from './service/runtime.js';
 import { MODES } from './service/index.js';
+import { isElevated } from './service/windowsService.js';
 
 const require = createRequire(import.meta.url);
 
@@ -140,6 +141,26 @@ export async function performUpdate({
   } catch { /* unreadable: treated as "no service" below */ }
   const serviceInstalled = Boolean(installed?.service?.installed);
   const serverMode = installed?.mode === MODES.SERVER;
+
+  // 2b. Windows Server mode: the service runs from a copy under ProgramData
+  // that only administrators may replace, and that is deliberate (replacing
+  // node.exe would run code as the service account). Asked of Windows before
+  // anything is stopped, so a normal terminal changes nothing at all.
+  if (isWindows && serverMode) {
+    const elevated = await (deps.isElevated ?? isElevated)({});
+    if (elevated === false) {
+      return {
+        ok: false,
+        step: 'elevation',
+        from,
+        needsElevation: true,
+        untouched: true,
+        command: 'ezz update',
+        reason: 'Updating a Windows Server-mode install replaces the runtime copy the service runs, which only '
+          + 'administrators can change. Run `ezz update` from PowerShell opened with "Run as administrator".',
+      };
+    }
+  }
 
   // 3. Stop the service. Its files are the ones npm is about to replace, and
   // on Windows an open handle makes the install fail rather than wait.

@@ -429,51 +429,97 @@ export const RUN_STATUS: Record<DeployRunStatus, { label: string; tone: Tone }> 
   rolled_back: { label: 'Rolled back', tone: 'warn' },
 };
 
-const STEP_LABELS: Record<string, string> = {
-  fetch: 'Fetching the code',
-  settings: 'Reading project settings',
-  pre: 'Pre-deploy hook',
-  install: 'Installing',
-  build: 'Building',
-  migrate: 'Running migrations',
-  start: 'Starting',
-  health: 'Health check',
-  post: 'Post-deploy hook',
-  finish: 'Finishing',
-  done: 'Done',
-};
+/** The done marker is a label, not one of the stages drawn in the bar. */
+const DONE_LABEL = 'Done';
 
-export function stepLabel(step: string): string {
-  return STEP_LABELS[step] ?? step;
+export interface RunStage {
+  /** The canonical id the agent sends as `stage` (and older agents as `step`). */
+  id: string;
+  /** The short name in the stage bar: "Install". */
+  short: string;
+  /** The sentence used wherever the run is labelled: "Installing". */
+  label: string;
 }
 
-/** The run's step chain, in order (contract §2.8). */
-export const RUN_STEPS = [
-  'fetch',
-  'settings',
-  'pre',
-  'install',
-  'build',
-  'migrate',
-  'start',
-  'health',
-  'post',
-  'finish',
-] as const;
+/**
+ * The run's stage chain, in order (contract §2.8). The one definition in this
+ * app: the Hub keeps the same ids, short names and long labels in
+ * `hub_frontend/src/components/servers/deploy/types.ts`.
+ */
+export const RUN_STAGES: readonly RunStage[] = [
+  { id: 'fetch', short: 'Fetch', label: 'Fetching the code' },
+  { id: 'settings', short: 'Settings', label: 'Reading project settings' },
+  { id: 'pre', short: 'Pre', label: 'Pre-deploy hook' },
+  { id: 'install', short: 'Install', label: 'Installing' },
+  { id: 'build', short: 'Build', label: 'Building' },
+  { id: 'migrate', short: 'Migrate', label: 'Running migrations' },
+  { id: 'start', short: 'Start', label: 'Starting' },
+  { id: 'health', short: 'Health', label: 'Health check' },
+  { id: 'post', short: 'Post', label: 'Post-deploy hook' },
+  { id: 'finish', short: 'Finish', label: 'Finishing' },
+];
 
-export type RunStepState = 'done' | 'active' | 'failed' | 'pending';
+export const RUN_STEPS: string[] = RUN_STAGES.map((stage) => stage.id);
 
-/** Each step's state for a run: before it done, after it pending. */
+const STAGE_BY_ID = new Map(RUN_STAGES.map((stage) => [stage.id, stage]));
+
+export function stepLabel(step: string): string {
+  if (step === 'done') return DONE_LABEL;
+  return STAGE_BY_ID.get(step)?.label ?? step;
+}
+
+/** The short name shown inside the stage bar. */
+export function stageShortName(step: string): string {
+  return STAGE_BY_ID.get(step)?.short ?? stepLabel(step);
+}
+
+/**
+ * The stage a run record points at. New agents send `stage`; older ones only
+ * `step`, and a custom step is "step N" there. A record has no history, so an
+ * unreadable step keeps the bar at build (where a custom step runs) instead of
+ * resetting it to Fetch.
+ */
+function runStage(run: Pick<DeployRun, 'stage' | 'step'>): string {
+  if (run.stage && (STAGE_BY_ID.has(run.stage) || run.stage === 'done')) return run.stage;
+  if (run.step === 'done') return 'done';
+  if (STAGE_BY_ID.has(run.step)) return run.step;
+  return 'build';
+}
+
+/** The real stage of a run, for a badge or the line above the stage bar. */
+export function runStageLabel(run: Pick<DeployRun, 'stage' | 'step'>): string {
+  if (run.stage === 'done') return DONE_LABEL;
+  const stage = run.stage ? STAGE_BY_ID.get(run.stage) : undefined;
+  if (stage) return stage.label;
+  if (run.step === 'done') return DONE_LABEL;
+  const custom = /^step\s+(\d+)$/i.exec(run.step.trim());
+  if (custom) return `Running step ${custom[1]}`;
+  return stepLabel(run.step);
+}
+
+export type RunStepState = 'done' | 'active' | 'failed' | 'pending' | 'skipped';
+
+/**
+ * Each stage's state for a run. Before the current stage is done, after it is
+ * pending; a failed run stops at the current stage. A stage named in
+ * `skippedStages` is skipped wherever it sits, and success marks every
+ * non-skipped stage done.
+ */
 export function runStepStates(run: DeployRun): Array<{ step: string; state: RunStepState }> {
-  const finished = run.status === 'success' || run.step === 'done';
+  const target = runStage(run);
+  const finished = run.status === 'success' || target === 'done';
   const failed = run.status === 'failed' || run.status === 'rolled_back';
-  const current = RUN_STEPS.indexOf(run.step as (typeof RUN_STEPS)[number]);
-  const reached = finished ? RUN_STEPS.length : current === -1 ? 0 : current;
+  const index = RUN_STEPS.indexOf(target);
+  const reached = finished ? RUN_STEPS.length : index === -1 ? RUN_STEPS.indexOf('build') : index;
+  const skipped = new Set(run.skippedStages ?? []);
 
-  return RUN_STEPS.map((step, index) => {
-    if (finished || index < reached) return { step, state: 'done' as const };
-    if (index > reached) return { step, state: 'pending' as const };
-    return { step, state: failed ? ('failed' as const) : ('active' as const) };
+  return RUN_STEPS.map((step, at) => {
+    let state: RunStepState;
+    if (skipped.has(step)) state = 'skipped';
+    else if (finished || at < reached) state = 'done';
+    else if (at > reached) state = 'pending';
+    else state = failed ? 'failed' : 'active';
+    return { step, state };
   });
 }
 

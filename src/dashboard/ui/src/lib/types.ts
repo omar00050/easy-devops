@@ -587,12 +587,23 @@ export interface UpdateRun {
   dashboardPort?: number;
 }
 
+export interface UpdateElevation {
+  /** True when replacing this install's files needs an administrator. */
+  required: boolean;
+  /** The command to run instead, e.g. `ezz update`; null when not required. */
+  command: string | null;
+  /** Where to run it, e.g. "Administrator PowerShell"; null when not required. */
+  shell: string | null;
+}
+
 export interface UpdateCheck {
   current: string;
   latest: string | null;
   reachable: boolean;
   updateAvailable: boolean;
   source: UpdateSource;
+  /** Absent on a server older than this UI: treat it as not required. */
+  elevation?: UpdateElevation;
   /** The last run, so a page loaded after a restart can report its outcome. */
   run: UpdateRun | null;
 }
@@ -807,6 +818,14 @@ export interface DeployRun {
   releaseId: string;
   status: DeployRunStatus;
   step: string;
+  /**
+   * Canonical stage id (fetch|settings|pre|install|build|migrate|start|health|
+   * post|finish|done). Absent on older agents; for a custom step the record's
+   * `step` is "step N" while this stays canonical.
+   */
+  stage?: string;
+  /** Canonical stages this run does not use, e.g. ['pre','migrate','post']. */
+  skippedStages?: string[];
   startedAt: number;
   finishedAt: number | null;
   error: string | null;

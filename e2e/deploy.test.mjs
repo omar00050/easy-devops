@@ -690,7 +690,13 @@ async function main() {
       d10.run.status === 'success' && /no port is configured/.test(logOf('worker', d10.run.id)), d10.run.error ?? '');
 
     commit(workerRepo, { 'worker.js': 'process.exit(1);' }, 'crashing worker');
-    const d11 = await deploy('worker');
+    // The no-port branch has no deadline; it waits NO_PORT_SETTLE_MS and is
+    // supposed to SEE the process exit. The shortened pause above is a 120ms
+    // cap, and on Windows a process that starts through the launcher's shell
+    // and exits takes 300-2300ms (measured), so the crash was still invisible
+    // when both reads happened. This one deploy uses the real pauses: the
+    // assertion is that a crash is caught, not that it is caught quickly.
+    const d11 = await deploy('worker', { deps: { ...deps, sleep } });
     check('an app without a port that exits is caught and rolled back',
       d11.run.status === 'failed' && d11.run.rollbackSucceeded === true
       && /crashed at boot/.test(d11.run.reason ?? ''), `${d11.run.status} ${d11.run.reason ?? d11.run.error}`);

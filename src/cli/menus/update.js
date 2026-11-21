@@ -26,6 +26,8 @@ import { dbGet, dbSet } from '../../core/db.js';
 import { loadConfig } from '../../core/config.js';
 import { getDashboardStatus, startDashboard, stopDashboard } from '../../core/dashboardProcess.js';
 import { page, pause } from '../ui/page.js';
+import { isWindows, isServerMode } from '../../core/platform.js';
+import { requireElevation } from '../elevation.js';
 
 
 // ─── Recover interrupted update ───────────────────────────────────────────────
@@ -214,6 +216,14 @@ async function runUpdate({ yes = false, heading = true } = {}) {
 
   for (const line of updater.whyCliOnly()) console.log('  ' + chalk.gray(line));
   console.log();
+
+  // Server mode replaces the service's administrator-only runtime copy. Asked
+  // before the confirmation and before the dashboard is stopped, so a normal
+  // terminal changes nothing; the elevated window asks the question itself.
+  if (isWindows && isServerMode()) {
+    const gate = await requireElevation({ args: ['update', ...(yes ? ['--yes'] : [])], what: 'Updating Easy DevOps' });
+    if (!gate.proceed) return gate.code;
+  }
 
   if (!yes) {
     let confirm = false;

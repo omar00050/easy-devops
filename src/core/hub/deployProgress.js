@@ -274,7 +274,7 @@ export function createDeployProgress({
     return parts.map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line));
   }
 
-  function emitProgress(state, { status, steps, done, now }) {
+  function emitProgress(state, { status, steps, stage, skippedStages, done, now }) {
     const pending = state.pending;
     state.pending = [];
 
@@ -290,6 +290,10 @@ export function createDeployProgress({
       runId: state.runId,
       status,
       steps,
+      // The canonical stage bar. `stage` is null and `skippedStages` empty for
+      // an agent old enough to send neither; readers fall back to `steps`.
+      stage,
+      skippedStages,
       lines,
       done,
       at: new Date(now).toISOString(),
@@ -338,13 +342,15 @@ export function createDeployProgress({
 
     const status = typeof run.status === 'string' ? run.status : RUNNING;
     const steps = stepsFromRun(run);
+    const stage = typeof run.stage === 'string' && run.stage !== '' ? run.stage : null;
+    const skippedStages = Array.isArray(run.skippedStages) ? run.skippedStages : [];
     const done = status !== RUNNING || !lockHeld;
-    const fingerprint = `${status}|${done}|${steps.map((s) => `${s.name}:${s.status}`).join(',')}`;
+    const fingerprint = `${status}|${done}|${stage ?? ''}|${skippedStages.join(',')}|${steps.map((s) => `${s.name}:${s.status}`).join(',')}`;
     const now = nowFn();
 
     const changed = done || state.pending.length > 0 || fingerprint !== state.lastFingerprint;
     if (changed && (done || now - state.lastEmitAt >= emitMs)) {
-      emitProgress(state, { status, steps, done, now });
+      emitProgress(state, { status, steps, stage, skippedStages, done, now });
       state.lastEmitAt = now;
       state.lastFingerprint = fingerprint;
     }
