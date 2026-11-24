@@ -361,6 +361,12 @@ async function main() {
 
     const withToken = apps.createApp({ id: 'priv', repoUrl: 'https://github.com/me/priv.git', authType: 'token', token: 'ghp_abcdefghij1234567890', env: { SECRET: 's3cret' } });
     check('a token app is created', withToken.ok);
+    const replacement = { repoUrl: 'https://other.example/owner/project.git' };
+    check('a new repository requires fresh authentication', !apps.updateApp('priv', replacement).ok);
+    check('changing repositories without authentication clears dormant tokens',
+      apps.normalizeAppInput({ ...replacement, authType: 'none' }, withToken.app).value.auth.token === null);
+    check('a replacement token binds to the new repository',
+      apps.normalizeAppInput({ ...replacement, token: 'replacement123' }, withToken.app).value.auth.token === 'replacement123');
 
     const updated = apps.updateApp('priv', { branch: 'develop' });
     check('an update keeps the token without it being sent again',
@@ -711,14 +717,47 @@ async function main() {
     // A token must never reach the log.
     const TOKEN = 'ghp_SuperSecretToken1234567890';
     register('tokened', { auth: { type: 'token', token: TOKEN, publicKey: null }, settings: { port: await freePort() } });
-    const d13 = await deploy('tokened');
+    const { runFile } = await import(srcUrl('core/shell.js'));
+    const fetchCalls = [];
+    const d13 = await deploy('tokened', { deps: { ...deps, runFile(file, args, options) {
+      fetchCalls.push({ command: [file, ...args].join(' '), env: options?.env });
+      return runFile(file, args, options);
+    } } });
     const tokenLog = logOf('tokened', d13.run.id);
-    check('a deployment with a token works and logs the header masked',
-      d13.run.status === 'success' && tokenLog.includes('Authorization: Basic ***'), d13.run.error ?? '');
+    const basic = Buffer.from(`x-access-token:${TOKEN}`).toString('base64');
+    const authenticated = fetchCalls.filter(c => c.env?.GIT_CONFIG_VALUE_0);
+    check('only git fetch receives the header in its environment',
+      d13.run.status === 'success' && authenticated.length === 1
+      && authenticated[0].command.includes(' fetch ') && authenticated[0].env.GIT_CONFIG_VALUE_0 === `Authorization: Basic ${basic}`, d13.run.error ?? '');
+    check('no command carries the token in its arguments', fetchCalls.every(c => !c.command.includes(TOKEN) && !c.command.includes(basic)));
     check('neither the token nor its encoded form is in the log',
       !tokenLog.includes(TOKEN) && !tokenLog.includes(Buffer.from(`x-access-token:${TOKEN}`).toString('base64')));
     check('nor in the checkout\'s git config',
       !fs.readFileSync(path.join(store.releaseDir('tokened', d13.run.releaseId), '.git', 'config'), 'utf8').includes('Basic'));
+
+    // Git may echo credentials in a failed authentication response. A
+    // successful fetch alone cannot prove that the failure path is safe.
+    const failedAuthCalls = [];
+    const d13Failed = await deploy('tokened', { deps: { ...deps, runFile(file, args, options) {
+      if (file === 'git' && args.includes('fetch')) {
+        const echo = `fatal: Authentication failed for ${TOKEN}; Authorization: Basic ${basic}`;
+        failedAuthCalls.push({ command: [file, ...args].join(' '), env: options?.env, onData: options?.onData });
+        options?.onData?.(echo);
+        return { success: false, stdout: echo, stderr: echo, exitCode: 128, command: file };
+      }
+      return runFile(file, args, options);
+    } } });
+    const failedAuthLog = logOf('tokened', d13Failed.run.id);
+    const failedAuthRecord = JSON.stringify(d13Failed.run);
+    check('a failed authenticated fetch still receives its header only through the child environment',
+      failedAuthCalls.length === 1 && failedAuthCalls[0].env.GIT_CONFIG_VALUE_0 === `Authorization: Basic ${basic}`
+      && !failedAuthCalls[0].command.includes(TOKEN) && !failedAuthCalls[0].command.includes(basic));
+    check('authenticated fetch output is never streamed into the log',
+      failedAuthCalls[0]?.onData === undefined && !failedAuthLog.includes(TOKEN)
+      && !failedAuthLog.includes(basic));
+    check('the persisted run error also contains neither the token nor its encoding',
+      d13Failed.run.status === 'failed' && !failedAuthRecord.includes(TOKEN)
+      && !failedAuthRecord.includes(basic), d13Failed.run.error ?? '');
 
     // A deploy-key app with no key yet.
     register('nokey', { repoUrl: 'git@github.com:me/x.git', auth: { type: 'deployKey', token: null, publicKey: null } });

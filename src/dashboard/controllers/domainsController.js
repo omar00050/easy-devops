@@ -4,6 +4,7 @@ import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../../core/domains-db.js';
 import { writeConfWithTest } from '../../core/nginx-apply.js';
+import { nginxDomainError } from '../../core/nginx-fields.js';
 import { missingCertFiles, CERT_MISSING_HINT } from '../../core/cert-usage.js';
 import { getCertExpiry } from '../../core/cert-reader.js';
 import { findCertificateForDomain } from '../../core/cert-suggest.js';
@@ -64,6 +65,8 @@ class DomainsController {
       const body = req.body ?? {};
 
       // Validate required fields
+      const fieldError = nginxDomainError(body);
+      if (fieldError) return res.status(400).json({ error: fieldError });
       const nameError = validateDomainName(body.name);
       if (nameError) {
         return res.status(400).json({ error: nameError });
@@ -102,7 +105,7 @@ class DomainsController {
       // Build domain object with defaults
       const domain = createDomain({
         name: body.name,
-        port: Number(body.port),
+        port: backendIsUrl && body.port == null ? null : Number(body.port),
         backendHost: body.backendHost ?? DOMAIN_DEFAULTS.backendHost,
         upstreamType: body.upstreamType ?? DOMAIN_DEFAULTS.upstreamType,
         www: body.www ?? false,
@@ -180,6 +183,8 @@ class DomainsController {
       const body = req.body ?? {};
 
       // Validate port if provided (skip when backendHost is a full external URL)
+      const fieldError = nginxDomainError({ ...body, backendHost: body.backendHost ?? existing.backendHost, name: existing.name });
+      if (fieldError) return res.status(400).json({ error: fieldError });
       const backendIsUrl = /^https?:\/\//i.test(body.backendHost ?? existing.backendHost ?? '');
       if (body.port !== undefined && !backendIsUrl) {
         const portError = validatePort(body.port);
@@ -221,6 +226,8 @@ class DomainsController {
       };
 
       // An update must not point nginx at certificate files that are not on disk.
+      const mergedError = nginxDomainError(updatedDomain);
+      if (mergedError) return res.status(400).json({ error: mergedError });
       const missingCert = await missingCertFiles(updatedDomain);
       if (missingCert) {
         return res.status(422).json(certMissingBody(missingCert));

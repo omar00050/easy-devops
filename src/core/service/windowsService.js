@@ -25,9 +25,10 @@
  */
 
 import fs from 'fs';
+import { randomUUID } from 'node:crypto';
 import path from 'path';
 
-import { run as shellRun } from '../shell.js';
+import { run as shellRun, runFile as shellRunFile } from '../shell.js';
 import { programDataDir, isWindows, WINDOWS_SC, windowsElevationCheckCmd } from '../platform.js';
 import {
   SERVICE_ID,
@@ -187,12 +188,12 @@ export async function isRegistered({ run = shellRun } = {}) {
  *
  * @returns {Promise<{ ok: boolean, removed: boolean, reason?: string }>}
  */
-export async function unregister({ run = shellRun, log = () => {} } = {}) {
+export async function unregister({ run = shellRun, runFile = shellRunFile, log = () => {} } = {}) {
   let removed = false;
 
   if (fs.existsSync(winswPath()) && fs.existsSync(serviceXmlPath())) {
-    await run(`& "${winswPath()}" stop`, { timeout: 60_000 });
-    const viaWinsw = await run(`& "${winswPath()}" uninstall`, { timeout: 60_000 });
+    await runFile(winswPath(), ['stop'], { timeout: 60_000 });
+    const viaWinsw = await runFile(winswPath(), ['uninstall'], { timeout: 60_000 });
     if (viaWinsw.success) removed = true;
   }
 
@@ -264,6 +265,7 @@ export async function install({
   operator = null,
   log = () => {},
   run = shellRun,
+  runFile = shellRunFile,
   fetchImpl = fetch,
   deps = {},
 } = {}) {
@@ -281,7 +283,7 @@ export async function install({
   // directory, which a new folder would inherit. See operator.js.
   for (const dir of [runtimeDir(dataDir), binDir()]) {
     const prepared = await (deps.prepareProtectedDir ?? prepareProtectedDir)({
-      dir, sid: operator?.sid ?? null, serviceAccount: false, run, log,
+      dir, sid: operator?.sid ?? null, serviceAccount: false, runFile, log,
     });
     if (!prepared.ok) return { ok: false, reason: `${prepared.reason}. Nothing was registered.` };
   }
@@ -340,7 +342,7 @@ export async function install({
   const existing = await isRegistered({ run });
   if (existing) {
     log(`A ${SERVICE_ID} service is already registered; removing it before registering again…`);
-    const cleared = await unregister({ run, log });
+    const cleared = await unregister({ run, runFile, log });
     if (!cleared.ok) {
       return {
         ok: false,
@@ -359,14 +361,14 @@ export async function install({
   // Elevation is confirmed in the normal case, so no prompt appears. When it
   // could not be confirmed, say what a prompt would be before it shows up.
   if (elevated !== true) log(UAC_NOTE);
-  const registered = await run(`& "${winswPath()}" install`, { timeout: 120_000 });
+  const registered = await runFile(winswPath(), ['install'], { timeout: 120_000 });
   if (!registered.success) {
     const output = outputOf(registered);
 
     // WinSW can fail after the Service Control Manager accepted the name, so
     // a failed register is followed by a clean-up: nothing half-registered is
     // left for the next attempt to trip over.
-    const cleanup = await unregister({ run, log });
+    const cleanup = await unregister({ run, runFile, log });
     const leftover = cleanup.ok
       ? 'Nothing was left registered.'
       : `A partial registration could not be removed (${cleanup.reason}); `
@@ -385,11 +387,10 @@ export async function install({
   log('Granting the service account access…');
   const grants = requiredGrants({
     dataDir,
-    runtimeDir: runtimeDir(dataDir),
     nginxDir: config.nginxDir ?? null,
     sslDir: config.sslDir ?? null,
   });
-  const acl = await applyGrants({ grants, run, log });
+  const acl = await applyGrants({ grants, runFile, log });
 
   if (!acl.ok) {
     // Not fatal: the service is registered and the data directory grant is the
@@ -411,13 +412,18 @@ export async function install({
     dataDir,
     protectedDirs: [binDir(), runtimeDir(dataDir)],
     run,
+    runFile,
     log,
   });
   for (const note of operatorGrant.notes) log(`  note: ${note}`);
 
+  if (operatorGrant.protection?.ok === false) {
+    return { ok: false, registered: true, operator: operatorGrant.record, reason: 'The service files could not be protected. Run service repair before starting.' };
+  }
+
   // ── 7. Start ─────────────────────────────────────────────────────────────
   log('Starting the service…');
-  const started = await run(`& "${winswPath()}" start`, { timeout: 60_000 });
+  const started = await runFile(winswPath(), ['start'], { timeout: 60_000 });
   if (!started.success) {
     const output = `${started.stdout ?? ''}\n${started.stderr ?? ''}`.trim();
     return {
@@ -452,7 +458,7 @@ export async function install({
  * uninstall flow (decision 5), because the ProgramData directory holds the
  * live data and silently relocating it would be a surprise.
  */
-export async function uninstall({ dataDir, config = {}, operator = null, log = () => {}, run = shellRun } = {}) {
+export async function uninstall({ dataDir, config = {}, operator = null, log = () => {}, run = shellRun, runFile = shellRunFile } = {}) {
   if (!isWindows) return { ok: false, reason: 'Server mode is Windows-only' };
 
   if ((await isElevated({ run })) === false || !canWriteProgramData()) {
@@ -466,10 +472,23 @@ export async function uninstall({ dataDir, config = {}, operator = null, log = (
 
   const notes = [];
 
+  // Revoked while the account still resolves. After the service is gone the
+  // SID may no longer map to a name, and icacls would refuse — so the order
+  // here is the reverse of install's for a reason.
+  log('Removing the service account grants…');
+  const revoked = await revokeGrants({
+    paths: [dataDir, config.nginxDir, config.sslDir].filter(Boolean),
+    runFile,
+    log,
+  });
+  if (!revoked.ok) {
+    for (const failure of revoked.failed) notes.push(`could not clear grants on ${failure.path}`);
+  }
+
   // WinSW's own stop + uninstall when the wrapper is there, and `sc delete`
   // for a registration whose wrapper is missing — so a service left behind by
   // a failed or interrupted install can always be removed.
-  const removed = await unregister({ run, log });
+  const removed = await unregister({ run, runFile, log });
   if (!removed.ok) {
     return { ok: false, reason: `the service could not be unregistered:\n${removed.reason}` };
   }
@@ -479,22 +498,9 @@ export async function uninstall({ dataDir, config = {}, operator = null, log = (
 
   removeLegacyWinsw(log);
 
-  // Revoked while the account still resolves. After the service is gone the
-  // SID may no longer map to a name, and icacls would refuse — so the order
-  // here is the reverse of install's for a reason.
-  log('Removing the service account grants…');
-  const revoked = await revokeGrants({
-    paths: [dataDir, runtimeDir(dataDir), config.nginxDir, config.sslDir].filter(Boolean),
-    run,
-    log,
-  });
-  if (!revoked.ok) {
-    for (const failure of revoked.failed) notes.push(`could not clear grants on ${failure.path}`);
-  }
-
   // The installing user's data directory access. Its start/stop right was an
   // entry on the service's own DACL, and went with the service.
-  const operatorRevoked = await revokeOperator({ operator, dataDir, run, log });
+  const operatorRevoked = await revokeOperator({ operator, dataDir, runFile, log });
   if (!operatorRevoked.ok) notes.push(`could not remove your account's data directory access: ${operatorRevoked.reason}`);
 
   return { ok: true, notes };
@@ -782,7 +788,6 @@ export async function status({ dataDir, config = {}, run = shellRun, granted = [
     granted,
     required: requiredGrants({
       dataDir,
-      runtimeDir: runtimeDir(dataDir),
       nginxDir: config.nginxDir ?? null,
       sslDir: config.sslDir ?? null,
     }),
@@ -851,6 +856,7 @@ export async function repair({
   operator = null,
   log = () => {},
   run = shellRun,
+  runFile = shellRunFile,
   waitForStart = async () => ({ alive: true }),
   deps = {},
 } = {}) {
@@ -890,6 +896,11 @@ export async function repair({
     return { ok: false, reason: `the service could not be stopped first, so nothing was changed: ${stopped.reason}` };
   }
 
+  let previousXml;
+  try { previousXml = fs.readFileSync(serviceXmlPath()); } catch (error) {
+    await start({ run });
+    return { ok: false, reason: `Could not read the service definition: ${error.message}` };
+  }
   const startAgain = async () => {
     const started = await start({ run });
     if (!started.ok) return { ok: false, reason: started.reason };
@@ -906,6 +917,7 @@ export async function repair({
       if (fs.existsSync(prev)) {
         fs.rmSync(dir, { recursive: true, force: true });
         fs.renameSync(prev, dir);
+        fs.writeFileSync(serviceXmlPath(), previousXml);
         restored = true;
       }
     } catch (err) {
@@ -938,7 +950,7 @@ export async function repair({
   // The new folder is protected while it is still empty, before anything the
   // service will run is copied into it.
   const prepared = await (deps.prepareProtectedDir ?? prepareProtectedDir)({
-    dir, sid: operator?.sid ?? null, run, log,
+    dir, sid: operator?.sid ?? null, runFile, log,
   });
   if (!prepared.ok) return restorePrevious(`the new runtime folder could not be protected: ${prepared.reason}`);
 
@@ -957,11 +969,10 @@ export async function repair({
   log('Re-applying the service account grants…');
   const grants = requiredGrants({
     dataDir,
-    runtimeDir: dir,
     nginxDir: config.nginxDir ?? null,
     sslDir: config.sslDir ?? null,
   });
-  const acl = await applyGrants({ grants, run, log });
+  const acl = await applyGrants({ grants, runFile, log });
 
   // The fresh runtime folder inherits again, so it is protected again before
   // the service starts on it; then the installing user's rights are renewed.
@@ -971,10 +982,15 @@ export async function repair({
     dataDir,
     protectedDirs: [binDir(), dir],
     run,
+    runFile,
     log,
   });
   for (const note of operatorGrant.notes) log(`  note: ${note}`);
 
+  if (operatorGrant.protection?.ok === false) return restorePrevious('the new runtime permissions could not be secured');
+  try { refreshServiceDefinition({ dataDir, runtime }); } catch (error) {
+    return restorePrevious(`could not refresh the service definition: ${error.message}`);
+  }
   log('Starting the service…');
   const started = await startAgain();
   if (!started.ok) return restorePrevious(`the service did not come up on the new copy: ${started.reason}`);
@@ -989,6 +1005,15 @@ export async function repair({
     operatorNotes: operatorGrant.notes,
     runtime: { version: native.version, abi: native.abi },
   };
+}
+
+export function refreshServiceDefinition({ dataDir, runtime }) {
+  const target = serviceXmlPath();
+  const temp = path.join(path.dirname(target), `.service-${randomUUID()}.xml`);
+  const xml = buildServiceXml({ nodeExe: runtime.nodeExe, entry: runtime.entry,
+    dataDir, logDir: logDir(), workingDir: path.join(runtime.dir, 'app') });
+  fs.writeFileSync(temp, xml, { flag: 'wx', mode: 0o600 });
+  try { fs.renameSync(temp, target); } finally { fs.rmSync(temp, { force: true }); }
 }
 
 export { SERVICE_ID, SERVICE_DISPLAY_NAME };

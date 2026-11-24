@@ -190,6 +190,11 @@ async function runUpdate({ yes = false, heading = true } = {}) {
     return 1;
   }
 
+  if (![check.current, check.latest].every(updater.isUpdateVersion)) {
+    console.log('  ' + chalk.red('Invalid update version. Check the installed package and registry version.'));
+    return 1;
+  }
+
   console.log(`  Latest    : ${chalk.green('v' + check.latest)}`);
   console.log();
 

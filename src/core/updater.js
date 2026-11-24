@@ -33,10 +33,11 @@
  * working tree may hold work in progress. See core/installSource.js.
  */
 
+import fs from 'fs';
 import path from 'path';
 import { createRequire } from 'module';
 
-import { run } from './shell.js';
+import { runFile } from './shell.js';
 import { getDataDir, isWindows } from './platform.js';
 import { closeDb, initDb } from './db.js';
 import { detectInstallSource, describeUnmanaged } from './installSource.js';
@@ -44,7 +45,8 @@ import { inspect as inspectLock } from './daemon/lock.js';
 import { loadConfig } from './config.js';
 import { copyRuntime, runtimeDir } from './service/runtime.js';
 import { MODES } from './service/index.js';
-import { isElevated } from './service/windowsService.js';
+import { protectServiceFiles } from './service/operator.js';
+import { isElevated, refreshServiceDefinition } from './service/windowsService.js';
 
 const require = createRequire(import.meta.url);
 
@@ -57,6 +59,26 @@ export const VERIFY_MS = 10_000;
 /** This package's version, read fresh so a post-update read is accurate. */
 export function currentVersion() {
   return String(require('../../package.json').version);
+}
+
+export function isUpdateVersion(value) {
+  return typeof value === 'string' && /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(value);
+}
+
+function runNpm(args, options, exec = runFile) {
+  if (process.env.EZ_TEST === '1' && exec === runFile) {
+    throw new Error('Updater tests must supply an npm runner.');
+  }
+  if (!isWindows) return exec('npm', args, options);
+
+  // Windows npm launchers are shell scripts. Run npm's JS entry with Node
+  // directly, including when the launcher's directory is separate from Node.
+  const dirs = [path.dirname(process.execPath), ...(process.env.PATH ?? '').split(path.delimiter)];
+  for (const dir of dirs.filter((item) => path.isAbsolute(item))) {
+    const cli = path.join(dir, 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    if (fs.existsSync(cli)) return exec(process.execPath, [cli, ...args], options);
+  }
+  return { success: false, stderr: 'Could not locate npm-cli.js. Install npm alongside Node and retry.' };
 }
 
 /** -1 / 0 / 1 by semver-ish triple. */
@@ -77,13 +99,12 @@ export function compareVersions(a, b) {
  * @returns {Promise<{ reachable: boolean, current: string, latest: string|null, updateAvailable: boolean }>}
  */
 export async function checkForUpdate({ deps = {} } = {}) {
-  const exec = deps.run ?? run;
   const current = deps.currentVersion ? deps.currentVersion() : currentVersion();
 
-  const result = await exec(`npm view ${PACKAGE} version`, { timeout: 30_000 });
-  const latest = result.success ? result.stdout.trim().split('\n').pop()?.trim() : null;
+  const result = await runNpm(['view', PACKAGE, 'version'], { timeout: 30_000 }, deps.runFile);
+  const latest = result.success ? result.stdout.replace(/\r?\n$/, '') : null;
 
-  if (!latest || !/^\d+\.\d+\.\d+/.test(latest)) {
+  if (!isUpdateVersion(latest)) {
     return { reachable: false, current, latest: null, updateAvailable: false };
   }
 
@@ -114,10 +135,14 @@ export async function performUpdate({
   log = () => {},
   deps = {},
 } = {}) {
-  const exec = deps.run ?? run;
   const service = deps.service ?? (await import('./service/index.js'));
   const source = (deps.detectInstallSource ?? detectInstallSource)();
   const from = deps.currentVersion ? deps.currentVersion() : currentVersion();
+
+  if (!isUpdateVersion(version) || !isUpdateVersion(from)) {
+    return { ok: false, step: 'version', reason: 'Use a valid release or prerelease version.', untouched: true };
+  }
+  const exec = deps.runFile ?? runFile;
 
   // 1. Can npm update THIS copy at all?
   if (!source.npmUpdatable) {
@@ -186,7 +211,7 @@ export async function performUpdate({
   closeDb();
 
   log(`Installing ${PACKAGE}@${version}...`);
-  const install = await exec(`npm install -g ${PACKAGE}@${version}`, { timeout: 600_000 });
+  const install = await runNpm(['install', '-g', `${PACKAGE}@${version}`], { timeout: 600_000 }, exec);
 
   initDb();
 
@@ -213,6 +238,14 @@ export async function performUpdate({
       nodeExe: path.join(runtimeDir(dataDir), 'node.exe'),
       log: (line) => log(`  ${line}`),
     });
+    if (copied.ok) {
+      const secured = await (deps.protectServiceFiles ?? protectServiceFiles)({ dirs: [copied.dir], log });
+      if (!secured.ok) return { ok: false, step: 'permissions', from, restored: false, reason: 'Runtime permissions could not be secured. Run ezz service repair as administrator before starting.' };
+    }
+    if (copied.ok && serviceInstalled) {
+      try { (deps.refreshServiceDefinition ?? refreshServiceDefinition)({ dataDir, runtime: copied }); }
+      catch (error) { copied = { ok: false, reason: error.message }; }
+    }
     if (!copied.ok) {
       const rolled = await rollback({ version: from, service, exec, serviceInstalled, log });
       return {
@@ -223,6 +256,16 @@ export async function performUpdate({
         rolledBack: rolled.ok,
         restored: rolled.started,
       };
+    }
+  }
+
+  if (serviceInstalled && !(isWindows && serverMode) && service.refreshUserService) {
+    let refreshed;
+    try { refreshed = await service.refreshUserService({ dataDir, log }); }
+    catch (error) { refreshed = { ok: false, reason: error.message }; }
+    if (!refreshed.ok) {
+      const rolled = await rollback({ version: from, service, exec, serviceInstalled, log });
+      return { ok: false, step: 'service', from, reason: refreshed.reason, rolledBack: rolled.ok, restored: rolled.started };
     }
   }
 
@@ -277,7 +320,7 @@ export async function performUpdate({
 /** Reinstalls a known-good version and starts the service again. */
 async function rollback({ version, service, exec, serviceInstalled, log }) {
   closeDb();
-  const back = await exec(`npm install -g ${PACKAGE}@${version}`, { timeout: 600_000 });
+  const back = await runNpm(['install', '-g', `${PACKAGE}@${version}`], { timeout: 600_000 }, exec);
   initDb();
 
   if (!back.success) {

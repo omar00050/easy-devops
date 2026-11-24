@@ -47,11 +47,12 @@ function makeGitStub() {
   let files = {};
   let sha = 'b'.repeat(40);
 
-  const run = async (command) => {
+  const run = async (command, args) => {
+    if (Array.isArray(args)) command = [command, ...args].join(' ');
     calls.push(command);
     if (command === 'git --version') return ok('git version 2.43.0');
 
-    const init = /^git init -q "(.+)"$/.exec(command);
+    const init = /^git init -q (.+)$/.exec(command);
     if (init) {
       const dir = init[1];
       fs.mkdirSync(dir, { recursive: true });
@@ -159,6 +160,7 @@ async function main() {
   let clock = Date.UTC(2026, 10, 19, 9, 0, 0);
   const deps = {
     run: git.run,
+    runFile: git.run,
     runCommandLine: commands.runCommandLine,
     runner: pm2,
     probe: async () => ({ ok: true, status: 200, error: null }),

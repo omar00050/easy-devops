@@ -18,6 +18,7 @@
 import './lib/guard.mjs';
 import { TEST_DATA_DIR, assertInsideTestDataDir } from './lib/guard.mjs';
 
+import assert from 'node:assert/strict';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
@@ -42,9 +43,28 @@ function scratch(name) {
   return dir;
 }
 
+// Check the actual subprocess boundary before normalizing it for the call log.
+function npmCommand(file, args) {
+  let npmArgs = args;
+  if (file === process.execPath) {
+    assert.equal(path.basename(args[0]), 'npm-cli.js');
+    npmArgs = args.slice(1);
+  } else {
+    assert.equal(file, 'npm');
+  }
+  if (npmArgs[0] === 'view') assert.deepEqual(npmArgs, ['view', 'easy-devops', 'version']);
+  else {
+    assert.equal(npmArgs.length, 3);
+    assert.deepEqual(npmArgs.slice(0, 2), ['install', '-g']);
+    assert.match(npmArgs[2], /^easy-devops@\d/);
+  }
+  return ['npm', ...npmArgs].join(' ');
+}
+
 function recordingRun(answers = {}) {
   const commands = [];
-  const fn = async (command) => {
+  const fn = async (file, args) => {
+    const command = npmCommand(file, args);
     commands.push(command);
     for (const [pattern, answer] of Object.entries(answers)) {
       if (command.includes(pattern)) {
@@ -102,7 +122,7 @@ async function testClone() {
   const result = await updater.performUpdate({
     version: '9.9.9',
     dataDir: scratch('upd-clone'),
-    deps: { run, service, detectInstallSource: () => SOURCES.clone, currentVersion: () => '1.2.1' },
+    deps: { runFile: run, service, detectInstallSource: () => SOURCES.clone, currentVersion: () => '1.2.1' },
   });
 
   check('the update refuses', result.ok === false && result.step === 'source', result.step);
@@ -129,7 +149,7 @@ async function testClone() {
     version: '9.9.9',
     dataDir: scratch('upd-loose'),
     deps: {
-      run: recordingRun(),
+      runFile: recordingRun(),
       service: serviceStub(),
       detectInstallSource: () => ({
         kind: 'unknown',
@@ -153,7 +173,8 @@ async function testNpmUpdate() {
   const dataDir = scratch('upd-npm');
   const order = [];
 
-  const run = async (command) => {
+  const run = async (file, args) => {
+    const command = npmCommand(file, args);
     order.push(`run:${command}`);
     return { success: true, stdout: 'ok', stderr: '', exitCode: 0, command };
   };
@@ -169,7 +190,7 @@ async function testNpmUpdate() {
     version: '1.3.0',
     dataDir,
     deps: {
-      run,
+      runFile: run,
       service,
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.2.1',
@@ -213,12 +234,13 @@ async function testServerCopyRefresh() {
 
   const dataDir = scratch('upd-server');
   const copies = [];
+  const serviceDefinitions = [];
 
   const result = await updater.performUpdate({
     version: '1.3.0',
     dataDir,
     deps: {
-      run: recordingRun({ 'npm install': 'installed' }),
+      runFile: recordingRun({ 'npm install': 'installed' }),
       service: serviceStub({ installed: true, mode: 'server' }),
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.2.1',
@@ -226,6 +248,8 @@ async function testServerCopyRefresh() {
       // Server mode refuses before stopping anything unless this process is
       // elevated; this test is about the runtime copy, not the gate.
       isElevated: async () => true,
+      protectServiceFiles: async () => ({ ok: true }),
+      refreshServiceDefinition: (opts) => { serviceDefinitions.push(opts); },
       copyRuntime: (opts) => { copies.push(opts); return { ok: true, dir: 'runtime' }; },
     },
   });
@@ -234,6 +258,8 @@ async function testServerCopyRefresh() {
   check('the runtime copy was refreshed', copies.length === 1, String(copies.length));
   check('from the package that npm just updated',
     copies[0]?.appRoot === SOURCES.npm.root, copies[0]?.appRoot);
+  check('the service definition is rewritten after the copy refreshes',
+    serviceDefinitions.length === 1 && serviceDefinitions[0]?.runtime?.dir === 'runtime');
   check('and the result says so', result.refreshedCopy === true);
 
   // Without this the service keeps running the OLD code from the copy, which
@@ -242,7 +268,7 @@ async function testServerCopyRefresh() {
     version: '1.3.0',
     dataDir,
     deps: {
-      run: recordingRun({ 'npm install': 'installed' }),
+      runFile: recordingRun({ 'npm install': 'installed' }),
       service: serviceStub({ installed: true, mode: 'server' }),
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.2.1',
@@ -256,6 +282,41 @@ async function testServerCopyRefresh() {
   check('rather than leaving the service on the old code silently',
     /could not be refreshed/.test(failed.reason), failed.reason);
   check('and it rolls back to the previous version', failed.rolledBack === true);
+}
+
+// ─── 3b. Systemd and Personal mode refresh their launcher on update ──────────
+
+async function testUserServiceRefresh() {
+  setGroup('3b. a user service definition is refreshed after the package update');
+
+  const updater = await import(srcUrl('core/updater.js'));
+  const dataDir = scratch('upd-user-refresh');
+  const refreshes = [];
+  const service = serviceStub({ installed: true, mode: 'personal' });
+  service.refreshUserService = async (opts) => {
+    service.calls.push('refresh');
+    refreshes.push(opts);
+    return { ok: true };
+  };
+
+  const result = await updater.performUpdate({
+    version: '1.4.4',
+    dataDir,
+    deps: {
+      runFile: recordingRun({ 'npm install': 'installed' }),
+      service,
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.4.3',
+      inspectLock: () => ({ lock: { version: '1.4.4' } }),
+    },
+  });
+
+  check('the update succeeds', result.ok === true, result.reason ?? '');
+  check('the systemd/Personal service definition is refreshed exactly once',
+    refreshes.length === 1 && refreshes[0]?.dataDir === dataDir, JSON.stringify(refreshes));
+  check('the refresh happens before the service starts',
+    service.calls.indexOf('refresh') !== -1 && service.calls.indexOf('refresh') < service.calls.indexOf('start'),
+    service.calls.join(' -> '));
 }
 
 // ─── 4. Rollback ─────────────────────────────────────────────────────────────
@@ -273,7 +334,7 @@ async function testRollback() {
   const installFailed = await updater.performUpdate({
     version: '1.3.0',
     dataDir,
-    deps: { run: failingNpm, service, detectInstallSource: () => SOURCES.npm, currentVersion: () => '1.2.1' },
+    deps: { runFile: failingNpm, service, detectInstallSource: () => SOURCES.npm, currentVersion: () => '1.2.1' },
   });
 
   check('a failing npm install is reported', installFailed.ok === false && installFailed.step === 'install',
@@ -282,7 +343,8 @@ async function testRollback() {
 
   // ── It installs, but the daemon never reports in ─────────────────────────
   const commands = [];
-  const run = async (command) => {
+  const run = async (file, args) => {
+    const command = npmCommand(file, args);
     commands.push(command);
     return { success: true, stdout: 'ok', stderr: '', exitCode: 0, command };
   };
@@ -291,7 +353,7 @@ async function testRollback() {
     version: '1.3.0',
     dataDir,
     deps: {
-      run,
+      runFile: run,
       service: serviceStub({ alive: false }),
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.2.1',
@@ -313,7 +375,7 @@ async function testRollback() {
     version: '1.3.0',
     dataDir,
     deps: {
-      run: stuck,
+      runFile: stuck,
       service: serviceStub({ stopOk: false }),
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.2.1',
@@ -339,7 +401,7 @@ async function testNoService() {
   const result = await updater.performUpdate({
     version: '1.3.0',
     dataDir: scratch('upd-noservice'),
-    deps: { run, service, detectInstallSource: () => SOURCES.npm, currentVersion: () => '1.2.1' },
+    deps: { runFile: run, service, detectInstallSource: () => SOURCES.npm, currentVersion: () => '1.2.1' },
   });
 
   check('the update succeeds', result.ok === true, result.reason ?? '');
@@ -358,24 +420,24 @@ async function testCheck() {
   const updater = await import(srcUrl('core/updater.js'));
 
   const newer = await updater.checkForUpdate({
-    deps: { run: recordingRun({ 'npm view': '1.3.0' }), currentVersion: () => '1.2.1' },
+    deps: { runFile: recordingRun({ 'npm view': '1.3.0' }), currentVersion: () => '1.2.1' },
   });
   check('a newer version is reported as available',
     newer.reachable && newer.updateAvailable && newer.latest === '1.3.0',
     JSON.stringify(newer));
 
   const same = await updater.checkForUpdate({
-    deps: { run: recordingRun({ 'npm view': '1.2.1' }), currentVersion: () => '1.2.1' },
+    deps: { runFile: recordingRun({ 'npm view': '1.2.1' }), currentVersion: () => '1.2.1' },
   });
   check('the same version is not an update', same.reachable && same.updateAvailable === false);
 
   const older = await updater.checkForUpdate({
-    deps: { run: recordingRun({ 'npm view': '1.1.0' }), currentVersion: () => '1.2.1' },
+    deps: { runFile: recordingRun({ 'npm view': '1.1.0' }), currentVersion: () => '1.2.1' },
   });
   check('an older registry version is not an update', older.updateAvailable === false);
 
   const offline = await updater.checkForUpdate({
-    deps: { run: recordingRun({ 'npm view': null }), currentVersion: () => '1.2.1' },
+    deps: { runFile: recordingRun({ 'npm view': null }), currentVersion: () => '1.2.1' },
   });
   check('an unreachable registry is reported, not guessed at',
     offline.reachable === false && offline.latest === null && offline.updateAvailable === false,
@@ -383,9 +445,25 @@ async function testCheck() {
 
   // Garbage from the registry must not be treated as a version.
   const junk = await updater.checkForUpdate({
-    deps: { run: recordingRun({ 'npm view': 'npm WARN something' }), currentVersion: () => '1.2.1' },
+    deps: { runFile: recordingRun({ 'npm view': 'npm WARN something' }), currentVersion: () => '1.2.1' },
   });
   check('non-version output is treated as unreachable', junk.reachable === false, JSON.stringify(junk));
+
+  for (const bad of ['1.3.0 extra', 'unrelated\\n1.3.0', '1.3.0\\nextra', '1.3.0+build']) {
+    const result = await updater.checkForUpdate({ deps: { runFile: recordingRun({ 'npm view': bad }) } });
+    check(`reject entire registry output ${JSON.stringify(bad)}`, !result.reachable && result.latest === null);
+  }
+  for (const [from, version] of [['1.2.1', '1.3.0 extra'], ['1.2.1 extra', '1.3.0']]) {
+    const service = serviceStub();
+    const npm = recordingRun();
+    const result = await updater.performUpdate({
+      version, deps: { service, runFile: npm, currentVersion: () => from, detectInstallSource: () => SOURCES.npm },
+    });
+    check(`invalid version refuses before service or npm (${from} to ${version})`,
+      result.step === 'version' && result.untouched && !service.calls.length && !npm.commands.length);
+  }
+  check('accepts a prerelease', updater.isUpdateVersion('1.4.4-rc.2'));
+  check('rejects trailing line breaks in stored versions', !updater.isUpdateVersion('1.4.4\\n'));
 
   check('the comparison handles each position',
     updater.compareVersions('1.10.0', '1.9.0') === 1
@@ -423,6 +501,7 @@ async function main() {
   await testClone();
   await testNpmUpdate();
   await testServerCopyRefresh();
+  await testUserServiceRefresh();
   await testRollback();
   await testNoService();
   await testCheck();

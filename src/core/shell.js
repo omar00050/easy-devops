@@ -48,6 +48,14 @@ export function getShell() {
   return { shell: 'bash', flag: '-c' };
 }
 
+/** Execute a native executable with literal arguments and no command interpreter. */
+export function runFile(file, args, options = {}) {
+  const { timeout = 30000, cwd = process.cwd(), env = null, onData = null } = options;
+  return capture((spawnOptions) => spawn(file, args, { ...spawnOptions, shell: false }), {
+    cmd: file, timeout, cwd, env, onData,
+  });
+}
+
 // ─── run ──────────────────────────────────────────────────────────────────────
 
 /**
@@ -230,11 +238,13 @@ export function runLive(cmd, options = {}) {
  * @returns {Promise<{ success: boolean, exitCode: number|null }>}
  */
 export function runInteractive(cmd, options = {}) {
-  const { cwd = process.cwd() } = options;
   const { shell, flag } = getShell();
+  return runInteractiveFile(shell, [flag, cmd], options);
+}
 
+export function runInteractiveFile(file, args, { cwd = process.cwd() } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(shell, [flag, cmd], {
+    const child = spawn(file, args, {
       cwd,
       stdio: 'inherit',
       windowsHide: true,

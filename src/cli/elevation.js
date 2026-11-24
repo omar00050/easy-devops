@@ -20,7 +20,8 @@ import chalk from 'chalk';
 import inquirer from 'inquirer';
 
 import { isWindows, windowsElevatedRelaunchCmd } from '../core/platform.js';
-import { run } from '../core/shell.js';
+import { WINDOWS_POWERSHELL } from '../core/service/acl.js';
+import { runFile } from '../core/shell.js';
 import { isElevated } from '../core/service/windowsService.js';
 import { currentUser, OPERATOR_SID_ENV } from '../core/service/operator.js';
 
@@ -94,13 +95,15 @@ export async function requireElevation({ args, what = 'This', yes = false, deps 
   const me = await (deps.currentUser ?? currentUser)({});
   const env = me ? { [OPERATOR_SID_ENV]: me.sid } : {};
 
-  const result = await (deps.run ?? run)(windowsElevatedRelaunchCmd({
+  const script = windowsElevatedRelaunchCmd({
     execPath: process.execPath,
     script: deps.argv1 ?? process.argv[1],
     args,
     cwd: process.cwd(),
     env,
-  }), { timeout: 120_000 });
+  });
+  const result = await (deps.runFile ?? runFile)(WINDOWS_POWERSHELL,
+    ['-NoProfile', '-NonInteractive', '-Command', script], { timeout: 120_000 });
 
   const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
   console.log();

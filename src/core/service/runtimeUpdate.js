@@ -44,14 +44,16 @@ import fs from 'fs';
 import path from 'path';
 import { createRequire } from 'module';
 
-import { run } from '../shell.js';
-import { isWindows, getDataDir, quoteExe } from '../platform.js';
+import { run, runFile } from '../shell.js';
+import { isWindows, getDataDir } from '../platform.js';
 import { detectInstallSource } from '../installSource.js';
 import * as windowsPersonal from './windowsPersonal.js';
+import { protectServiceFiles } from './operator.js';
 import { canWriteProgramData, isElevated } from './windowsService.js';
 import {
   runtimeDir,
   runtimeNodePath,
+  installRuntimeStubs,
   inspectLink,
   linkRuntime,
   verifyNativeModules,
@@ -212,7 +214,7 @@ export async function detectSystemNode({ deps = {} } = {}) {
   const first = which.success ? which.stdout.split('\n')[0]?.trim() : '';
   if (!first) return { path: null, version: null };
 
-  const probe = await exec(`${quoteExe(first)} --version`, { timeout: 15_000 });
+  const probe = await (deps.runFile ?? runFile)(first, ['--version'], { timeout: 15_000 });
   return {
     path: first,
     version: probe.success ? probe.stdout.trim().replace(/^v/, '') : null,
@@ -280,13 +282,12 @@ export async function listTargets({ dataDir = getDataDir(), deps = {} } = {}) {
 
 /** What the pinned runtime is, per mechanism. */
 async function describePinned({ dataDir, mech, deps = {} }) {
-  const exec = deps.run ?? run;
   const recorded = (deps.recordedState ?? recordedState)();
 
   if (!isWindows) {
     const link = inspectLink(dataDir);
     const probe = link.exists && !link.broken
-      ? await exec(`${quoteExe(link.link)} --version`, { timeout: 15_000 })
+      ? await (deps.runFile ?? runFile)(link.link, ['--version'], { timeout: 15_000 })
       : null;
     return {
       kind: 'symlink',
@@ -301,7 +302,7 @@ async function describePinned({ dataDir, mech, deps = {} }) {
   const copied = runtimeNodePath(dataDir);
   if (mech.mode === MODES.SERVER || fs.existsSync(copied)) {
     const probe = fs.existsSync(copied)
-      ? await exec(`${quoteExe(copied)} --version`, { timeout: 15_000 })
+      ? await (deps.runFile ?? runFile)(copied, ['--version'], { timeout: 15_000 })
       : null;
     return {
       kind: 'copy',
@@ -314,7 +315,7 @@ async function describePinned({ dataDir, mech, deps = {} }) {
 
   const nodeExe = recorded.nodeExe ?? null;
   const exists = Boolean(nodeExe && fs.existsSync(nodeExe));
-  const probe = exists ? await exec(`${quoteExe(nodeExe)} --version`, { timeout: 15_000 }) : null;
+  const probe = exists ? await (deps.runFile ?? runFile)(nodeExe, ['--version'], { timeout: 15_000 }) : null;
   return {
     kind: 'recorded',
     path: nodeExe,
@@ -368,7 +369,7 @@ function upgradeHint({ manager, system, pinned }) {
 export async function installTarget({ target, deps = {} } = {}) {
   const exec = deps.run ?? run;
 
-  if (!target?.version) return { ok: false, reason: 'no target version given' };
+  if (typeof target?.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(target.version)) return { ok: false, reason: 'no target version given' };
 
   if (target.source === 'system') {
     if (!target.path) return { ok: false, reason: 'the system node path is unknown' };
@@ -376,7 +377,7 @@ export async function installTarget({ target, deps = {} } = {}) {
   }
 
   if (target.source === 'nvm-windows') {
-    const installed = await exec(`nvm install ${target.version}`, { timeout: 600_000 });
+    const installed = await (deps.runFile ?? runFile)('nvm.exe', ['install', target.version], { timeout: 600_000 });
     if (!installed.success) {
       return { ok: false, reason: `nvm install ${target.version} failed: ${trimOutput(installed)}` };
     }
@@ -391,12 +392,12 @@ export async function installTarget({ target, deps = {} } = {}) {
     };
   }
 
-  const installed = await exec(nvmShell(`nvm install ${target.version}`), { timeout: 600_000 });
+  const installed = await (deps.runFile ?? runFile)('bash', ['-c', nvmShell('nvm install "$1"'), 'nvm', target.version], { timeout: 600_000 });
   if (!installed.success) {
     return { ok: false, reason: `nvm install ${target.version} failed: ${trimOutput(installed)}` };
   }
 
-  const located = await exec(nvmShell(`nvm which ${target.version}`), { timeout: 20_000 });
+  const located = await (deps.runFile ?? runFile)('bash', ['-c', nvmShell('nvm which "$1"'), 'nvm', target.version], { timeout: 20_000 });
   const nodeExe = located.success ? located.stdout.trim().split('\n').pop()?.trim() : '';
   if (nodeExe && fs.existsSync(nodeExe)) return { ok: true, nodeExe };
 
@@ -423,9 +424,7 @@ function trimOutput(result) {
  * @returns {Promise<{ ok: boolean, version?: string, abi?: string, reason?: string, fix?: string }>}
  */
 export async function smokeTest({ nodeExe, appDir = appRoot(), entry = entryScript(), probeDataDir, deps = {} } = {}) {
-  const exec = deps.run ?? run;
-
-  const versionProbe = await exec(`${quoteExe(nodeExe)} --version`, { timeout: 20_000 });
+  const versionProbe = await (deps.runFile ?? runFile)(nodeExe, ['--version'], { timeout: 20_000 });
   if (!versionProbe.success) {
     return { ok: false, reason: `${nodeExe} did not run: ${trimOutput(versionProbe)}` };
   }
@@ -454,7 +453,7 @@ export async function smokeTest({ nodeExe, appDir = appRoot(), entry = entryScri
     return { ok: false, version, reason: `could not create the smoke-test directory: ${err.message}` };
   }
 
-  const entryProbe = await exec(`${quoteExe(nodeExe)} "${entry}" --version`, {
+  const entryProbe = await (deps.runFile ?? runFile)(nodeExe, [entry, '--version'], {
     timeout: 60_000,
     cwd: appDir,
     env: { ...process.env, EASY_DEVOPS_DATA_DIR: dir },
@@ -584,6 +583,8 @@ async function applyWindowsServer({ nodeExe, dataDir, log, deps = {} }) {
   const native = await fixAppCopyModules({ nodeExe: dest, appDir, log, deps });
   if (!native.ok) return { ok: false, reason: native.reason, fix: native.fix, rollback };
 
+  const protection = await (deps.protectServiceFiles ?? protectServiceFiles)({ dirs: [path.dirname(dest)], log });
+  if (!protection.ok) return { ok: false, unsafeRuntime: true, reason: 'Could not secure the runtime. Run service repair before starting it.', rollback };
   return { ok: true, detail: `${dest} (${native.detail})`, rollback };
 }
 
@@ -601,14 +602,18 @@ async function fixAppCopyModules({ nodeExe, appDir, log, deps = {} }) {
     return { ok: true, detail: 'no app copy to fix' };
   }
 
-  const first = await verify({ nodeExe, appDir });
+  const verifyCopy = async () => {
+    try { installRuntimeStubs(appDir); } catch (err) { return { ok: false, reason: err.message }; }
+    return verify({ nodeExe, appDir });
+  };
+  const first = await verifyCopy();
   if (first.ok) return { ok: true, detail: 'native modules already match' };
 
   log('The native modules were built for a different Node ABI; rebuilding in the copy...');
   const rebuilt = await exec('npm rebuild better-sqlite3', { cwd: appDir, timeout: 600_000 });
 
   if (rebuilt.success) {
-    const after = await verify({ nodeExe, appDir });
+    const after = await verifyCopy();
     if (after.ok) return { ok: true, detail: 'native modules rebuilt' };
   }
 
@@ -622,7 +627,7 @@ async function fixAppCopyModules({ nodeExe, appDir, log, deps = {} }) {
     } catch (err) {
       return { ok: false, reason: `could not refresh the runtime copy's node_modules: ${err.message}` };
     }
-    const after = await verify({ nodeExe, appDir });
+    const after = await verifyCopy();
     if (after.ok) return { ok: true, detail: 'node_modules refreshed from the package' };
     return { ok: false, reason: after.reason, fix: after.fix };
   }
@@ -702,7 +707,7 @@ export async function update({
   }
 
   // 1. The target has to be installable and allowed.
-  if (!target?.version) return { ok: false, step: 'target', reason: 'no target version was chosen' };
+  if (typeof target?.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(target.version)) return { ok: false, step: 'target', reason: 'no target version was chosen' };
   if (!meetsMinimum(target.version)) {
     const minimum = minimumNode();
     return {
@@ -761,7 +766,7 @@ export async function update({
     // modules could not be made to load). The second one leaves a new binary
     // in place, so it hands back a rollback and it has to be used.
     const back = applied.rollback ? await applied.rollback() : null;
-    const restarted = await service.start({ log });
+    const restarted = applied.unsafeRuntime ? { ok: false } : await service.start({ log });
     return {
       ok: false,
       step: 'swap',

@@ -13,7 +13,7 @@
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import ora from 'ora';
-import { run, runLive, runInteractive } from '../../core/shell.js';
+import { run, runLive, runInteractive, runInteractiveFile } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { ensureNginxInclude } from '../../core/nginx-conf-generator.js';
 import { isWindows, isNginxTestOk } from '../../core/platform.js';
@@ -85,7 +85,7 @@ async function testConfig(nginxExe, nginxDir) {
     if (isWindows) {
       await import('fs/promises').then(fs => fs.mkdir(confDPath, { recursive: true }));
     } else {
-      const mkResult = await runInteractive(`sudo mkdir -p "${confDPath}"`);
+      const mkResult = await runInteractiveFile('sudo', ['mkdir', '-p', '--', confDPath]);
       if (!mkResult.success) {
         console.warn(chalk.red(`  Failed to create ${confDPath} — run manually: sudo mkdir -p ${confDPath}`));
       }
@@ -97,7 +97,7 @@ async function testConfig(nginxExe, nginxDir) {
     if (isWindows) {
       await import('fs/promises').then(fs => fs.mkdir(acmePath, { recursive: true }));
     } else {
-      const mkResult = await runInteractive(`sudo mkdir -p "${acmePath}"`);
+      const mkResult = await runInteractiveFile('sudo', ['mkdir', '-p', '--', acmePath]);
       if (!mkResult.success) {
         console.warn(chalk.red(`  Failed to create ${acmePath} — run manually: sudo mkdir -p ${acmePath}`));
       }
@@ -300,7 +300,7 @@ async function installNginx() {
 
     // Create conf.d directory for domain config files
     const confSpinner = ora(`Creating ${confDPath}…`).start();
-    const confResult = await runInteractive(`sudo mkdir -p "${confDPath}"`);
+    const confResult = await runInteractiveFile('sudo', ['mkdir', '-p', '--', confDPath]);
     if (confResult.success) {
       confSpinner.succeed(`Created ${confDPath}`);
     } else {
@@ -309,9 +309,9 @@ async function installNginx() {
 
     // Create html/.well-known/acme-challenge directory for SSL certificate verification
     const acmeSpinner = ora(`Creating ${acmePath}…`).start();
-    const acmeResult = await runInteractive(`sudo mkdir -p "${acmePath}"`);
+    const acmeResult = await runInteractiveFile('sudo', ['mkdir', '-p', '--', acmePath]);
     if (acmeResult.success) {
-      await runInteractive(`sudo touch "${path.join(acmePath, '.keep')}"`);
+      await runInteractiveFile('sudo', ['touch', '--', path.join(acmePath, '.keep')]);
       acmeSpinner.succeed(`Created ${acmePath}`);
     } else {
       acmeSpinner.warn(`Could not create ${acmePath} — run manually: sudo mkdir -p ${acmePath}`);

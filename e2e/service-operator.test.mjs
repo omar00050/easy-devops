@@ -27,6 +27,7 @@
  */
 
 import './lib/guard.mjs';
+import { withFileStub, aclCall } from './lib/windows-file-stub.mjs';
 import { TEST_DATA_DIR, assertInsideTestDataDir } from './lib/guard.mjs';
 
 import fs from 'fs';
@@ -262,17 +263,17 @@ async function testDataDirCommands() {
   const dataDir = 'C:\\ProgramData\\easy-devops';
   const grant = op.buildDataDirGrantCommand(dataDir, SID);
   check('the grant is Modify, inherited by what the directory contains',
-    grant === `icacls "${dataDir}" /grant "*${SID}:(OI)(CI)M" /C /Q`, grant);
+    JSON.stringify(grant) === JSON.stringify([dataDir, '/grant', `*${SID}:(OI)(CI)M`, '/L', '/Q']), grant);
   check('it is NOT recursive with /T, so the protected folders can opt out',
     !/\/T\b/.test(grant), grant);
   check('the SID is quoted with the * prefix, so it does not depend on the display language',
-    grant.includes(`"*${SID}:`), grant);
+    grant.includes(`*${SID}:(OI)(CI)M`), grant);
   check('the grant names no group SID',
     FORBIDDEN_TRUSTEES.every((sid) => !grant.includes(sid)), grant);
 
   const revoke = op.buildDataDirRevokeCommand(dataDir, SID);
   check('the revoke removes the allow entry for that SID',
-    revoke === `icacls "${dataDir}" /remove:g "*${SID}" /T /C /Q`, revoke);
+    aclCall(revoke) === `icacls "${dataDir}" /remove:g "*${SID}" /T /L /Q`, revoke);
 
   const dir = 'C:\\ProgramData\\easy-devops\\runtime';
   const commands = op.buildProtectCommands(dir, SID);
@@ -281,7 +282,7 @@ async function testDataDirCommands() {
 
   const [takeOwner, replace, removeOperator] = commands;
   check('Administrators are made the owner FIRST, so no other account keeps the owner\'s implicit WRITE_DAC',
-    takeOwner === `icacls "${dir}" /setowner "*S-1-5-32-544" /T /C /Q`, takeOwner);
+    aclCall(takeOwner) === `icacls "${dir}" /setowner "*S-1-5-32-544" /T /L /Q`, takeOwner);
   check('and it reaches what is already inside, not only the folder',
     /\/T\b/.test(takeOwner), takeOwner);
   check('inheritance is turned off before the explicit list is written', replace.includes('/inheritance:r'), replace);
@@ -301,7 +302,7 @@ async function testDataDirCommands() {
     /\/T\b/.test(replace), replace);
 
   check('a stale operator entry is removed LAST, after the list is in place',
-    removeOperator.includes(`/remove:g "*${SID}"`), removeOperator);
+    removeOperator.includes(`/remove:g`) && removeOperator.includes(`*${SID}`), removeOperator);
 
   const noService = op.buildProtectCommands('C:\\x', null, { serviceAccount: false });
   check('before the service exists its account is left out of the list',
@@ -311,7 +312,7 @@ async function testDataDirCommands() {
     && noService[1].includes('*S-1-5-32-544:(OI)(CI)F')
     && noService[1].includes('*S-1-5-32-545:(OI)(CI)RX'), noService[1]);
   check('with no account SID there is nothing to remove', noService.length === 2, String(noService.length));
-  check('the default keeps the service account', op.buildProtectCommands('C:\\x')[1].includes(SERVICE_ACCOUNT));
+  check('the default keeps the service account', op.buildProtectCommands('C:\\x')[1].includes(`${SERVICE_ACCOUNT}:(OI)(CI)RX`));
 
   // ── A path that cannot sit inside double quotes is refused, never escaped ─
   const refused = (fn) => {
@@ -362,15 +363,15 @@ async function testProtectServiceFiles() {
 
   const run = stubRun([[/icacls /, { success: true, stdout: 'Successfully processed 1 files' }]]);
   const logs = [];
-  const done = await op.protectServiceFiles({
+  const done = await op.protectServiceFiles(withFileStub({
     dirs: [bin, runtime], sid: SID, run, log: (line) => logs.push(line),
-  });
+  }));
 
   check('both directories are protected', done.ok === true && done.protected.length === 2,
     JSON.stringify(done.protected));
   check('each directory runs the owner, the list, then the removal, in that order',
     JSON.stringify(run.calls) === JSON.stringify([
-      ...op.buildProtectCommands(bin, SID), ...op.buildProtectCommands(runtime, SID),
+      ...op.buildProtectCommands(bin, SID).map(aclCall), ...op.buildProtectCommands(runtime, SID).map(aclCall),
     ]), run.calls.join(' | '));
   check('the owner is set before the list and the list before the removal',
     run.calls.length === 6 && run.calls[0].includes(`/setowner`) && run.calls[0].includes(bin)
@@ -388,7 +389,7 @@ async function testProtectServiceFiles() {
   let oddThrew = null;
   let oddResult = null;
   try {
-    oddResult = await op.protectServiceFiles({ dirs: [oddDir, bin], sid: SID, run: oddRun, log: () => {} });
+    oddResult = await op.protectServiceFiles(withFileStub({ dirs: [oddDir, bin], sid: SID, run: oddRun, log: () => {} }));
   } catch (err) { oddThrew = err; }
   check('a directory whose path cannot be quoted is reported, not thrown', oddThrew === null,
     oddThrew?.message);
@@ -404,18 +405,18 @@ async function testProtectServiceFiles() {
 
   const missing = path.join(root, 'not-created');
   const skipRun = stubRun([[/icacls /, { success: true }]]);
-  const skipped = await op.protectServiceFiles({ dirs: [missing], sid: SID, run: skipRun });
+  const skipped = await op.protectServiceFiles(withFileStub({ dirs: [missing], sid: SID, run: skipRun }));
   check('a directory that does not exist yet is skipped, not created',
-    skipped.ok === true && skipped.protected.length === 0 && !fs.existsSync(missing));
+    skipped.ok === false && skipped.protected.length === 0 && !fs.existsSync(missing));
   check('and nothing was run for it', skipRun.calls.length === 0);
 
   const deniedRun = stubRun([[/icacls /, { success: false, stderr: 'Access is denied.' }]]);
-  const denied = await op.protectServiceFiles({
+  const denied = await op.protectServiceFiles(withFileStub({
     dirs: [bin, runtime],
     sid: SID,
     run: deniedRun,
     log: () => {},
-  });
+  }));
   check('a refusal is reported as a failure, not swallowed', denied.ok === false);
   check('with the path and the reason', denied.failed.length === 2
     && denied.failed.every((f) => f.reason.includes('Access is denied')), JSON.stringify(denied.failed));
@@ -438,7 +439,7 @@ async function testGrantServiceControl() {
     [/^sc\.exe sdset /, () => { state.gave = true; return { success: true, stdout: '[SC] ChangeServiceConfig2 SUCCESS' }; }],
   ]);
 
-  const granted = await op.grantServiceControl({ sid: SID, run });
+  const granted = await op.grantServiceControl(withFileStub({ sid: SID, run }));
   check('the grant succeeds', granted.ok === true, granted.reason ?? '');
   check('the sequence is sdshow, sdset, sdshow',
     run.calls.map((c) => c.split(' ')[1]).join(',') === 'sdshow,sdset,sdshow',
@@ -449,12 +450,12 @@ async function testGrantServiceControl() {
     !FORBIDDEN_TRUSTEES.some((sid) => run.calls[1].includes(sid)), run.calls[1]);
 
   const noSid = stubRun();
-  const refusedNoSid = await op.grantServiceControl({ sid: 'S-1-5-32-545', run: noSid });
+  const refusedNoSid = await op.grantServiceControl(withFileStub({ sid: 'S-1-5-32-545', run: noSid }));
   check('no account SID means no grant, and no command at all',
     refusedNoSid.ok === false && noSid.calls.length === 0, refusedNoSid.reason);
 
   const unreadable = stubRun([[/^sc\.exe sdshow /, { success: false, stderr: 'Access is denied.' }]]);
-  const refusedRead = await op.grantServiceControl({ sid: SID, run: unreadable });
+  const refusedRead = await op.grantServiceControl(withFileStub({ sid: SID, run: unreadable }));
   check('an unreadable DACL is refused, not guessed at', refusedRead.ok === false);
   check('and it names the service permissions',
     /service permissions/.test(refusedRead.reason ?? ''), refusedRead.reason);
@@ -462,7 +463,7 @@ async function testGrantServiceControl() {
 
   // A DACL that is not plain SDDL must never reach a shell.
   const odd = stubRun([[/^sc\.exe sdshow /, { stdout: 'D:(A;;CC;;;SY) & calc' }]]);
-  const refusedOdd = await op.grantServiceControl({ sid: SID, run: odd });
+  const refusedOdd = await op.grantServiceControl(withFileStub({ sid: SID, run: odd }));
   check('a DACL with characters outside [A-Za-z0-9:;()-] is REFUSED', refusedOdd.ok === false);
   check('and the message says nothing was changed',
     /nothing was changed/.test(refusedOdd.reason ?? ''), refusedOdd.reason);
@@ -472,7 +473,7 @@ async function testGrantServiceControl() {
     [/^sc\.exe sdshow /, { stdout: SERVICE_SDDL }],
     [/^sc\.exe sdset /, { success: false, stderr: 'Access is denied.' }],
   ]);
-  const refusedSet = await op.grantServiceControl({ sid: SID, run: failedSet });
+  const refusedSet = await op.grantServiceControl(withFileStub({ sid: SID, run: failedSet }));
   check('a refused sdset is reported with its output',
     refusedSet.ok === false && /Access is denied/.test(refusedSet.reason ?? ''), refusedSet.reason);
   check('and it is not read back', failedSet.calls.length === 2);
@@ -482,7 +483,7 @@ async function testGrantServiceControl() {
     [/^sc\.exe sdshow /, { stdout: SERVICE_SDDL }],
     [/^sc\.exe sdset /, { success: true }],
   ]);
-  const refusedReadBack = await op.grantServiceControl({ sid: SID, run: neverLands });
+  const refusedReadBack = await op.grantServiceControl(withFileStub({ sid: SID, run: neverLands }));
   check('a grant that does not read back is a failure',
     refusedReadBack.ok === false && /does not read back/.test(refusedReadBack.reason ?? ''),
     refusedReadBack.reason);
@@ -501,8 +502,8 @@ async function testGrantOperator() {
   const runtime = path.join(root, 'runtime');
   for (const dir of [dataDir, bin, runtime]) fs.mkdirSync(dir, { recursive: true });
 
-  const protectCommands = [...op.buildProtectCommands(bin, SID), ...op.buildProtectCommands(runtime, SID)];
-  const dataGrant = op.buildDataDirGrantCommand(dataDir, SID);
+  const protectCommands = [...op.buildProtectCommands(bin, SID).map(aclCall), ...op.buildProtectCommands(runtime, SID).map(aclCall)];
+  const dataGrant = aclCall(op.buildDataDirGrantCommand(dataDir, SID));
   const expected = `${SERVICE_SDDL}${OPERATOR_ACE}`;
 
   const run = stubRun([
@@ -511,13 +512,13 @@ async function testGrantOperator() {
     [/icacls /, { success: true, stdout: 'Successfully processed 1 files' }],
   ]);
 
-  const result = await op.grantOperator({
+  const result = await op.grantOperator(withFileStub({
     operator: { sid: SID, name: 'DOMAIN\\me' },
     dataDir,
     protectedDirs: [bin, runtime],
     run,
     log: () => {},
-  });
+  }));
 
   check('a record is produced', result.record !== null, JSON.stringify(result.record));
   check('it names the account and the SID',
@@ -557,23 +558,23 @@ async function testGrantOperator() {
     [/inheritance:r/, { success: false, stderr: 'Access is denied.' }],
     [/icacls /, { success: true }],
   ]);
-  const notShared = await op.grantOperator({
+  const notShared = await op.grantOperator(withFileStub({
     operator: { sid: SID, name: 'DOMAIN\\me' },
     dataDir,
     protectedDirs: [bin, runtime],
     run: failedRun,
     log: () => {},
-  });
+  }));
 
   check('a failed protection is reported', notShared.protection.ok === false);
   check('the data directory is NOT granted', notShared.record.dataDir === false);
   check('and no data grant command ran',
     !failedRun.calls.some((c) => c.includes(`/grant "*${SID}:(OI)(CI)M"`)), failedRun.calls.join(' | '));
   check('an earlier grant is actively REVOKED, so inheritance cannot reach an unprotected folder',
-    failedRun.calls.filter((c) => c === op.buildDataDirRevokeCommand(dataDir, SID)).length === 1,
+    failedRun.calls.filter((c) => c === aclCall(op.buildDataDirRevokeCommand(dataDir, SID))).length === 1,
     failedRun.calls.join(' | '));
   check('the revoke is the last thing done to the data directory',
-    failedRun.calls.indexOf(op.buildDataDirRevokeCommand(dataDir, SID)) > failedRun.calls.findIndex((c) => /^sc\.exe sdset /.test(c)),
+    failedRun.calls.indexOf(aclCall(op.buildDataDirRevokeCommand(dataDir, SID))) > failedRun.calls.findIndex((c) => /^sc\.exe sdset /.test(c)),
     failedRun.calls.join(' | '));
   check('the note explains why the data was not shared and what to do',
     notShared.notes.some((n) => /could not be protected/.test(n) && /service repair/.test(n)),
@@ -582,7 +583,7 @@ async function testGrantOperator() {
     failedRun.calls.some((c) => /^sc\.exe sdset /.test(c)));
 
   // ── Data grant failed after protection ──────────────────────────────────
-  const deniedData = await op.grantOperator({
+  const deniedData = await op.grantOperator(withFileStub({
     operator: { sid: SID, name: null },
     dataDir,
     protectedDirs: [bin],
@@ -593,56 +594,56 @@ async function testGrantOperator() {
       [/icacls /, { success: true }],
     ]),
     log: () => {},
-  });
+  }));
   check('a refused data grant leaves dataDir false', deniedData.record.dataDir === false);
   check('and is noted rather than thrown',
     deniedData.notes.some((n) => /data directory access was not granted/.test(n)),
     deniedData.notes.join(' | '));
 
   // ── Nobody identified ───────────────────────────────────────────────────
-  const noOperator = await op.grantOperator({
+  const noOperator = await op.grantOperator(withFileStub({
     operator: null,
     dataDir,
     protectedDirs: [bin],
     run: stubRun([[/icacls /, { success: true }]]),
     log: () => {},
-  });
+  }));
   check('with no operator there is no record', noOperator.record === null);
   check('the files are still protected with no operator entry to remove',
     noOperator.protection.ok === true);
   check('and the note says why nobody was granted',
     noOperator.notes.some((n) => /could not tell which account/.test(n)), noOperator.notes.join(' | '));
 
-  const groupOperator = await op.grantOperator({
+  const groupOperator = await op.grantOperator(withFileStub({
     operator: { sid: 'S-1-5-32-545', name: 'Users' },
     dataDir,
     protectedDirs: [bin],
     run: stubRun([[/icacls /, { success: true }]]),
     log: () => {},
-  });
+  }));
   check('a group as operator is refused outright', groupOperator.record === null);
 
   // ── Revocation ──────────────────────────────────────────────────────────
   const revokeRun = stubRun([[/icacls /, { success: true }]]);
-  const revoked = await op.revokeOperator({ operator: { sid: SID }, dataDir, run: revokeRun, log: () => {} });
+  const revoked = await op.revokeOperator(withFileStub({ operator: { sid: SID }, dataDir, run: revokeRun, log: () => {} }));
   check('revocation succeeds', revoked.ok === true);
   check('and runs the removal command for that SID',
-    revokeRun.calls.length === 1 && revokeRun.calls[0] === op.buildDataDirRevokeCommand(dataDir, SID),
+    revokeRun.calls.length === 1 && revokeRun.calls[0] === aclCall(op.buildDataDirRevokeCommand(dataDir, SID)),
     revokeRun.calls[0]);
 
   const nothingToRevoke = stubRun();
   check('no operator is a no-op',
-    (await op.revokeOperator({ operator: null, dataDir, run: nothingToRevoke })).ok === true
+    (await op.revokeOperator(withFileStub({ operator: null, dataDir, run: nothingToRevoke }))).ok === true
     && nothingToRevoke.calls.length === 0);
   check('a directory that does not exist is a no-op',
-    (await op.revokeOperator({
+    (await op.revokeOperator(withFileStub({
       operator: { sid: SID }, dataDir: path.join(root, 'gone'), run: nothingToRevoke,
-    })).ok === true && nothingToRevoke.calls.length === 0);
+    }))).ok === true && nothingToRevoke.calls.length === 0);
 
-  const revokeDenied = await op.revokeOperator({
+  const revokeDenied = await op.revokeOperator(withFileStub({
     operator: { sid: SID }, dataDir, run: stubRun([[/icacls /, { success: false, stderr: 'Access is denied.' }]]),
     log: () => {},
-  });
+  }));
   check('a refused revocation is reported', revokeDenied.ok === false && /Access is denied/.test(revokeDenied.reason));
 
   // ── A data directory that cannot be quoted never throws ──────────────────
@@ -654,7 +655,7 @@ async function testGrantOperator() {
   let grantThrew = null;
   let oddGrant = null;
   try {
-    oddGrant = await op.grantOperator({
+    oddGrant = await op.grantOperator(withFileStub({
       operator: { sid: SID, name: 'DOMAIN\\me' },
       dataDir: oddData,
       protectedDirs: [bin],
@@ -664,7 +665,7 @@ async function testGrantOperator() {
         [/icacls /, { success: true }],
       ]),
       log: () => {},
-    });
+    }));
   } catch (err) { grantThrew = err; }
   check('a data directory that cannot be quoted does not throw', grantThrew === null, grantThrew?.message);
   check('it is reported as no data access', oddGrant?.record?.dataDir === false);
@@ -675,7 +676,7 @@ async function testGrantOperator() {
   let oddRevoke = null;
   const oddRun = stubRun([[/icacls /, { success: true }]]);
   try {
-    oddRevoke = await op.revokeOperator({ operator: { sid: SID }, dataDir: oddData, run: oddRun, log: () => {} });
+    oddRevoke = await op.revokeOperator(withFileStub({ operator: { sid: SID }, dataDir: oddData, run: oddRun, log: () => {} }));
   } catch (err) { revokeThrew = err; }
   check('revocation of such a path does not throw either', revokeThrew === null, revokeThrew?.message);
   check('and reports a failure with the refusal', oddRevoke?.ok === false
@@ -705,7 +706,7 @@ async function testRelaunchCommand() {
     env: { EZ_OPERATOR_SID: SID },
   });
 
-  check('it starts an elevated PowerShell window', /Start-Process -FilePath powershell\.exe/.test(command));
+  check('it starts an elevated PowerShell window', /Start-Process -FilePath \(Join-Path \$PSHOME powershell\.exe\)/.test(command));
   check('with Verb RunAs, which is the only way to elevate', /-Verb RunAs/.test(command));
   check('and stays open so the result can be read', /-NoExit/.test(command));
   check('nothing is passed as an argument that a shell would parse again',
@@ -716,23 +717,14 @@ async function testRelaunchCommand() {
   const script = decodeRelaunch(command);
   check('the encoded script decodes as UTF-16LE', typeof script === 'string' && script.length > 0);
 
-  check('the working directory is a single-quoted literal',
-    script.includes(`Set-Location -LiteralPath 'C:\\O''Brien\\easy devops'`), script.split('\n')[0]);
-  check('a quote in a path is doubled, not escaped with a backslash',
-    !/[^']\\'/.test(script));
-  check('the runtime is invoked as a literal, never through a shell',
-    script.includes(`& 'C:\\Program Files\\nodejs\\node.exe'`), script.split('\n').find((l) => l.startsWith('& ')));
-  check('the same arguments are passed unchanged, each as a literal',
-    script.includes("'C:\\npm\\node_modules\\easy-devops\\src\\cli\\index.js' 'service' 'install'"),
-    script.split('\n').find((l) => l.startsWith('& ')));
-  check('the operator SID reaches the elevated copy through the environment',
-    script.includes(`$env:EZ_OPERATOR_SID = '${SID}'`), script.split('\n')[0]);
-  check('the script says the window stays open', /stays open/.test(script));
-
-  const noEnv = decodeRelaunch(platform.windowsElevatedRelaunchCmd({
-    execPath: 'node', script: 'cli.js', args: [], cwd: '/tmp', env: {},
-  }));
-  check('with no environment there is no $env line', !/\$env:/.test(noEnv), noEnv.split('\n')[0]);
+  const unpack = script => JSON.parse(Buffer.from(script.match(/FromBase64String\('([^']+)'\)/)[1], 'base64').toString());
+  const payload = unpack(script);
+  check('cwd is passed as data to Set-Location', payload.cwd === "C:\\O'Brien\\easy devops" && script.includes('Set-Location -LiteralPath $p.cwd'));
+  check('node and cli arguments are passed as separate values', payload.execPath.endsWith('node.exe') && payload.script.endsWith('index.js') && payload.args.join(' ') === 'service install' && script.includes('& $p.execPath @cliArgs'));
+  check('the elevated copy receives the operator SID', payload.sid === SID);
+  check('the window stays open', /stays open/.test(script));
+  const noEnv = unpack(decodeRelaunch(platform.windowsElevatedRelaunchCmd({execPath: 'node', script: 'cli.js', args: [], cwd: '/tmp', env: {}})));
+  check('no SID is passed without an operator', noEnv.sid === undefined);
 
   // Refusals: this string reaches a shell as base64, but its CONTENTS must not
   // become a way to smuggle another command into an elevated process.
@@ -832,7 +824,7 @@ async function testRequireElevation() {
       isInteractive: () => true,
       prompt: async () => ({ relaunch: true }),
       currentUser: async () => ({ sid: SID, name: 'DOMAIN\\me' }),
-      run: acceptedRun,
+      runFile: (_exe, args) => acceptedRun(args.at(-1)),
       argv1: 'C:\\pkg\\src\\cli\\index.js',
     },
   });
@@ -844,9 +836,9 @@ async function testRequireElevation() {
   check('the command is the elevated relaunch of this same CLI command',
     /Start-Process/.test(acceptedRun.calls[0] ?? '') && acceptedScript !== null);
   check('with the arguments that were asked for',
-    acceptedScript?.includes(`'service' 'install'`), acceptedScript?.split('\n')[2]);
+    JSON.parse(Buffer.from(acceptedScript.match(/FromBase64String\('([^']+)'\)/)[1], 'base64')).args.join(' ') === 'service install', acceptedScript?.split('\n')[2]);
   check('and the SID of the account that asked, so the elevated copy grants them',
-    acceptedScript?.includes(`$env:EZ_OPERATOR_SID = '${SID}'`), acceptedScript?.split('\n')[0]);
+    JSON.parse(Buffer.from(acceptedScript.match(/FromBase64String\('([^']+)'\)/)[1], 'base64')).sid === SID, acceptedScript?.split('\n')[0]);
 
   // ── Accepted with --yes: no question is asked ───────────────────────────
   let promptWithYes = 0;
@@ -859,7 +851,7 @@ async function testRequireElevation() {
       isInteractive: () => true,
       prompt: async () => { promptWithYes++; return { relaunch: false }; },
       currentUser: async () => ({ sid: SID, name: null }),
-      run: stubRun([[/Start-Process/, { success: true, stdout: 'relaunched' }]]),
+      runFile: async () => ({ success: true, stdout: 'relaunched' }),
       argv1: 'cli.js',
     },
   });
@@ -874,10 +866,10 @@ async function testRequireElevation() {
       isInteractive: () => true,
       prompt: async () => ({ relaunch: true }),
       currentUser: async () => ({ sid: SID, name: null }),
-      run: stubRun([[
+      runFile: (_exe, args) => stubRun([[
         /Start-Process/,
         { success: false, stdout: 'relaunch-failed: The operation was canceled by the user.' },
-      ]]),
+      ]])(args.at(-1)),
       argv1: 'cli.js',
     },
   });
@@ -892,7 +884,7 @@ async function testRequireElevation() {
     isInteractive: () => true,
     prompt: async () => ({ relaunch: true }),
     currentUser: async () => ({ sid: SID, name: null }),
-    run: offerRun,
+    runFile: (_exe, args) => offerRun(args.at(-1)),
     argv1: 'cli.js',
   };
 
@@ -946,7 +938,7 @@ async function testUpdaterElevation() {
   }
 
   const deps = (service, isElevated, run) => ({
-    run,
+    runFile: run,
     service,
     detectInstallSource: () => NPM_SOURCE,
     currentVersion: () => '1.4.2',
@@ -1286,7 +1278,7 @@ async function testWindowsServiceOperatorWiring() {
       },
     };
 
-    const installed = await ws.install({
+    const installed = await ws.install(withFileStub({
       dataDir,
       appRoot,
       config: {},
@@ -1295,7 +1287,7 @@ async function testWindowsServiceOperatorWiring() {
       log: () => {},
       fetchImpl: async () => { events.push('FETCH'); throw new Error('the wrapper is already present'); },
       deps: installDeps,
-    });
+    }));
 
     check('the install succeeds', installed.ok === true, installed.reason ?? '');
     check('the result carries the operator record, for service-state',
@@ -1333,7 +1325,7 @@ async function testWindowsServiceOperatorWiring() {
 
     // ── A folder that cannot be protected stops the install, before it registers
     const blockedLedger = scmRun({ initial: 'MISSING' });
-    const blocked = await ws.install({
+    const blocked = await ws.install(withFileStub({
       dataDir,
       appRoot,
       config: {},
@@ -1346,7 +1338,7 @@ async function testWindowsServiceOperatorWiring() {
         copyRuntime: () => { throw new Error('must not copy into an unprotected folder'); },
         prepareProtectedDir: async () => ({ ok: false, reason: 'Access is denied.' }),
       },
-    });
+    }));
     check('a folder that cannot be protected fails the install', blocked.ok === false);
     check('and says nothing was registered', /Nothing was registered/.test(blocked.reason ?? ''),
       blocked.reason);
@@ -1361,7 +1353,7 @@ async function testWindowsServiceOperatorWiring() {
     let repairedDirs = null;
     let prevExistedAtPrepare = null;
 
-    const repaired = await ws.repair({
+    const repaired = await ws.repair(withFileStub({
       dataDir,
       appRoot,
       config: {},
@@ -1395,7 +1387,7 @@ async function testWindowsServiceOperatorWiring() {
           return { record, protection: { ok: true, protected: opts.protectedDirs, failed: [] }, notes: [] };
         },
       },
-    });
+    }));
 
     check('the repair succeeds', repaired.ok === true, repaired.reason ?? '');
     check('and carries the operator record', repaired.operator === record);
@@ -1422,7 +1414,7 @@ async function testWindowsServiceOperatorWiring() {
     // ── A failed preparation restores the previous runtime and starts on it ─
     const restoreLedger = scmRun();
     let restoreCopied = false;
-    const restored = await ws.repair({
+    const restored = await ws.repair(withFileStub({
       dataDir,
       appRoot,
       config: {},
@@ -1439,7 +1431,7 @@ async function testWindowsServiceOperatorWiring() {
         copyRuntime: () => { restoreCopied = true; throw new Error('must not copy into an unprotected folder'); },
         stopWaitMs: 2_000,
       },
-    });
+    }));
     check('a fresh runtime folder that cannot be protected fails the repair',
       restored.ok === false && /could not be protected/.test(restored.reason ?? ''), restored.reason);
     check('the previous copy is put back, not left behind', restored.restored === true
@@ -1457,7 +1449,7 @@ async function testWindowsServiceOperatorWiring() {
       [/inheritance:r/, { success: false, stderr: 'Access is denied.' }],
       [/EasyDevOps\.exe" (install|start)$/, { success: true }],
     ]);
-    const withheld = await ws.install({
+    const withheld = await ws.install(withFileStub({
       dataDir,
       appRoot,
       config: {},
@@ -1466,16 +1458,16 @@ async function testWindowsServiceOperatorWiring() {
       log: () => {},
       fetchImpl: async () => { throw new Error('the wrapper is already present'); },
       deps: { ...installDeps, grantOperator: undefined },
-    });
-    check('with a failed protection the install still fails its notes, not the service',
-      withheld.ok === true, withheld.reason ?? '');
+    }));
+    check('failed protection leaves the service registered and stopped',
+      withheld.ok === false && withheld.registered === true && !withheldRun.calls.some(c => /EasyDevOps\.exe" start$/.test(c)), withheld.reason ?? '');
     check('the recorded operator has no data directory access',
       withheld.operator?.dataDir === false, JSON.stringify(withheld.operator));
     check('and no data-directory grant command was run',
       !withheldRun.calls.some((c) => c.includes(`/grant "*${SID}:(OI)(CI)M"`)),
       withheldRun.calls.filter((c) => /\/grant/.test(c)).join(' | '));
     check('while an earlier data-directory grant is revoked',
-      withheldRun.calls.some((c) => c === `icacls "${dataDir}" /remove:g "*${SID}" /T /C /Q`),
+      withheldRun.calls.some((c) => c === `icacls "${dataDir}" /remove:g "*${SID}" /T /L /Q`),
       withheldRun.calls.join(' | '));
   });
 }
@@ -1490,15 +1482,16 @@ async function testPrepareProtectedDir() {
 
   const root = scratch('prepare-dir');
   const dir = path.join(root, 'created', 'runtime');
+  fs.mkdirSync(path.dirname(dir));
 
   const run = stubRun([[/icacls /, { success: true }]]);
-  const prepared = await op.prepareProtectedDir({
+  const prepared = await op.prepareProtectedDir(withFileStub({
     dir, sid: SID, serviceAccount: false, run, log: () => {},
-  });
+  }));
 
   check('the missing folder is created', prepared.ok === true && fs.existsSync(dir), prepared.reason ?? '');
   check('and protected in the same call, before anything could be placed in it',
-    JSON.stringify(run.calls) === JSON.stringify(op.buildProtectCommands(dir, SID, { serviceAccount: false })),
+    JSON.stringify(run.calls) === JSON.stringify(op.buildProtectCommands(dir, SID, { serviceAccount: false }).map(aclCall)),
     run.calls.join(' | '));
   check('the owner is Administrators first', run.calls[0]?.includes(`/setowner "*S-1-5-32-544"`), run.calls[0]);
   check('the service account is omitted while the service does not exist yet',
@@ -1506,24 +1499,24 @@ async function testPrepareProtectedDir() {
   check('and the operator\'s own SID is removed, not granted', run.calls[2]?.includes(`/remove:g "*${SID}"`),
     run.calls[2]);
 
-  const again = await op.prepareProtectedDir({
+  const again = await op.prepareProtectedDir(withFileStub({
     dir, sid: SID, run: stubRun([[/icacls /, { success: true }]]), log: () => {},
-  });
+  }));
   check('preparing a folder that already exists is not an error', again.ok === true);
 
   const deniedDir = path.join(root, 'denied');
-  const denied = await op.prepareProtectedDir({
+  const denied = await op.prepareProtectedDir(withFileStub({
     dir: deniedDir, sid: SID, run: stubRun([[/icacls /, { success: false, stderr: 'Access is denied.' }]]),
     log: () => {},
-  });
+  }));
   check('a folder that cannot be protected is {ok:false}', denied.ok === false);
   check('with the icacls output as the reason', /Access is denied/.test(denied.reason ?? ''), denied.reason);
   check('and it is left empty, so nothing ran from it',
     fs.existsSync(deniedDir) && fs.readdirSync(deniedDir).length === 0);
 
-  const odd = await op.prepareProtectedDir({
+  const odd = await op.prepareProtectedDir(withFileStub({
     dir: path.join(root, 'odd$dir'), sid: SID, run: stubRun([[/icacls /, { success: true }]]), log: () => {},
-  });
+  }));
   check('a path that cannot be quoted is {ok:false}, never a throw',
     odd.ok === false && /refusing an unusual path/.test(odd.reason ?? ''), odd.reason);
 }

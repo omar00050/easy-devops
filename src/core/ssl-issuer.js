@@ -48,6 +48,7 @@ import {
   hasChallengeLocation,
   DEFAULT_ACME_CHALLENGE_PORT,
 } from './nginx-conf-generator.js';
+import { protectKeyDirectory, loadAccountKey, replaceCertificateFile } from './ssl/private-keys.js';
 import { withChallengeServer } from './acme-challenge.js';
 
 /**
@@ -166,34 +167,22 @@ export async function reloadNginx(run = defaultRun) {
  * was never handed over, the failure names that setup rather than looking
  * like an unexplained issuance error.
  *
- * @param {string} certDir
+ * @param {string} sslDir
+ * @param {string} domainName
  */
-async function ensureCertDir(certDir) {
+async function ensureCertDir(sslDir, domainName) {
   try {
-    await fs.mkdir(certDir, { recursive: true });
+    await protectKeyDirectory(sslDir, domainName);
   } catch (err) {
     if (err?.code === 'EACCES' || err?.code === 'EPERM') {
       throw new Error(
-        `Cannot create the certificate directory ${certDir}: permission denied. `
+        `Cannot create the certificate directory ${path.join(sslDir, domainName)}: permission denied. `
         + 'Run the one-time setup from a terminal so this account owns it '
         + '(dashboard: Settings -> Linux permissions; CLI: Settings -> Linux Permissions), '
         + 'then try again.',
       );
     }
     throw err;
-  }
-}
-
-/** Loads or creates the persistent ACME account key. */
-async function getAccountKey(sslDir, acmeLib = acme) {
-  const keyPath = path.join(sslDir, '.account', 'account.key');
-  await fs.mkdir(path.dirname(keyPath), { recursive: true });
-  try {
-    return await fs.readFile(keyPath);
-  } catch {
-    const key = await acmeLib.crypto.createPrivateKey();
-    await fs.writeFile(keyPath, key);
-    return key;
   }
 }
 
@@ -678,8 +667,8 @@ export async function issueCertificate(domainName, options = {}) {
   let altNames;
   try {
     report('account and order', 'running', "Preparing the Let's Encrypt account and order");
-    await ensureCertDir(path.join(sslDir, domainName));
-    const accountKey = await getAccountKey(sslDir, acmeLib);
+    await ensureCertDir(sslDir, domainName);
+    const accountKey = await loadAccountKey(sslDir, () => acmeLib.crypto.createPrivateKey());
     client = new acmeLib.Client({ directoryUrl: directoryUrl(staging, acmeLib), accountKey });
 
     altNames = wildcard
@@ -696,14 +685,14 @@ export async function issueCertificate(domainName, options = {}) {
   const writeCert = async (cert) => {
     const certPath = path.join(certDir, 'fullchain.pem');
     const keyPath = path.join(certDir, 'privkey.pem');
-    await fs.writeFile(keyPath, domainKey);
-    await fs.writeFile(certPath, cert);
+    await replaceCertificateFile(keyPath, domainKey);
+    await replaceCertificateFile(certPath, cert);
 
     // Best effort: a certificate without this file still renews — the names
     // are read back out of the certificate — so a failed write must never
     // turn a successful issuance into a reported failure.
     try {
-      await fs.writeFile(
+      await replaceCertificateFile(
         path.join(certDir, CERT_META_FILE),
         JSON.stringify({
           domain: domainName,

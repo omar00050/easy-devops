@@ -30,6 +30,7 @@
  */
 
 import './lib/guard.mjs';
+import { withFileStub } from './lib/windows-file-stub.mjs';
 import { TEST_DATA_DIR, assertInsideTestDataDir } from './lib/guard.mjs';
 
 import fs from 'fs';
@@ -227,6 +228,15 @@ async function testSystemdUnit() {
   check('nginx is ordering only, never a hard requirement', !/^Requires=.*nginx/m.test(unit));
   check('the data directory is passed in the environment',
     /^Environment=EASY_DEVOPS_DATA_DIR=\/home\/deploy\/\.config\/easy-devops$/m.test(unit));
+  check('the daemon blocks optional ws accelerators and ambient Node lookup',
+    [
+      'NODE_OPTIONS=',
+      'NODE_PATH=',
+      'WS_NO_BUFFER_UTIL=1',
+      'WS_NO_UTF_8_VALIDATE=1',
+    ].every((setting) => unit.split('\n').includes(`Environment=${setting}`)), unit);
+  check('the daemon starts through the runtime boundary loader',
+    /--experimental-loader=.*runtime-loader\.mjs/.test(unit));
   check('WantedBy=multi-user.target so it starts at boot',
     /^WantedBy=multi-user\.target$/m.test(unit));
 
@@ -262,6 +272,45 @@ async function testSystemdUnit() {
   check('without systemd it prints a runnable command',
     manual.includes('/usr/bin/node /opt/ez/src/cli/index.js daemon'));
   check('and names real alternatives', /runit|s6|supervisord|OpenRC/.test(manual));
+
+  const refreshPath = path.join(scratch('systemd-refresh'), 'easy-devops.service');
+  fs.writeFileSync(refreshPath, `[Unit]
+Description=Easy DevOps background service
+
+[Service]
+Type=simple
+User=deploy
+WorkingDirectory=/opt/easy-devops
+ExecStart=/home/deploy/.config/easy-devops/runtime/node --experimental-loader=file:///opt/easy-devops/src/core/service/runtime-loader.mjs /opt/easy-devops/src/cli/index.js daemon
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+`);
+  const refreshCommands = [];
+  const refreshed = await sd.refreshUnit({
+    entry: '/opt/easy-devops/src/cli/index.js',
+    dataDir: '/home/deploy/.config/easy-devops',
+    unitPath: refreshPath,
+    fileRunner: async (file, args) => {
+      refreshCommands.push([file, ...args]);
+      const source = args.at(-2);
+      const destination = args.at(-1);
+      fs.copyFileSync(source, destination);
+      return { success: true, exitCode: 0 };
+    },
+    interactive: async () => ({ success: true, exitCode: 0 }),
+  });
+  const refreshedUnit = fs.readFileSync(refreshPath, 'utf8');
+  check('repair refreshes an older unit without replacing its identity or limits',
+    refreshed.ok === true && /^User=deploy$/m.test(refreshedUnit) && /^LimitNOFILE=65536$/m.test(refreshedUnit));
+  check('repair adds every daemon environment protection to an older unit',
+    ['NODE_OPTIONS=', 'NODE_PATH=', 'WS_NO_BUFFER_UTIL=1', 'WS_NO_UTF_8_VALIDATE=1']
+      .every((setting) => refreshedUnit.split('\n').includes(`Environment=${setting}`)), refreshedUnit);
+  check('repair stages the rewritten unit with direct sudo argv',
+    refreshCommands[0]?.[0] === 'sudo' && refreshCommands[0]?.[1] === 'install'
+      && refreshCommands[0]?.at(-1) === refreshPath
+      && refreshCommands[0]?.at(-2) !== refreshPath);
 }
 
 // ─── 3. systemd install: the exact commands, and no password ────────────────
@@ -276,11 +325,32 @@ async function testSystemdInstall() {
   const commands = [];
   const interactive = async (cmd) => { commands.push(cmd); return { success: true, exitCode: 0 }; };
 
+  const { isWindows } = await import(srcUrl('core/platform.js'));
+  const stages = [];
+  let failCopy = false;
+  const fileRunner = async (file, args) => {
+    commands.push([file, ...args].join(' '));
+    if (args[0] === 'install') {
+      const staged = args.at(-2);
+      stages.push(path.dirname(staged));
+      check('sudo receives the source and destination as separate arguments',
+        file === 'sudo' && args.at(-1) === unitPath && staged !== unitPath);
+      check('staged contents match the generated unit', fs.readFileSync(staged, 'utf8') === sd.buildUnit({
+        nodeExe: '/x/node', entry: '/x/entry.js', dataDir: dir, user: 'deploy',
+      }));
+      if (!isWindows) {
+        check('only the installer can access the staged directory and unit',
+          (fs.statSync(stages.at(-1)).mode & 0o777) === 0o700 && (fs.statSync(staged).mode & 0o777) === 0o600);
+      }
+    }
+    return { success: !failCopy, exitCode: Number(failCopy) };
+  };
+
   // install() requires a TTY, which a test child does not have. Faking it is
   // the point of the check: the real guard is that a non-TTY is REFUSED, which
   // is asserted first.
   const refusedWithoutTty = await sd.install({
-    nodeExe: '/x/node', entry: '/x/entry.js', dataDir: dir, interactive, unitPath,
+    nodeExe: '/x/node', entry: '/x/entry.js', dataDir: dir, interactive, fileRunner, unitPath,
   });
   check('install refuses without a terminal, because sudo must ask',
     refusedWithoutTty.ok === false && /terminal/i.test(refusedWithoutTty.reason),
@@ -296,6 +366,7 @@ async function testSystemdInstall() {
       dataDir: dir,
       user: 'deploy',
       interactive,
+      fileRunner,
       unitPath,
       runner: stubRun([[/journalctl/, { stdout: '' }]]),
     });
@@ -303,7 +374,6 @@ async function testSystemdInstall() {
     check('install succeeds with the stub', installed.ok === true, installed.reason ?? '');
 
     const joined = commands.join('\n');
-    check('it copies the staged unit with sudo', /sudo cp .* ".*easy-devops\.service"/.test(joined));
     check('it reloads systemd', joined.includes('sudo systemctl daemon-reload'));
     check('it enables the unit for boot', /sudo systemctl enable easy-devops\.service/.test(joined));
     check('it starts the unit', /sudo systemctl restart easy-devops\.service/.test(joined));
@@ -316,17 +386,18 @@ async function testSystemdInstall() {
       !commands.some((c) => /-S\b|--stdin|password|echo .*\|/i.test(c)),
       commands.find((c) => /-S\b|--stdin|password/i.test(c)) ?? '');
 
-    check('nothing was left in the system temp directory', (() => {
-      const leftovers = fs.readdirSync(os.tmpdir()).filter((f) => /^easy-devops-\d+\.service$/.test(f));
-      return leftovers.length === 0;
-    })());
-
-    // The unit that was staged must be the one that got copied.
-    check('the staged unit is removed after the copy', !/\.service"$/.test(''));
+    check('successful install cleans up the private staging directory', stages.length === 1 && !fs.existsSync(stages[0]));
+    failCopy = true;
+    const failed = await sd.install({
+      nodeExe: '/x/node', entry: '/x/entry.js', dataDir: dir, user: 'deploy', interactive, fileRunner, unitPath,
+    });
+    check('failed install uses and cleans up a fresh private directory',
+      !failed.ok && stages.length === 2 && stages[1] !== stages[0] && !fs.existsSync(stages[1]));
+    failCopy = false;
 
     // ── uninstall ───────────────────────────────────────────────────────────
     commands.length = 0;
-    const removed = await sd.uninstall({ interactive, unitPath });
+    const removed = await sd.uninstall({ interactive, fileRunner, unitPath });
     check('uninstall succeeds', removed.ok === true, removed.reason ?? '');
 
     const removeJoined = commands.join('\n');
@@ -425,6 +496,15 @@ async function testWinswXml() {
   check('the daemon is given time to release its lock on stop', /<stoptimeout>/.test(xml));
   check('the data directory is passed in the environment',
     /<env name="EASY_DEVOPS_DATA_DIR" value="C:\\ProgramData\\easy-devops"\/>/.test(xml));
+  check('WinSW disables optional ws accelerators and ambient Node lookup',
+    [
+      ['NODE_OPTIONS', ''],
+      ['NODE_PATH', ''],
+      ['WS_NO_BUFFER_UTIL', '1'],
+      ['WS_NO_UTF_8_VALIDATE', '1'],
+    ].every(([name, value]) => xml.includes(`<env name="${name}" value="${value}"/>`)), xml);
+  check('WinSW starts through the runtime boundary loader',
+    /<arguments>[^<]*runtime-loader\.mjs[^<]*<\/arguments>/.test(xml));
 
   // A path with an ampersand would otherwise produce invalid XML.
   const escaped = winsw.buildServiceXml({
@@ -506,8 +586,7 @@ async function testAcls() {
   check('C:\\ssl is NOT hardcoded anywhere', !paths.some((p) => /^C:\\ssl$/i.test(p)));
   check('the data directory gets Modify',
     grants.find((g) => g.path === 'C:\\ProgramData\\easy-devops')?.access === 'M');
-  check('the runtime gets read-and-execute only',
-    grants.find((g) => g.path.endsWith('runtime'))?.access === 'RX');
+  check('the protected runtime is excluded from Modify grants', !grants.some(g => g.path.endsWith('runtime')));
 
   const noPaths = acl.requiredGrants({ dataDir: 'C:\\d' });
   check('with no Settings paths, only the data directory is granted',
@@ -519,30 +598,24 @@ async function testAcls() {
   check('a duplicated path is granted once', shared.length === 1, `${shared.length} entries`);
   check('and keeps the broader access', shared[0]?.access === 'M');
 
-  const cmd = acl.buildGrantCommand('D:\\my\\nginx', 'M');
-  check('the command inherits to files and subdirectories', cmd.includes('(OI)(CI)'));
-  check('the command applies to existing contents', /\/T\b/.test(cmd));
-  check('the account is quoted, since it contains a backslash and a space',
-    cmd.includes('"NT SERVICE\\EasyDevOps:(OI)(CI)M"'));
-
   // Applying: driven by a stub, so no real ACL is ever changed.
   const dir = scratch('acl-target');
   const run = stubRun([[/icacls/, { success: true, stdout: 'Successfully processed 1 files' }]]);
-  const applied = await acl.applyGrants({ grants: [{ path: dir, access: 'M', why: 'test' }], run });
+  const applied = await acl.applyGrants(withFileStub({ approvedDirs: [dir], grants: [{ path: dir, access: 'M', why: 'test' }], run }));
   check('a grant is applied through icacls', applied.ok === true && run.matching(/icacls/).length === 1);
   check('the applied command names the real directory', run.calls[0].includes(dir));
 
-  const denied = await acl.applyGrants({
-    grants: [{ path: dir, access: 'M', why: 'test' }],
+  const denied = await acl.applyGrants(withFileStub({
+    approvedDirs: [dir], grants: [{ path: dir, access: 'M', why: 'test' }],
     run: stubRun([[/icacls/, { success: false, stderr: 'Access is denied.' }]]),
-  });
+  }));
   check('an Access denied result is reported as needing elevation',
     denied.ok === false && denied.needsElevation === true);
 
-  const absent = await acl.applyGrants({
-    grants: [{ path: path.join(dir, 'does-not-exist'), access: 'M', why: 'test' }],
+  const absent = await acl.applyGrants(withFileStub({
+    approvedDirs: [path.join(dir, 'does-not-exist')], grants: [{ path: path.join(dir, 'does-not-exist'), access: 'M', why: 'test' }],
     run: stubRun([[/icacls/, { success: true }]]),
-  });
+  }));
   check('a directory that does not exist yet is skipped, not created',
     absent.failed.length === 1 && /does not exist/.test(absent.failed[0].reason));
   check('and nothing was created for it', !fs.existsSync(path.join(dir, 'does-not-exist')));
@@ -649,6 +722,11 @@ async function testGuardRefusesProgramData() {
 
   // Run in children, because the guard throws at getDataDir() and the refusal
   // depends on the environment being set before any import.
+  const programData = scratch('guard-machine');
+  const roaming = scratch('guard-user');
+  // The guard permits anything under os.tmpdir(). Give each child its own
+  // temp root, beside the simulated profile and machine directories.
+  const childTemp = scratch('guard-temp');
   const probe = (dataDir) => new Promise((resolve) => {
     const child = spawn(process.execPath, [
       '-e',
@@ -656,7 +734,10 @@ async function testGuardRefusesProgramData() {
       + 'process.stdout.write("ALLOWED")}catch(e){process.stdout.write("REFUSED:"+e.message.split("\\n")[1])}})',
     ], {
       cwd: ROOT,
-      env: { ...process.env, EZ_TEST: '1', EASY_DEVOPS_DATA_DIR: dataDir },
+      env: {
+        ...process.env, EZ_TEST: '1', EASY_DEVOPS_DATA_DIR: dataDir,
+        ProgramData: programData, APPDATA: roaming, TEMP: childTemp, TMP: childTemp,
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';
@@ -664,9 +745,9 @@ async function testGuardRefusesProgramData() {
     child.on('exit', () => resolve(out));
   });
 
-  const programData = process.env.ProgramData || 'C:\\ProgramData';
   const ezProgramData = path.join(programData, 'easy-devops');
 
+  fs.mkdirSync(path.join(ezProgramData, 'sub', 'dir'), { recursive: true });
   const exact = await probe(ezProgramData);
   check('C:\\ProgramData\\easy-devops is refused', exact.startsWith('REFUSED'), exact.slice(0, 80));
 
@@ -676,11 +757,12 @@ async function testGuardRefusesProgramData() {
   const parent = await probe(programData);
   check('ProgramData itself is refused, since it contains it', parent.startsWith('REFUSED'), parent.slice(0, 80));
 
-  const appdata = path.join(process.env.APPDATA || os.homedir(), 'easy-devops');
+  const appdata = path.join(roaming, 'easy-devops');
+  fs.mkdirSync(appdata);
   const perUser = await probe(appdata);
   check('the per-user directory is still refused', perUser.startsWith('REFUSED'), perUser.slice(0, 80));
 
-  const temp = await probe(path.join(TEST_DATA_DIR, 'allowed'));
+  const temp = await probe(childTemp);
   check('a temp directory is still allowed', temp === 'ALLOWED', temp.slice(0, 80));
 }
 
@@ -719,7 +801,13 @@ async function testPersonalLauncher() {
   // ── Actually run it. Batch syntax cannot be verified by reading. ──────────
   const runDir = path.join(dir, 'run');
   fs.mkdirSync(runDir, { recursive: true });
-  const entry = path.join(runDir, 'entry.js');
+  const entry = path.join(runDir, 'src', 'cli', 'entry.cjs');
+  fs.mkdirSync(path.dirname(entry), { recursive: true });
+  const serviceDir = path.join(runDir, 'src/core/service');
+  fs.mkdirSync(serviceDir, { recursive: true });
+  for (const file of ['runtime-loader.mjs', 'runtime-boundary.cjs']) {
+    fs.copyFileSync(path.join(ROOT, 'src/core/service', file), path.join(serviceDir, file));
+  }
   fs.writeFileSync(entry, [
     'const fs = require("fs");',
     `const f = ${JSON.stringify(path.join(runDir, 'attempts'))};`,
@@ -1191,6 +1279,15 @@ async function testNotDevMode() {
     nodeExe: 'N', entry: 'E', dataDir: path.join(TEST_DATA_DIR, 'custom'), logFile: 'L', stopFile: 'S',
   });
   check('it DOES set it for a non-default dir', /set "EASY_DEVOPS_DATA_DIR=/.test(custom));
+  check('the Personal supervisor clears ambient Node lookup and disables ws accelerators',
+    [
+      'NODE_OPTIONS=',
+      'NODE_PATH=',
+      'WS_NO_BUFFER_UTIL=1',
+      'WS_NO_UTF_8_VALIDATE=1',
+    ].every((setting) => custom.includes(`set "${setting}"`)), custom);
+  check('the Personal supervisor starts through the runtime boundary loader',
+    /--experimental-loader=.*runtime-loader\.mjs/.test(custom));
 
   const unit = sd.buildUnit({ nodeExe: 'n', entry: '/e/src/cli/index.js', user: 'u', dataDir: defaultDir });
   check('the systemd unit omits it for the default dir', !/^Environment=EASY_DEVOPS_DATA_DIR=/m.test(unit));
@@ -1209,6 +1306,10 @@ async function testNotDevMode() {
   // The question that matters: a daemon started by the launcher with the
   // ordinary data directory must use PRODUCTION Let's Encrypt. It used to use
   // staging, because dev mode was inferred from the variable being set at all.
+  const profile = scratch('launcher-profile');
+  const defaultProbeDir = platform.isWindows
+    ? path.join(profile, 'easy-devops') : path.join(profile, '.config', 'easy-devops');
+  fs.mkdirSync(defaultProbeDir, { recursive: true });
   const probe = (env) => new Promise((resolve) => {
     const child = spawn(process.execPath, [
       '-e',
@@ -1217,7 +1318,10 @@ async function testNotDevMode() {
       + ' dev: p.isDevDataDir(), staging: s.useStaging({ acmeStaging: false }) })))',
     ], {
       cwd: ROOT,
-      env: { ...process.env, EZ_TEST: '', EZ_DEV: '', EASY_DEVOPS_DATA_DIR: '', ...env },
+      env: {
+        ...process.env, EZ_TEST: '1', EZ_DEV: '', APPDATA: profile, HOME: profile,
+        EASY_DEVOPS_DATA_DIR: TEST_DATA_DIR, ...env,
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';
@@ -1229,13 +1333,13 @@ async function testNotDevMode() {
     });
   });
 
-  const asLauncher = await probe({ EASY_DEVOPS_DATA_DIR: defaultDir });
+  const asLauncher = await probe({ EASY_DEVOPS_DATA_DIR: defaultProbeDir });
   check('a daemon started by the launcher is NOT in dev mode',
     asLauncher.dev === false, JSON.stringify(asLauncher));
   check('and uses PRODUCTION Let\'s Encrypt, not staging',
     asLauncher.staging === false, JSON.stringify(asLauncher));
 
-  const asService = await probe({ EASY_DEVOPS_DATA_DIR: path.join(TEST_DATA_DIR, 'service-dir') });
+  const asService = await probe({ EASY_DEVOPS_DATA_DIR: scratch('service-dir') });
   check('nor is a service with some other data directory',
     asService.dev === false && asService.staging === false, JSON.stringify(asService));
 
@@ -1243,7 +1347,7 @@ async function testNotDevMode() {
   check('--dev (EZ_DEV=1) IS dev mode', asDevFlag.dev === true, JSON.stringify(asDevFlag));
   check('and does use staging', asDevFlag.staging === true, JSON.stringify(asDevFlag));
 
-  const asDevDir = await probe({ EASY_DEVOPS_DATA_DIR: path.join(ROOT, '.dev-data') });
+  const asDevDir = await probe({ EASY_DEVOPS_DATA_DIR: scratch('.dev-data') });
   check('a .dev-data directory is dev mode even without the flag',
     asDevDir.dev === true, JSON.stringify(asDevDir));
 
@@ -1699,7 +1803,7 @@ async function testWinswLeftoverUpgrade() {
     const run = serviceRun({ registered: false });
 
     let fetched = false;
-    const installed = await ws.install({
+    const installed = await ws.install(withFileStub({
       dataDir,
       appRoot: path.join(root, 'app'),
       config: {},
@@ -1720,7 +1824,7 @@ async function testWinswLeftoverUpgrade() {
         verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
         verifyWinsw: async () => ({ ok: true, sha256: 'stub' }),
       },
-    });
+    }));
 
     check('the install succeeds', installed.ok === true, installed.reason ?? '');
     check('the wrapper is now EasyDevOps.exe', fs.existsSync(ws.winswPath()));
@@ -1778,7 +1882,7 @@ async function testWinswReregisters() {
     // this stub, so only `sc delete` does. That is the awkward real case.
     const run = serviceRun({ registered: true });
 
-    const installed = await ws.install({
+    const installed = await ws.install(withFileStub({
       dataDir,
       appRoot: path.join(root, 'app'),
       config: {},
@@ -1796,7 +1900,7 @@ async function testWinswReregisters() {
         verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
         verifyWinsw: async () => ({ ok: true, sha256: 'stub' }),
       },
-    });
+    }));
 
     check('the install succeeds even though a service was registered',
       installed.ok === true, installed.reason ?? '');
@@ -1843,7 +1947,7 @@ async function testWinswRegistrationFailure() {
       registerResult: { success: false, stdout: '', stderr: output },
     });
 
-    const failed = await ws.install({
+    const failed = await ws.install(withFileStub({
       dataDir,
       appRoot: path.join(root, 'app'),
       config: {},
@@ -1861,7 +1965,7 @@ async function testWinswRegistrationFailure() {
         verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
         verifyWinsw: async () => ({ ok: true, sha256: 'stub' }),
       },
-    });
+    }));
 
     check('the install fails', failed.ok === false);
     check('and says registration was the failing step', failed.registrationFailed === true);
@@ -2188,7 +2292,7 @@ async function testScExeEverywhere() {
     };
     const log = () => {};
 
-    await ws.install({
+    await ws.install(withFileStub({
       dataDir,
       appRoot,
       config: {},
@@ -2196,8 +2300,8 @@ async function testScExeEverywhere() {
       log,
       fetchImpl: async () => { throw new Error('the wrapper is already present'); },
       deps,
-    });
-    await ws.uninstall({ dataDir, config: {}, run, log });
+    }));
+    await ws.uninstall(withFileStub({ dataDir, config: {}, run, log }));
     scState = 'RUNNING';
     await ws.stop({ run, stopWaitMs: 2_000 });
     await ws.start({ run });
@@ -2206,7 +2310,7 @@ async function testScExeEverywhere() {
     scState = 'RUNNING';
     fs.mkdirSync(runtime, { recursive: true });
     fs.writeFileSync(path.join(runtime, 'marker'), 'OLD');
-    await ws.repair({
+    await ws.repair(withFileStub({
       dataDir,
       appRoot,
       config: {},
@@ -2214,7 +2318,7 @@ async function testScExeEverywhere() {
       log,
       waitForStart: async () => ({ alive: true }),
       deps,
-    });
+    }));
   } finally {
     if (previous === undefined) delete process.env.ProgramData;
     else process.env.ProgramData = previous;
@@ -2255,7 +2359,7 @@ async function testElevation() {
   check('and specifically for Administrator', /Administrator/.test(command));
 
   let copied = 0;
-  const refused = await ws.install({
+  const refused = await ws.install(withFileStub({
     dataDir: scratch('elevation-nocopy'),
     appRoot: scratch('elevation-app'),
     run: stubRun(),
@@ -2265,7 +2369,7 @@ async function testElevation() {
       canWrite: () => { throw new Error('the write probe must not be reached'); },
       copyRuntime: () => { copied++; return { ok: true }; },
     },
-  });
+  }));
   check('install refuses without elevation',
     refused.ok === false && refused.needsElevation === true, refused.reason ?? '');
   check('and copied nothing', copied === 0);
@@ -2307,7 +2411,7 @@ async function testElevation() {
       return base(cmd);
     };
 
-    const installed = await ws.install({
+    const installed = await ws.install(withFileStub({
       dataDir,
       appRoot: path.join(root, 'app'),
       config: {},
@@ -2326,7 +2430,7 @@ async function testElevation() {
         verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
         verifyWinsw: async () => ({ ok: true }),
       },
-    });
+    }));
 
     check('with unknown elevation the install proceeds', installed.ok === true, installed.reason ?? '');
     check('the UAC note is logged', logs.includes(ws.UAC_NOTE));
@@ -2627,14 +2731,14 @@ async function testRepairWhileRunning() {
 
     const successEvents = [];
     const successRun = makeRun(successEvents);
-    const success = await ws.repair({
+    const success = await ws.repair(withFileStub({
       dataDir,
       appRoot,
       config: {},
       run: successRun,
       waitForStart: async () => ({ alive: true }),
       deps: makeDeps(successEvents, successRun),
-    });
+    }));
 
     check('the repair succeeds', success.ok === true, success.reason ?? '');
     check('the runtime was copied while the service was STOPPED',
@@ -2654,7 +2758,7 @@ async function testRepairWhileRunning() {
     let startCalls = 0;
     let atSecondStart = null;
 
-    const rollback = await ws.repair({
+    const rollback = await ws.repair(withFileStub({
       dataDir,
       appRoot,
       config: {},
@@ -2670,7 +2774,7 @@ async function testRepairWhileRunning() {
         return { alive: true };
       },
       deps: makeDeps(rollbackEvents, rollbackRun),
-    });
+    }));
 
     check('the repair reports failure', rollback.ok === false);
     check('and says the previous copy was restored', rollback.restored === true, rollback.reason ?? '');
@@ -2685,13 +2789,13 @@ async function testRepairWhileRunning() {
 
     const noElevationEvents = [];
     const noElevationRun = makeRun(noElevationEvents);
-    const refused = await ws.repair({
+    const refused = await ws.repair(withFileStub({
       dataDir,
       appRoot,
       config: {},
       run: noElevationRun,
       deps: { isWindows: true, isElevated: () => false, canWrite: () => true },
-    });
+    }));
     check('repair refuses without elevation',
       refused.ok === false && refused.needsElevation === true, refused.reason ?? '');
     check('and issued no stop',

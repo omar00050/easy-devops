@@ -195,6 +195,12 @@ On update every field is optional and is deep-merged over the stored domain;
 notification config rather than into the domain object. Unspecified fields take
 `DOMAIN_DEFAULTS` on create.
 
+Typed domain fields reject line breaks, semicolons and braces before nginx
+files are written. Use a hostname, IP address or HTTP(S) URL for the upstream,
+whole numbers for timeouts and rates, and space-separated MIME types for gzip.
+Invalid domain input returns HTTP 400 with an `error` message.
+`advanced.customLocations` accepts literal nginx configuration.
+
 `behindCloudflare` (boolean, default `false`) is optional on create/update. When
 `true`, the generated server block adds `set_real_ip_from` for every published
 Cloudflare IPv4/IPv6 range and `real_ip_header CF-Connecting-IP`. Absent means
@@ -628,9 +634,15 @@ listener.
     "npmUpdatable": true,
     "howToUpdate": []
   },
+  "elevation": { "required": false, "command": null, "shell": null },
   "run": null
 }
 ```
+`elevation.required` is `true` on a Windows Server-mode install when this
+dashboard process is not elevated: the update replaces the service's runtime
+copy, which only administrators may change, so the worker would refuse at its
+first check. `command` is then `"ezz update"` and `shell` is
+`"Administrator PowerShell"`; the UI shows them instead of an Update button.
 `source.kind` is `npm`, `clone` or `unknown`. Only `npm` is updatable in place;
 for the others `howToUpdate` carries the commands to run instead, and `POST`
 refuses (the same rule as `ezz update` — see `src/core/installSource.js`).
@@ -646,9 +658,9 @@ client polls while the dashboard is going down and coming back. `run` is `null`
 until an update has been started from this data directory.
 
 **`POST /api/update`** body `{ "version": "1.3.5" }` — all of it optional and
-the body may be absent. `version` must be a release triple
-(`^\d+\.\d+\.\d+$`); when it is absent or malformed the server does a fresh
-registry check and uses `latest`. The request never performs the update itself
+the body may be absent. `version` accepts a release triple with an optional prerelease suffix
+(`^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$`); an omitted version triggers a fresh registry check and uses `latest`.
+A malformed version returns `400` before a worker starts. The request never performs the update itself
 — npm replaces the files this process runs from, and the process is stopped
 mid-way — so it records the run and spawns a detached worker
 (`src/dashboard/updateWorker.js`) that survives the restart and performs the
@@ -659,6 +671,9 @@ SAME `core/updater.js` flow as `ezz update`.
 - `409` when this copy is not npm-managed (`error` and `source` included), when
   a run is already active (`error` and `run` included), or when the registry
   says it is up to date (`error`, `current`, `latest`).
+- `403` `{ "error": "elevation_required", "message", "command", "shell" }`
+  when `elevation.required` would be `true` (checked before anything else is
+  recorded or started).
 - `502` `{ "error" }` when the registry cannot be reached and no version was
   given.
 - `500` `{ "error": "Internal server error" }` on an unexpected failure.
@@ -1062,7 +1077,8 @@ is `core/deploy/`; these routes are a thin layer over it.
   step and leaves the running release untouched. `install`/`build`/`migrate`
   keep their old behaviour (`migrate` still runs with the forward-only hint),
   and `custom` has none. The run record's `step` is the kind, or `step N`
-  (1-based list position) for a custom step. `steps` is also read from `ez.json`
+  (1-based list position) for a custom step; the record also carries `stage`
+  and `skippedStages` (see the run object below). `steps` is also read from `ez.json`
   and is one field for precedence: the first layer that states it wins the whole
   list — an app setting replaces the list from `ez.json`, and `[]` clears it. An
   older app that still stores `install`/`build`/`migrate` keeps winning over a
@@ -1131,6 +1147,8 @@ metadata, which is what a rollback follows.
 **`GET /api/deployments`** also returns `hook` (below), `requirements`
 `{ git, gitVersion, pm2 }`, `limits`, `ezFileLocations`, `channels`
 (`[{ id, name, type }]`) and `domains` (`[{ name, enabled, ssl }]`).
+
+Changing `repoUrl` discards the saved credential. A token-authenticated replacement origin requires a new token in the same request.
 
 **`POST /api/deployments`** takes `{ id, repoUrl, branch?, authType?, token?,
 generateKey?, settings?, env?, keepReleases?, autoRollback?, notifyChannelIds? }`
@@ -1297,6 +1315,8 @@ says so.
   "releaseId": "20261115-214502-3fa9c1",
   "status": "running",
   "step": "build",
+  "stage": "build",
+  "skippedStages": ["migrate", "post"],
   "startedAt": 1794000000000,
   "finishedAt": null,
   "error": null,
@@ -1320,6 +1340,20 @@ says so.
   `kind` (`install`, `build` or `migrate`), or `step N` (1-based list position)
   for a `custom` step. On a failure it stays at the step that failed; a failed
   migration is `migrate`, a failed custom step is `step N`.
+- `stage` (2.17.0) — the canonical stage the run is in, for a stage bar that
+  both the dashboard and the Hub can draw: `fetch`, `settings`, `pre`,
+  `install`, `build`, `migrate`, `start`, `health`, `post`, `finish`, or `done`
+  once the run succeeded. It is a reserved step's own id, or — for a `custom`
+  step, which has no stage of its own — the install/build/migrate stage it
+  continues, `build` otherwise. A failure keeps the stage it failed in. The
+  rollback run (`trigger: "rollback"`) goes `start` → `health` → `done`.
+- `skippedStages` (2.17.0) — the stages this run does not perform, in bar
+  order: `pre` when there is no pre hook, `post` when there is no post hook,
+  and `install`/`build`/`migrate` when no enabled step maps to them. It is `[]`
+  until the settings have been read, and for a rollback it is
+  `["fetch","settings","pre","install","build","migrate","post"]`.
+  **Old agents send neither `stage` nor `skippedStages`; readers fall back to
+  `step` and show no skipped stages.**
 - `reason` (2.11.0) — a short explanation, set on a boot crash or health
   failure: `crashed at boot: restarting N times`, `crashed at boot: process is
   "errored"…`, or `health check failed: …`. `null` otherwise.
@@ -1624,12 +1658,15 @@ carries it as `data`, and the stored result keeps it:
   on and either file is missing (blank paths resolve to `<sslDir>/<name>/`),
   the same refusal as the dashboard's `422 cert_missing`. `update` ignores
   `configFile`, `enabled` and `createdAt` from the payload.
+  Creating a domain with custom locations, changing the stored text or clearing
+  it requires the additional local grant `nginx.config.edit`. An update can
+  omit the text or send its current value with only `domains.edit`.
 
 | Command | Payload | Permission |
 |---|---|---|
 | `hub:reloadNginx` | — | `nginx.reload` |
 | `hub:nginxAction` | `{ action: start \| stop \| restart \| reload \| test }` | `nginx.<action>` |
-| `hub:manageDomain` | `{ action: create \| update \| toggle \| delete \| reload, … }` | `domains.<action>` (`reload` → `nginx.reload`) |
+| `hub:manageDomain` | `{ action: create \| update \| toggle \| delete \| reload, … }` | `domains.create`, `domains.edit`, `domains.toggle`, `domains.delete` or `nginx.reload` respectively. Raw custom-location changes also require `nginx.config.edit`. |
 | `hub:manageSSL` | `{ action: renew \| renewAll \| issue \| delete, … }` | `ssl.<action>` |
 | `hub:manageSSL` | `{ action: suggest, domain }` | none (read-only) |
 | `hub:manageProcess` | `{ action: start \| stop \| restart, name }` | `process.<action>` |
@@ -1698,7 +1735,7 @@ the push is skipped and the next reconnect re-sends the full state.
 | `service:state` | `{ installed, running, status, mechanism, mode, startsAt, stoppedByUser, jobsRunningHere, enabledOnBoot, dev, pm2Installed, pm2Version, uptimeMs }` | On connect, every 5 min, and whenever the shared revision moves. It describes the **native** service; `pm2*` is the user's own PM2, a different thing |
 | `processes:list` | `{ daemonRunning, apps }` — the same app objects as `GET /api/processes`, and `daemonRunning: false` with `apps: []` when PM2 is absent or its daemon is down | On connect and every 60 s. It never starts a PM2 daemon just to report |
 | `deploy:apps` | The **public** app array: `envKeys` (sorted names, never values) instead of `env`, and no credentials. See §6 | On connect, every 20 s, and when any deployment begins or ends — whatever started it |
-| `deploy:progress` | `{ appId, runId, status, steps: [{ name, status }], lines: string[], skipped?, done, at }`. `steps` comes from the run record's `step` field; `at` is an ISO string. `lines` is empty unless `deploy.logs` is granted. See §6 | Every second while a run is active, and once with `done: true` when it ends (status no longer running or its lock is released) |
+| `deploy:progress` | `{ appId, runId, status, steps: [{ name, status }], stage, skippedStages: string[], lines: string[], skipped?, done, at }`. `steps` comes from the run record's `step` field; `stage` (2.17.0) is the canonical stage the run is in, or `null` when the record has none; `skippedStages` (2.17.0) is the record's own `skippedStages`, or `[]` when it has none. `at` is an ISO string. `lines` is empty unless `deploy.logs` is granted. See §6 | Every second while a run is active, and once with `done: true` when it ends (status no longer running or its lock is released) |
 | `permissions:state` | `{ tree, permissions, comingSoon }` — the catalog plus this server's grant map | On connect and whenever permissions change |
 | `nginx:configs` | `[{ name, content }]` | After a `hub:getConfigs` command, in addition to its `command:result` |
 | `nginx:logs` | `{ lines }` — the error log, without the REST response's `file` echo | After a `hub:getLogs` command, in addition to its `command:result` |
@@ -1873,7 +1910,12 @@ longer `running`, or its app's deploy lock is released). The agent finds the
 run from the same per-app lock, run record and run log the engine writes, so a
 deployment started in another process is visible too. `status` and
 `steps: [{ name, status }]` come from the run record's real `step` and `status`
-fields. `lines` carries the newest log lines only, and is present only while
+fields. `stage` (2.17.0) and `skippedStages` (2.17.0) come from the record's own
+`stage` and `skippedStages`, so the Hub can draw the same stage bar as the
+dashboard: `stage` is the canonical stage the run is in (`null` when the record
+has none) and `skippedStages` is the stages this run does not perform (`[]` when
+the record has none). Old agents send neither; a reader then falls back to
+`steps` and shows no skipped stages. `lines` carries the newest log lines only, and is present only while
 `deploy.logs` is granted at send time — otherwise it is `[]`. One event carries
 at most 200 lines and 32 KiB; each line is capped at 2000 characters, and when
 more arrived the newest are kept with `skipped` counting the rest. Every line

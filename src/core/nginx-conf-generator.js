@@ -12,6 +12,16 @@ import path from 'path';
 import { loadConfig } from './config.js';
 import { isWindows, toNginxPath, toEscapedNginxPath } from './platform.js';
 import { CLOUDFLARE_RANGES } from './cloudflare-ips.js';
+import { nginxDomainError, nginxPathError } from './nginx-fields.js';
+import { validatePort } from './validators.js';
+
+export class NginxFieldError extends Error {}
+
+function assertPort(value, field) {
+  if (!['string', 'number'].includes(typeof value) || !/^\d+$/.test(value) || validatePort(value)) {
+    throw new NginxFieldError(`Invalid ${field}. Use a port from 1 to 65535.`);
+  }
+}
 
 /**
  * How certificate paths are written into a generated config.
@@ -45,6 +55,7 @@ export const DEFAULT_ACME_CHALLENGE_PORT = 8089;
  * @returns {string} Indented nginx location block
  */
 export function buildChallengeLocation(port = DEFAULT_ACME_CHALLENGE_PORT) {
+  assertPort(port, 'acmeChallengePort');
   const target = `http://127.0.0.1:${Number(port) || DEFAULT_ACME_CHALLENGE_PORT}`;
   return [
     ` # ACME HTTP-01 challenge — answered by Easy DevOps so nginx never stops.`,
@@ -136,6 +147,7 @@ export async function ensureWebsocketMap(nginxDir) {
  * @returns {string} Indented nginx location block
  */
 export function buildDeployHookLocation(port) {
+  assertPort(port, 'deployHookPort');
   return [
     ` # Easy DevOps deploy hook — lets CI trigger a deployment over this domain.`,
     ` location ^~ ${DEPLOY_HOOK_PATH} {`,
@@ -239,7 +251,11 @@ export function parseListenAddresses(confText, port = 80) {
  */
 function formatCertPath(p, style) {
   if (isWindows && style === CERT_PATH_STYLES.ESCAPED) return toEscapedNginxPath(p);
-  return toNginxPath(p);
+  return literalPath(toNginxPath(p));
+}
+
+function literalPath(value) {
+  return /[\s\\]/u.test(value) ? `"${value.replace(/\\/g, '\\\\')}"` : value;
 }
 
 /** Returns the conf.d directory for domain config files. */
@@ -265,7 +281,7 @@ function buildIncludeLine(nginxDir) {
     const fwd = nginxDir.replace(/\\/g, '/');
     return ` include "${fwd}/conf/conf.d/*.conf";`;
   }
-  return ` include ${nginxDir}/conf.d/*.conf;`;
+  return ` include ${literalPath(nginxDir + '/conf.d/*.conf')};`;
 }
 
 /**
@@ -274,6 +290,8 @@ function buildIncludeLine(nginxDir) {
  * @param {string} nginxDir
  */
 export async function ensureNginxInclude(nginxDir) {
+  const error = nginxPathError(nginxDir, 'nginxDir');
+  if (error) throw new NginxFieldError(error);
   const confPath = getNginxConfPath(nginxDir);
 
   let content;
@@ -401,6 +419,8 @@ export function migrateDomain(d) {
  * @returns {string} Complete nginx conf content for the domain
  */
 export function buildConf(domain, nginxDir, sslDir, options = {}) {
+  const error = nginxDomainError(domain) || nginxPathError(nginxDir, 'nginxDir') || nginxPathError(sslDir, 'sslDir');
+  if (error) throw new NginxFieldError(error);
   const certPathStyle = options.certPathStyle ?? CERT_PATH_STYLES.FORWARD;
   const {
     name,
@@ -579,7 +599,7 @@ ${challengeLocation}
   // Logging - use platform-appropriate log path
   if (advanced?.accessLog) {
     const logDir = isWindows ? `${nginxDir.replace(/\\/g, '/')}/logs` : '/var/log/nginx';
-    mainBlock.push(` access_log ${logDir}/${name}.access.log;`);
+    mainBlock.push(` access_log ${literalPath(logDir + '/' + name + '.access.log')};`);
   }
 
   // The deploy hook, when this domain is the one chosen to expose it. It goes
@@ -665,10 +685,10 @@ ${challengeLocation}
       mainBlock.push(` error_page 500 502 503 504 /50x.html;`);
     }
     if (security.custom404) {
-      mainBlock.push(` location = /404.html { root ${isWindows ? nginxDir.replace(/\\/g, '/') + '/html' : '/usr/share/nginx/html'}; internal; }`);
+      mainBlock.push(` location = /404.html { root ${literalPath(isWindows ? nginxDir.replace(/\\/g, '/') + '/html' : '/usr/share/nginx/html')}; internal; }`);
     }
     if (security.custom50x) {
-      mainBlock.push(` location = /50x.html { root ${isWindows ? nginxDir.replace(/\\/g, '/') + '/html' : '/usr/share/nginx/html'}; internal; }`);
+      mainBlock.push(` location = /50x.html { root ${literalPath(isWindows ? nginxDir.replace(/\\/g, '/') + '/html' : '/usr/share/nginx/html')}; internal; }`);
     }
   }
 

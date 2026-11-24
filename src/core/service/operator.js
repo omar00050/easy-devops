@@ -37,9 +37,11 @@
  */
 
 import fs from 'fs';
+import path from 'path';
 
-import { run as shellRun } from '../shell.js';
-import { WINDOWS_SC, windowsCurrentUserCmd } from '../platform.js';
+import { run as shellRun, runFile as shellRunFile } from '../shell.js';
+import { WINDOWS_SC, programDataDir, windowsCurrentUserCmd } from '../platform.js';
+import { checkedAclDirectory, systemTool } from './acl.js';
 import { SERVICE_ID, SERVICE_ACCOUNT } from './winsw.js';
 
 /** Set by the relaunch, so the elevated copy grants the user who asked — see cli/elevation.js. */
@@ -167,7 +169,7 @@ export async function readServiceSddl({ run = shellRun } = {}) {
  *
  * @returns {Promise<{ ok: boolean, reason?: string }>}
  */
-export async function grantServiceControl({ sid, run = shellRun } = {}) {
+export async function grantServiceControl({ sid, run = shellRun, runFile = shellRunFile } = {}) {
   if (!isAccountSid(sid)) return { ok: false, reason: 'no user account to grant it to' };
 
   const current = await readServiceSddl({ run });
@@ -179,13 +181,13 @@ export async function grantServiceControl({ sid, run = shellRun } = {}) {
   } catch (err) {
     return { ok: false, reason: err.message };
   }
-  // The value is passed to a shell. SDDL is letters, digits and `:;()-`;
+  // Only the supported SDDL grammar is accepted;
   // anything else means it was not read correctly, and it is not sent.
   if (!/^[A-Za-z0-9:;()-]+$/.test(next)) {
     return { ok: false, reason: 'the service permissions contained unexpected characters; nothing was changed' };
   }
 
-  const result = await run(`${WINDOWS_SC} sdset ${SERVICE_ID} "${next}"`, { timeout: 20_000 });
+  const result = await runFile(systemTool(WINDOWS_SC), ['sdset', SERVICE_ID, next], { timeout: 20_000 });
   if (!result.success) {
     return { ok: false, reason: `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300) || 'sc.exe sdset failed' };
   }
@@ -211,12 +213,12 @@ const SID_USERS = '*S-1-5-32-545';
  * write it onto every child explicitly, protected or not.
  */
 export function buildDataDirGrantCommand(dataDir, sid) {
-  return `icacls "${safePath(dataDir)}" /grant "*${accountSid(sid)}:(OI)(CI)M" /C /Q`;
+  return [safePath(dataDir), '/grant', `*${accountSid(sid)}:(OI)(CI)M`, '/L', '/Q'];
 }
 
 /** Removes every allow entry for the SID under the data directory. */
 export function buildDataDirRevokeCommand(dataDir, sid) {
-  return `icacls "${safePath(dataDir)}" /remove:g "*${accountSid(sid)}" /T /C /Q`;
+  return [safePath(dataDir), '/remove:g', `*${accountSid(sid)}`, '/T', '/L', '/Q'];
 }
 
 /**
@@ -247,15 +249,14 @@ export function buildProtectCommands(dir, sid = null, { serviceAccount = true } 
   const target = safePath(dir);
   // Before the service is registered its account does not exist yet, and
   // icacls refuses an unknown name; install protects again once it does.
-  const service = serviceAccount ? ` "${SERVICE_ACCOUNT}:(OI)(CI)RX"` : '';
+  const recursive = ['/T', '/L', '/Q'];
+  const trustees = [`${SID_SYSTEM}:(OI)(CI)F`, `${SID_ADMINISTRATORS}:(OI)(CI)F`, `${SID_USERS}:(OI)(CI)RX`];
+  if (serviceAccount) trustees.push(`${SERVICE_ACCOUNT}:(OI)(CI)RX`);
   const commands = [
-    // Administrators own it, so no other account holds the owner's implicit
-    // right to rewrite its permissions.
-    `icacls "${target}" /setowner "${SID_ADMINISTRATORS}" /T /C /Q`,
-    `icacls "${target}" /inheritance:r /grant:r "${SID_SYSTEM}:(OI)(CI)F" "${SID_ADMINISTRATORS}:(OI)(CI)F" `
-      + `"${SID_USERS}:(OI)(CI)RX"${service} /T /C /Q`,
+    [target, '/setowner', SID_ADMINISTRATORS, ...recursive],
+    [target, '/inheritance:r', '/grant:r', ...trustees, ...recursive],
   ];
-  if (isAccountSid(sid)) commands.push(`icacls "${target}" /remove:g "*${sid}" /T /C /Q`);
+  if (isAccountSid(sid)) commands.push([target, '/remove:g', `*${sid}`, ...recursive]);
   return commands;
 }
 
@@ -270,20 +271,22 @@ export function buildProtectCommands(dir, sid = null, { serviceAccount = true } 
  * @param {string|null} [opts.sid]
  * @returns {Promise<{ ok: boolean, protected: string[], failed: Array<{ path: string, reason: string }> }>}
  */
-export async function protectServiceFiles({ dirs, sid = null, serviceAccount = true, run = shellRun, log = () => {} } = {}) {
+export async function protectServiceFiles({ dirs, sid = null, serviceAccount = true, runFile = shellRunFile, log = () => {} } = {}) {
   const done = [];
   const failed = [];
   for (const dir of dirs) {
-    if (!dir || !fs.existsSync(dir)) continue;
+    if (!dir) continue;
     let error = null;
     let commands = [];
     try {
       commands = buildProtectCommands(dir, sid, { serviceAccount });
+      await checkedAclDirectory(dir, runFile, true);
     } catch (err) {
       error = err.message;
+      commands = [];
     }
     for (const command of commands) {
-      const result = await run(command, { timeout: 120_000 });
+      const result = await runFile(systemTool('icacls.exe'), command, { timeout: 120_000 });
       if (!result.success) {
         error = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300) || 'icacls failed';
         break;
@@ -310,8 +313,8 @@ export async function protectServiceFiles({ dirs, sid = null, serviceAccount = t
  * @param {string[]} opts.protectedDirs  The runtime and wrapper folders
  * @returns {Promise<Object>} the record to keep under `service-state.operator`
  */
-export async function grantOperator({ operator, dataDir, protectedDirs, run = shellRun, log = () => {} } = {}) {
-  const protection = await protectServiceFiles({ dirs: protectedDirs, sid: operator?.sid ?? null, run, log });
+export async function grantOperator({ operator, dataDir, approvedDataDir = programDataDir(), protectedDirs, run = shellRun, runFile = shellRunFile, log = () => {} } = {}) {
+  const protection = await protectServiceFiles({ dirs: protectedDirs, sid: operator?.sid ?? null, runFile, log });
 
   if (!operator || !isAccountSid(operator.sid)) {
     return {
@@ -323,7 +326,7 @@ export async function grantOperator({ operator, dataDir, protectedDirs, run = sh
   }
 
   const notes = [];
-  const control = await grantServiceControl({ sid: operator.sid, run });
+  const control = await grantServiceControl({ sid: operator.sid, run, runFile });
   if (control.ok) log(`  ${operator.name ?? operator.sid}: may start, stop and restart the service`);
   else notes.push(`start/stop without elevation was not granted: ${control.reason}`);
 
@@ -331,14 +334,14 @@ export async function grantOperator({ operator, dataDir, protectedDirs, run = sh
   // inherited, and until then it would have reached them.
   let dataAccess = false;
   if (protection.ok) {
-    const result = await runSafely(() => buildDataDirGrantCommand(dataDir, operator.sid), run, 60_000);
+    const result = await runSafely(() => buildDataDirGrantCommand(dataDir, operator.sid), approvedDataDir, runFile, 60_000);
     dataAccess = result.success;
     if (dataAccess) log(`  ${operator.name ?? operator.sid}: may use the data directory without elevation`);
     else notes.push(`data directory access was not granted: ${`${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 200)}`);
   } else {
     // Fail closed. A grant from an earlier install or repair would otherwise
     // still be inherited by a runtime folder that could not be protected.
-    await runSafely(() => buildDataDirRevokeCommand(dataDir, operator.sid), run, 120_000);
+    await runSafely(() => buildDataDirRevokeCommand(dataDir, operator.sid), approvedDataDir, runFile, 120_000);
     notes.push('the runtime folder could not be protected, so the data directory is not shared with your account; '
       + 'run `ezz service repair` as administrator again');
   }
@@ -360,9 +363,9 @@ export async function grantOperator({ operator, dataDir, protectedDirs, run = sh
  * Removes the operator's data directory grant. The service DACL entry needs no
  * removal: it belongs to the service and is deleted with it.
  */
-export async function revokeOperator({ operator, dataDir, run = shellRun, log = () => {} } = {}) {
+export async function revokeOperator({ operator, dataDir, approvedDataDir = programDataDir(), runFile = shellRunFile, log = () => {} } = {}) {
   if (!operator || !isAccountSid(operator.sid) || !dataDir || !fs.existsSync(dataDir)) return { ok: true };
-  const result = await runSafely(() => buildDataDirRevokeCommand(dataDir, operator.sid), run, 120_000);
+  const result = await runSafely(() => buildDataDirRevokeCommand(dataDir, operator.sid), approvedDataDir, runFile, 120_000);
   if (result.success) log(`  ${operator.name ?? operator.sid}: data directory access removed`);
   return result.success
     ? { ok: true }
@@ -370,14 +373,16 @@ export async function revokeOperator({ operator, dataDir, run = shellRun, log = 
 }
 
 /** Builds a command and runs it; a refused build is a failed result, never a throw. */
-async function runSafely(build, run, timeout) {
+async function runSafely(build, approvedDataDir, runFile, timeout) {
   let command;
   try {
     command = build();
+    if (path.relative(approvedDataDir, command[0]) !== '') throw new Error('Only the approved service data directory may be shared');
+    await checkedAclDirectory(command[0], runFile, command.includes('/T'));
   } catch (err) {
     return { success: false, stdout: '', stderr: err.message };
   }
-  return run(command, { timeout });
+  return runFile(systemTool('icacls.exe'), command, { timeout });
 }
 
 /**
@@ -390,12 +395,15 @@ async function runSafely(build, run, timeout) {
  *
  * @returns {Promise<{ ok: boolean, reason?: string }>}
  */
-export async function prepareProtectedDir({ dir, sid = null, serviceAccount = true, run = shellRun, log = () => {} } = {}) {
+export async function prepareProtectedDir({ dir, sid = null, serviceAccount = true, runFile = shellRunFile, log = () => {} } = {}) {
   try {
-    fs.mkdirSync(dir, { recursive: true });
+    if (!fs.existsSync(dir)) {
+      await checkedAclDirectory(path.dirname(dir), runFile);
+      fs.mkdirSync(dir);
+    }
   } catch (err) {
     return { ok: false, reason: `could not create ${dir}: ${err.message}` };
   }
-  const result = await protectServiceFiles({ dirs: [dir], sid, serviceAccount, run, log });
+  const result = await protectServiceFiles({ dirs: [dir], sid, serviceAccount, runFile, log });
   return result.ok ? { ok: true } : { ok: false, reason: result.failed[0]?.reason ?? `could not protect ${dir}` };
 }

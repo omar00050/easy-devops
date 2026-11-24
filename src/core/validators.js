@@ -52,7 +52,8 @@ export function validatePort(port) {
  */
 export function validateEmail(email) {
   if (email === undefined || email === null || email === '') return null;
-  if (typeof email !== 'string' || !email.includes('@') || email.trim() !== email) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (typeof email !== 'string' || !emailRegex.test(email) || email.trim() !== email) {
     return 'Invalid email address';
   }
   return null;

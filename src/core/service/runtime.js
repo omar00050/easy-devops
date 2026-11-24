@@ -43,11 +43,11 @@
  */
 
 import fs from 'fs';
-import os from 'os';
+import { randomUUID } from 'node:crypto';
 import path from 'path';
 
-import { run } from '../shell.js';
-import { isWindows, programDataDir, quoteExe } from '../platform.js';
+import { runFile } from '../shell.js';
+import { isWindows, programDataDir } from '../platform.js';
 
 /** Where the pinned runtime lives, per platform. */
 export function runtimeDir(dataDir) {
@@ -196,6 +196,85 @@ export function inspectLink(dataDir) {
  * package directory, which `npm update` replaces wholesale. `dist/ui` is
  * included so a dashboard started from the copy can serve the built UI.
  */
+// Missing literal package imports in the daemon dependency graph. ws, pg and
+// mongodb catch MODULE_NOT_FOUND and use their non-native or disabled paths.
+export const OPTIONAL_DAEMON_PACKAGES = ['bufferutil', 'utf-8-validate', 'pg-native', 'kerberos',
+  '@mongodb-js/zstd', '@aws-sdk/credential-providers', 'gcp-metadata', 'snappy', 'socks', 'aws4', 'mongodb-client-encryption'];
+
+function assertRuntimeDirectory(dir, root) {
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`Unexpected non-directory module path: ${dir}`);
+  }
+  const canonical = fs.realpathSync.native(dir);
+  const relative = path.relative(root, canonical);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Optional module directory is outside the runtime: ${dir}`);
+  }
+}
+
+function ensureRuntimeDirectory(dir, root, mode = 0o755) {
+  try {
+    fs.mkdirSync(dir, { mode });
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+  }
+  assertRuntimeDirectory(dir, root);
+}
+
+function writeExclusive(file, contents, mode) {
+  const fd = fs.openSync(file, 'wx', mode);
+  try {
+    fs.writeFileSync(fd, contents);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+export function installRuntimeStubs(appDir) {
+  const requestedRoot = path.resolve(appDir);
+  const root = fs.realpathSync.native(requestedRoot);
+  if (path.relative(requestedRoot, root)) throw new Error('The runtime application directory must be canonical');
+  assertRuntimeDirectory(root, root);
+
+  const modulesDir = path.join(root, 'node_modules');
+  ensureRuntimeDirectory(modulesDir, root);
+  for (const name of OPTIONAL_DAEMON_PACKAGES) {
+    const parts = name.split('/');
+    let parent = modulesDir;
+    for (const part of parts.slice(0, -1)) {
+      parent = path.join(parent, part);
+      ensureRuntimeDirectory(parent, root);
+    }
+
+    const target = path.join(parent, parts.at(-1));
+    try {
+      assertRuntimeDirectory(target, root);
+      continue;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+
+    const stub = `throw Object.assign(new Error('Optional module ${name} unavailable'), { code: 'MODULE_NOT_FOUND' });\n`;
+    const manifest = JSON.stringify({ name, type: 'commonjs', main: 'easy-devops-optional.cjs' });
+    const temporary = fs.mkdtempSync(path.join(parent, `.easy-devops-${randomUUID()}-`));
+    try {
+      fs.chmodSync(temporary, 0o755);
+      writeExclusive(path.join(temporary, 'easy-devops-optional.cjs'), stub, 0o644);
+      writeExclusive(path.join(temporary, 'package.json'), manifest, 0o644);
+      try {
+        // Publish the complete package atomically and only if its name is free.
+        fs.renameSync(temporary, target);
+      } catch (error) {
+        if (!['EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error;
+        assertRuntimeDirectory(target, root);
+      }
+    } finally {
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  }
+}
+
 const COPY_ENTRIES = ['package.json', 'src', 'node_modules', 'dist'];
 
 /** Path equality as Windows sees it: case-insensitive, separators normalised. */
@@ -283,6 +362,10 @@ export function copyRuntime({ dataDir, appRoot, nodeExe = process.execPath, log 
     }
   }
 
+  try { installRuntimeStubs(appDir); } catch (err) {
+    return { ok: false, reason: `could not secure optional runtime dependencies: ${err.message}` };
+  }
+
   // The entry point inside the copy, which is what the service XML invokes.
   const entry = path.join(appDir, 'src', 'cli', 'index.js');
   if (!fs.existsSync(entry)) {
@@ -311,36 +394,21 @@ export async function verifyNativeModules({ nodeExe, appDir } = {}) {
   // better-sqlite3 is reached through good.db. Opening an in-memory database
   // and closing it exercises the addon's load path and its entry points
   // without touching any file.
-  //
-  // Written to a file rather than passed with `node -e`: run() goes through a
-  // shell, and PowerShell mangles an inline script's quotes beyond rescue —
-  // measured, not assumed. A file sidesteps the quoting problem entirely.
   const probe = [
     'const { createRequire } = require("module");',
     `const r = createRequire(${JSON.stringify(path.join(appDir, 'package.json'))});`,
+    'r("./src/core/service/runtime-boundary.cjs").install();',
     'const Database = r("better-sqlite3");',
     'const db = new Database(":memory:");',
     'db.close();',
     'process.stdout.write(JSON.stringify({ abi: process.versions.modules, version: process.version }));',
   ].join('\n');
 
-  const probeFile = path.join(
-    os.tmpdir(),
-    `ez-runtime-probe-${process.pid}-${Date.now()}.cjs`,
-  );
-
   let result;
   try {
-    fs.writeFileSync(probeFile, probe, 'utf8');
-    // quoteExe() is the single owner of this: on Windows a quoted executable
-    // path needs PowerShell's `&` call operator, and three places here got it
-    // wrong by hand-rolling the quoting instead.
-    const invoke = `${quoteExe(nodeExe)} "${probeFile}"`;
-    result = await run(invoke, { cwd: appDir, timeout: 30_000 });
+    result = await runFile(nodeExe, ['-e', probe], { cwd: appDir, timeout: 30_000, env: { NODE_PATH: '', NODE_OPTIONS: '' } });
   } catch (err) {
     return { ok: false, reason: `could not run the runtime probe: ${err.message}` };
-  } finally {
-    try { fs.rmSync(probeFile, { force: true }); } catch { /* best effort */ }
   }
 
   if (result.success) {
@@ -422,7 +490,7 @@ export async function inspectRuntime({ dataDir, recordedNodeExe = null } = {}) {
     if (link.broken) out.warnings.push(link.reason);
 
     if (link.exists && !link.broken) {
-      const probe = await run(`${quoteExe(link.link)} --version`, { timeout: 10_000 });
+      const probe = await runFile(link.link, ['--version'], { timeout: 10_000 });
       out.pinned.version = probe.success ? probe.stdout.trim() : null;
       if (!probe.success) {
         out.warnings.push(`${link.link} exists but did not run: ${probe.stderr.trim() || 'no output'}`);
@@ -440,7 +508,7 @@ export async function inspectRuntime({ dataDir, recordedNodeExe = null } = {}) {
   // Windows: either the Server-mode copy or the recorded Personal-mode path.
   const copied = runtimeNodePath(dataDir);
   if (fs.existsSync(copied)) {
-    const probe = await run(`${quoteExe(copied)} --version`, { timeout: 10_000 });
+    const probe = await runFile(copied, ['--version'], { timeout: 10_000 });
     out.pinned = {
       kind: 'copy',
       path: copied,
@@ -456,7 +524,7 @@ export async function inspectRuntime({ dataDir, recordedNodeExe = null } = {}) {
 
   if (recordedNodeExe) {
     const exists = fs.existsSync(recordedNodeExe);
-    const probe = exists ? await run(`${quoteExe(recordedNodeExe)} --version`, { timeout: 10_000 }) : null;
+    const probe = exists ? await runFile(recordedNodeExe, ['--version'], { timeout: 10_000 }) : null;
     out.pinned = {
       kind: 'recorded',
       path: recordedNodeExe,

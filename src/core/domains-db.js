@@ -7,7 +7,8 @@ import { run } from './shell.js';
 import { loadConfig } from './config.js';
 import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk } from './platform.js';
 import { saveDomainNotifConfig } from './domainNotifier.js';
-import { bumpHubRevision } from './hubLink.js';
+import { bumpHubRevision, getHubPermissions } from './hubLink.js';
+import { nginxDomainError } from './nginx-fields.js';
 import { missingCertFiles, CERT_MISSING_HINT } from './cert-usage.js';
 import {
   validateDomainName, validatePort, validateUpstreamType,
@@ -85,6 +86,13 @@ export function createDomain(partial) {
  * @returns {string|null} The first problem, or null
  */
 function hubDomainInputError(input, { creating, existing = null }) {
+  const fieldError = nginxDomainError({ ...input, backendHost: input.backendHost ?? existing?.backendHost, name: creating ? input.name : existing.name });
+  if (fieldError) return fieldError;
+  const raw = input.advanced?.customLocations;
+  if (raw !== undefined && (raw ?? '') !== (existing?.advanced?.customLocations ?? '') &&
+      getHubPermissions()['nginx.config.edit'] !== true) {
+    return "Permission 'nginx.config.edit' is required to change custom locations.";
+  }
   if (creating) {
     const nameError = validateDomainName(input.name);
     if (nameError) return nameError;

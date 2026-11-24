@@ -17,7 +17,9 @@
 
 import fs from 'fs';
 import path from 'path';
+import { pathToFileURL } from 'url';
 import { getDataDir } from '../core/platform.js';
+import { isUpdateVersion, performUpdate, currentVersion } from '../core/updater.js';
 import { loadConfig } from '../core/config.js';
 import { readStatus, writeStatus } from '../core/updateStatus.js';
 import { startDashboard, stopDashboard, isPidAlive } from '../core/dashboardProcess.js';
@@ -50,7 +52,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function main() {
+export async function runPendingUpdate({ dataDir, runId, apply = applyUpdate }) {
   const run = readStatus(dataDir);
   if (!run) {
     process.stderr.write('update worker: no status record to run\n');
@@ -66,6 +68,18 @@ async function main() {
     return 1;
   }
 
+  if (![run.from, run.to, currentVersion()].every(isUpdateVersion)) {
+    writeStatus({
+      phase: 'failed', step: 'version', reason: 'Invalid update version. Check for updates again.',
+      finishedAt: Date.now(),
+    }, { dataDir });
+    return 1;
+  }
+
+  return apply(run);
+}
+
+async function applyUpdate(run) {
   // Claim the record with this pid before touching anything: from here on the
   // route's double-start guard sees a live worker.
   writeStatus({ phase: 'stopping', workerPid: process.pid, step: 'dashboard' }, { dataDir });
@@ -95,8 +109,7 @@ async function main() {
   let result;
   try {
     writeStatus({ phase: 'updating', step: 'install' }, { dataDir });
-    const updater = await import('../core/updater.js');
-    result = await updater.performUpdate({ version: run.to, dataDir, log });
+    result = await performUpdate({ version: run.to, dataDir, log });
   } catch (error) {
     result = { ok: false, step: 'exception', reason: error?.message ?? String(error) };
   } finally {
@@ -143,21 +156,23 @@ async function main() {
   return result.ok ? 0 : 1;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((error) => {
-    try {
-      writeStatus(
-        {
-          phase: 'failed',
-          step: 'worker',
-          reason: error?.message ?? String(error),
-          finishedAt: Date.now(),
-          logTail: [...logTail],
-        },
-        { dataDir }
-      );
-    } catch { /* the file may be unwritable; nothing else to do */ }
-    process.stderr.write(`update worker failed: ${error?.stack ?? error}\n`);
-    process.exit(1);
-  });
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  runPendingUpdate({ dataDir, runId })
+    .then((code) => process.exit(code))
+    .catch((error) => {
+      try {
+        writeStatus(
+          {
+            phase: 'failed',
+            step: 'worker',
+            reason: error?.message ?? String(error),
+            finishedAt: Date.now(),
+            logTail: [...logTail],
+          },
+          { dataDir }
+        );
+      } catch { /* the file may be unwritable; nothing else to do */ }
+      process.stderr.write(`update worker failed: ${error?.stack ?? error}\n`);
+      process.exit(1);
+    });
+}

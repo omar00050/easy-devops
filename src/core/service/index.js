@@ -29,6 +29,7 @@
  * with no TTY, and keeps the dashboard unable to trigger anything interactive.
  */
 
+import { repairPrivateKeys } from '../ssl/private-keys.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -1293,8 +1294,20 @@ export async function repair({ log = () => {}, deps = {} } = {}) {
   const mech = resolveMechanism();
   const dataDir = getDataDir();
 
+  async function finish(result, mechanism) {
+    if (result.ok) {
+      try {
+        await (deps.repairPrivateKeys ?? repairPrivateKeys)(loadConfig().sslDir, { server: mechanism === 'winsw' });
+      } catch (error) {
+        return { ...result, ok: false, mechanism, reason: `Certificate key permission repair failed: ${error.message}` };
+      }
+    }
+    return { ...result, mechanism };
+  }
+
   if (!isWindows) {
-    return { ...(await (deps.systemd ?? systemd).repair({ dataDir, log, ...(deps.systemdOpts ?? {}) })), mechanism: 'systemd' };
+    const result = await (deps.systemd ?? systemd).repair({ dataDir, entry: entryScript(), log, ...(deps.systemdOpts ?? {}) });
+    return finish(result, 'systemd');
   }
 
   if (mech.mode === MODES.SERVER) {
@@ -1323,7 +1336,7 @@ export async function repair({ log = () => {}, deps = {} } = {}) {
         repairedAt: new Date().toISOString(),
       });
     }
-    return { ...result, mechanism: 'winsw' };
+    return finish(result, 'winsw');
   }
 
   const result = (deps.windowsPersonal ?? windowsPersonal).repair({
@@ -1336,7 +1349,7 @@ export async function repair({ log = () => {}, deps = {} } = {}) {
     const existing = dbGet(STATE_KEY) ?? {};
     dbSet(STATE_KEY, { ...existing, nodeExe: result.nodeExe, repairedAt: new Date().toISOString() });
   }
-  return { ...result, mechanism: 'startup-supervisor' };
+  return finish(result, 'startup-supervisor');
 }
 
 /** Records what was installed, merged over whatever is already there. */
@@ -1346,6 +1359,12 @@ function record(details) {
 }
 
 /** The recorded install details, for callers that only need to read them. */
+export async function refreshUserService({ dataDir, log }) {
+  const entry = entryScript();
+  if (!isWindows) return systemd.refreshUnit({ dataDir, entry, log });
+  return windowsPersonal.repair({ dataDir, entry, nodeExe: recordedState().nodeExe || process.execPath, log });
+}
+
 export function recordedState() {
   return dbGet(STATE_KEY) ?? {};
 }

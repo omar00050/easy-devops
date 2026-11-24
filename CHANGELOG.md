@@ -7,7 +7,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [1.4.4] — 2026-11-24
+
+### Security
+
+- Deployments protect generated PM2 configuration and release metadata from links in the checkout.
+- Windows service permission changes accept only approved existing directories and pass paths directly to the permissions tool.
+- Editing raw Advanced nginx settings through the Hub requires `nginx.config.edit`. Structured fields reject characters that could introduce new directives.
+- Changing an app’s repository origin clears its saved token. Enter a new token if the new repository requires one.
+- Site and ACME account private keys use restricted permissions. Renewal replaces keys atomically, and renewal and service repair correct existing key permissions.
+- Git receives deployment credentials in its process environment, keeping them out of command arguments and logs.
+- The daemon loads dependencies from its own runtime. Service setup disables optional native WebSocket modules.
+- Linux service installation stages the systemd unit in a private temporary directory and cleans up after installation.
+- The updater validates the entire version before stopping the service and passes the version as a separate argument.
+
+### Upgrading
+
+Run `ezz update` for an npm installation. After updating to 1.4.4, Windows Server mode
+users must run `ezz service repair` from an Administrator PowerShell to apply the new protections.
+
 ## [1.4.3] — 2026-11-20
+
+**Not recommended: security issues fixed in 1.4.4. Update to 1.4.4.**
 
 ### Added
 

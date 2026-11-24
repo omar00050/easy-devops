@@ -179,6 +179,18 @@ Examples:
 
 const { flags, options, command, args, unknown } = parseArgs(process.argv.slice(2));
 
+if (command === 'daemon') {
+  process.env.WS_NO_BUFFER_UTIL = '1';
+  process.env.WS_NO_UTF_8_VALIDATE = '1';
+  require('../core/service/runtime-boundary.cjs').install();
+  const loader = new URL('../core/service/runtime-loader.mjs', import.meta.url);
+  if (!process.execArgv.includes(`--experimental-loader=${loader.href}`)) {
+    const { register } = await import('node:module');
+    if (!register) throw new Error('Run service repair to enable the daemon module loader, or use Node 18.19 or later.');
+    register(loader.href);
+  }
+}
+
 if (unknown.length > 0) {
   process.stderr.write(`Unknown option: ${unknown.join(', ')}\n`);
   process.stderr.write('Run `easy-devops --help` to see the available options.\n');

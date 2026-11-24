@@ -31,7 +31,7 @@ import {
   isCertPathErrorFor,
   parseNginxErrorFiles,
 } from './platform.js';
-import { generateConf, getConfDDir, CERT_PATH_STYLES } from './nginx-conf-generator.js';
+import { generateConf, getConfDDir, CERT_PATH_STYLES, NginxFieldError } from './nginx-conf-generator.js';
 
 /** Runs `nginx -t` and returns { ok, output }. Never inspects the exit code directly. */
 async function runNginxTest(nginxDir) {
@@ -148,6 +148,10 @@ export async function writeConfWithTest(domain) {
     try {
       await generateConf(domain, { certPathStyle: style });
     } catch (err) {
+      // Field validation runs before the generator writes anything.
+      if (err instanceof NginxFieldError && i === 0) {
+        return { ok: false, confPath: null, style: null, output: '', error: err.message, restored: false, existed };
+      }
       await restore(confPath, previous);
       return {
         ok: false,

@@ -1,3 +1,4 @@
+import { pathToFileURL } from 'node:url';
 /**
  * core/service/winsw.js
  *
@@ -262,7 +263,7 @@ export function buildServiceXml({ nodeExe, entry, dataDir, logDir, workingDir = 
   <description>${escape(SERVICE_DESCRIPTION)}</description>
 
   <executable>${escape(nodeExe)}</executable>
-  <arguments>${escape(entry)} daemon</arguments>
+  <arguments>"--experimental-loader=${escape(pathToFileURL(path.resolve(path.dirname(entry), '../core/service/runtime-loader.mjs')).href)}" "${escape(entry)}" daemon</arguments>
   <workingdirectory>${escape(workingDir ?? path.dirname(entry))}</workingdirectory>
 
   <!-- Starts at boot, before anyone logs in. -->
@@ -295,6 +296,10 @@ export function buildServiceXml({ nodeExe, entry, dataDir, logDir, workingDir = 
 
 ${dataDirEnv}
   <!-- Node writes diagnostics to stderr; keep them in the rolling log. -->
+  <env name="NODE_OPTIONS" value=""/>
+  <env name="NODE_PATH" value=""/>
+  <env name="WS_NO_BUFFER_UTIL" value="1"/>
+  <env name="WS_NO_UTF_8_VALIDATE" value="1"/>
   <env name="NODE_ENV" value="production"/>
 </service>
 `;

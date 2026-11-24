@@ -32,7 +32,7 @@ import { fileURLToPath } from 'url';
 import { getDataDir, isWindows, isServerMode } from '../../core/platform.js';
 import { isElevated } from '../../core/service/windowsService.js';
 import { loadConfig } from '../../core/config.js';
-import { checkForUpdate, currentVersion } from '../../core/updater.js';
+import { checkForUpdate, currentVersion, isUpdateVersion } from '../../core/updater.js';
 import { detectInstallSource } from '../../core/installSource.js';
 import {
 	readStatus, writeStatus, describeRun, runIsActive,
@@ -40,9 +40,6 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_PATH = path.resolve(__dirname, '..', 'updateWorker.js');
-
-/** A release triple, the only shape `npm install -g easy-devops@…` gets. */
-const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
 
 /**
  * Starts the detached worker.
@@ -198,10 +195,14 @@ class UpdateController {
 				return;
 			}
 
-			let target = String(req.body?.version ?? '').trim();
-			if (!VERSION_PATTERN.test(target)) {
+			let target = req.body?.version;
+			if (target !== undefined && !isUpdateVersion(target)) {
+				res.status(400).json({ error: 'Supply a complete release version.' });
+				return;
+			}
+			if (target === undefined) {
 				const check = await this.checkForUpdate();
-				if (!check.reachable) {
+				if (!check.reachable || !isUpdateVersion(check.latest)) {
 					res.status(502).json({
 						error: 'Could not reach the npm registry to find the latest version.',
 					});

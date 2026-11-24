@@ -37,7 +37,7 @@
 import os from 'os';
 import path from 'path';
 
-import { run, runInteractive } from './shell.js';
+import { run, runInteractiveFile } from './shell.js';
 import { isWindows } from './platform.js';
 import { loadConfig } from './config.js';
 
@@ -282,10 +282,15 @@ export async function setupLinuxPermissions({ ownDirs = [] } = {}) {
   const script = buildSetupScript({ ownDirs });
   if (!script.ok) return { success: false, reason: script.reason };
 
-  for (const line of script.lines) {
-    const result = await runInteractive(line);
-    if (!result.success) {
-      return { success: false, reason: `stopped at: ${line}`, failedAt: line };
+  const user = os.userInfo().username;
+  const stage = `set -e; t=$(mktemp); trap 'rm -f "$t"' EXIT; printf '%s\\n' "$1" > "$t"; sudo visudo -cf "$t"; sudo install -o root -g root -m 0440 "$t" "$2"`;
+  const commands = [['bash', ['-c', stage, 'easy-devops', buildSudoersLine(user), SUDOERS_PATH]]];
+  for (const dir of ownDirs) {
+    commands.push(['sudo', ['mkdir', '-p', '--', dir]], ['sudo', ['chown', '--', `${user}:${user}`, dir]]);
+  }
+  for (const [index, [file, args]] of commands.entries()) {
+    if (!(await runInteractiveFile(file, args)).success) {
+      return { success: false, reason: `stopped at: ${script.lines[index]}`, failedAt: script.lines[index] };
     }
   }
 

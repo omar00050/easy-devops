@@ -52,18 +52,20 @@ function makeGitStub() {
   let files = {};
   let sha = 'a'.repeat(40);
 
-  const run = async (command) => {
+  const run = async (command, args) => {
+    if (Array.isArray(args)) command = [command, ...args].join(' ');
     calls.push(command);
     if (command === 'git --version') return ok('git version 2.43.0');
 
-    const init = /^git init -q "(.+)"$/.exec(command);
+    const init = /^git init -q (.+)$/.exec(command);
     if (init) {
       const dir = init[1];
       fs.mkdirSync(dir, { recursive: true });
       for (const [rel, content] of Object.entries(files)) {
         const file = path.join(dir, rel);
         fs.mkdirSync(path.dirname(file), { recursive: true });
-        fs.writeFileSync(file, content);
+        if (typeof content === 'function') content(file);
+        else fs.writeFileSync(file, content);
       }
       return ok('');
     }
@@ -202,6 +204,7 @@ async function main() {
 
   const deps = {
     run: git.run,
+    runFile: git.run,
     runCommandLine: commands.runCommandLine,
     runner: pm2,
     probe: async () => {
@@ -303,6 +306,29 @@ async function main() {
           repoUrl: 'https://github.com/me/migrate-bad.git',
           settings: { migrate: 5 },
         }).ok);
+    }
+
+    setGroup('Generated release files');
+    {
+      const target = path.join(TEST_DATA_DIR, 'generated-file-sentinel');
+      fs.writeFileSync(target, 'keep');
+      register('generated-files');
+      git.setFiles(files('v1', { files: {
+        'ez.pm2.json': file => fs.linkSync(target, file),
+        'ez.release.json': file => fs.linkSync(target, file),
+      } }));
+      const result = await deploy('generated-files');
+      check('generated files replace existing inodes without modifying linked data',
+        result.status === 'success' && fs.readFileSync(target, 'utf8') === 'keep', result.error ?? '');
+      // A junction is available to ordinary Windows users and lstat reports it as a link.
+      git.setFiles(files('v2', { files: {
+        'ez.pm2.json': file => fs.symlinkSync(TEST_DATA_DIR, file, 'junction'),
+      } }));
+      const refused = await deploy('generated-files');
+      check('a linked generated filename is refused before PM2 starts',
+        refused.status === 'failed' && /Invalid generated file/.test(refused.error ?? ''));
+      commands.calls.length = 0;
+      pm2.calls.length = 0;
     }
 
     // ── 2. Order: install → build → migrate → start ─────────────────────────

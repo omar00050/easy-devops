@@ -213,7 +213,9 @@ async function main() {
   cfgMod.saveConfig({ ...cfgMod.loadConfig(), nginxDir, sslDir, dashboardPassword: '' });
 
   // Isolated hub database.
-  const DATABASE_URL = `file:${path.join(tmpRoot, 'hub-test.db').replace(/\\/g, '/')}`;
+  const hubDb = path.join(tmpRoot, 'hub-test.db');
+  fs.writeFileSync(hubDb, '', { flag: 'wx', mode: 0o600 });
+  const DATABASE_URL = `file:${hubDb.replace(/\\/g, '/')}`;
   const mig = spawnSync('npx', ['prisma', 'migrate', 'deploy'], {
     cwd: HUB_DIR, env: { ...process.env, DATABASE_URL }, encoding: 'utf8', shell: true,
   });

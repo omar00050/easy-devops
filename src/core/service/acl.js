@@ -39,7 +39,8 @@
 import fs from 'fs';
 import path from 'path';
 
-import { run as shellRun } from '../shell.js';
+import { runFile as shellRunFile } from '../shell.js';
+import { isWindows, programDataDir } from '../platform.js';
 import { SERVICE_ACCOUNT } from './winsw.js';
 
 /** Access levels, in icacls's own notation. */
@@ -60,14 +61,11 @@ export const ACCESS = Object.freeze({
  * @param {string} [opts.sslDir]   From Settings — never a default
  * @returns {Array<{ path: string, access: string, why: string }>}
  */
-export function requiredGrants({ dataDir, runtimeDir = null, nginxDir = null, sslDir = null } = {}) {
+export function requiredGrants({ dataDir, nginxDir = null, sslDir = null } = {}) {
   const grants = [
     { path: dataDir, access: ACCESS.MODIFY, why: 'the database, the daemon lock and logs' },
   ];
 
-  if (runtimeDir) {
-    grants.push({ path: runtimeDir, access: ACCESS.READ_EXECUTE, why: 'running the pinned node.exe' });
-  }
   if (nginxDir) {
     grants.push({ path: nginxDir, access: ACCESS.MODIFY, why: 'writing and reloading domain configs' });
   }
@@ -93,93 +91,126 @@ export function requiredGrants({ dataDir, runtimeDir = null, nginxDir = null, ss
   return [...seen.values()];
 }
 
-/**
- * The icacls command for one grant.
- *
- * The account name is quoted because it contains a backslash and a space;
- * `icacls` is given the path quoted for the same reason.
- *
- * @param {string} dir
- * @param {string} access
- * @param {string} [account]
- * @returns {string}
- */
-export function buildGrantCommand(dir, access, account = SERVICE_ACCOUNT) {
-  return `icacls "${dir}" /grant "${account}:(OI)(CI)${access}" /T /C /Q`;
+/** Pin native tools to the Windows installation, bypassing the current directory and PATH. */
+export function systemTool(name) {
+  return path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', name);
 }
 
-/** The icacls command that removes every grant for the account. */
-export function buildRevokeCommand(dir, account = SERVICE_ACCOUNT) {
-  return `icacls "${dir}" /remove:g "${account}" /T /C /Q`;
+export const WINDOWS_POWERSHELL = systemTool('WindowsPowerShell\\v1.0\\powershell.exe');
+
+function inside(dir, base) {
+  const rel = path.relative(base, dir);
+  return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel));
 }
 
-/**
- * Applies every required grant.
- *
- * `run` is injectable so tests drive a stub and assert on the exact commands
- * rather than touching real ACLs. This is not optional politeness: applying a
- * real grant during a test run would change permissions on the developer's own
- * nginx directory.
- *
- * @param {Object} opts
- * @param {Array} opts.grants From requiredGrants()
- * @param {Function} [opts.run]
- * @param {(line: string) => void} [opts.log]
- * @returns {Promise<{ ok: boolean, applied: Array, failed: Array, needsElevation: boolean }>}
- */
-export async function applyGrants({ grants, run = shellRun, log = () => {} } = {}) {
-  const applied = [];
-  const failed = [];
+/** Validate before examining a settings-controlled location or passing it to an OS utility. */
+export function canonicalAclDirectory(dir) {
+  if (typeof dir !== 'string' || !path.isAbsolute(dir) || /["*?<>|\x00-\x1f]/.test(dir)
+      || dir.split(/[\\/]/).some(part => part === '.' || part === '..' || /[. ]$/.test(part))
+      || (isWindows && (!/^[A-Za-z]:[\\/]/.test(dir) || dir.slice(2).includes(':')))) {
+    throw new Error('refusing an unusual path: use an absolute local directory');
+  }
+  const target = path.resolve(dir);
+  const root = path.parse(target).root;
+  const windows = process.env.SystemRoot || 'C:\\Windows';
+  const blocked = [windows, process.env.ProgramFiles, process.env['ProgramFiles(x86)'],
+    process.env.ProgramW6432, path.join(root, 'System Volume Information'), path.join(root, '$Recycle.Bin')];
+  if (target === root || (isWindows && (blocked.filter(Boolean).some(base => inside(target, base))
+      || [process.env.ProgramData, process.env.USERPROFILE, path.join(root, 'Users')]
+        .filter(Boolean).some(base => inside(base, target))))) {
+    throw new Error('refusing a system directory');
+  }
+  // Check every component before descending. realpath additionally catches aliases such as 8.3 names.
+  let current = root;
+  for (const part of target.slice(root.length).split(path.sep)) {
+    current = path.join(current, part);
+    const stat = fs.lstatSync(current, { throwIfNoEntry: false });
+    if (!stat) throw new Error('the directory does not exist yet');
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('refusing a reparse point or non-directory');
+  }
+  if (path.relative(target, fs.realpathSync.native(target)) !== '') throw new Error('refusing a directory alias');
+  return target;
+}
+
+// Node reports junctions and symbolic links through lstat, but Windows has other reparse tags.
+// Inspect native attributes without expanding the path, including descendants before recursive operations.
+const CHECK_ATTRIBUTES = [
+  "$ErrorActionPreference = 'Stop'",
+  '$p = [IO.DirectoryInfo]$env:EZ_ACL_TARGET',
+  'for ($a = $p; $null -ne $a; $a = $a.Parent) { if ($a.Attributes -band 1024) { throw "reparse point" } }',
+  'if ($env:EZ_ACL_TREE -eq "1") {',
+  '  $stack = New-Object System.Collections.Stack; $stack.Push($p)',
+  '  while ($stack.Count) { foreach ($item in $stack.Pop().EnumerateFileSystemInfos()) {',
+  '    if ($item.Attributes -band 1024) { throw "reparse point" }',
+  '    if ($item.Attributes -band 16) { $stack.Push($item) }',
+  '  } }',
+  '}',
+].join('\n');
+
+export async function checkedAclDirectory(dir, runFile, recursive = false) {
+  const target = canonicalAclDirectory(dir);
+  const result = await runFile(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', CHECK_ATTRIBUTES], {
+    env: { EZ_ACL_TARGET: target, EZ_ACL_TREE: recursive ? '1' : '0' }, timeout: 120_000,
+  });
+  if (!result.success) throw new Error('could not verify directory attributes or found a reparse point');
+  return target;
+}
+
+/** Read independent approvals from the machine environment (HKLM), never the operator database. */
+export async function approvedGrantDirs(runFile) {
+  const keys = ['EASY_DEVOPS_APPROVED_NGINX_DIR', 'EASY_DEVOPS_APPROVED_SSL_DIR'];
+  const dirs = [programDataDir()];
+  for (const [i, key] of keys.entries()) {
+    const result = await runFile(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command',
+      `[Environment]::GetEnvironmentVariable('${key}', 'Machine')`], { timeout: 20_000 });
+    if (result.success) dirs.push(result.stdout.trim() || ['C:\\nginx', 'C:\\easy-devops\\ssl'][i]);
+  }
+  return dirs;
+}
+
+async function changeGrants({ grants, approvedDirs, runFile, revoke, log }) {
+  const applied = [], failed = [];
   let needsElevation = false;
-
+  const approved = approvedDirs ?? await approvedGrantDirs(runFile);
   for (const grant of grants) {
-    if (!grant.path) continue;
-
-    if (!fs.existsSync(grant.path)) {
-      // A missing directory is not a failure to grant: nginxDir can legitimately
-      // point somewhere not yet created, and `repair` will pick it up later.
-      // Granting on a path we then create would also be wrong, because we would
-      // be choosing its location rather than the user.
-      failed.push({ ...grant, reason: 'the directory does not exist yet' });
-      log(`  ${grant.path}: skipped, does not exist`);
-      continue;
-    }
-
-    const result = await run(buildGrantCommand(grant.path, grant.access), { timeout: 60_000 });
-    const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
-
-    if (result.success) {
+    try {
+      const dir = grant.path;
+      if (!approved.some(base => typeof dir === 'string' && path.isAbsolute(dir)
+          && path.relative(base, dir) === '')) {
+        throw new Error('directory lacks administrator approval; set the matching machine-level '
+          + 'EASY_DEVOPS_APPROVED_NGINX_DIR or EASY_DEVOPS_APPROVED_SSL_DIR and run ezz service repair');
+      }
+      const target = await checkedAclDirectory(dir, runFile, revoke);
+      const machine = programDataDir();
+      if (['runtime', 'runtime.prev', 'bin'].some(name => inside(target, path.join(machine, name)))) {
+        throw new Error('Service code directories cannot receive a data grant');
+      }
+      // Inherit Modify into ordinary children. Protected bin/runtime DACLs must remain read-only.
+      const args = revoke ? [target, '/remove:g', SERVICE_ACCOUNT, '/T']
+        : [target, '/grant', `${SERVICE_ACCOUNT}:(OI)(CI)M`];
+      const result = await runFile(systemTool('icacls.exe'), [...args, '/L', '/Q'], { timeout: 120_000 });
+      if (!result.success) {
+        const output = `${result.stdout ?? ''} ${result.stderr ?? ''}`.trim();
+        if (/access is denied/i.test(output)) needsElevation = true;
+        throw new Error(output.slice(0, 300) || 'icacls failed');
+      }
       applied.push(grant);
-      log(`  ${grant.path}: ${grant.access} granted (${grant.why})`);
-      continue;
+      log(`  ${target}: ${revoke ? 'removed service grant' : 'granted Modify'}`);
+    } catch (err) {
+      failed.push({ ...grant, reason: err.message });
+      log(`  ${grant.path}: ${err.message}`);
     }
-
-    if (/access is denied/i.test(output)) needsElevation = true;
-    failed.push({ ...grant, reason: output.trim().slice(0, 300) || 'icacls failed with no output' });
-    log(`  ${grant.path}: FAILED`);
   }
-
-  return { ok: failed.length === 0, applied, failed, needsElevation };
+  return { ok: !failed.length, applied, failed, needsElevation };
 }
 
-/** Removes the account's grants. Used by uninstall. */
-export async function revokeGrants({ paths, run = shellRun, log = () => {} } = {}) {
-  const removed = [];
-  const failed = [];
+export function applyGrants({ grants, approvedDirs, runFile = shellRunFile, log = () => {} }) {
+  return changeGrants({ grants, approvedDirs, runFile, log, revoke: false });
+}
 
-  for (const dir of paths) {
-    if (!dir || !fs.existsSync(dir)) continue;
-
-    const result = await run(buildRevokeCommand(dir), { timeout: 60_000 });
-    if (result.success) {
-      removed.push(dir);
-      log(`  ${dir}: grants removed`);
-    } else {
-      failed.push({ path: dir, reason: `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300) });
-    }
-  }
-
-  return { ok: failed.length === 0, removed, failed };
+export async function revokeGrants({ paths, approvedDirs, runFile = shellRunFile, log = () => {} }) {
+  const result = await changeGrants({ grants: paths.map(dir => ({ path: dir })), approvedDirs, runFile, log, revoke: true });
+  return { ok: result.ok, removed: result.applied.map(g => g.path), failed: result.failed };
 }
 
 /**

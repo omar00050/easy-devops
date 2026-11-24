@@ -202,6 +202,25 @@ async function testStartRefusals() {
   check('an unreachable registry with no version is 502',
     unreachableRes.statusCode === 502, String(unreachableRes.statusCode));
 
+  const badDir = scratch('invalid-registry');
+  const bad = await makeController(badDir, {
+    checkForUpdate: async () => ({ reachable: true, current: '1.3.4', latest: '1.3.5 extra', updateAvailable: true }),
+  });
+  const badRes = makeRes();
+  await bad.controller.start(makeReq({}), badRes);
+  check('invalid registry target cannot start a worker', badRes.statusCode === 502 && !bad.calls.spawns.length);
+
+  const { runPendingUpdate } = await import(srcUrl('dashboard/updateWorker.js'));
+  for (const [from, to] of [['1.3.4', '1.3.5 extra'], ['1.3.4 extra', '1.3.5']]) {
+    const runId = 'invalid-worker';
+    status.writeStatus({ id: runId, phase: 'starting', from, to }, { dataDir: badDir, replace: true });
+    let applied = false;
+    const code = await runPendingUpdate({ dataDir: badDir, runId, apply: () => { applied = true; } });
+    const record = status.readStatus(badDir);
+    check('worker refuses an invalid saved version before stopping the dashboard',
+      code === 1 && !applied && record.phase === 'failed' && record.step === 'version');
+  }
+
   const uptodateDir = scratch('refuse-uptodate');
   const uptodate = await makeController(uptodateDir, {
     checkForUpdate: async () => ({ reachable: true, current: '1.3.5', latest: '1.3.5', updateAvailable: false }),
@@ -222,11 +241,11 @@ async function testStartAccepted() {
   const { controller, calls } = await makeController(dir);
   const res = makeRes();
 
-  await controller.start(makeReq({ version: '9.9.9' }, 7777), res);
+  await controller.start(makeReq({ version: '9.9.9-rc.1' }, 7777), res);
 
   check('the client is told the worker started', res.statusCode === 202 && res.body.started === true,
     String(res.statusCode));
-  check('the target version is the one asked for', res.body.run?.to === '9.9.9');
+  check('the target version is the one asked for', res.body.run?.to === '9.9.9-rc.1');
   check('the run starts in the starting phase', res.body.run?.phase === 'starting');
   check('the dashboard port comes from the request, not the config',
     res.body.run?.dashboard.port === 7777, String(res.body.run?.dashboard.port));
@@ -247,17 +266,15 @@ async function testStartAccepted() {
 
   // A second start while the first is active is refused; the record stays.
   const again = makeRes();
-  await controller.start(makeReq({ version: '9.9.9' }), again);
+  await controller.start(makeReq({ version: '9.9.9-rc.1' }), again);
   check('a second start while it runs is refused', again.statusCode === 409 && calls.spawns.length === 1);
 
-  // A malformed version falls back to a fresh registry check.
+  // Only an omitted version requests a registry lookup.
   const fallbackDir = scratch('accept-fallback');
   const fallback = await makeController(fallbackDir);
   const fallbackRes = makeRes();
   await fallback.controller.start(makeReq({ version: 'latest' }), fallbackRes);
-  check('a non-triple version is replaced by the registry answer',
-    fallbackRes.body.run?.to === '1.3.5' && fallback.calls.checks === 1,
-    fallbackRes.body.run?.to);
+  check('a malformed target is refused before lookup or launch', fallbackRes.statusCode === 400 && fallback.calls.checks === 0 && !fallback.calls.spawns.length);
 
   // A stale active run does not block a new one. Written directly: writeStatus
   // stamps a fresh heartbeat, which is exactly what the fixture must not have.

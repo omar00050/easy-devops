@@ -1,3 +1,4 @@
+import { pathToFileURL } from 'node:url';
 /**
  * core/service/windowsPersonal.js
  *
@@ -169,6 +170,10 @@ rem \`ezz service start\`. Do not put this file in the Startup folder: it would
 rem then run with a visible console window for the whole session.
 
 ${dataDirLine}
+set "NODE_OPTIONS="
+set "NODE_PATH="
+set "WS_NO_BUFFER_UTIL=1"
+set "WS_NO_UTF_8_VALIDATE=1"
 set "NODE_ENV=production"
 set "LOGFILE=${logFile}"
 set "NODEEXE=${nodeExe}"
@@ -202,7 +207,7 @@ if exist "!STOPFILE!" (
 
 echo [%DATE% %TIME%] starting daemon>>"!LOGFILE!"
 
-"!NODEEXE!" "!ENTRY!" daemon>>"!LOGFILE!" 2>&1
+"!NODEEXE!" "--experimental-loader=${pathToFileURL(path.resolve(path.dirname(entry), '../core/service/runtime-loader.mjs')).href.replaceAll('%', '%%')}" "!ENTRY!" daemon>>"!LOGFILE!" 2>&1
 
 set "CODE=!ERRORLEVEL!"
 echo [%DATE% %TIME%] daemon exited with code !CODE!>>"!LOGFILE!"
@@ -357,10 +362,8 @@ export async function startNow({ dataDir, run = shellRun, log = () => {} } = {})
   // The path travels in the environment for the quoting reason explained on
   // hiddenStartCommand(). `run()` goes through PowerShell, so the command is
   // the same one the bootstrap uses.
-  const command = `$env:EZ_SUPERVISOR = ${JSON.stringify(supervisor)}; `
-    + 'Start-Process -FilePath $env:EZ_SUPERVISOR -WindowStyle Hidden';
-
-  const result = await run(command, { timeout: 30_000 });
+  const command = 'Start-Process -FilePath $env:EZ_SUPERVISOR -WindowStyle Hidden';
+  const result = await run(command, { timeout: 30_000, env: { EZ_SUPERVISOR: supervisor } });
   if (!result.success) {
     return {
       ok: false,

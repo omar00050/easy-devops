@@ -444,6 +444,7 @@ async function testWindowsServerSwap() {
       mech: { platform: 'windows', mode: 'server', mechanism: 'winsw' },
       deps: {
         run: recordingRun({ 'npm rebuild': 'rebuilt' }),
+        protectServiceFiles: async () => ({ ok: true }),
         canWriteProgramData: () => true,
         // The app copy's modules load under the new binary: nothing to fix.
         verifyNativeModules: async () => ({ ok: true, abi: '127' }),
@@ -471,6 +472,7 @@ async function testWindowsServerSwap() {
       mech: { platform: 'windows', mode: 'server', mechanism: 'winsw' },
       deps: {
         run: rebuildRun,
+        protectServiceFiles: async () => ({ ok: true }),
         canWriteProgramData: () => true,
         // Fails the first time (the ABI changed), passes after the rebuild.
         verifyNativeModules: async () => {

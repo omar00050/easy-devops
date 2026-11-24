@@ -225,8 +225,8 @@ async function testCertDir() {
 
   const body = codeOnly(source.slice(start, end + 2));
   check('it contains no sudo', !/sudo/i.test(body), body.match(/.*sudo.*/)?.[0] ?? '');
-  check('it creates the directory with plain fs.mkdir',
-    /fs\.mkdir\(certDir,\s*\{\s*recursive:\s*true\s*\}\)/.test(body));
+  check('the issuer protects the managed key directory before use',
+    /await protectKeyDirectory\(sslDir, domainName\)/.test(body));
   check('a permission failure names the one-time setup',
     /EACCES/.test(body) && /EPERM/.test(body) && /Linux permissions/i.test(body));
 }

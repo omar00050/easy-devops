@@ -1,3 +1,4 @@
+import { pathToFileURL } from 'node:url';
 /**
  * core/service/systemd.js
  *
@@ -26,7 +27,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { run, runInteractive } from '../shell.js';
+import { run, runFile, runInteractive } from '../shell.js';
 import { isDefaultDataDir } from '../platform.js';
 import { runtimeNodePath } from './runtime.js';
 
@@ -101,6 +102,12 @@ export async function hasSystemd({ runner = run } = {}) {
  * @param {string} [opts.workingDir]
  * @returns {string}
  */
+function unitArg(value) {
+  if (/[\r\n\0]/.test(value)) throw new Error('Invalid systemd argument');
+  const escaped = value.replaceAll('%', '%%').replaceAll('$', '$$');
+  return /^[=a-zA-Z0-9_./:-]+$/.test(escaped) ? escaped : JSON.stringify(escaped);
+}
+
 export function buildUnit({ nodeExe, entry, user, dataDir, workingDir = null }) {
   // Only passed when it is NOT the default. A unit that sets it to the very
   // directory the code already resolves on its own adds nothing, and the one
@@ -108,7 +115,7 @@ export function buildUnit({ nodeExe, entry, user, dataDir, workingDir = null }) 
   // certificates on real domains. See isDevDataDir() in core/platform.js.
   const dataDirLine = isDefaultDataDir(dataDir)
     ? '# EASY_DEVOPS_DATA_DIR is not set: this is the default directory.'
-    : `Environment=EASY_DEVOPS_DATA_DIR=${dataDir}`;
+    : `Environment=${unitArg(`EASY_DEVOPS_DATA_DIR=${dataDir}`)}`;
 
   return `[Unit]
 Description=Easy DevOps background service
@@ -125,13 +132,17 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=${user}
-WorkingDirectory=${workingDir ?? packageRootFor(entry)}
+User=${unitArg(user)}
+WorkingDirectory=${unitArg(workingDir ?? packageRootFor(entry))}
 
 # The pinned runtime, not whatever "node" resolves to in a shell. A version
 # manager can change that at any time; this path is ours.
-ExecStart=${nodeExe} ${entry} daemon
+ExecStart=${unitArg(nodeExe)} ${unitArg(`--experimental-loader=${pathToFileURL(path.resolve(path.dirname(entry), '../core/service/runtime-loader.mjs')).href}`)} ${unitArg(entry)} daemon
 
+Environment=NODE_OPTIONS=
+Environment=NODE_PATH=
+Environment=WS_NO_BUFFER_UTIL=1
+Environment=WS_NO_UTF_8_VALIDATE=1
 Environment=NODE_ENV=production
 ${dataDirLine}
 
@@ -176,7 +187,7 @@ export function manualInstructions({ nodeExe, entry, dataDir }) {
 /**
  * Installs and starts the unit.
  *
- * `runInteractive` is used for every privileged step so SUDO asks for the
+ * sudo asks for the
  * password, on the user's terminal, in its own words. This process never sees
  * it. That also means a real TTY is required, which is checked first rather
  * than discovered as a hang.
@@ -200,6 +211,7 @@ export async function install({
   log = () => {},
   runner = run,
   interactive = runInteractive,
+  fileRunner = runFile,
   unitPath = UNIT_PATH,
 } = {}) {
   if (!process.stdin.isTTY) {
@@ -212,21 +224,40 @@ export async function install({
 
   const unit = buildUnit({ nodeExe, entry, user, dataDir });
 
-  // Written to a temp file and copied with sudo, rather than piping into a
-  // privileged shell redirect. `sudo tee` or `sudo sh -c '… > file'` both put
-  // the content through a shell, where every character in the unit has to be
-  // escaped correctly; a plain `cp` of a file does not.
-  const staged = path.join(os.tmpdir(), `easy-devops-${process.pid}.service`);
-  try {
-    fs.writeFileSync(staged, unit, 'utf8');
-  } catch (err) {
-    return { ok: false, reason: `could not stage the unit file: ${err.message}` };
+  const written = await writeUnit(unit, { fileRunner, interactive, unitPath, log });
+  if (!written.ok) return written;
+  const enable = await interactive(`sudo systemctl enable ${UNIT_NAME}`);
+  if (!enable.success) return { ok: false, reason: `systemctl enable ${UNIT_NAME} failed` };
+
+  const start = await interactive(`sudo systemctl restart ${UNIT_NAME}`);
+  if (!start.success) {
+    const recent = await journal({ lines: 20, runner });
+    return {
+      ok: false,
+      reason: `the service was installed but would not start.\n\nLast log lines:\n${recent.output}`,
+      unitPath,
+    };
   }
 
-  log(`Installing ${unitPath} (sudo will ask for your password)`);
+  return { ok: true, unitPath };
+}
 
+async function writeUnit(unit, { fileRunner = runFile, interactive = runInteractive, unitPath = UNIT_PATH, log = () => {} } = {}) {
+  let stagingDir;
   try {
-    const copy = await interactive(`sudo cp "${staged}" "${unitPath}" && sudo chmod 644 "${unitPath}"`);
+    let staged;
+    try {
+      // mkdtemp creates the directory atomically with mode 0700 on Linux.
+      stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-devops-unit-'));
+      staged = path.join(stagingDir, UNIT_NAME);
+      fs.writeFileSync(staged, unit, { flag: 'wx', mode: 0o600 });
+    } catch (err) {
+      return { ok: false, reason: `could not stage the unit file: ${err.message}` };
+    }
+
+    log(`Installing ${unitPath} (sudo will ask for your password)`);
+    // sudo reads passwords directly from its controlling terminal.
+    const copy = await fileRunner('sudo', ['install', '-m', '0644', '--', staged, unitPath], { timeout: 300_000 });
     if (!copy.success) {
       return { ok: false, reason: `could not write ${unitPath}. sudo exited ${copy.exitCode ?? 'non-zero'}.` };
     }
@@ -234,23 +265,27 @@ export async function install({
     const reload = await interactive('sudo systemctl daemon-reload');
     if (!reload.success) return { ok: false, reason: 'systemctl daemon-reload failed' };
 
-    const enable = await interactive(`sudo systemctl enable ${UNIT_NAME}`);
-    if (!enable.success) return { ok: false, reason: `systemctl enable ${UNIT_NAME} failed` };
-
-    const start = await interactive(`sudo systemctl restart ${UNIT_NAME}`);
-    if (!start.success) {
-      const recent = await journal({ lines: 20, runner });
-      return {
-        ok: false,
-        reason: `the service was installed but would not start.\n\nLast log lines:\n${recent.output}`,
-        unitPath,
-      };
-    }
+    return { ok: true };
   } finally {
-    try { fs.rmSync(staged, { force: true }); } catch { /* best effort */ }
+    if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true });
   }
+}
 
-  return { ok: true, unitPath };
+// Preserve the installed service identity, limits and other operator settings.
+export async function refreshUnit({ entry, dataDir, unitPath = UNIT_PATH, ...options }) {
+  const original = fs.readFileSync(unitPath, 'utf8');
+  if (!/^\[Service\]$/m.test(original) || !/^ExecStart=.* daemon$/m.test(original)) {
+    return { ok: false, reason: 'Unrecognized service definition. Review the unit before repair.' };
+  }
+  let updated = original;
+  for (const setting of ['WS_NO_BUFFER_UTIL=1', 'WS_NO_UTF_8_VALIDATE=1', 'NODE_OPTIONS=', 'NODE_PATH=']) {
+    if (!updated.split('\n').includes(`Environment=${setting}`)) updated = updated.replace('[Service]', `[Service]\nEnvironment=${setting}`);
+  }
+  if (!/^ExecStart=.*--experimental-loader=/m.test(updated)) {
+    const line = buildUnit({ nodeExe: runtimeNodePath(dataDir), entry, dataDir, user: 'unused' }).match(/^ExecStart=.*$/m)[0];
+    updated = updated.replace(/^ExecStart=.* daemon$/m, () => line);
+  }
+  return updated === original ? { ok: true } : writeUnit(updated, { ...options, unitPath });
 }
 
 /**
@@ -260,7 +295,7 @@ export async function install({
  * where the user removed the unit by hand, or they are left unable to clean up
  * through the tool at all.
  */
-export async function uninstall({ log = () => {}, interactive = runInteractive, unitPath = UNIT_PATH } = {}) {
+export async function uninstall({ log = () => {}, interactive = runInteractive, fileRunner = runFile, unitPath = UNIT_PATH } = {}) {
   if (!process.stdin.isTTY) {
     return {
       ok: false,
@@ -270,24 +305,14 @@ export async function uninstall({ log = () => {}, interactive = runInteractive, 
 
   log(`Removing ${unitPath} (sudo will ask for your password)`);
 
-  // `|| true` on each: a stop of something not running, or a disable of
-  // something not enabled, exits non-zero and must not abort the rest.
-  const steps = [
-    `sudo systemctl stop ${UNIT_NAME} || true`,
-    `sudo systemctl disable ${UNIT_NAME} || true`,
-    `sudo rm -f "${unitPath}"`,
-    'sudo systemctl daemon-reload',
-    // Clears systemd's record of a failed unit, so a reinstall does not start
-    // against a start-limit counter from before.
-    `sudo systemctl reset-failed ${UNIT_NAME} || true`,
-  ];
+  await interactive(`sudo systemctl stop ${UNIT_NAME} || true`);
+  await interactive(`sudo systemctl disable ${UNIT_NAME} || true`);
+  const remove = await fileRunner('sudo', ['rm', '-f', '--', unitPath], { timeout: 300_000 });
+  if (!remove.success) return { ok: false, reason: `could not remove ${unitPath}` };
 
-  for (const step of steps) {
-    const result = await interactive(step);
-    if (!result.success && !step.endsWith('|| true')) {
-      return { ok: false, reason: `\`${step}\` failed` };
-    }
-  }
+  const reload = await interactive('sudo systemctl daemon-reload');
+  if (!reload.success) return { ok: false, reason: 'systemctl daemon-reload failed' };
+  await interactive(`sudo systemctl reset-failed ${UNIT_NAME} || true`);
 
   return { ok: true };
 }
@@ -430,7 +455,7 @@ export async function status({ runner = run } = {}) {
  * link is enough — the unit itself refers to the link, not to a Node version,
  * which is the entire reason it is a link.
  */
-export async function repair({ dataDir, nodeExe = process.execPath, log = () => {}, interactive = runInteractive } = {}) {
+export async function repair({ dataDir, entry, nodeExe = process.execPath, log = () => {}, interactive = runInteractive } = {}) {
   const { linkRuntime } = await import('./runtime.js');
 
   const linked = linkRuntime({ dataDir, nodeExe });
@@ -448,6 +473,10 @@ export async function repair({ dataDir, nodeExe = process.execPath, log = () => 
     };
   }
 
+  if (entry) {
+    const result = await refreshUnit({ dataDir, entry, interactive, log });
+    if (!result.ok) return { ...result, relinked: true };
+  }
   const result = await interactive(`sudo systemctl restart ${UNIT_NAME}`);
   return result.success
     ? { ok: true, relinked: true, target: linked.target }

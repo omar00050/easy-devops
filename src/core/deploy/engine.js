@@ -51,8 +51,9 @@
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
+import { randomUUID } from 'node:crypto';
 
-import { run as defaultRun, runCommandLine as defaultRunCommandLine } from '../shell.js';
+import { run as defaultRun, runFile as defaultRunFile, runCommandLine as defaultRunCommandLine } from '../shell.js';
 import * as defaultRunner from '../runner.js';
 import { createDeployEvent } from '../events.js';
 import { sendNotification as defaultSendNotification } from '../notifier.js';
@@ -179,6 +180,7 @@ export function redactSecrets(text, env = {}, token = null) {
 function resolveDeps(deps = {}) {
   return {
     run: deps.run ?? defaultRun,
+    runFile: deps.runFile ?? defaultRunFile,
     runCommandLine: deps.runCommandLine ?? defaultRunCommandLine,
     runner: deps.runner ?? defaultRunner,
     probe: deps.probe ?? probeHttp,
@@ -223,28 +225,22 @@ function makeLogger(appId, runId) {
   };
 }
 
-/** Double-quotes a path for a shell command. Paths come from the data directory, never from user input. */
-function q(p) {
-  return `"${String(p)}"`;
-}
-
 /**
- * The git invocation prefix and environment for an app's credentials.
- *
- * A token is passed as a per-command HTTP header rather than embedded in the
- * remote URL: in the URL it would be written into the checkout's .git/config
- * and stay on disk in every release. `display` is what goes in the log.
+ * Authentication is scoped to one fetch. It must never reach argv, checkout
+ * hooks, build scripts or the persisted repository configuration.
  */
 function gitAuth(app) {
   const env = { GIT_TERMINAL_PROMPT: '0' };
 
   if (app.auth?.type === AUTH_TYPES.TOKEN && app.auth.token) {
     const basic = Buffer.from(`x-access-token:${app.auth.token}`).toString('base64');
-    return {
-      env,
-      flags: `-c "http.extraHeader=Authorization: Basic ${basic}"`,
-      display: '-c "http.extraHeader=Authorization: Basic ***"',
-    };
+    env.GIT_CONFIG_COUNT = '1';
+    env.GIT_CONFIG_KEY_0 = 'http.extraHeader';
+    env.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${basic}`;
+    // Git tracing can print headers to stderr, which becomes deploy output.
+    env.GIT_TRACE_CURL = '0';
+    env.GIT_CURL_VERBOSE = '0';
+    env.GIT_TRACE_REDACT = '1';
   }
 
   if (app.auth?.type === AUTH_TYPES.DEPLOY_KEY) {
@@ -261,7 +257,7 @@ function gitAuth(app) {
     env.GIT_SSH_COMMAND = sshCmd;
   }
 
-  return { env, flags: '', display: '' };
+  return env;
 }
 
 function readTextIfExists(file) {
@@ -645,6 +641,32 @@ function appEnvironment(app, settings, releaseId) {
   return env;
 }
 
+function regularReleaseFile(file) {
+  const parent = fs.lstatSync(path.dirname(file), { throwIfNoEntry: false });
+  if (!parent?.isDirectory()) return false;
+  const entry = fs.lstatSync(file, { throwIfNoEntry: false });
+  return Boolean(entry?.isFile() && entry.nlink === 1);
+}
+
+/** Publish a fresh inode. A repository-controlled link must never receive a write or chmod. */
+function writeReleaseFile(file, contents) {
+  if (!fs.lstatSync(path.dirname(file)).isDirectory()) throw new Error('Invalid release directory');
+  const existing = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (existing && !existing.isFile()) throw new Error(`Invalid generated file: ${path.basename(file)}`);
+  const temporary = path.join(path.dirname(file), `.ez-write-${randomUUID()}`);
+  const fd = fs.openSync(temporary, 'wx', 0o600);
+  try {
+    try {
+      fs.writeFileSync(fd, contents);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(temporary, file);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+}
+
 /** Writes the PM2 config (and the launcher, when needed) into a release directory. */
 function writePm2Config(dir, app, settings, env) {
   const start = parseStartCommand(settings.start);
@@ -662,7 +684,7 @@ function writePm2Config(dir, app, settings, env) {
     entry.script = start.script;
     if (start.args.length > 0) entry.args = start.args;
   } else {
-    fs.writeFileSync(path.join(dir, LAUNCHER_FILE), LAUNCHER_SOURCE);
+    writeReleaseFile(path.join(dir, LAUNCHER_FILE), LAUNCHER_SOURCE);
     entry.script = LAUNCHER_FILE;
     entry.env[LAUNCHER_COMMAND_ENV] = start.command;
   }
@@ -676,15 +698,16 @@ function writePm2Config(dir, app, settings, env) {
 
   const file = path.join(dir, PM2_CONFIG_FILE);
   // Holds the app's environment, so owner-only like the deploy key.
-  fs.writeFileSync(file, JSON.stringify({ apps: [entry] }, null, 2), { mode: 0o600 });
-  try { fs.chmodSync(file, 0o600); } catch { /* not meaningful on Windows */ }
+  writeReleaseFile(file, JSON.stringify({ apps: [entry] }, null, 2));
   return file;
 }
 
 /** Reads back the health settings a release was started with, for a rollback. */
 function releaseHealth(dir) {
   try {
-    const meta = JSON.parse(fs.readFileSync(path.join(dir, 'ez.release.json'), 'utf8'));
+    const file = path.join(dir, 'ez.release.json');
+    if (!regularReleaseFile(file)) throw new Error('Missing or linked release metadata');
+    const meta = JSON.parse(fs.readFileSync(file, 'utf8'));
     return {
       port: Number.isInteger(meta.port) ? meta.port : null,
       healthPath: typeof meta.healthPath === 'string' ? meta.healthPath : '/',
@@ -714,7 +737,7 @@ export function describeRelease(appId, releaseId) {
     ref: meta.ref,
     execMode: meta.execMode,
     instances: meta.instances,
-    startable: fs.existsSync(path.join(dir, PM2_CONFIG_FILE)),
+    startable: regularReleaseFile(path.join(dir, PM2_CONFIG_FILE)),
   };
 }
 
@@ -922,7 +945,7 @@ async function captureBootLog(name, app, pm2Path, d) {
  */
 async function switchTo(dir, name, pm2Path, d, log, { execMode = 'fork' } = {}) {
   const config = path.join(dir, PM2_CONFIG_FILE);
-  if (!fs.existsSync(config)) return { ok: false, output: `${PM2_CONFIG_FILE} is missing from ${dir}.` };
+  if (!regularReleaseFile(config)) return { ok: false, output: `${PM2_CONFIG_FILE} is missing from ${dir}.` };
 
   if (execMode === 'cluster' && typeof d.runner.reloadConfig === 'function') {
     const current = await readPm2Status(name, pm2Path, d);
@@ -1053,13 +1076,14 @@ async function executeDeployment(app, run, d) {
   };
 
   /** Runs one of the engine's own commands (git) through the shared shell. */
-  const sh = async (step, command, display, options = {}) => {
-    log.line(`$ ${display ?? command}`);
-    const r = await d.run(command, { timeout: GIT_TIMEOUT_MS, onData: (c) => log.output(c), ...options });
+  const git = async (args, env) => {
+    log.line(`$ git ${args.map(arg => JSON.stringify(arg)).join(' ')}`);
+    const authenticated = Boolean(env?.GIT_CONFIG_VALUE_0);
+    const r = await d.runFile('git', args, { timeout: GIT_TIMEOUT_MS, env, onData: authenticated ? undefined : c => log.output(c) });
     log.flush();
     if (!r.success) {
-      const tail = (r.stderr || r.stdout || '').split('\n').filter(Boolean).slice(-1)[0] ?? '';
-      throw new StepError(step, tail ? `${step} failed: ${tail}` : `${step} failed (exit ${r.exitCode ?? 'none'})`);
+      const tail = authenticated ? '' : (r.stderr || r.stdout || '').split('\n').filter(Boolean).slice(-1)[0] ?? '';
+      throw new StepError('fetch', tail ? `fetch failed: ${tail}` : `fetch failed (exit ${r.exitCode ?? 'none'})`);
     }
     return r;
   };
@@ -1109,22 +1133,14 @@ async function executeDeployment(app, run, d) {
       throw new StepError('fetch', 'git is not installed on this server (or not on PATH for the Easy DevOps service).');
     }
 
-    const auth = gitAuth(app);
-    const gitOpts = { env: auth.env };
-    const flags = auth.flags ? ` ${auth.flags}` : '';
-    const shown = auth.display ? ` ${auth.display}` : '';
+    const fetchEnv = gitAuth(app);
 
     fs.mkdirSync(dir, { recursive: true });
-    await sh('fetch', `git init -q ${q(dir)}`, null, gitOpts);
-    await sh('fetch', `git -C ${q(dir)} remote add origin ${q(app.repoUrl)}`, null, gitOpts);
-    await sh(
-      'fetch',
-      `git -C ${q(dir)}${flags} fetch --depth 1 origin ${q(run.ref)}`,
-      `git -C ${q(dir)}${shown} fetch --depth 1 origin ${q(run.ref)}`,
-      gitOpts,
-    );
-    await sh('fetch', `git -C ${q(dir)} checkout -q FETCH_HEAD`, null, gitOpts);
-    const head = await sh('fetch', `git -C ${q(dir)} rev-parse HEAD`, null, gitOpts);
+    await git(['init', '-q', dir]);
+    await git(['-C', dir, 'remote', 'add', 'origin', app.repoUrl]);
+    await git(['-C', dir, 'fetch', '--depth', '1', 'origin', run.ref], fetchEnv);
+    await git(['-C', dir, 'checkout', '-q', 'FETCH_HEAD']);
+    const head = await git(['-C', dir, 'rev-parse', 'HEAD']);
     run.sha = head.stdout.trim().split(/\s+/).pop() || null;
     writeRun(run);
 
@@ -1200,7 +1216,7 @@ async function executeDeployment(app, run, d) {
     pm2Path = pm2.path ?? 'pm2';
 
     writePm2Config(dir, app, settings, env);
-    fs.writeFileSync(path.join(dir, 'ez.release.json'), JSON.stringify({
+    writeReleaseFile(path.join(dir, 'ez.release.json'), JSON.stringify({
       sha: run.sha, ref: run.ref, port: settings.port, healthPath: settings.healthPath, strict,
       persist: settings.persist,
       execMode: settings.execMode,
@@ -1365,7 +1381,7 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
 
   let targetDir;
   try { targetDir = releaseDir(appId, target); } catch { return { ok: false, status: 400, error: 'Invalid release id.' }; }
-  if (!fs.existsSync(path.join(targetDir, PM2_CONFIG_FILE))) {
+  if (!regularReleaseFile(path.join(targetDir, PM2_CONFIG_FILE))) {
     return { ok: false, status: 409, error: `Release ${target} was never started, so it cannot be rolled back to.` };
   }
 
@@ -1644,7 +1660,7 @@ export async function moveApp(appId, targetDir, { deps = {} } = {}) {
   const startCurrent = async () => {
     if (!state.current || !pm2Path) return false;
     const config = path.join(releaseDir(appId, state.current), PM2_CONFIG_FILE);
-    if (!fs.existsSync(config)) return false;
+    if (!regularReleaseFile(config)) return false;
     const started = await d.runner.startConfig(config, { run: d.run, pm2Path });
     if (started.ok) await d.runner.save({ run: d.run, pm2Path });
     return started.ok;
@@ -1682,9 +1698,10 @@ export async function moveApp(appId, targetDir, { deps = {} } = {}) {
       const dir = releaseDir(appId, id);
       const file = path.join(dir, PM2_CONFIG_FILE);
       try {
+        if (!regularReleaseFile(file)) continue;
         const config = JSON.parse(fs.readFileSync(file, 'utf8'));
         for (const entry of config.apps ?? []) entry.cwd = dir;
-        fs.writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
+        writeReleaseFile(file, JSON.stringify(config, null, 2));
       } catch { /* a release that never started has no config */ }
     }
 

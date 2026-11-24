@@ -193,10 +193,11 @@ export function normalizeAppInput(input, existing = null) {
   const authType = has('authType') ? src.authType : (existing?.auth?.type ?? AUTH_TYPES.NONE);
   if (!Object.values(AUTH_TYPES).includes(authType)) errors.push('authType must be none, deployKey or token.');
 
-  let token = existing?.auth?.token ?? null;
+  // A credential belongs to the repository for which the operator supplied it.
+  let token = repoUrl === existing?.repoUrl ? existing?.auth?.token ?? null : null;
   if (has('token') && src.token !== null && src.token !== '') {
     const t = String(src.token).trim();
-    // The token goes into an HTTP header on the git command line.
+    // The fetch subprocess receives the credential through its environment.
     if (!/^[A-Za-z0-9_.-]{10,255}$/.test(t)) errors.push('The token contains characters that are not allowed.');
     else token = t;
   }
