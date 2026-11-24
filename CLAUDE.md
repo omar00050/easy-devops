@@ -102,7 +102,16 @@ requires it.
     (`dashboard/lib/localRequest.js`). They stop a hostile page in the same
     browser, which a password never did.
 16. **`systemctl` from the dashboard always uses `sudo -n`.** Never interactive
-    sudo. Never add broad sudoers rules — print the command for the user.
+    sudo, and never a password: `core/permissions.js` is the single source of
+    the sudoers rules and of the one-time setup script, and it grants **exactly
+    five** commands — `systemctl start|stop|reload|restart|status nginx`, full
+    path, no wildcards. Adding a line there is a security decision: do not add
+    a shell, an editor, a file writer, an ownership or mode changer, or a unit
+    manager without a fixed unit. The dashboard never receives, stores or
+    forwards a sudo password: `POST /api/settings/permissions/setup` takes no
+    body and answers with the commands the operator runs in their own terminal,
+    where sudo asks them. Directories that would need `sudo mkdir`/`sudo chown`
+    at runtime are created and handed over once by that same script.
 17. **Session secrets** come from `crypto.randomBytes(32)`, persisted in SQLite.
 18. **First-run setup needs a one-time code** (`core/setupCode.js`).
     `POST /api/setup` is public by necessity — there is no session before the
@@ -165,7 +174,7 @@ requires it.
 
 ### Contracts and docs
 
-24. **`docs/api-contract.md` is authoritative** for dashboard REST endpoints and
+24. **`API-CONTRACT.md` is authoritative** for dashboard REST endpoints and
     Socket.io events. Any change to an endpoint or event updates that file in
     the same change; `npm test` fails on a mismatch.
 25. **Every user-visible change goes in `CHANGELOG.md`** under `[Unreleased]`.
@@ -180,6 +189,13 @@ requires it.
     a question asked of every future user. Detect rather than ask.
 29. **Errors say what to do next**, not only what went wrong.
 
+### UI documentation
+
+30. **Before any UI work, read `docs-ui/README.md`** (local, gitignored agent
+    knowledge for both the dashboard and the Hub UI). **Update `docs-ui` in the
+    same change** whenever you add or change a page, component, pattern or
+    token. Every UI brief requires it.
+
 ---
 
 ## Architecture
@@ -189,7 +205,8 @@ requires it.
 ```
 src/
   cli/           ← interactive terminal app (inquirer menus)
-  dashboard/     ← Express + Socket.io web app (classic EJS UI + ui/ React source)
+  dashboard/     ← Express + Socket.io; the React UI in ui/ is the default,
+                   the classic EJS page is a temporary fallback
   core/          ← shared logic used by both
 dist/ui/         ← built React dashboard (npm run build:ui, published, not committed)
 ```
@@ -200,9 +217,11 @@ dist/ui/         ← built React dashboard (npm run build:ui, published, not com
 - `config.js` — loads/saves the `'config'` key. Always merge with defaults so new fields survive old databases, and migrate carefully: an upgrade must not change behaviour silently.
 - `shell.js` — **all subprocess execution goes through here**: `run()` (captures output), `runLive()` (streams), `runInteractive()` (full stdio inherit, for commands that prompt — needs a real terminal), `runWithStdin()`.
 - `passwords.js` — scrypt hashing for the dashboard password.
-- `runner.js` — the only PM2 wrapper, now for the user's OWN apps (the
-  Processes page). There is no `core/service.js`: the PM2-era install path was
-  deleted once nothing routed to it. The service lives in `service/` below.
+- `runner.js` — the only PM2 wrapper. PM2 runs the user's OWN apps (the
+  Processes page) and every project Easy DevOps deploys; the dashboard itself is
+  a native service, not a PM2 app. There is no `core/service.js`: the PM2-era
+  install path was deleted once nothing routed to it. The service lives in
+  `service/` below.
 - `service/` — the native OS service: `index.js` (the dispatcher), `systemd.js`,
   `windowsService.js` (WinSW), `windowsPersonal.js`, `winsw.js` (the pinned
   wrapper), `runtime.js` (the pinned Node), `runtimeUpdate.js` (moving the
@@ -214,6 +233,19 @@ dist/ui/         ← built React dashboard (npm run build:ui, published, not com
   service running the clone, so the update reports success and changes nothing.
 - `updater.js` — `ezz update`: stop, replace, refresh the Windows Server
   runtime copy, start, verify against the daemon's heartbeat, roll back.
+- `updateStatus.js` — the run record a dashboard-initiated update leaves behind
+  (`update-status.json`, written atomically). The dashboard request starts a
+  detached `dashboard/updateWorker.js` and answers before the work begins, so
+  the file — not the request — is where the outcome lives; an abandoned active
+  phase is reported as `interrupted`, never as still running.
+- `deploy/` — Deployments: `apps.js` (registry and validation), `store.js`
+  (folders, releases, runs, the per-app deploy lock), `ezfile.js` (`ez.json` /
+  `package.json` precedence and persistent paths), `engine.js` (one deployment
+  with automatic rollback), `deployKey.js` (the ed25519 key, its file and the
+  pinned-host-key connection test), `domainLink.js`, `hookServer.js` (the opt-in CI
+  listener), `hubCommands.js`, `github.js`, `githubApi.js`, `status.js`,
+  `launcher.js`. Deployment data lives under `<deployDir>/<appId>` on disk, not
+  in the database; only the app registry is a SQLite key (`deployApps`).
 - `cleanup.js` — the reclaimable-file inventory. Scans, never deletes unless
   handed specific items.
 - `purge.js` — `ezz uninstall --purge`: export a backup first, then remove the
@@ -224,7 +256,10 @@ dist/ui/         ← built React dashboard (npm run build:ui, published, not com
   `GET /api/service` took twenty: six of them, in sequence. Serve the cached
   answer, refresh behind the response, and `invalidate()` whenever a command
   changes what was measured.
-- `permissions.js` — Linux-only sudoers setup.
+- `permissions.js` — Linux-only. The **only** source of the sudoers rules
+  (exactly five fixed `systemctl … nginx` commands) and of the setup script that
+  installs them and hands over the runtime directories. It never accepts a
+  password; the dashboard and the CLI both only show or run its commands.
 - `validators.js` — shared input validation.
 - `nginx-conf-generator.js` — builds nginx `.conf` content. `nginx-apply.js` writes, tests and rolls back.
 - `hubLink.js`, `hubPermissions.js` — hub pairing and the permission catalog.
@@ -233,9 +268,11 @@ dist/ui/         ← built React dashboard (npm run build:ui, published, not com
   actions the Hub can request. These were in `dashboard/lib/` until the daemon
   needed them; core must not import from `dashboard/`.
 - `hub/agent.js` — the outbound agent to the Hub. Background work, so it starts
-  and stops with job ownership, not with the dashboard.
+  and stops with job ownership, not with the dashboard. `hub/deployProgress.js`
+  is its live deploy feed, read from the deploy lock, run record and log across
+  processes.
 - `jobs/` — the background work and who runs it. `bus.js` (in-process event
-  channel, using the api-contract event names), `monitors.js` (nginx status,
+  channel, using the API-CONTRACT.md event names), `monitors.js` (nginx status,
   domain health, cert expiry), `revisionWatcher.js`, `owner.js` (the exclusive
   jobs-ownership marker: pid + heartbeat, claimed before anything starts and
   released after everything stops), and `index.js` (`startJobs({ role })` — the
@@ -356,13 +393,16 @@ Subcommands: `system-info`, `daemon`, `service <action>`,
 `runtime <action>`, `update`, `cleanup`, `uninstall --purge`,
 `dashboard setup-code`.
 
-The last four are CLI-only on purpose, and the reason is the same each time:
-each one stops or replaces the process that would have served the request.
-`ezz update` replaces the running package; `ezz runtime update` swaps the
-binary the service runs; `--purge` deletes the database the dashboard reads;
-and the setup code exists precisely to prove the caller can read this
-machine's terminal. `core/updater.js` exports `whyCliOnly()` so that
-explanation is given to the user rather than only written in a comment.
+Three of the last four are CLI-only on purpose, and the reason is the same
+each time: each one stops or replaces the process that would have served the
+request. `ezz runtime update` swaps the binary the service runs; `--purge`
+deletes the database the dashboard reads; and the setup code exists precisely
+to prove the caller can read this machine's terminal. `ezz update` is the
+exception: Settings → Update in the dashboard records the run and hands it to
+a detached worker (`dashboard/updateWorker.js`) that survives the restart, runs
+the same `core/updater.js` flow, and leaves the outcome in
+`core/updateStatus.js`. The Hub still cannot run it, which is what
+`core/updater.js` `whyCliOnly()` explains.
 
 - `menus/` — thin dispatchers. `managers/` — the actual logic.
 
@@ -373,7 +413,10 @@ Socket.io so sockets see the same session), the local-request guard, the
 routers, the UI choice (the built React app in `dist/ui` with an SPA fallback,
 or classic EJS), and the standby job runner plus the daemon bridge.
 
-- `routes/` — `auth.js` (the only public router), `domains.js`, `ssl.js`, `nginx.js`, `settings.js`, `hub.js`, `processes.js`.
+- `routes/` — `auth.js` (the only public router), `domains.js`, `ssl.js`,
+  `nginx.js`, `settings.js`, `hub.js`, `processes.js`, `deployments.js`,
+  `update.js`. Mounted in `server.js`; `e2e/run.mjs` compares this list with
+  `API-CONTRACT.md` and fails on any difference.
 - `lib/requireAuth.js` — the single auth gate, HTTP and socket.
 - `lib/localRequest.js` — Host/Origin/`X-EZ-Request` checks.
 - `lib/daemonBridge.js` — the IPC client; republishes the daemon's events onto
@@ -411,6 +454,10 @@ or classic EJS), and the standby job runner plus the daemon bridge.
 | `domains` | JSON array of domain config objects (v2 schema) |
 | `hub-link`, `hub-permissions`, `hub-revision` | Hub pairing, granted permissions, change counter |
 | `service-state` | Recorded boot mode and install time |
+| `deployApps` | The deployed-app registry (repositories, settings, env, linked domains) |
+| `dashboard-pid`, `dashboard-port` | The last dashboard the CLI menu or the update worker started |
+| `setup-code` | The hashed one-time first-run code, its expiry and failure count |
+| `sslAutoRenewState` | The last automatic-renewal attempt per certificate |
 | `system-detection` | Cached OS/nginx/node detection |
 | `session_secret` | Generated once via `crypto.randomBytes(32)` |
 | `notification_channels`, `domain_notification_config`, `notification_state` | Notifications |
