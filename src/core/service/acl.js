@@ -49,6 +49,10 @@ import {
   WINDOWS_SYSTEM_ROOT,
 } from '../platform.js';
 import { SERVICE_ACCOUNT } from './winsw.js';
+import {
+  UNINSTALL_STAGE_TIMEOUT_MS,
+  remainingStageMs,
+} from './stageTimeout.js';
 
 /** Access levels, in icacls's own notation. */
 export const ACCESS = Object.freeze({
@@ -120,7 +124,12 @@ function sameDirectory(left, right) {
 }
 
 /** Validate before examining a settings-controlled location or passing it to an OS utility. */
-export function canonicalAclDirectory(dir) {
+export async function canonicalAclDirectory(dir, {
+  deadline = Infinity,
+  stage = 'ACL validation',
+  timeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
+  signal,
+} = {}) {
   if (typeof dir !== 'string' || !path.isAbsolute(dir) || /["*?<>|\x00-\x1f]/.test(dir)
       || dir.split(/[\\/]/).some(part => part === '.' || part === '..' || /[. ]$/.test(part))
       || (isWindows && (!/^[A-Za-z]:[\\/]/.test(dir) || dir.slice(2).includes(':')))) {
@@ -151,12 +160,23 @@ export function canonicalAclDirectory(dir) {
   // Check every component before descending. realpath additionally catches aliases such as 8.3 names.
   let current = root;
   for (const part of target.slice(root.length).split(path.sep)) {
+    remainingStageMs(deadline, stage, timeoutMs);
+    signal?.throwIfAborted();
     current = path.join(current, part);
-    const stat = fs.lstatSync(current, { throwIfNoEntry: false });
+    let stat;
+    try {
+      stat = await fs.promises.lstat(current);
+    } catch (error) {
+      if (error?.code === 'ENOENT') throw new Error('the directory does not exist yet');
+      throw error;
+    }
     if (!stat) throw new Error('the directory does not exist yet');
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('refusing a reparse point or non-directory');
   }
-  if (path.relative(target, fs.realpathSync.native(target)) !== '') throw new Error('refusing a directory alias');
+  const realpath = await fs.promises.realpath(target);
+  if (path.relative(target, realpath) !== '') throw new Error('refusing a directory alias');
+  remainingStageMs(deadline, stage, timeoutMs);
+  signal?.throwIfAborted();
   return target;
 }
 
@@ -175,15 +195,32 @@ const CHECK_ATTRIBUTES = [
   '}',
 ].join('\n');
 
-export async function checkedAclDirectory(dir, runFile, recursive = false) {
-  const target = canonicalAclDirectory(dir);
+export async function checkedAclDirectory(dir, runFile, recursive = false, {
+  deadline = Infinity,
+  stage = 'ACL validation',
+  timeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
+  signal,
+} = {}) {
+  signal?.throwIfAborted();
+  const target = await canonicalAclDirectory(dir, {
+    deadline,
+    stage,
+    timeoutMs,
+    signal,
+  });
   // The native walk checks reparse attributes before this process traverses
   // anything below the root. Hard-linked files are checked in walkAclTree only
   // after their parent DACL has been locked, which avoids a JavaScript tree
   // walk following a reparse tag that lstat did not classify as a symlink.
+  const timeout = deadline === Infinity
+    ? 120_000
+    : remainingStageMs(deadline, stage, timeoutMs);
   const result = await runFile(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', CHECK_ATTRIBUTES], {
-    env: { EZ_ACL_TARGET: target, EZ_ACL_TREE: recursive ? '1' : '0' }, timeout: 120_000,
+    env: { EZ_ACL_TARGET: target, EZ_ACL_TREE: recursive ? '1' : '0' },
+    timeout,
   });
+  remainingStageMs(deadline, stage, timeoutMs);
+  signal?.throwIfAborted();
   if (!result.success) throw new Error('could not verify directory attributes or found a reparse point');
   return target;
 }
@@ -204,16 +241,26 @@ export async function checkedAclDirectory(dir, runFile, recursive = false) {
 export async function walkAclTree(root, visit, {
   runFile = shellRunFile,
   fsApi = fs,
+  deadline = Infinity,
+  stage = 'ACL update',
+  timeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
+  signal,
 } = {}) {
-  const canonical = await checkedAclDirectory(root, runFile, true);
+  const canonical = await checkedAclDirectory(root, runFile, true, {
+    deadline, stage, timeoutMs, signal,
+  });
   const pending = [canonical];
 
   while (pending.length > 0) {
+    remainingStageMs(deadline, stage, timeoutMs);
+    signal?.throwIfAborted();
     const directory = pending.pop();
     // The parent is locked before this check, so it cannot have been swapped
     // for another native reparse tag by the account this operation removes.
-    await checkedAclDirectory(directory, runFile, false);
-    const directoryStat = fsApi.lstatSync(directory);
+    await checkedAclDirectory(directory, runFile, false, {
+      deadline, stage, timeoutMs, signal,
+    });
+    const directoryStat = await fsApi.promises.lstat(directory);
     if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
       throw new Error(`refusing a reparse point or non-directory at ${directory}`);
     }
@@ -221,7 +268,7 @@ export async function walkAclTree(root, visit, {
 
     let entries;
     try {
-      entries = fsApi.readdirSync(directory, { withFileTypes: true });
+      entries = await fsApi.promises.readdir(directory, { withFileTypes: true });
     } catch (error) {
       throw new Error(`could not inspect ${directory}: ${error.message}`);
     }
@@ -230,7 +277,7 @@ export async function walkAclTree(root, visit, {
       const target = path.join(directory, entry.name);
       let stat;
       try {
-        stat = fsApi.lstatSync(target);
+        stat = await fsApi.promises.lstat(target);
       } catch (error) {
         throw new Error(`could not inspect ${target}: ${error.message}`);
       }
@@ -248,6 +295,67 @@ export async function walkAclTree(root, visit, {
         throw new Error(`refusing a hard-linked file in the approved directory: ${target}`);
       }
       await visit(target, 'file', stat);
+    }
+  }
+
+  return canonical;
+}
+
+/**
+ * Validate a complete ACL tree before one recursive revoke.
+ *
+ * The recursive revoke is one direct icacls process rather than hundreds of
+ * processes. `/L` acts on links themselves, and this pass refuses every native
+ * reparse point and hard-linked file before icacls runs. The deadline is
+ * checked throughout the scan, so a large tree cannot hold uninstall open.
+ */
+async function validateAclTreeForBulkRevoke(root, {
+  runFile = shellRunFile,
+  fsApi = fs,
+  deadline = Infinity,
+  stage = 'Removing service-account permissions',
+  timeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
+  signal,
+} = {}) {
+  const canonical = await checkedAclDirectory(root, runFile, true, {
+    deadline, stage, timeoutMs, signal,
+  });
+  const pending = [canonical];
+
+  while (pending.length) {
+    remainingStageMs(deadline, stage, timeoutMs);
+    signal?.throwIfAborted();
+    const directory = pending.pop();
+    const directoryStat = await fsApi.promises.lstat(directory);
+    if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
+      throw new Error(`refusing a reparse point or non-directory at ${directory}`);
+    }
+
+    let entries;
+    try {
+      entries = await fsApi.promises.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      throw new Error(`could not inspect ${directory}: ${error.message}`);
+    }
+
+    for (const entry of entries) {
+      remainingStageMs(deadline, stage, timeoutMs);
+      signal?.throwIfAborted();
+      const target = path.join(directory, entry.name);
+      const stat = await fsApi.promises.lstat(target);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`refusing a reparse point at ${target}`);
+      }
+      if (stat.isDirectory()) {
+        pending.push(target);
+        continue;
+      }
+      if (!stat.isFile()) {
+        throw new Error(`refusing a non-file entry at ${target}`);
+      }
+      if (stat.nlink > 1) {
+        throw new Error(`refusing a hard-linked file in the approved directory: ${target}`);
+      }
     }
   }
 
@@ -310,9 +418,67 @@ export function applyGrants({ grants, approvedDirs, runFile = shellRunFile, log 
   return changeGrants({ grants, approvedDirs, runFile, log, revoke: false });
 }
 
-export async function revokeGrants({ paths, approvedDirs, runFile = shellRunFile, log = () => {} }) {
-  const result = await changeGrants({ grants: paths.map(dir => ({ path: dir })), approvedDirs, runFile, log, revoke: true });
-  return { ok: result.ok, removed: result.applied.map(g => g.path), failed: result.failed };
+export async function revokeGrants({
+  paths,
+  approvedDirs,
+  runFile = shellRunFile,
+  log = () => {},
+  deadline = Infinity,
+  timeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
+  signal,
+  trustee = SERVICE_ACCOUNT,
+}) {
+  const removed = [];
+  const failed = [];
+  let needsElevation = false;
+  remainingStageMs(deadline, 'Removing service-account permissions', timeoutMs);
+  signal?.throwIfAborted();
+  if (trustee !== SERVICE_ACCOUNT
+      && !/^\*S-1-5-80-\d+-\d+-\d+-\d+-\d+$/.test(trustee)) {
+    throw new Error('refusing an unusual service-account trustee');
+  }
+  const approved = approvedDirs ?? await approvedGrantDirs(runFile);
+  remainingStageMs(deadline, 'Removing service-account permissions', timeoutMs);
+  signal?.throwIfAborted();
+
+  for (const dir of paths.filter(Boolean)) {
+    try {
+      signal?.throwIfAborted();
+      if (!approved.some(base => typeof dir === 'string' && path.isAbsolute(dir)
+          && path.relative(base, dir) === '')) {
+        throw new Error('directory lacks administrator approval');
+      }
+      const machine = programDataDir();
+      const canonical = await validateAclTreeForBulkRevoke(dir, {
+        runFile, deadline, timeoutMs, signal,
+      });
+      if (['runtime', 'runtime.prev', 'bin'].some(name => inside(canonical, path.join(machine, name)))) {
+        throw new Error('Service code directories cannot receive a data revoke');
+      }
+      const timeout = deadline === Infinity
+        ? 120_000
+        : remainingStageMs(deadline, 'Removing service-account permissions', timeoutMs);
+      signal?.throwIfAborted();
+      const result = await runFile(systemTool('icacls.exe'), [
+        canonical, '/remove:g', trustee, '/T', '/L', '/Q',
+      ], { timeout });
+      remainingStageMs(deadline, 'Removing service-account permissions', timeoutMs);
+      signal?.throwIfAborted();
+      if (!result.success) {
+        const output = `${result.stdout ?? ''} ${result.stderr ?? ''}`.trim();
+        if (/access is denied/i.test(output)) needsElevation = true;
+        throw new Error(output.slice(0, 300) || 'icacls failed');
+      }
+      removed.push(dir);
+      log(`  ${canonical}: removed service grant`);
+    } catch (error) {
+      if (error?.code === 'EZ_STAGE_TIMEOUT' || signal?.aborted) throw error;
+      failed.push({ path: dir, reason: error.message });
+      log(`  ${dir}: ${error.message}`);
+    }
+  }
+
+  return { ok: failed.length === 0, removed, failed, needsElevation };
 }
 
 /**

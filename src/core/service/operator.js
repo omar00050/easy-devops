@@ -43,6 +43,10 @@ import { run as shellRun, runFile as shellRunFile } from '../shell.js';
 import { WINDOWS_SC, programDataDir, windowsCurrentUserCmd } from '../platform.js';
 import { checkedAclDirectory, systemTool, walkAclTree } from './acl.js';
 import { SERVICE_ID, SERVICE_ACCOUNT } from './winsw.js';
+import {
+  UNINSTALL_STAGE_TIMEOUT_MS,
+  remainingStageMs,
+} from './stageTimeout.js';
 
 /** Set by the relaunch, so the elevated copy grants the user who asked — see cli/elevation.js. */
 export const OPERATOR_SID_ENV = 'EZ_OPERATOR_SID';
@@ -132,8 +136,28 @@ export function withOperatorAce(sddl, sid) {
   if (!isAccountSid(sid)) throw new Error(`not an account SID: ${sid}`);
   const parts = splitDacl(sddl);
   if (!parts) throw new Error('the service security descriptor has no DACL');
+  if (parts.aces.some((ace) => ace.startsWith('(D;')
+      && aceTrustee(ace).toUpperCase() === sid.toUpperCase())) {
+    throw new Error('the service DACL explicitly denies this account; remove that policy instead of weakening it');
+  }
   const kept = parts.aces.filter((ace) => aceTrustee(ace).toUpperCase() !== sid.toUpperCase());
   return `${parts.head}${kept.join('')}(A;;${OPERATOR_SERVICE_RIGHTS};;;${sid})${parts.tail}`;
+}
+
+/** Remove the operator's allow ACEs while preserving an explicit deny. */
+export function withoutOperatorAce(sddl, sid) {
+  if (!isAccountSid(sid)) throw new Error(`not an account SID: ${sid}`);
+  const parts = splitDacl(sddl);
+  if (!parts) throw new Error('the service security descriptor has no DACL');
+  const removed = parts.aces.some((ace) => ace.startsWith('(A;')
+    && aceTrustee(ace).toUpperCase() === sid.toUpperCase());
+  return {
+    sddl: `${parts.head}${parts.aces
+      .filter((ace) => !ace.startsWith('(A;')
+        || aceTrustee(ace).toUpperCase() !== sid.toUpperCase())
+      .join('')}${parts.tail}`,
+    changed: removed,
+  };
 }
 
 /**
@@ -201,6 +225,80 @@ export async function grantServiceControl({ sid, run = shellRun, runFile = shell
   return after.granted && !after.excessive
     ? { ok: true }
     : { ok: false, reason: 'the permission was written but does not read back as expected' };
+}
+
+/**
+ * Temporarily removes the installing account's start/stop ACE before an
+ * uninstall recursively changes data permissions. An account with service
+ * control could otherwise start the stopped service while the elevated
+ * operation is walking the tree.
+ */
+export async function revokeServiceControl({
+  sid,
+  run = shellRun,
+  runFile = shellRunFile,
+} = {}) {
+  if (!isAccountSid(sid)) return { ok: true, changed: false };
+
+  const current = await readServiceSddl({ run, runFile });
+  if (!current) return { ok: false, reason: `could not read the ${SERVICE_ID} service permissions` };
+
+  let next;
+  try {
+    next = withoutOperatorAce(current, sid);
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+  if (!next.changed) return { ok: true, changed: false };
+  if (!/^[A-Za-z0-9:;()-]+$/.test(next.sddl)) {
+    return { ok: false, reason: 'the service permissions contained unexpected characters; nothing was changed' };
+  }
+
+  const written = await runFile(systemTool(WINDOWS_SC), [
+    'sdset', SERVICE_ID, next.sddl,
+  ], { timeout: 20_000 });
+  if (!written.success) {
+    return {
+      ok: false,
+      reason: `${written.stdout ?? ''}${written.stderr ?? ''}`.trim().slice(0, 300)
+        || 'sc.exe sdset failed',
+    };
+  }
+  const after = operatorAceState(await readServiceSddl({ run, runFile }), sid);
+  return after.granted
+    ? { ok: false, reason: 'the permission was removed but the service DACL still grants it' }
+    : { ok: true, changed: true, previousSddl: current };
+}
+
+/** Restore the exact DACL read before a temporary operator hold. */
+export async function restoreServiceControl({
+  sid,
+  sddl,
+  run = shellRun,
+  runFile = shellRunFile,
+} = {}) {
+  if (!isAccountSid(sid)) return { ok: false, reason: 'no user account to restore' };
+  if (typeof sddl !== 'string' || !/^[A-Za-z0-9:;()-]+$/.test(sddl)) {
+    return { ok: false, reason: 'the saved service permissions are not valid SDDL; nothing was changed' };
+  }
+  if (!operatorAceState(sddl, sid).granted) {
+    return { ok: false, reason: 'the saved service permissions do not contain the expected operator grant' };
+  }
+
+  const written = await runFile(systemTool(WINDOWS_SC), [
+    'sdset', SERVICE_ID, sddl,
+  ], { timeout: 20_000 });
+  if (!written.success) {
+    return {
+      ok: false,
+      reason: `${written.stdout ?? ''}${written.stderr ?? ''}`.trim().slice(0, 300)
+        || 'sc.exe sdset failed',
+    };
+  }
+  const after = await readServiceSddl({ run, runFile });
+  return after === sddl
+    ? { ok: true }
+    : { ok: false, reason: 'the service DACL was written but did not read back exactly as saved' };
 }
 
 // ─── The data directory ──────────────────────────────────────────────────────
@@ -451,7 +549,16 @@ export async function grantOperator({ operator, dataDir, approvedDataDir = progr
  * Removes the operator's data directory grant. The service DACL entry needs no
  * removal: it belongs to the service and is deleted with it.
  */
-export async function revokeOperator({ operator, dataDir, approvedDataDir = programDataDir(), runFile = shellRunFile, log = () => {} } = {}) {
+export async function revokeOperator({
+  operator,
+  dataDir,
+  approvedDataDir = programDataDir(),
+  runFile = shellRunFile,
+  log = () => {},
+  deadline = Infinity,
+  timeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
+  signal,
+} = {}) {
   if (!operator || !isAccountSid(operator.sid) || !dataDir) return { ok: true };
   return removeOperatorDataAce({
     operator,
@@ -459,14 +566,59 @@ export async function revokeOperator({ operator, dataDir, approvedDataDir = prog
     approvedDataDir,
     runFile,
     log,
+    deadline,
+    timeoutMs,
+    signal,
   });
 }
 
 /**
- * Removes one account's ACE from every entry below the approved data root.
- * Each directory's ACL is rewritten before it is enumerated, and links,
- * reparse points, and hard-linked files are refused by walkAclTree. No
- * recursive `icacls /T` ever follows a path chosen by the filesystem.
+ * Restore only the root data-directory ACE after a cancelled or keep-data
+ * uninstall. It does not recurse: ordinary children inherit this one ACE.
+ */
+export async function restoreOperatorDataAccess({
+  operator,
+  dataDir,
+  approvedDataDir = programDataDir(),
+  runFile = shellRunFile,
+  log = () => {},
+  deadline = Infinity,
+  timeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
+  signal,
+} = {}) {
+  if (!operator || !isAccountSid(operator.sid) || !dataDir) return { ok: true };
+  const relative = path.relative(path.resolve(approvedDataDir), path.resolve(dataDir));
+  if (relative !== '') {
+    return { ok: false, reason: 'Only the approved service data directory may be changed' };
+  }
+
+  const timeout = deadline === Infinity
+    ? 60_000
+    : remainingStageMs(deadline, 'Restoring installing-account access', timeoutMs);
+  const result = await runSafely(
+    () => buildDataDirGrantCommand(dataDir, operator.sid),
+    approvedDataDir,
+    runFile,
+    timeout,
+    { deadline, timeoutMs, signal },
+  );
+  if (!result.success) {
+    return {
+      ok: false,
+      reason: `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300)
+        || 'the data directory grant failed',
+    };
+  }
+  log(`  ${operator.name ?? operator.sid}: data directory access restored`);
+  return { ok: true };
+}
+
+/**
+ * Removes the one inheritable operator ACE from the approved data root.
+ *
+ * `grantOperator` writes this ACE only on the root. Removing it there removes
+ * the effective inherited access from the tree without launching one process
+ * per file. This is a single bounded ACL call during uninstall.
  */
 async function removeOperatorDataAce({
   operator,
@@ -474,6 +626,9 @@ async function removeOperatorDataAce({
   approvedDataDir,
   runFile,
   log,
+  deadline,
+  timeoutMs,
+  signal,
 }) {
   if (!operator || !isAccountSid(operator.sid) || !dataDir) return { ok: true };
   const relative = path.relative(path.resolve(approvedDataDir), path.resolve(dataDir));
@@ -482,8 +637,12 @@ async function removeOperatorDataAce({
   }
   let directory;
   try {
-    directory = fs.lstatSync(dataDir, { throwIfNoEntry: false }) ?? null;
+    remainingStageMs(deadline, 'Removing installing-account access', timeoutMs);
+    signal?.throwIfAborted();
+    directory = await fs.promises.lstat(dataDir);
   } catch (error) {
+    if (error?.code === 'ENOENT') return { ok: true };
+    if (error?.code === 'EZ_STAGE_TIMEOUT' || signal?.aborted) throw error;
     return { ok: false, reason: `${dataDir} could not be inspected: ${error.code ?? error.message}` };
   }
   if (!directory) return { ok: true };
@@ -492,16 +651,27 @@ async function removeOperatorDataAce({
   }
 
   try {
-    await walkAclTree(dataDir, async (target) => {
-      const result = await runFile(systemTool('icacls.exe'), [
-        target, '/remove:g', `*${operator.sid}`, '/L', '/Q',
-      ], { timeout: 120_000 });
-      if (!result.success) {
-        throw new Error(`${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300)
-          || 'icacls failed');
-      }
-    }, { runFile });
+    const canonical = await checkedAclDirectory(dataDir, runFile, false, {
+      deadline,
+      stage: 'Removing installing-account access',
+      timeoutMs,
+      signal,
+    });
+    const timeout = deadline === Infinity
+      ? 120_000
+      : remainingStageMs(deadline, 'Removing installing-account access', timeoutMs);
+    signal?.throwIfAborted();
+    const result = await runFile(systemTool('icacls.exe'), [
+      canonical, '/remove:g', `*${operator.sid}`, '/L', '/Q',
+    ], { timeout });
+    remainingStageMs(deadline, 'Removing installing-account access', timeoutMs);
+    signal?.throwIfAborted();
+    if (!result.success) {
+      throw new Error(`${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300)
+        || 'icacls failed');
+    }
   } catch (error) {
+    if (error?.code === 'EZ_STAGE_TIMEOUT' || signal?.aborted) throw error;
     return { ok: false, reason: error.message };
   }
   log(`  ${operator.name ?? operator.sid}: data directory access removed`);
@@ -509,13 +679,23 @@ async function removeOperatorDataAce({
 }
 
 /** Builds a command and runs it; a refused build is a failed result, never a throw. */
-async function runSafely(build, approvedDataDir, runFile, timeout) {
+async function runSafely(
+  build,
+  approvedDataDir,
+  runFile,
+  timeout,
+  { deadline = Infinity, timeoutMs = UNINSTALL_STAGE_TIMEOUT_MS, signal } = {},
+) {
   let command;
   try {
     command = build();
     if (path.relative(approvedDataDir, command[0]) !== '') throw new Error('Only the approved service data directory may be shared');
-    await checkedAclDirectory(command[0], runFile, false);
+    await checkedAclDirectory(command[0], runFile, false, {
+      deadline, timeoutMs, signal,
+    });
+    signal?.throwIfAborted();
   } catch (err) {
+    if (err?.code === 'EZ_STAGE_TIMEOUT' || signal?.aborted) throw err;
     return { success: false, stdout: '', stderr: err.message };
   }
   return runFile(systemTool('icacls.exe'), command, { timeout });

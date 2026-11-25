@@ -113,7 +113,7 @@ export async function repairPrivateKeys(sslDir, options = {}) {
     if (!approved.some(dir => path.relative(dir, sslDir) === '')) throw new Error('SSL directory lacks administrator approval');
   }
   if (!await statIfPresent(sslDir)) return;
-  if (isWindows && options.server) canonicalAclDirectory(sslDir);
+  if (isWindows && options.server) await canonicalAclDirectory(sslDir);
   await assertCanonical(sslDir);
   const dataDir = options.dataDir ?? getDataDir();
   for (const entry of await fs.readdir(sslDir, { withFileTypes: true })) {

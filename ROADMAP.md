@@ -1,18 +1,18 @@
 # Easy DevOps — Roadmap
 
-**Start here next session.** 1.4.1 is prepared, not published, and waits for the user's real-server test. 1.4.0 was never published to npm, so 1.4.1 is the first release that will carry it. What remains is the real-server pass: run the manual tests in `docs-rev/fix-report-4.md` and `docs-rev/fix-report-5.md`, and verify the Windows Server service fixes in CHANGELOG `[1.4.1]`; on Linux, re-run the sudo permissions script after upgrading (CHANGELOG `[1.4.0]`, "Upgrading from 1.2/1.3"); then create the GitHub release `v1.4.1` and publish to npm with the manual `npm-publish.yml` workflow. Root CI cannot run until `ci.yml` is restored (Standing debt). After the release, start phase 1.5.0 with this prompt:
+**Start here next session.** 1.4.5 is prepared, not published. Run the manual tests in `docs-rev/fix-report-1.4.5.md` on real Windows Server and Linux installations, review the remaining platform verification debt, then create the GitHub release and publish with the manual `npm-publish.yml` workflow. Windows Server mode must run `ezz service repair` after the update. Root CI remains standing debt. After the release, start phase 1.5.0 with this prompt:
 
 > Start phase 1.5.0 "Hub control and safety". First verify the 1.4.x patch item on a Linux server — `stopDashboard` may refuse the real dashboard pid — then write the PIN design (server-only set/change/unlock, hashed on the server, verified by the agent, bound to the exact command and payload).
 
-Where the workspace stands and what comes next, in the order it should be done. Updated 2026-11-19 from the code, not from earlier plans. `docs_refactor/` is the audit of 2026-11-07 and is **out of date** — most of its security findings have since been fixed; use this file instead.
+Where the workspace stands and what comes next, in the order it should be done. Updated 2026-11-24 from the code, not from earlier plans. `docs_refactor/` is the audit of 2026-11-07 and is **out of date** — most of its security findings have since been fixed; use this file instead.
 
 The workspace holds four projects. `hub_backend/`, `hub_frontend/` and `docs/` each have their own git repository and are kept here for development only.
 
 | Project | What it is | State |
 |---|---|---|
-| root (`src/`) | The `easy-devops` npm package: CLI, local dashboard, daemon, Hub agent | `1.4.0` prepared in `package.json` and `CHANGELOG.md`; not yet published |
-| `hub_backend/` | Hub API + agent socket (Express, Prisma, SQLite for now) | `0.2.1`; working, one account per user, no Teams yet |
-| `hub_frontend/` | Hub web UI (Next.js) | `0.1.2`; working, one account per user; dashboard parity done, no Teams yet |
+| root (`src/`) | The `easy-devops` npm package: CLI, local dashboard, daemon, Hub agent | `1.4.5` prepared in `package.json` and `CHANGELOG.md`; not yet published |
+| `hub_backend/` | Hub API + agent socket (Express, Prisma, SQLite for now) | `0.2.2`; working, one account per user, no Teams yet |
+| `hub_frontend/` | Hub web UI (Next.js) | `0.1.3`; working, one account per user; dashboard parity done, no Teams yet |
 | `docs/` | Documentation and landing site (Next.js) | `1.1.0`; CI builds it; no ESLint config yet |
 
 ---
@@ -35,6 +35,23 @@ No new features, no breaking contract change.
 5. [ ] Verify `ezz update` on a real Windows machine (Personal and Server mode): the CLI runs from the npm folder it replaces and holds better_sqlite3.node open, so it may hit EBUSY; if it does, run the npm step from a detached process after the CLI exits, as the dashboard update worker does (`src/dashboard/updateWorker.js`).
 6. [x] **Hub SSL issue/delete (1.4.2):** the server already granted `ssl.issue` and `ssl.delete`, but the Hub only offered renew. The Hub SSL page now issues (HTTP-01 only; DNS-01/wildcard stays server-only with the reason shown) and deletes (refused while in use, with the domains that use it), and the Hub domain form matches the dashboard's, including Create certificate. The agent's delete was also made traversal-safe. The PIN one-time run for these actions stays in 1.5.0. (CHANGELOG `[1.4.2]`, `docs-rev/progress-7.md`.)
 7. [x] **Deployment run view parity (1.4.3):** the dashboard's app detail shows the real current stage and the same stage bar as the Hub (Fetch > Settings > Pre > Install > Build > Migrate > Start > Health > Post > Finish; done, current, failed, skipped), fed by the run record's new `stage` and `skippedStages`; one stage list per app, same names and order. The dashboard also gained the Hub's Environment tab. (CHANGELOG `[1.4.3]`, `docs-rev/progress-8.md`.)
+
+### 1.4.5 — security audit follow-up · DONE
+
+The findings deferred from `docs-rev/security-audit-codex-easy-devops.md` are
+implemented and covered by tests.
+
+- [x] **EZ-09** — Redact deployment secrets before persistence and never serve unverifiable old-format logs.
+- [x] **EZ-10** — Verify the Windows Node installer in a private attempt directory before running it.
+- [x] **EZ-11** — Restrict Linux permission setup to dedicated, verified Easy DevOps and nginx roots.
+- [x] **EZ-12** — Delete only certificate artifacts recorded in the managed-file manifest.
+- [x] **EZ-13** — Bundle and hash-pin Linux installer helpers and refuse mutable nvm downloads.
+- [x] **EZ-14** — Make the dashboard loopback-only and require HTTPS for remote proxy and Hub access.
+- [x] **EZ-16** — Bound log tails, build capture and incomplete-line buffers.
+- [x] **EZ-17** — Count concurrent setup-code failures atomically.
+- [x] **EZ-18** — Enforce the Hub pairing response limit as the body streams.
+- [x] **EZ-19** — Send an explicit safe domain projection to the Hub.
+- [x] **EZ-20** — Require `deploy.logs` before sending deployment diagnostics.
 
 ### 1.5.0 — the next phase
 
@@ -85,7 +102,7 @@ The local half: everything works with no Hub at all.
 - [x] Option A — GitHub Actions calls the deploy hook, exposed through a domain (nginx) or directly. (CHANGELOG `[1.4.0]`, "Deployments".)
 - [x] Dashboard: the Deployments page, with the GitHub setup steps. (`src/dashboard/ui/src/pages/DeploymentsPage.tsx`; `AppSetupTabs.tsx`.)
 - [x] Ordered deploy steps, runtime field, presets, drag reorder and the step switch. (CHANGELOG `[1.4.0]`, "Deployments: ordered steps, runtimes and presets"; `docs-rev/fix-report-5.md` §1–3.)
-- [x] Contract 2.4.0 and `e2e/deploy.test.mjs`. (CHANGELOG `[1.4.0]`, "Deployments"; test file present. Current contract is 2.17.0.)
+- [x] Contract 2.4.0 and `e2e/deploy.test.mjs`. (CHANGELOG `[1.4.0]`, "Deployments"; test file present. Current contract is 2.18.0.)
 
 Decisions taken here that the constitution should record (CLAUDE.md "Hard rules"):
 
@@ -158,20 +175,6 @@ CLI and release hygiene:
 - [ ] Root CI is **not** done. `.github/workflows/ci.yml` is present locally but removed from git for now; its first ubuntu run failed six suites (Standing debt).
 
 ## Phase 1.5.0 — Hub control and safety · NEXT
-
-### Security audit follow-up
-
-- [ ] EZ-09 — Keep rotated secrets out of historical deployment logs served to readers.
-- [ ] EZ-10 — Verify the Windows Node installer before running it and reject stale downloads.
-- [ ] EZ-11 — Restrict Linux permission setup to directories managed by Easy DevOps.
-- [ ] EZ-12 — Limit certificate purge to managed certificate files.
-- [ ] EZ-13 — Pin and verify scripts used by the Linux installer.
-- [ ] EZ-14 — Require encrypted transport for remote dashboard access and Hub pairing.
-- [ ] EZ-16 — Bound memory use when reading logs and collecting build output.
-- [ ] EZ-17 — Count concurrent failed setup-code attempts atomically.
-- [ ] EZ-18 — Enforce the Hub pairing response size limit while reading the response.
-- [ ] EZ-19 — Send only the domain fields needed for routine Hub monitoring.
-- [ ] EZ-20 — Require `deploy.logs` before including crash logs in monitoring responses.
 
 ### PIN (two functions)
 

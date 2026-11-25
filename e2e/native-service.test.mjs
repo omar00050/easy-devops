@@ -715,7 +715,7 @@ async function testDataDir() {
   fs.writeFileSync(path.join(from, 'easy-devops.sqlite'), 'DATABASE-CONTENTS');
   fs.writeFileSync(path.join(from, 'sessions', 's1.json'), '{"a":1}');
 
-  const moved = moveDataDir({ from, to });
+  const moved = await moveDataDir({ from, to });
   check('the move succeeds', moved.ok === true && moved.moved === true, moved.reason ?? '');
   check('the database arrived', fs.readFileSync(path.join(to, 'easy-devops.sqlite'), 'utf8') === 'DATABASE-CONTENTS');
   check('nested files arrived too', fs.existsSync(path.join(to, 'sessions', 's1.json')));
@@ -729,17 +729,17 @@ async function testDataDir() {
   const from2 = path.join(base, 'appdata2');
   fs.mkdirSync(from2, { recursive: true });
   fs.writeFileSync(path.join(from2, 'easy-devops.sqlite'), 'SECOND');
-  const refused = moveDataDir({ from: from2, to });
-  check('a destination that already has a database is REFUSED', refused.ok === false);
+  const refused = await moveDataDir({ from: from2, to });
+  check('a non-empty destination is REFUSED', refused.ok === false);
   check('the refusal says nothing was changed', /nothing has been changed/.test(refused.reason));
   check('the existing destination database is intact',
     fs.readFileSync(path.join(to, 'easy-devops.sqlite'), 'utf8') === 'DATABASE-CONTENTS');
   check('the source is still there after a refusal', fs.existsSync(path.join(from2, 'easy-devops.sqlite')));
 
-  const absent = moveDataDir({ from: path.join(base, 'never-existed'), to: path.join(base, 'x') });
+  const absent = await moveDataDir({ from: path.join(base, 'never-existed'), to: path.join(base, 'x') });
   check('nothing to move is a success, not an error', absent.ok === true && absent.moved === false);
 
-  const same = moveDataDir({ from: to, to });
+  const same = await moveDataDir({ from: to, to });
   check('moving a directory onto itself is a no-op', same.ok === true && same.moved === false);
 
   // Refuses while a daemon holds the directory: copying a live SQLite file can
@@ -753,7 +753,7 @@ async function testDataDir() {
   check('a directory with a live daemon is reported in use', busy.ok === false);
   check('and the message says to stop the service first', /stop the service/i.test(busy.reason));
 
-  const blocked = moveDataDir({ from: busyDir, to: path.join(base, 'blocked-target') });
+  const blocked = await moveDataDir({ from: busyDir, to: path.join(base, 'blocked-target') });
   check('the move is refused while a daemon holds it', blocked.ok === false);
   check('and nothing was copied', !fs.existsSync(path.join(base, 'blocked-target', 'easy-devops.sqlite')));
   lock.release({ dataDir: busyDir });
@@ -766,13 +766,265 @@ async function testDataDir() {
   fs.writeFileSync(path.join(a, 'one'), '1234567890');
   fs.writeFileSync(path.join(a, 'two'), 'xx');
   fs.writeFileSync(path.join(b, 'one'), '123');
-  const verified = verifyCopy(a, b);
+  const verified = await verifyCopy(a, b);
   check('verification catches a missing file', verified.missing.includes('two'));
   check('verification catches a truncated file', verified.differing.includes('one'));
   check('and reports not-ok', verified.ok === false);
 
   check('the backup path is beside the original, so the rename stays on one volume',
     path.dirname(backupPathFor('/x/y/data')) === path.dirname('/x/y/data'));
+}
+
+// ─── 8b. Uninstall stages are bounded and migrate only user data ─────────────
+
+async function testBoundedUninstallStages() {
+  setGroup('8b. uninstall stages are bounded and move only user data');
+
+  const stages = await import(srcUrl('core/service/stageTimeout.js'));
+  const { moveDataDir } = await import(srcUrl('core/service/dataDir.js'));
+
+  check('the default stage limit is five minutes',
+    stages.UNINSTALL_STAGE_TIMEOUT_MS === 5 * 60_000);
+
+  const logs = [];
+  let stageError;
+  const started = Date.now();
+  try {
+    await stages.runUninstallStage({
+      stage: 'Timed copy',
+      timeoutMs: 30,
+      log: (line) => logs.push(line),
+      action: ({ signal }) => new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      }),
+    });
+  } catch (error) {
+    stageError = error;
+  }
+  check('a stage that does not settle fails at its own deadline',
+    stageError?.code === 'EZ_STAGE_TIMEOUT'
+      && stageError.stage === 'Timed copy'
+      && stageError.timeoutMs === 30,
+    JSON.stringify({ code: stageError?.code, stage: stageError?.stage, timeoutMs: stageError?.timeoutMs }));
+  check('the timeout names the failed stage and its limit',
+    /Timed copy/.test(stageError?.message ?? '') && /1 second/.test(stageError?.message ?? ''),
+    stageError?.message);
+  check('the stage timer fired promptly', Date.now() - started < 2_000,
+    `${Date.now() - started}ms`);
+  check('the visible stage name is logged before the failure',
+    logs.some((line) => /Timed copy/.test(line)), logs.join(' | '));
+
+  const base = scratch('bounded-move');
+  const from = path.join(base, 'server-data');
+  const to = path.join(base, 'user-data');
+  const excludes = ['runtime', 'runtime.prev', 'bin'].map((name) => path.join(from, name));
+  fs.mkdirSync(path.join(from, 'sessions'), { recursive: true });
+  for (const name of ['runtime', 'runtime.prev', 'bin']) {
+    fs.mkdirSync(path.join(from, name, 'nested'), { recursive: true });
+    fs.writeFileSync(path.join(from, name, 'nested', 'code.bin'), 'service code');
+  }
+  fs.writeFileSync(path.join(from, 'easy-devops.sqlite'), 'USER-DB');
+  fs.writeFileSync(path.join(from, 'sessions', 's1.json'), '{"user":true}');
+  const moved = await moveDataDir({
+    from,
+    to,
+    excludes,
+    keepBackup: false,
+  });
+  check('the user-data move succeeds', moved.ok === true && moved.moved === true, moved.reason ?? '');
+  check('the database and sessions arrive',
+    fs.readFileSync(path.join(to, 'easy-devops.sqlite'), 'utf8') === 'USER-DB'
+      && fs.readFileSync(path.join(to, 'sessions', 's1.json'), 'utf8') === '{"user":true}');
+  check('the runtime, previous runtime, and wrapper trees are not copied',
+    ['runtime', 'runtime.prev', 'bin'].every((name) => !fs.existsSync(path.join(to, name))));
+
+  const backupTimeoutFrom = path.join(base, 'backup-timeout-source');
+  const backupTimeoutTo = path.join(base, 'backup-timeout-target');
+  fs.mkdirSync(backupTimeoutFrom);
+  fs.writeFileSync(path.join(backupTimeoutFrom, 'easy-devops.sqlite'), 'BACKUP-TIMEOUT');
+  const backupTimeout = new stages.StageTimeoutError('Moving data', 30);
+  const backupTimeoutFs = {
+    createReadStream: fs.createReadStream.bind(fs),
+    createWriteStream: fs.createWriteStream.bind(fs),
+    promises: new Proxy(fs.promises, {
+      get(target, property) {
+        if (property === 'rename') {
+          return async (source, destination) => {
+            if (String(destination).includes('.backup-')) throw backupTimeout;
+            return target.rename(source, destination);
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }),
+  };
+  let backupTimeoutError;
+  try {
+    await moveDataDir({
+      from: backupTimeoutFrom,
+      to: backupTimeoutTo,
+      fsApi: backupTimeoutFs,
+    });
+  } catch (error) {
+    backupTimeoutError = error;
+  }
+  check('a timed-out backup rename is not reported as a successful move',
+    backupTimeoutError === backupTimeout);
+  check('a timed-out backup rename leaves the original live and removes the uncommitted copy',
+    fs.readFileSync(path.join(backupTimeoutFrom, 'easy-devops.sqlite'), 'utf8') === 'BACKUP-TIMEOUT'
+      && !fs.existsSync(backupTimeoutTo));
+
+  const cancelFrom = path.join(base, 'cancel-source');
+  const cancelTo = path.join(base, 'cancel-target');
+  fs.mkdirSync(cancelFrom);
+  fs.writeFileSync(path.join(cancelFrom, 'easy-devops.sqlite'), 'KEEP');
+  const controller = new AbortController();
+  controller.abort();
+  let cancelled;
+  try {
+    cancelled = await moveDataDir({
+      from: cancelFrom,
+      to: cancelTo,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    cancelled = { ok: false, reason: error.message };
+  }
+  check('cancellation stops before a live destination is published',
+    cancelled.ok === false && !fs.existsSync(cancelTo)
+      && fs.existsSync(path.join(cancelFrom, 'easy-devops.sqlite')),
+    cancelled.reason ?? '');
+
+  const platform = await import(srcUrl('core/platform.js'));
+  if (platform.isWindows) {
+    const { disableServerMode } = await import(srcUrl('core/service/dataDir.js'));
+    const previousProgramData = process.env.ProgramData;
+    const previousAppData = process.env.APPDATA;
+    const lateRoot = scratch('late-target-publish');
+    process.env.ProgramData = path.join(lateRoot, 'programdata');
+    process.env.APPDATA = path.join(lateRoot, 'appdata');
+    platform.resetDataDirCache();
+    try {
+      const source = platform.programDataDir();
+      const target = path.join(lateRoot, 'appdata', 'easy-devops');
+      const marker = platform.serverModeMarkerPath();
+      fs.mkdirSync(source, { recursive: true });
+      fs.writeFileSync(path.join(source, 'easy-devops.sqlite'), 'LIVE-AFTER-TIMEOUT');
+      fs.writeFileSync(marker, '{"test":"late-target"}\n');
+
+      const delayedFs = {
+        createReadStream: fs.createReadStream.bind(fs),
+        createWriteStream: fs.createWriteStream.bind(fs),
+        promises: new Proxy(fs.promises, {
+          get(api, property) {
+            if (property === 'rename') {
+              return async (from, to) => {
+                if (path.resolve(to) === path.resolve(target)) {
+                  await new Promise((resolve) => setTimeout(resolve, 100));
+                }
+                return api.rename(from, to);
+              };
+            }
+            const value = Reflect.get(api, property, api);
+            return typeof value === 'function' ? value.bind(api) : value;
+          },
+        }),
+      };
+
+      let lateError;
+      try {
+        await stages.runUninstallStage({
+          stage: 'Late data publication',
+          timeoutMs: 30,
+          action: ({ deadline, signal, timeoutMs }) => disableServerMode({
+            deadline,
+            signal,
+            timeoutMs,
+            deps: {
+              moveDataDir: (options) => moveDataDir({ ...options, fsApi: delayedFs }),
+            },
+          }),
+        });
+      } catch (error) {
+        lateError = error;
+      }
+      check('a target rename that finishes after the deadline still reports a timeout',
+        lateError?.code === 'EZ_STAGE_TIMEOUT' && lateError.stage === 'Late data publication',
+        JSON.stringify({ code: lateError?.code, stage: lateError?.stage }));
+      check('a timed-out data move keeps Server mode and the original database live',
+        fs.existsSync(marker)
+          && fs.readFileSync(path.join(source, 'easy-devops.sqlite'), 'utf8') === 'LIVE-AFTER-TIMEOUT',
+        lateError?.message ?? '');
+      check('a late destination rename is rolled back instead of poisoning the next retry',
+        !fs.existsSync(target), target);
+
+      const lateSourceRoot = scratch('late-source-backup');
+      process.env.ProgramData = path.join(lateSourceRoot, 'programdata');
+      process.env.APPDATA = path.join(lateSourceRoot, 'appdata');
+      platform.resetDataDirCache();
+      const lateSource = platform.programDataDir();
+      const lateSourceTarget = path.join(lateSourceRoot, 'appdata', 'easy-devops');
+      const lateSourceMarker = platform.serverModeMarkerPath();
+      fs.mkdirSync(lateSource, { recursive: true });
+      fs.writeFileSync(path.join(lateSource, 'easy-devops.sqlite'), 'RESTORE-AFTER-SOURCE-RENAME');
+      fs.writeFileSync(lateSourceMarker, '{"test":"late-source"}\n');
+
+      const delayedBackupFs = {
+        createReadStream: fs.createReadStream.bind(fs),
+        createWriteStream: fs.createWriteStream.bind(fs),
+        promises: new Proxy(fs.promises, {
+          get(api, property) {
+            if (property === 'rename') {
+              return async (from, to) => {
+                if (String(path.basename(to)).includes('.backup-')) {
+                  await new Promise((resolve) => setTimeout(resolve, 100));
+                }
+                return api.rename(from, to);
+              };
+            }
+            const value = Reflect.get(api, property, api);
+            return typeof value === 'function' ? value.bind(api) : value;
+          },
+        }),
+      };
+
+      let lateSourceError;
+      try {
+        await stages.runUninstallStage({
+          stage: 'Late source backup',
+          timeoutMs: 30,
+          action: ({ deadline, signal, timeoutMs }) => disableServerMode({
+            deadline,
+            signal,
+            timeoutMs,
+            deps: {
+              moveDataDir: (options) => moveDataDir({ ...options, fsApi: delayedBackupFs }),
+            },
+          }),
+        });
+      } catch (error) {
+        lateSourceError = error;
+      }
+      check('a source backup rename that finishes after the deadline reports the timeout',
+        lateSourceError?.code === 'EZ_STAGE_TIMEOUT' && lateSourceError.stage === 'Late source backup',
+        JSON.stringify({ code: lateSourceError?.code, stage: lateSourceError?.stage }));
+      check('a late source rename restores the Server-mode source and marker',
+        fs.existsSync(lateSourceMarker)
+          && fs.readFileSync(path.join(lateSource, 'easy-devops.sqlite'), 'utf8') === 'RESTORE-AFTER-SOURCE-RENAME',
+        lateSourceError?.message ?? '');
+      check('the uncommitted destination is removed after the late source rename',
+        !fs.existsSync(lateSourceTarget), lateSourceTarget);
+      check('the late source rollback leaves no timestamped backup',
+        !fs.readdirSync(path.dirname(lateSource)).some((name) => name.includes('.backup-')));
+    } finally {
+      if (previousProgramData === undefined) delete process.env.ProgramData;
+      else process.env.ProgramData = previousProgramData;
+      if (previousAppData === undefined) delete process.env.APPDATA;
+      else process.env.APPDATA = previousAppData;
+      platform.resetDataDirCache();
+    }
+  }
 }
 
 // ─── 9. Decision 4: the test guard refuses ProgramData ──────────────────────
@@ -1283,6 +1535,103 @@ async function testUninstallDataChoice() {
 
   check('uninstall offers the legacy cleanup too', Array.isArray(kept.legacy?.found));
   check('and removes nothing unless asked', kept.legacy.removed.length === 0);
+
+  if (isWindows) {
+    const platform = await import(srcUrl('core/platform.js'));
+    const previousProgramData = process.env.ProgramData;
+    const previousAppData = process.env.APPDATA;
+    const root = scratch('uninstall-move-stage');
+    process.env.ProgramData = path.join(root, 'programdata');
+    process.env.APPDATA = path.join(root, 'appdata');
+    fs.mkdirSync(path.dirname(platform.serverModeMarkerPath()), { recursive: true });
+    fs.writeFileSync(platform.serverModeMarkerPath(), '{}\n');
+    platform.resetDataDirCache();
+    const db = await import(srcUrl('core/db.js'));
+    const previousServiceState = db.dbGet('service-state') ?? null;
+
+    try {
+      const logs = [];
+      let moveCalls = 0;
+      let receivedDeadline = false;
+      const operator = {
+        sid: 'S-1-5-21-1111111111-2222222222-3333333333-1001',
+        name: 'DOMAIN\\installer',
+        dataDir: true,
+        serviceControl: false,
+      };
+      db.dbSet('service-state', {
+        ...(db.dbGet('service-state') ?? {}),
+        mode: 'server',
+        operator,
+      });
+      const moved = await svc.uninstall({
+        keepServerDataLocation: false,
+        stageTimeoutMs: 60_000,
+        log: (line) => logs.push(line),
+        deps: {
+          ...deps,
+          disableServerMode: ({ deadline, signal }) => {
+            moveCalls++;
+            receivedDeadline = Number.isFinite(deadline) && !signal.aborted;
+            return {
+              ok: true,
+              dataDir: path.join(root, 'appdata', 'easy-devops'),
+              moved: true,
+              backup: path.join(root, 'programdata', 'easy-devops.backup-test'),
+            };
+          },
+        },
+      });
+      check('the explicit move-back choice succeeds', moved.ok === true, moved.reason ?? '');
+      check('the move-back choice calls the data migration exactly once', moveCalls === 1);
+      check('the move-back stage receives its own finite deadline', receivedDeadline);
+      check('the move-back stage is visible before it starts',
+        logs.some((line) => /^Moving user data back to %APPDATA% \(limit 1 minute\)/.test(line)),
+        logs.join(' | '));
+
+      const timedOutLogs = [];
+      let restoreCalls = 0;
+      db.dbSet('service-state', {
+        ...(db.dbGet('service-state') ?? {}),
+        mode: 'server',
+        operator,
+      });
+      const timedOut = await svc.uninstall({
+        keepServerDataLocation: false,
+        stageTimeoutMs: 30,
+        log: (line) => timedOutLogs.push(line),
+        deps: {
+          ...deps,
+          disableServerMode: () => new Promise(() => {}),
+          restoreOperatorDataAccess: async ({ deadline, signal }) => {
+            restoreCalls++;
+            return {
+              ok: Number.isFinite(deadline) && !signal.aborted,
+            };
+          },
+        },
+      });
+      check('a stalled move-back stage fails instead of hanging',
+        timedOut.ok === false
+          && timedOut.stage === 'Moving user data back to %APPDATA%'
+          && /exceeded its 1 second limit/.test(timedOut.reason ?? ''),
+        JSON.stringify({ ok: timedOut.ok, stage: timedOut.stage, reason: timedOut.reason }));
+      check('the stalled move-back is named in the visible output',
+        timedOutLogs.some((line) => /^Moving user data back to %APPDATA% \(limit 1 second\)/.test(line)),
+        timedOutLogs.join(' | '));
+      check('a timed-out move restores the installer data access before returning',
+        restoreCalls === 1 && /data-directory access was restored/.test(timedOut.reason ?? ''),
+        `calls=${restoreCalls}; reason=${timedOut.reason ?? ''}`);
+    } finally {
+      if (previousServiceState === null) db.dbDelete('service-state');
+      else db.dbSet('service-state', previousServiceState);
+      if (previousProgramData === undefined) delete process.env.ProgramData;
+      else process.env.ProgramData = previousProgramData;
+      if (previousAppData === undefined) delete process.env.APPDATA;
+      else process.env.APPDATA = previousAppData;
+      platform.resetDataDirCache();
+    }
+  }
 }
 
 // ─── 18. The launcher is hidden, and is two files ───────────────────────────
@@ -2361,9 +2710,15 @@ async function testServerInstallResume() {
 async function testDataDirOriginal() {
   setGroup('30. a migration names where the original data is');
 
-  const { moveDataDir, enableServerMode, describeOriginal } =
+  const {
+    moveDataDir,
+    enableServerMode,
+    disableServerMode,
+    describeOriginal,
+  } =
     await import(srcUrl('core/service/dataDir.js'));
   const platform = await import(srcUrl('core/platform.js'));
+  const { StageTimeoutError } = await import(srcUrl('core/service/stageTimeout.js'));
 
   const previousProgramData = process.env.ProgramData;
   const previousAppData = process.env.APPDATA;
@@ -2379,7 +2734,7 @@ async function testDataDirOriginal() {
     fs.mkdirSync(source, { recursive: true });
     fs.writeFileSync(path.join(source, 'easy-devops.sqlite'), 'ORIGINAL');
 
-    const switched = enableServerMode({});
+    const switched = await enableServerMode({});
     check('the migration succeeds', switched.ok === true && switched.migrated === true,
       switched.reason ?? '');
     check('the backup is a real path, not null',
@@ -2390,7 +2745,7 @@ async function testDataDirOriginal() {
       describeOriginal(switched).includes(switched.backup), describeOriginal(switched));
 
     // moveDataDir is the primitive underneath, and must carry the same fact.
-    const direct = moveDataDir({
+    const direct = await moveDataDir({
       from: path.join(root, 'second-source'),
       to: path.join(root, 'second-target'),
     });
@@ -2407,7 +2762,7 @@ async function testDataDirOriginal() {
     fs.mkdirSync(linkedSource, { recursive: true });
     fs.writeFileSync(path.join(linkedSource, 'easy-devops.sqlite'), 'LINKED');
     const linkedDestination = path.join(linkedParent, 'easy-devops');
-    const linkedRefused = moveDataDir({ from: linkedSource, to: linkedDestination });
+    const linkedRefused = await moveDataDir({ from: linkedSource, to: linkedDestination });
     check('a linked destination component is refused before the copy',
       linkedRefused.ok === false
         && /link|reparse/i.test(linkedRefused.reason ?? '')
@@ -2420,7 +2775,7 @@ async function testDataDirOriginal() {
     fs.writeFileSync(path.join(linkedTreeSource, 'easy-devops.sqlite'), 'TREE');
     fs.symlinkSync(outside, path.join(linkedTreeSource, 'escape'), 'junction');
     const linkedTreeTarget = path.join(root, 'linked-tree-target');
-    const linkedTreeRefused = moveDataDir({ from: linkedTreeSource, to: linkedTreeTarget });
+    const linkedTreeRefused = await moveDataDir({ from: linkedTreeSource, to: linkedTreeTarget });
     check('a reparse point inside the source tree is refused before the copy',
       linkedTreeRefused.ok === false
         && /link|reparse/i.test(linkedTreeRefused.reason ?? '')
@@ -2438,13 +2793,73 @@ async function testDataDirOriginal() {
     const markerSource = path.join(root, 'appdata-marker', 'easy-devops');
     fs.mkdirSync(markerSource, { recursive: true });
     fs.writeFileSync(path.join(markerSource, 'easy-devops.sqlite'), 'MARKER-SOURCE');
-    const markerRefused = enableServerMode({});
+    const markerRefused = await enableServerMode({});
     check('a linked Server-mode marker is refused before data is copied into it',
       markerRefused.ok === false
         && /marker|link|reparse/i.test(markerRefused.reason ?? '')
         && !fs.existsSync(path.join(markerTarget, 'easy-devops.sqlite'))
         && fs.readFileSync(path.join(markerSource, 'easy-devops.sqlite'), 'utf8') === 'MARKER-SOURCE',
       markerRefused.reason ?? '');
+
+    // Leaving Server mode validates the marker before reading it, and restores
+    // it when the copy stage fails.
+    process.env.ProgramData = path.join(root, 'programdata-move-fail');
+    process.env.APPDATA = path.join(root, 'appdata-move-fail');
+    platform.resetDataDirCache();
+    const moveSource = platform.programDataDir();
+    fs.mkdirSync(moveSource, { recursive: true });
+    fs.writeFileSync(path.join(moveSource, 'easy-devops.sqlite'), 'LIVE');
+    const marker = platform.serverModeMarkerPath();
+    fs.writeFileSync(marker, '{"test":"marker"}\n');
+    const failedMove = await disableServerMode({
+      deps: {
+        moveDataDir: async () => ({ ok: false, reason: 'simulated copy timeout' }),
+      },
+    });
+    check('a failed move reports the copy failure', failedMove.ok === false
+      && /simulated copy timeout/.test(failedMove.reason ?? ''), failedMove.reason ?? '');
+    check('the Server-mode marker is restored after a failed move',
+      fs.existsSync(marker)
+        && fs.readFileSync(marker, 'utf8') === '{"test":"marker"}\n'
+        && fs.readFileSync(path.join(moveSource, 'easy-devops.sqlite'), 'utf8') === 'LIVE');
+
+    const copyTimeout = new StageTimeoutError('Moving data', 60_000);
+    let timedOutMove;
+    try {
+      await disableServerMode({
+        timeoutMs: 60_000,
+        deps: {
+          moveDataDir: async () => { throw copyTimeout; },
+        },
+      });
+    } catch (error) {
+      timedOutMove = error;
+    }
+    check('a thrown copy timeout keeps its stage error',
+      timedOutMove?.code === 'EZ_STAGE_TIMEOUT'
+        && timedOutMove.stage === 'Moving data',
+      JSON.stringify({ code: timedOutMove?.code, stage: timedOutMove?.stage }));
+    check('a thrown copy timeout restores Server mode before returning',
+      fs.existsSync(marker)
+        && fs.readFileSync(marker, 'utf8') === '{"test":"marker"}\n'
+        && fs.readFileSync(path.join(moveSource, 'easy-devops.sqlite'), 'utf8') === 'LIVE',
+      timedOutMove?.message ?? '');
+
+    const foreignFile = path.join(root, 'foreign-marker-file');
+    fs.writeFileSync(foreignFile, 'FOREIGN');
+    const linkedMarker = path.join(root, 'programdata-linked-marker', 'easy-devops');
+    fs.mkdirSync(linkedMarker, { recursive: true });
+    fs.symlinkSync(foreignFile, path.join(linkedMarker, '.server-mode'), 'file');
+    process.env.ProgramData = path.dirname(linkedMarker);
+    platform.resetDataDirCache();
+    fs.writeFileSync(path.join(linkedMarker, 'easy-devops.sqlite'), 'LINKED-MARKER-DATA');
+    const linkedMove = await disableServerMode({});
+    check('leaving Server mode refuses a linked marker before reading or moving data',
+      linkedMove.ok === false
+        && /marker|link|reparse/i.test(linkedMove.reason ?? '')
+        && fs.readFileSync(foreignFile, 'utf8') === 'FOREIGN'
+        && fs.existsSync(path.join(linkedMarker, 'easy-devops.sqlite')),
+      linkedMove.reason ?? '');
   } finally {
     if (previousProgramData === undefined) delete process.env.ProgramData;
     else process.env.ProgramData = previousProgramData;
@@ -2549,6 +2964,276 @@ async function testReopenDb() {
   db.dbDelete(key);
 }
 
+// ─── 33b. Windows uninstall has named, bounded stages ───────────────────────
+
+async function testWindowsUninstallStages() {
+  setGroup('33b. Windows uninstall stages are visible, bounded, and keep data');
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const platform = await import(srcUrl('core/platform.js'));
+  const previous = process.env.ProgramData;
+  const root = scratch('windows-uninstall-stages');
+  process.env.ProgramData = root;
+  platform.resetDataDirCache();
+
+  const SID = 'S-1-5-21-1111111111-2222222222-3333333333-1001';
+  const serviceSddl = `D:(A;;CCLCLORPWP;;;${SID})(A;;CC;;;SY)`;
+  let registered = true;
+  let state = 'RUNNING';
+  let currentSddl = serviceSddl;
+  const calls = [];
+  const run = async (cmd) => {
+    calls.push(cmd);
+    if (/IsInRole[\s\S]*Administrator/.test(cmd)) return { success: true, stdout: 'True' };
+    if (/^sc\.exe query /.test(cmd)) {
+      return registered
+        ? { success: true, stdout: `SERVICE_NAME: EasyDevOps\nSTATE : 4  ${state}` }
+        : { success: false, stdout: '', stderr: 'The specified service does not exist (1060)' };
+    }
+    if (/^sc\.exe stop /.test(cmd)) {
+      state = 'STOPPED';
+      return { success: true, stdout: '' };
+    }
+    if (/^sc\.exe delete /.test(cmd)) {
+      registered = false;
+      state = 'MISSING';
+      return { success: true, stdout: '' };
+    }
+    if (/^sc\.exe sdshow /.test(cmd)) return { success: true, stdout: currentSddl };
+    if (/^sc\.exe sdset /.test(cmd)) {
+      const match = /"([^"]+)"\s*$/.exec(cmd);
+      if (!match) return { success: false, stdout: '', stderr: 'missing SDDL argument' };
+      currentSddl = match[1];
+      return { success: true, stdout: '' };
+    }
+    if (/^icacls /.test(cmd)) return { success: true, stdout: '' };
+    return { success: false, stdout: '', stderr: `unexpected: ${cmd}` };
+  };
+
+  try {
+    const dataDir = platform.programDataDir();
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, '.server-mode'), '{}\n');
+    fs.writeFileSync(path.join(dataDir, 'easy-devops.sqlite'), 'KEEP');
+    for (const name of ['runtime', 'runtime.prev', 'bin']) {
+      fs.mkdirSync(path.join(dataDir, name, 'nested'), { recursive: true });
+      fs.writeFileSync(path.join(dataDir, name, 'nested', 'code.bin'), 'code');
+    }
+
+    const logs = [];
+    const result = await ws.uninstall(withFileStub({
+      dataDir,
+      config: {},
+      operator: { sid: SID, name: 'DOMAIN\\installer', dataDir: true, serviceControl: true },
+      keepOperatorDataAccess: true,
+      run,
+      log: (line) => logs.push(line),
+      stageTimeoutMs: 1_000,
+    }));
+
+    check('the Windows uninstall succeeds', result.ok === true, result.reason ?? '');
+    check('every uninstall stage is visible with a limit',
+      [
+        'Stopping the Easy DevOps service',
+        'Locking installing-account access',
+        'Removing service-account permissions',
+        'Removing the Easy DevOps service registration',
+        'Removing obsolete service files',
+        'Restoring installing-account access',
+      ].every((name) => logs.some((line) => line.includes(name) && /limit/.test(line))),
+      logs.join(' | '));
+    check('the private stage order prevents a restart or root-level race',
+      logs.findIndex((line) => line.startsWith('Stopping the Easy DevOps service'))
+        < logs.findIndex((line) => line.startsWith('Locking installing-account access'))
+        && logs.findIndex((line) => line.startsWith('Locking installing-account access'))
+          < logs.findIndex((line) => line.startsWith('Removing service-account permissions'))
+        && logs.findIndex((line) => line.startsWith('Removing service-account permissions'))
+          < logs.findIndex((line) => line.startsWith('Removing the Easy DevOps service registration')),
+      logs.join(' | '));
+
+    const deleteAcl = calls.find((call) => /\/remove:g "NT SERVICE\\EasyDevOps"/.test(call)
+      && /\/T\b/.test(call));
+    check('the large ACL revoke is one direct recursive call, not one process per item',
+      Boolean(deleteAcl) && calls.filter((call) => /\/remove:g "NT SERVICE\\EasyDevOps"/.test(call)
+        && /\/T\b/.test(call)).length === 1,
+      calls.filter((call) => /\/remove:g/.test(call)).join(' | '));
+    check('the installing account restores only the inheritable data-root grant',
+      calls.some((call) => call === `icacls "${dataDir}" /grant "*${SID}:(OI)(CI)M" /L /Q`),
+      calls.filter((call) => /\/grant/.test(call)).join(' | '));
+    check('the service account can no longer control the service during the ACL walk',
+      !currentSddl.includes(SID), currentSddl);
+    check('keeping data leaves the database and Server-mode marker in place',
+      fs.readFileSync(path.join(dataDir, 'easy-devops.sqlite'), 'utf8') === 'KEEP'
+        && fs.existsSync(path.join(dataDir, '.server-mode')));
+    check('service-owned runtime and wrapper files are removed',
+      ['runtime', 'runtime.prev', 'bin'].every((name) => !fs.existsSync(path.join(dataDir, name))));
+    check('no copy or move stage runs when data is kept',
+      !logs.some((line) => /Moving user data|Copying /.test(line)), logs.join(' | '));
+  } finally {
+    if (previous === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previous;
+    platform.resetDataDirCache();
+  }
+}
+
+async function testWindowsUninstallAclTimeout() {
+  setGroup('33c. a stalled Windows ACL revoke fails and restores access');
+
+  const platform = await import(srcUrl('core/platform.js'));
+  if (!platform.isWindows) return;
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const previousProgramData = process.env.ProgramData;
+  const root = scratch('windows-uninstall-acl-timeout');
+  process.env.ProgramData = root;
+  platform.resetDataDirCache();
+
+  const SID = 'S-1-5-21-1111111111-2222222222-3333333333-1001';
+  const serviceSddl = `D:(A;;CCLCLORPWP;;;${SID})(A;;CC;;;SY)`;
+  let registered = true;
+  let state = 'RUNNING';
+  let currentSddl = serviceSddl;
+  let restoredDataGrant = false;
+  const run = async (cmd) => {
+    if (/IsInRole[\s\S]*Administrator/.test(cmd)) return { success: true, stdout: 'True' };
+    if (/^sc\.exe query /.test(cmd)) {
+      return registered
+        ? { success: true, stdout: `SERVICE_NAME: EasyDevOps\nSTATE : 4  ${state}` }
+        : { success: false, stdout: '', stderr: 'The specified service does not exist (1060)' };
+    }
+    if (/^sc\.exe stop /.test(cmd)) {
+      state = 'STOPPED';
+      return { success: true, stdout: '' };
+    }
+    if (/^sc\.exe sdshow /.test(cmd)) return { success: true, stdout: currentSddl };
+    if (/^sc\.exe sdset /.test(cmd)) {
+      const match = /"([^"]+)"\s*$/.exec(cmd);
+      if (!match) return { success: false, stdout: '', stderr: 'missing SDDL argument' };
+      currentSddl = match[1];
+      return { success: true, stdout: '' };
+    }
+    if (/^icacls /.test(cmd)) {
+      if (cmd.includes(`/grant "*${SID}:(OI)(CI)M"`)) restoredDataGrant = true;
+      return { success: true, stdout: '' };
+    }
+    return { success: false, stdout: '', stderr: `unexpected: ${cmd}` };
+  };
+
+  try {
+    const dataDir = platform.programDataDir();
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, 'easy-devops.sqlite'), 'KEEP');
+    const stubbed = withFileStub({
+      dataDir,
+      config: {},
+      operator: { sid: SID, name: 'DOMAIN\\installer', dataDir: true, serviceControl: true },
+      keepOperatorDataAccess: true,
+      run,
+      log: () => {},
+      stageTimeoutMs: 30,
+    });
+    const routedRunFile = stubbed.runFile;
+    stubbed.runFile = (file, args, options) => {
+      const exe = path.win32.basename(file).toLowerCase();
+      if (exe === 'icacls.exe' && args.includes('NT SERVICE\\EasyDevOps')) {
+        return new Promise(() => {});
+      }
+      return routedRunFile(file, args, options);
+    };
+
+    const started = Date.now();
+    const result = await ws.uninstall(stubbed);
+    check('the stalled ACL stage returns an error at its deadline',
+      result.ok === false
+        && result.stage === 'Removing service-account permissions'
+        && /exceeded its 1 second limit/.test(result.reason ?? '')
+        && Date.now() - started < 2_000,
+      JSON.stringify({ ok: result.ok, stage: result.stage, reason: result.reason }));
+    check('the failed ACL stage restores the installing-account data grant',
+      restoredDataGrant === true, `restored=${restoredDataGrant}`);
+    check('the failed ACL stage leaves the service registration intact for retry',
+      registered === true, `registered=${registered}`);
+  } finally {
+    if (previousProgramData === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previousProgramData;
+    platform.resetDataDirCache();
+  }
+}
+
+async function testWindowsUninstallRetryAfterRegistrationRemoved() {
+  setGroup('33d. an uninstall retry cleans ACLs without a service registration');
+
+  const platform = await import(srcUrl('core/platform.js'));
+  if (!platform.isWindows) return;
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const previousProgramData = process.env.ProgramData;
+  const root = scratch('windows-uninstall-retry-no-service');
+  process.env.ProgramData = root;
+  platform.resetDataDirCache();
+
+  const SID = 'S-1-5-21-1111111111-2222222222-3333333333-1001';
+  const SERVICE_SID = 'S-1-5-80-1111111111-2222222222-3333333333-4444444444-5555555555';
+  const calls = [];
+  const run = async (cmd) => {
+    calls.push(cmd);
+    if (/IsInRole[\s\S]*Administrator/.test(cmd)) return { success: true, stdout: 'True' };
+    if (/^sc\.exe query /.test(cmd)) {
+      return {
+        success: false,
+        stdout: '',
+        stderr: 'The specified service does not exist as an installed service. (1060)',
+      };
+    }
+    if (/^sc\.exe showsid /.test(cmd)) {
+      return { success: true, stdout: `SERVICE SID: ${SERVICE_SID}` };
+    }
+    if (/^icacls /.test(cmd)) return { success: true, stdout: 'Successfully processed 1 files' };
+    return { success: false, stdout: '', stderr: `unexpected: ${cmd}` };
+  };
+
+  try {
+    const dataDir = platform.programDataDir();
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, '.server-mode'), '{}\n');
+    fs.writeFileSync(path.join(dataDir, 'easy-devops.sqlite'), 'KEEP');
+
+    const result = await ws.uninstall(withFileStub({
+      dataDir,
+      config: {},
+      operator: {
+        sid: SID,
+        name: 'DOMAIN\\installer',
+        dataDir: true,
+        serviceControl: true,
+      },
+      keepOperatorDataAccess: true,
+      run,
+      log: () => {},
+      stageTimeoutMs: 1_000,
+    }));
+
+    check('an uninstall with no registration still succeeds after retry',
+      result.ok === true, result.reason ?? '');
+    check('stale service-account grants are revoked even when the service is absent',
+      calls.some((call) => call.includes(`/remove:g "*${SERVICE_SID}"`) && /\/T\b/.test(call)),
+      calls.filter((call) => call.includes('/remove:g')).join(' | '));
+    check('the installing account grant is removed and then restored for Keep data',
+      calls.filter((call) => call.includes(`*${SID}`)).length >= 2,
+      calls.filter((call) => call.includes(`*${SID}`)).join(' | '));
+    check('the original database and Server-mode marker remain live',
+      fs.readFileSync(path.join(dataDir, 'easy-devops.sqlite'), 'utf8') === 'KEEP'
+        && fs.existsSync(path.join(dataDir, '.server-mode')));
+    check('no service DACL is touched when SCM reports no registration',
+      !calls.some((call) => /^sc\.exe sdshow /.test(call)),
+      calls.filter((call) => /^sc\.exe sdshow /.test(call)).join(' | '));
+  } finally {
+    if (previousProgramData === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previousProgramData;
+    platform.resetDataDirCache();
+  }
+}
+
 // ─── 34. Every service-control command uses sc.exe ──────────────────────────
 
 async function testScExeEverywhere() {
@@ -2585,6 +3270,12 @@ async function testScExeEverywhere() {
           : { success: true, stdout: `STATE : 4  ${scState}` };
       }
       if (/^sc\.exe qc /.test(cmd)) return { success: true, stdout: 'START_TYPE : 2  AUTO_START' };
+      if (/^sc\.exe showsid /.test(cmd)) {
+        return {
+          success: true,
+          stdout: 'SERVICE SID: S-1-5-80-1111111111-2222222222-3333333333-4444444444-5555555555',
+        };
+      }
       if (/^sc\.exe stop /.test(cmd)) { scState = 'STOPPED'; return { success: true }; }
       if (/^sc\.exe start /.test(cmd)) { scState = 'RUNNING'; return { success: true }; }
       if (/^sc\.exe delete /.test(cmd)) { scState = 'MISSING'; return { success: true }; }
@@ -2646,10 +3337,10 @@ async function testScExeEverywhere() {
   check('NO command was run as bare `sc`',
     !calls.some((c) => /^sc /.test(c)), calls.filter((c) => /^sc /.test(c)).join(' | '));
   check('every service-control command is sc.exe',
-    calls.filter((c) => /^sc\.exe /.test(c)).every((c) => /^sc\.exe (query|qc|stop|start|delete) /.test(c)),
+    calls.filter((c) => /^sc\.exe /.test(c)).every((c) => /^sc\.exe (query|qc|showsid|stop|start|delete) /.test(c)),
     calls.filter((c) => /^sc\.exe /.test(c)).join(' | '));
 
-  for (const verb of ['query', 'qc', 'stop', 'start', 'delete']) {
+  for (const verb of ['query', 'qc', 'showsid', 'stop', 'start', 'delete']) {
     check(`sc.exe ${verb} ran`, calls.some((c) => c.startsWith(`sc.exe ${verb} `)));
   }
 }
@@ -3506,6 +4197,7 @@ async function main() {
   await testWinswPin();
   await testAcls();
   await testDataDir();
+  await testBoundedUninstallStages();
   if (isWindows) await testGuardRefusesProgramData();
   if (isWindows) await testPersonalLauncher();
   if (isWindows) await testPersonalInstall();
@@ -3532,6 +4224,11 @@ async function main() {
   if (isWindows) await testPersonalRefusedInServerMode();
   if (isWindows) await testDashboardRunningBlocksMigration();
   await testReopenDb();
+  if (isWindows) {
+    await testWindowsUninstallStages();
+    await testWindowsUninstallAclTimeout();
+    await testWindowsUninstallRetryAfterRegistrationRemoved();
+  }
   if (isWindows) await testScExeEverywhere();
   if (isWindows) await testShellLaunchSafety();
   if (isWindows) await testElevation();

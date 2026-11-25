@@ -44,11 +44,25 @@ import {
   requiredGrants, applyGrants, revokeGrants, compareGrants, systemTool,
 } from './acl.js';
 import { runtimeDir, copyRuntime, verifyNativeModules } from './runtime.js';
-import { grantOperator, revokeOperator, readServiceSddl, operatorAceState, prepareProtectedDir } from './operator.js';
+import {
+  grantOperator,
+  revokeOperator,
+  revokeServiceControl,
+  restoreServiceControl,
+  restoreOperatorDataAccess,
+  readServiceSddl,
+  operatorAceState,
+  prepareProtectedDir,
+} from './operator.js';
 import {
   completeLogLines,
   readBoundedTailSync,
 } from './logTail.js';
+import {
+  UNINSTALL_STAGE_TIMEOUT_MS,
+  remainingStageMs,
+  runUninstallStage,
+} from './stageTimeout.js';
 
 /** Where the wrapper, its config and its logs live. Admin-writable only. */
 export function binDir() {
@@ -94,7 +108,7 @@ export function errLogPath() {
  * tell you whether the process is actually running elevated, and a directory
  * write is exactly the permission that matters here.
  */
-export function canWriteProgramData() {
+export async function canWriteProgramData() {
   const dir = programDataDir();
 
   // Probes the directory if it already exists, and otherwise probes its
@@ -102,15 +116,23 @@ export function canWriteProgramData() {
   // "am I elevated?" would leave a directory behind on a machine that never
   // installed anything — and this question is asked on paths that then
   // decline to proceed. Install creates the directory explicitly.
-  const target = fs.existsSync(dir) ? dir : path.dirname(dir);
-  const probe = path.join(target, `.ez-write-probe-${process.pid}`);
+  let exists = false;
+  try {
+    await fs.promises.lstat(dir);
+    exists = true;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') return false;
+  }
+  const target = exists ? dir : path.dirname(dir);
+  const probe = path.join(target, `.ez-write-probe-${process.pid}-${randomUUID()}`);
 
   try {
-    fs.writeFileSync(probe, 'probe');
-    fs.rmSync(probe, { force: true });
+    await fs.promises.writeFile(probe, 'probe', { flag: 'wx', mode: 0o600 });
     return true;
   } catch {
     return false;
+  } finally {
+    await fs.promises.rm(probe, { force: true }).catch(() => {});
   }
 }
 
@@ -231,6 +253,30 @@ export async function isRegistered({
 }
 
 /**
+ * The stable SID for this service's virtual account.
+ *
+ * `sc.exe showsid` calculates it from the service name and works even when the
+ * registration is already absent. That lets an interrupted uninstall remove
+ * stale ACL entries without relying on name translation for an account the
+ * Service Control Manager no longer knows.
+ */
+export async function serviceAccountSid({
+  run = shellRun,
+  runFile = shellRunFile,
+} = {}) {
+  const sc = scExecutor({ run, runFile });
+  let result;
+  try {
+    result = await sc(['showsid', SERVICE_ID], { timeout: 20_000 });
+  } catch {
+    return null;
+  }
+  const output = outputOf(result);
+  const sid = /SERVICE\s+SID\s*:\s*(S-1-5-80-\d+-\d+-\d+-\d+-\d+)/i.exec(output)?.[1] ?? null;
+  return sid && /^S-1-5-80-\d+-\d+-\d+-\d+-\d+$/.test(sid) ? sid : null;
+}
+
+/**
  * Removes a registration of SERVICE_ID, whatever state it is in.
  *
  * Removal uses `sc stop` + `sc delete` only. An existing wrapper is never
@@ -247,6 +293,7 @@ export async function unregister({
   runFile = shellRunFile,
   log = () => {},
   force = false,
+  skipStop = false,
   deleteWaitMs = 30_000,
   deletePollMs = 500,
 } = {}) {
@@ -263,7 +310,7 @@ export async function unregister({
   }
   if (still === false && !force) return { ok: true, removed: false };
 
-  await sc(['stop', SERVICE_ID], { timeout: 60_000 });
+  if (!skipStop) await sc(['stop', SERVICE_ID], { timeout: 60_000 });
   const deleted = await sc(['delete', SERVICE_ID], { timeout: 30_000 });
   const output = outputOf(deleted);
 
@@ -311,6 +358,92 @@ function removeLegacyWinsw(log) {
   } catch (err) {
     log(`  warning: could not remove ${legacy}: ${err.message}`);
   }
+}
+
+/**
+ * Removes one service-owned directory without following links.
+ *
+ * Deletion is bottom-up and asynchronous so the uninstall stage deadline can
+ * abort it. Hard links are safe to unlink because only this directory entry is
+ * removed. Reparse points and non-file entries are refused before deletion.
+ */
+async function removeServiceDirectory(target, {
+  deadline = Infinity,
+  signal,
+  stage = 'Removing obsolete service files',
+  timeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
+} = {}) {
+  let root;
+  try {
+    root = await fs.promises.lstat(target);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+  if (root.isSymbolicLink() || !root.isDirectory()) {
+    throw new Error(`${target} is a link, reparse point, or non-directory`);
+  }
+
+  const pending = [target];
+  const directories = [];
+  const files = [];
+  while (pending.length) {
+    remainingStageMs(deadline, stage, timeoutMs);
+    signal?.throwIfAborted();
+    const directory = pending.pop();
+    directories.push(directory);
+    const entries = await fs.promises.readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      remainingStageMs(deadline, stage, timeoutMs);
+      signal?.throwIfAborted();
+      const entryPath = path.join(directory, entry.name);
+      const stat = await fs.promises.lstat(entryPath);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`refusing a reparse point at ${entryPath}`);
+      }
+      if (stat.isDirectory()) {
+        pending.push(entryPath);
+      } else if (stat.isFile()) {
+        files.push(entryPath);
+      } else {
+        throw new Error(`refusing a non-file entry at ${entryPath}`);
+      }
+    }
+  }
+
+  for (const file of files) {
+    remainingStageMs(deadline, stage, timeoutMs);
+    signal?.throwIfAborted();
+    await fs.promises.unlink(file);
+  }
+  for (const directory of directories.reverse()) {
+    remainingStageMs(deadline, stage, timeoutMs);
+    signal?.throwIfAborted();
+    await fs.promises.rmdir(directory);
+  }
+  return true;
+}
+
+async function removeObsoleteServiceFiles({
+  dataDir,
+  deadline,
+  signal,
+  log,
+  timeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
+}) {
+  let removed = 0;
+  for (const target of [runtimeDir(dataDir), `${runtimeDir(dataDir)}.prev`, binDir()]) {
+    if (await removeServiceDirectory(target, {
+      deadline,
+      signal,
+      stage: 'Removing obsolete service files',
+      timeoutMs,
+    })) {
+      removed++;
+      log(`  removed ${target}`);
+    }
+  }
+  return removed;
 }
 
 /**
@@ -560,10 +693,19 @@ export async function install({
  * uninstall flow (decision 5), because the ProgramData directory holds the
  * live data and silently relocating it would be a surprise.
  */
-export async function uninstall({ dataDir, config = {}, operator = null, log = () => {}, run = shellRun, runFile = shellRunFile } = {}) {
+export async function uninstall({
+  dataDir,
+  config = {},
+  operator = null,
+  keepOperatorDataAccess = false,
+  log = () => {},
+  run = shellRun,
+  runFile = shellRunFile,
+  stageTimeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
+} = {}) {
   if (!isWindows) return { ok: false, reason: 'Server mode is Windows-only' };
 
-  if ((await isElevated({ run })) === false || !canWriteProgramData()) {
+  if ((await isElevated({ run })) === false) {
     return {
       ok: false,
       needsElevation: true,
@@ -571,39 +713,255 @@ export async function uninstall({ dataDir, config = {}, operator = null, log = (
         + '  Right-click PowerShell → "Run as administrator", then: ezz service uninstall',
     };
   }
+  let canWrite;
+  try {
+    canWrite = await runUninstallStage({
+      stage: 'Checking ProgramData access',
+      timeoutMs: stageTimeoutMs,
+      log,
+      action: () => canWriteProgramData(),
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      stage: error.stage ?? 'Checking ProgramData access',
+      reason: `could not verify ProgramData write access: ${error.message}`,
+    };
+  }
+  if (!canWrite) {
+    return {
+      ok: false,
+      needsElevation: true,
+      reason: 'Removing the Windows service needs write access to ProgramData.\n\n'
+        + '  Run this from an Administrator PowerShell: ezz service uninstall',
+    };
+  }
 
   const notes = [];
+  let removed = { ok: true, removed: false };
+  let registrationRemoved = false;
+  let operatorDataLocked = false;
+  let operatorControlSddl = null;
 
-  // Revoked while the account still resolves. After the service is gone the
-  // SID may no longer map to a name, and icacls would refuse — so the order
-  // here is the reverse of install's for a reason.
-  log('Removing the service account grants…');
-  const revoked = await revokeGrants({
-    paths: [dataDir, config.nginxDir, config.sslDir].filter(Boolean),
-    runFile,
-    log,
-  });
-  if (!revoked.ok) {
-    for (const failure of revoked.failed) notes.push(`could not clear grants on ${failure.path}`);
+  const restoreOperatorAccess = async ({ includeServiceControl }) => {
+    const failures = [];
+    if (includeServiceControl && operatorControlSddl && operator?.sid) {
+      try {
+        const restored = await restoreServiceControl({
+          sid: operator.sid,
+          sddl: operatorControlSddl,
+          run,
+          runFile,
+        });
+        if (restored.ok) operatorControlSddl = null;
+        else failures.push(`could not restore the installer's service-control permission: ${restored.reason}`);
+      } catch (error) {
+        failures.push(`could not restore the installer's service-control permission: ${error.message}`);
+      }
+    }
+    if (operatorDataLocked && operator?.sid) {
+      try {
+        const restored = await runUninstallStage({
+          stage: 'Restoring installing-account access',
+          timeoutMs: stageTimeoutMs,
+          log,
+          action: ({ deadline, signal, timeoutMs }) => restoreOperatorDataAccess({
+            operator,
+            dataDir,
+            runFile,
+            log,
+            deadline,
+            signal,
+            timeoutMs,
+          }),
+        });
+        if (restored.ok) operatorDataLocked = false;
+        else failures.push(`could not restore the installer's data-directory access: ${restored.reason}`);
+      } catch (error) {
+        failures.push(`could not restore the installer's data-directory access: ${error.message}`);
+      }
+    }
+    return failures;
+  };
+
+  try {
+    const registered = await isRegistered({ run, runFile });
+    if (registered === null) {
+      return {
+        ok: false,
+        reason: `could not determine whether ${SERVICE_ID} is registered. Nothing was removed.`,
+      };
+    }
+
+    if (registered) {
+      const stopped = await runUninstallStage({
+        stage: 'Stopping the Easy DevOps service',
+        timeoutMs: stageTimeoutMs,
+        log,
+        action: async ({ deadline }) => stop({
+          run,
+          runFile,
+          stopWaitMs: Math.min(
+            30_000,
+            remainingStageMs(
+              deadline,
+              'Stopping the Easy DevOps service',
+              stageTimeoutMs,
+            ),
+          ),
+        }),
+      });
+      if (!stopped.ok) {
+        return {
+          ok: false,
+          needsElevation: stopped.needsElevation ?? false,
+          reason: `the service could not be stopped before uninstall: ${stopped.reason}`,
+        };
+      }
+    } else {
+      notes.push('no service was registered, so there was nothing to stop or unregister');
+    }
+
+    if (operator?.sid) {
+      // Retry-safe: this runs even when a previous attempt already removed the
+      // registration. Otherwise an interrupted uninstall would silently leave
+      // stale installer and service-account grants behind.
+      operatorDataLocked = true;
+      await runUninstallStage({
+        stage: 'Locking installing-account access',
+        timeoutMs: stageTimeoutMs,
+        log,
+        action: async ({ deadline, signal, timeoutMs }) => {
+          if (registered) {
+            const control = await revokeServiceControl({
+              sid: operator.sid,
+              run,
+              runFile,
+            });
+            if (!control.ok) {
+              throw new Error(`could not remove the installer's service-control permission: ${control.reason}`);
+            }
+            if (control.changed) operatorControlSddl = control.previousSddl;
+          }
+          const data = await revokeOperator({
+            operator,
+            dataDir,
+            runFile,
+            log,
+            deadline,
+            signal,
+            timeoutMs,
+          });
+          if (!data.ok) {
+            throw new Error(`could not remove the installer's data-directory permission: ${data.reason}`);
+          }
+        },
+      });
+    }
+
+    // Revoke while the service account still resolves when it is registered.
+    // When a prior attempt already removed the registration, still try: stale
+    // grants must never be silently carried into either the retained data or
+    // its backup.
+    const serviceSid = await serviceAccountSid({ run, runFile });
+    const revoked = await runUninstallStage({
+      stage: 'Removing service-account permissions',
+      timeoutMs: stageTimeoutMs,
+      log,
+      action: ({ deadline, signal, timeoutMs }) => revokeGrants({
+        paths: [dataDir, config.nginxDir, config.sslDir].filter(Boolean),
+        ...(serviceSid ? { trustee: `*${serviceSid}` } : {}),
+        runFile,
+        log,
+        deadline,
+        signal,
+        timeoutMs,
+      }),
+    });
+    if (!revoked.ok) {
+      const detail = revoked.failed
+        .map((failure) => `${failure.path}: ${failure.reason}`)
+        .join('; ');
+      throw new Error(`could not clear every service-account grant: ${detail}`);
+    }
+
+    if (registered) {
+      removed = await runUninstallStage({
+        stage: 'Removing the Easy DevOps service registration',
+        timeoutMs: stageTimeoutMs,
+        log,
+        action: async ({ deadline }) => unregister({
+          run,
+          runFile,
+          log,
+          skipStop: true,
+          deleteWaitMs: Math.min(
+            60_000,
+            remainingStageMs(
+              deadline,
+              'Removing the Easy DevOps service registration',
+              stageTimeoutMs,
+            ),
+          ),
+        }),
+      });
+      if (!removed.ok) {
+        throw new Error(`the service could not be unregistered:\n${removed.reason}`);
+      }
+      registrationRemoved = true;
+    }
+
+    if (removed.reason) notes.push(removed.reason);
+    if (removed.removed) log('Service unregistered.');
+
+    await runUninstallStage({
+      stage: 'Removing obsolete service files',
+      timeoutMs: stageTimeoutMs,
+      log,
+      action: ({ deadline, signal, timeoutMs }) => removeObsoleteServiceFiles({
+        dataDir,
+        deadline,
+        signal,
+        log,
+        timeoutMs,
+      }),
+    });
+
+    // Start/stop authority was part of the service DACL and disappeared with
+    // the registration. Keep the data grant only when the user chose to keep
+    // the data at its Server-mode location.
+    if (keepOperatorDataAccess && operator?.sid) {
+      const restored = await runUninstallStage({
+        stage: 'Restoring installing-account access',
+        timeoutMs: stageTimeoutMs,
+        log,
+        action: ({ deadline, signal, timeoutMs }) => restoreOperatorDataAccess({
+          operator,
+          dataDir,
+          runFile,
+          log,
+          deadline,
+          signal,
+          timeoutMs,
+        }),
+      });
+      if (!restored.ok) {
+        throw new Error(`the service was removed, but the installer's data access was not restored: ${restored.reason}`);
+      }
+      operatorDataLocked = false;
+    }
+  } catch (error) {
+    const restoreFailures = await restoreOperatorAccess({
+      includeServiceControl: !registrationRemoved,
+    });
+    return {
+      ok: false,
+      stage: error?.stage ?? null,
+      reason: `${error?.message ?? String(error)}`
+        + (restoreFailures.length ? `\n${restoreFailures.join('\n')}` : ''),
+      notes,
+    };
   }
-
-  // WinSW's own stop + uninstall when the wrapper is there, and `sc delete`
-  // for a registration whose wrapper is missing — so a service left behind by
-  // a failed or interrupted install can always be removed.
-  const removed = await unregister({ run, runFile, log });
-  if (!removed.ok) {
-    return { ok: false, reason: `the service could not be unregistered:\n${removed.reason}` };
-  }
-  if (removed.reason) notes.push(removed.reason);
-  if (removed.removed) log('Service unregistered.');
-  else notes.push('no service was registered, so there was nothing to unregister');
-
-  removeLegacyWinsw(log);
-
-  // The installing user's data directory access. Its start/stop right was an
-  // entry on the service's own DACL, and went with the service.
-  const operatorRevoked = await revokeOperator({ operator, dataDir, runFile, log });
-  if (!operatorRevoked.ok) notes.push(`could not remove your account's data directory access: ${operatorRevoked.reason}`);
 
   return { ok: true, notes };
 }

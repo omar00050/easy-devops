@@ -60,6 +60,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   instead of merging into existing content. Optional WebSocket package stubs
   are recreated from admin-owned temporary packages even when an old package or
   link already exists.
+- Windows Server uninstall now shows the active operation and limits every
+  stage to five minutes. A stalled stage stops with an error that names the
+  operation instead of leaving the CLI waiting indefinitely.
+- Windows Server uninstall removes the service account from a preflighted data,
+  nginx, and SSL tree with one recursive permissions operation instead of
+  starting one permissions process per file.
+- Keeping Server data during uninstall performs no copy or move and leaves the
+  database and Server-mode marker in place. Moving data copies and verifies
+  user files only, excludes runtime and wrapper folders, and keeps a backup.
+  A copy, verification, activation, or deadline failure restores the live
+  source before the database is reopened. If Windows blocks a rollback, the
+  error names both paths so the data remains recoverable.
 - Linux systemd installation stages its unit in a fresh directory with mode
   `0700`, creates the file exclusively with mode `0600`, passes `sudo install`
   direct arguments, and removes the staging directory on every outcome.

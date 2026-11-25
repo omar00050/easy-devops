@@ -174,6 +174,29 @@ async function testServiceDacl() {
   check('applying it again does not stack a second ACE',
     (twice.match(/CCLCLORPWP/g) ?? []).length === 1, twice);
 
+  const without = op.withoutOperatorAce(next, SID);
+  check('the operator ACE can be removed without changing the service DACL',
+    without.changed === true
+      && !without.sddl.includes(SID)
+      && without.sddl.includes('(A;;CCLCSWRPWPDTLOCRRC;;;SY)'),
+    without.sddl);
+
+  const deniedDacl = `D:(D;;CCLCLORPWP;;;${SID})(A;;CCLCLORPWP;;;${SID})(A;;CC;;;SY)`;
+  const withDeny = op.withoutOperatorAce(deniedDacl, SID);
+  check('a temporary uninstall removes only the allow ACE',
+    withDeny.changed === true
+      && withDeny.sddl.includes(`(D;;CCLCLORPWP;;;${SID})`)
+      && !withDeny.sddl.includes(`(A;;CCLCLORPWP;;;${SID})`),
+    withDeny.sddl);
+  let denyGrantError = null;
+  try {
+    op.withOperatorAce(deniedDacl, SID);
+  } catch (error) {
+    denyGrantError = error;
+  }
+  check('a repair refuses to erase an explicit deny ACE',
+    /explicitly denies/.test(denyGrantError?.message ?? ''), denyGrantError?.message);
+
   const earlier = `D:(A;;CCLCLORPWP;;;${SID})(A;;CCLCSWRPWPDTLOCRRC;;;SY)`;
   const repaired = op.withOperatorAce(earlier, SID);
   check('an earlier ACE for the same SID is replaced, not duplicated',
@@ -262,8 +285,52 @@ async function testServiceDacl() {
       && JSON.stringify(directCalls[0].args) === JSON.stringify(['sdshow', 'EasyDevOps']),
     JSON.stringify(directCalls));
 
+  const revokeCalls = [];
+  let revokeSddl = `D:(A;;CCLCLORPWP;;;${SID})(A;;CC;;;SY)`;
+  const revokeControl = await op.revokeServiceControl({
+    sid: SID,
+    runFile: async (file, args) => {
+      revokeCalls.push({ file, args });
+      if (args[0] === 'sdshow') return { success: true, stdout: revokeSddl };
+      if (args[0] === 'sdset') {
+        revokeSddl = args[2];
+        return { success: true, stdout: '' };
+      }
+      return { success: false, stdout: '', stderr: `unexpected ${args.join(' ')}` };
+    },
+  });
+  check('service control is revoked before a recursive uninstall ACL change',
+    revokeControl.ok === true && revokeControl.changed === true
+      && !revokeSddl.includes(SID), JSON.stringify({ revokeControl, revokeSddl }));
+  check('revocation returns the exact DACL needed for an interrupted retry',
+    revokeControl.previousSddl
+      === `D:(A;;CCLCLORPWP;;;${SID})(A;;CC;;;SY)`,
+    revokeControl.previousSddl);
+  check('the service DACL change uses direct sc.exe argv',
+    revokeCalls.some(({ file, args }) => /sc\.exe$/i.test(file)
+      && JSON.stringify(args) === JSON.stringify(['sdset', 'EasyDevOps', revokeSddl])),
+    JSON.stringify(revokeCalls));
+
   const noSd = stubRun([[/^sc\.exe sdshow /, { stdout: 'SERVICE_NAME: EasyDevOps' }]]);
   check('no DACL line is null, not an empty string', (await op.readServiceSddl({ run: noSd })) === null);
+
+  let restoredSddl = '';
+  const restored = await op.restoreServiceControl({
+    sid: SID,
+    sddl: `D:(D;;CCLCLORPWP;;;${SID})(A;;CCLCLORPWP;;;${SID})(A;;CC;;;SY)`,
+    runFile: async (file, args) => {
+      if (args[0] === 'sdshow') return { success: true, stdout: restoredSddl };
+      if (args[0] === 'sdset') {
+        restoredSddl = args[2];
+        return { success: true, stdout: '' };
+      }
+      return { success: false, stdout: '', stderr: 'unexpected command' };
+    },
+  });
+  check('an interrupted uninstall restores the saved DACL byte-for-byte',
+    restored.ok === true
+      && restoredSddl === `D:(D;;CCLCLORPWP;;;${SID})(A;;CCLCLORPWP;;;${SID})(A;;CC;;;SY)`,
+    restored.reason ?? restoredSddl);
 }
 
 // ─── 3. Data directory and the protection commands ───────────────────────────
@@ -357,7 +424,7 @@ async function testDataDirCommands() {
     : path.parse(TEST_DATA_DIR).root;
   let containerError = null;
   try {
-    acl.canonicalAclDirectory(protectedContainer);
+    await acl.canonicalAclDirectory(protectedContainer);
   } catch (error) {
     containerError = error;
   }
@@ -372,7 +439,7 @@ async function testDataDirCommands() {
     let approvedError = null;
     let approvedPath = null;
     try {
-      approvedPath = acl.canonicalAclDirectory(approvedBin);
+      approvedPath = await acl.canonicalAclDirectory(approvedBin);
     } catch (error) {
       approvedError = error;
     }
@@ -797,6 +864,19 @@ async function testGrantOperator() {
       c === `icacls "${dataDir}" /remove:g "*${SID}" /L /Q`).length === 1
       && !revokeRun.calls.some((c) => /\/remove:g/.test(c) && /\/T\b/.test(c)),
     revokeRun.calls.join(' | '));
+
+  const restoreRun = stubRun([[/icacls /, { success: true }]]);
+  const restored = await op.restoreOperatorDataAccess(withFileStub({
+    operator: { sid: SID, name: 'DOMAIN\\me' },
+    dataDir,
+    run: restoreRun,
+    log: () => {},
+  }));
+  check('keeping Server data restores only the inheritable root grant',
+    restored.ok === true
+      && restoreRun.calls.length === 1
+      && restoreRun.calls[0] === `icacls "${dataDir}" /grant "*${SID}:(OI)(CI)M" /L /Q`,
+    restoreRun.calls.join(' | '));
 
   const nothingToRevoke = stubRun();
   check('no operator is a no-op',

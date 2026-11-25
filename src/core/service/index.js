@@ -57,7 +57,11 @@ import * as windowsPersonal from './windowsPersonal.js';
 import * as legacy from './legacy.js';
 import { enableServerMode, disableServerMode, describeOriginal } from './dataDir.js';
 import { linkRuntime, inspectRuntime, runtimeNodePath } from './runtime.js';
-import { resolveOperator } from './operator.js';
+import { resolveOperator, restoreOperatorDataAccess } from './operator.js';
+import {
+  UNINSTALL_STAGE_TIMEOUT_MS,
+  runUninstallStage,
+} from './stageTimeout.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -82,6 +86,13 @@ const WAIT_PROGRESS_MS = 5_000;
 
 /** How long to wait for a stopping daemon to actually release its lock. */
 export const STOP_GRACE_MS = 15_000;
+
+/**
+ * Safety net around the Windows implementation. Its named stages each have
+ * their own deadline. This outer limit only catches an implementation bug that
+ * bypasses an inner timer, after enough time for every expected stage.
+ */
+const WINDOWS_UNINSTALL_OUTER_STAGES = 8;
 
 /**
  * The `ezz` entry script, resolved from this file rather than from `cwd`.
@@ -508,7 +519,7 @@ async function installWindowsServer({ entry, root, log, legacyResult, deps = {} 
   (deps.closeDb ?? closeDb)();
   let switched;
   try {
-    switched = (deps.enableServerMode ?? enableServerMode)({ log });
+    switched = await (deps.enableServerMode ?? enableServerMode)({ log });
   } finally {
     (deps.reopenDb ?? reopenDb)();
   }
@@ -700,12 +711,14 @@ async function installWindowsPersonal({ entry, log, legacyResult, deps = {} }) {
  * @param {Object} opts
  * @param {boolean} [opts.keepServerDataLocation] Default true
  * @param {boolean} [opts.removeLegacy]
+ * @param {number} [opts.stageTimeoutMs] Per-stage deadline (5 minutes by default)
  * @param {(line: string) => void} [opts.log]
  * @returns {Promise<Object>}
  */
 export async function uninstall({
   keepServerDataLocation = true,
   removeLegacy = false,
+  stageTimeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
   log = () => {},
   deps = {},
 } = {}) {
@@ -715,23 +728,59 @@ export async function uninstall({
   const result = { mechanism: mech.mechanism, mode: mech.mode, notes: [], dataDir: getDataDir() };
 
   if (!isWindows) {
-    const removed = await (deps.systemd ?? systemd).uninstall({ log, ...(deps.systemdOpts ?? {}) });
+    let removed;
+    try {
+      removed = await runUninstallStage({
+        stage: 'Removing the Easy DevOps systemd service',
+        timeoutMs: stageTimeoutMs,
+        log,
+        action: async () => (deps.systemd ?? systemd).uninstall({
+          log,
+          ...(deps.systemdOpts ?? {}),
+        }),
+      });
+    } catch (error) {
+      return { ok: false, ...result, stage: error.stage ?? null, reason: error.message };
+    }
     if (!removed.ok) return { ok: false, ...result, reason: removed.reason };
   } else if (mech.mode === MODES.SERVER) {
     const config = loadConfig();
     const operator = (dbGet(STATE_KEY) ?? {}).operator ?? null;
-    const removed = await (deps.windowsService ?? windowsService).uninstall({
-      dataDir: getDataDir(),
-      config,
-      // The start/stop right goes with the service. The data directory grant
-      // is removed only when the data leaves ProgramData: while the CLI keeps
-      // using it there, removing it would bring back the read-only database.
-      operator: keepServerDataLocation ? null : operator,
-      log,
-      ...(deps.windowsServiceOpts ?? {}),
-    });
+    let removed;
+    try {
+      removed = await runUninstallStage({
+        stage: 'Removing the Easy DevOps Windows service',
+        timeoutMs: stageTimeoutMs * WINDOWS_UNINSTALL_OUTER_STAGES,
+        log,
+        action: async () => (deps.windowsService ?? windowsService).uninstall({
+          dataDir: getDataDir(),
+          config,
+          // Remove this temporarily while the recursive ACL operation runs.
+          // The Windows implementation restores only the data grant when the
+          // user chooses to keep the data at the Server-mode location.
+          operator,
+          keepOperatorDataAccess: keepServerDataLocation,
+          log,
+          stageTimeoutMs,
+          ...(deps.windowsServiceOpts ?? {}),
+        }),
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        ...result,
+        stage: error.stage ?? null,
+        reason: error.message,
+      };
+    }
     if (!removed.ok) {
-      return { ok: false, ...result, reason: removed.reason, needsElevation: removed.needsElevation ?? false };
+      return {
+        ok: false,
+        ...result,
+        stage: removed.stage ?? null,
+        reason: removed.reason,
+        needsElevation: removed.needsElevation ?? false,
+      };
     }
     result.notes.push(...(removed.notes ?? []));
 
@@ -748,19 +797,77 @@ export async function uninstall({
         );
       }
       result.dataDir = programDataDir();
+      log(`Keeping data in ${programDataDir()} (no copy or move).`);
     } else {
-      log('Moving the data back to %APPDATA%…');
       // Same reason as on install: this process's own handle would stop
       // Windows renaming the ProgramData directory, and every write after the
       // move must reach the database that is now live.
       (deps.closeDb ?? closeDb)();
+
+      const restoreInstallerAfterFailedMove = async () => {
+        if (!operator?.sid) return null;
+        try {
+          const restored = await runUninstallStage({
+            stage: 'Restoring installing-account access',
+            timeoutMs: stageTimeoutMs,
+            log,
+            action: ({ deadline, signal, timeoutMs }) => (
+              deps.restoreOperatorDataAccess ?? restoreOperatorDataAccess
+            )({
+              operator,
+              dataDir: programDataDir(),
+              log,
+              deadline,
+              signal,
+              timeoutMs,
+            }),
+          });
+          return restored.ok ? null : restored.reason;
+        } catch (error) {
+          return error.message;
+        }
+      };
+
       let moved;
       try {
-        moved = (deps.disableServerMode ?? disableServerMode)({ log });
+        moved = await runUninstallStage({
+          stage: 'Moving user data back to %APPDATA%',
+          timeoutMs: stageTimeoutMs,
+          log,
+          action: ({ deadline, signal }) => (
+            deps.disableServerMode ?? disableServerMode
+          )({ log, deadline, signal }),
+        });
+      } catch (error) {
+        const restoreFailure = await restoreInstallerAfterFailedMove();
+        return {
+          ok: false,
+          ...result,
+          stage: error.stage ?? null,
+          reason: `${error.message}`
+            + (restoreFailure
+              ? `\nThe installer's data-directory access could not be restored: ${restoreFailure}`
+              : operator?.sid
+                ? '\nThe installer\'s data-directory access was restored.'
+                : ''),
+        };
       } finally {
         (deps.reopenDb ?? reopenDb)();
       }
-      if (!moved.ok) return { ok: false, ...result, reason: moved.reason };
+      if (!moved.ok) {
+        const restoreFailure = await restoreInstallerAfterFailedMove();
+        return {
+          ok: false,
+          ...result,
+          stage: moved.stage ?? null,
+          reason: `${moved.reason}`
+            + (restoreFailure
+              ? `\nThe installer's data-directory access could not be restored: ${restoreFailure}`
+              : operator?.sid
+                ? '\nThe installer\'s data-directory access was restored.'
+                : ''),
+        };
+      }
       result.dataDir = moved.dataDir;
       result.movedData = moved.moved;
       result.backup = moved.backup;
@@ -768,19 +875,55 @@ export async function uninstall({
       if (moved.moved) result.notes.push(`Data moved back: ${describeOriginal(moved)}.`);
     }
   } else {
-    const removed = (deps.windowsPersonal ?? windowsPersonal).uninstall({ log, ...(deps.windowsPersonalOpts ?? {}) });
+    let removed;
+    try {
+      removed = await runUninstallStage({
+        stage: 'Removing the Personal-mode startup supervisor',
+        timeoutMs: stageTimeoutMs,
+        log,
+        action: async () => (deps.windowsPersonal ?? windowsPersonal).uninstall({
+          log,
+          ...(deps.windowsPersonalOpts ?? {}),
+        }),
+      });
+    } catch (error) {
+      return { ok: false, ...result, stage: error.stage ?? null, reason: error.message };
+    }
     if (!removed.ok) return { ok: false, ...result, reason: removed.reason };
     result.notes.push(...(removed.notes ?? []));
   }
 
   // Legacy cleanup is offered on uninstall too: a user removing our service
   // almost certainly does not want the old PM2 boot hook left behind.
-  const found = await legacy.detectLegacy(deps.legacy ?? {});
+  let found;
+  try {
+    found = await runUninstallStage({
+      stage: 'Checking for an old PM2 setup',
+      timeoutMs: stageTimeoutMs,
+      log,
+      action: async () => legacy.detectLegacy(deps.legacy ?? {}),
+    });
+  } catch (error) {
+    return { ok: false, ...result, stage: error.stage ?? null, reason: error.message };
+  }
   result.legacy = { found: found.items, removed: [], failed: [] };
   if (found.found && removeLegacy) {
-    const cleaned = await legacy.removeLegacy({ items: found.items, log, ...(deps.legacy ?? {}) });
-    result.legacy.removed = cleaned.removed;
-    result.legacy.failed = cleaned.failed;
+    try {
+      const cleaned = await runUninstallStage({
+        stage: 'Removing the old PM2 startup setup',
+        timeoutMs: stageTimeoutMs,
+        log,
+        action: async () => legacy.removeLegacy({
+          items: found.items,
+          log,
+          ...(deps.legacy ?? {}),
+        }),
+      });
+      result.legacy.removed = cleaned.removed;
+      result.legacy.failed = cleaned.failed;
+    } catch (error) {
+      return { ok: false, ...result, stage: error.stage ?? null, reason: error.message };
+    }
   }
 
   const existing = dbGet(STATE_KEY) ?? {};
