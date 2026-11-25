@@ -35,6 +35,13 @@
  * owns it, and a stale heartbeat alone can be a paused process.
  */
 
+import {
+  createStateFile,
+  moveIntoPlace,
+  replaceStateFile,
+  reportStateWriteFailure,
+  reportStateWriteSuccess,
+} from '../atomicState.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -68,8 +75,8 @@ const RECOVERY_GUARD_STALE_MS = 30_000;
 
 /**
  * How long an empty, unreadable marker may exist before another process may
- * treat it as abandoned: creating it is `writeFileSync(path, data, { flag:
- * 'wx' })`, which creates the file and THEN writes it, so a brand-new marker is
+ * treat it as abandoned: creating it is createStateFile() (`open(..., 'wx')`),
+ * which creates the file and THEN writes it, so a brand-new marker is
  * briefly empty. A reader in that window must not "recover" it.
  */
 const UNREADABLE_GRACE_MS = 2_000;
@@ -287,7 +294,7 @@ function acquireRecoveryGuard({ dataDir, now }) {
 
   const attempt = () => {
     try {
-      fs.writeFileSync(file, `${JSON.stringify(payload)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      createStateFile(file, `${JSON.stringify(payload)}\n`);
       return { ok: true };
     } catch (err) {
       return { ok: false, code: err?.code ?? 'UNKNOWN', message: err?.message ?? String(err) };
@@ -344,12 +351,20 @@ function replaceOwner({ dataDir, payload }) {
   const body = `${JSON.stringify(payload)}\n`;
 
   try {
-    fs.writeFileSync(candidate, body, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    createStateFile(candidate, body);
   } catch (err) {
     return { ok: false, message: err?.message ?? String(err) };
   }
 
-  const moved = renameWithRetry(candidate, target);
+  const moved = (() => {
+    try {
+      moveIntoPlace(candidate, target);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, message: err?.message ?? String(err) };
+    }
+  })();
+
   if (!moved.ok) {
     try { fs.unlinkSync(candidate); } catch { /* already gone */ }
     return { ok: false, message: moved.message };
@@ -359,30 +374,13 @@ function replaceOwner({ dataDir, payload }) {
 }
 
 /**
- * `rename`, retried briefly while Windows refuses it.
- *
- * A file another process has open for reading cannot be replaced on Windows
- * (EPERM/EBUSY) until that handle closes. Readers here read and close
- * immediately, so a bounded retry is enough — and bounded, so a stuck file can
- * never hang an acquisition.
- */
-function renameWithRetry(from, to, attempts = 200, waitMs = 1) {
-  for (let i = 0; ; i++) {
-    try {
-      fs.renameSync(from, to);
-      return { ok: true };
-    } catch (err) {
-      const transient = err?.code === 'EPERM' || err?.code === 'EBUSY' || err?.code === 'EACCES';
-      if (!transient || i >= attempts) {
-        return { ok: false, message: err?.message ?? String(err) };
-      }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
-    }
-  }
-}
-
-/**
  * Refreshes the heartbeat.
+ *
+ * Returns false only when the marker is gone or belongs to someone else. A
+ * failed WRITE is not a lost ownership: on Windows a rename over the marker
+ * can be refused while another process reads it, so it is logged once and
+ * retried on the next beat. Throwing here — or crashing — is what took the
+ * daemon down in 1.4.6 (finding A4).
  *
  * @returns {boolean} True while this process still owns the jobs
  */
@@ -390,7 +388,13 @@ export function heartbeat({ dataDir = getDataDir(), role = 'unknown', now = Date
   const current = readOwner(dataDir);
   if (!current || current.pid !== process.pid) return false;
 
-  write({ dataDir, role, now, at: current.at });
+  const file = ownerPath(dataDir);
+  try {
+    write({ dataDir, role, now, at: current.at });
+    reportStateWriteSuccess(file);
+  } catch (err) {
+    reportStateWriteFailure(file, err, 'It will be retried on the next heartbeat.');
+  }
   return true;
 }
 
@@ -448,11 +452,7 @@ export async function waitUntilFree({
 function createExclusive(dataDir, payload) {
   try {
     fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(ownerPath(dataDir), `${JSON.stringify(payload)}\n`, {
-      encoding: 'utf8',
-      mode: 0o600,
-      flag: 'wx',
-    });
+    createStateFile(ownerPath(dataDir), `${JSON.stringify(payload)}\n`);
     return { ok: true };
   } catch (err) {
     return { ok: false, code: err?.code ?? 'UNKNOWN', message: err?.message ?? String(err) };
@@ -469,11 +469,9 @@ function createExclusive(dataDir, payload) {
 function write({ dataDir, role, now, at }) {
   const payload = { pid: process.pid, role, at: at ?? now, heartbeatAt: now };
   const target = ownerPath(dataDir);
-  const temp = `${target}.${process.pid}.tmp`;
 
   fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(temp, `${JSON.stringify(payload)}\n`, { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(temp, target);
+  replaceStateFile(target, `${JSON.stringify(payload)}\n`);
 
   return payload;
 }

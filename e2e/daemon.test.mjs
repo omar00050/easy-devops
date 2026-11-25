@@ -22,7 +22,7 @@ import { TEST_DATA_DIR, assertInsideTestDataDir } from './lib/guard.mjs';
 
 import fs from 'fs';
 import path from 'path';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { once } from 'events';
 import { fileURLToPath, pathToFileURL } from 'url';
 
@@ -217,6 +217,9 @@ async function testDaemonRole() {
   await jobs.ready();
   check('the daemon takes the lock and runs the jobs', jobs.ok !== false && jobs.state().running === true);
   check('the daemon reports itself as the owner', jobs.state().role === 'daemon');
+
+  const owner = await import(srcUrl('core/jobs/owner.js'));
+  check('the jobs marker is written for this daemon', owner.readOwner(dataDir)?.pid === process.pid);
 
   // A second daemon in this same process would be the same pid, which the lock
   // treats as a re-acquire. The real case is another process, so that is what
@@ -700,6 +703,11 @@ async function testDaemonLifecycle() {
   await isolateConfig();
   bus.clearAll();
 
+  const stop = await import(srcUrl('core/daemon/stopRequest.js'));
+  // A request written before this start is spent: the daemon must clear it, or
+  // it exits at once and `ezz service status` keeps saying "stopped by you".
+  stop.requestStop({ dataDir, reason: 'test: superseded by this start' });
+
   const lines = [];
   const daemon = await startDaemon({
     dataDir,
@@ -709,6 +717,9 @@ async function testDaemonLifecycle() {
   });
 
   check('the daemon starts', daemon.ok === true, daemon.ok === false ? daemon.reason : '');
+  check('a start clears a stop request left from before it', stop.isStopRequested({ dataDir }) === false);
+  check('and the log says it was superseded',
+    lines.some((l) => /stop request\s+:\s+cleared/.test(l)), lines.join(' | '));
   check('it holds the lock', lock.isDaemonRunning({ dataDir }) === true);
   check('it reports an event channel', typeof daemon.ipcPath === 'string' && daemon.ipcPath.length > 0);
   check('it printed the data directory', lines.some((l) => l.includes(dataDir)));
@@ -926,18 +937,376 @@ async function testServiceChangedEvent() {
 
 // ─── main ─────────────────────────────────────────────────────────────────────
 
+async function testStateRetries() {
+  setGroup('state publication under sharing contention');
+  const dataDir = scratch('state-retries');
+  const state = await import(srcUrl('core/daemon/stateFile.js'));
+  const stop = await import(srcUrl('core/daemon/stopRequest.js'));
+  const update = await import(srcUrl('core/updateStatus.js'));
+  const lock = await import(srcUrl('core/daemon/lock.js'));
+  const owner = await import(srcUrl('core/jobs/owner.js'));
+  const { claim, claimPath, CLAIM_TTL_MS } = await import(srcUrl('core/notifications/claim.js'));
+
+  /**
+   * (a) Windows refuses a rename over a file another process has open with
+   * EPERM/EBUSY/EACCES. Two denials then success is the ordinary case: the
+   * bounded retry in core/atomicState.js must ride it out and the document must
+   * still land.
+   */
+  const denyTwice = (write) => {
+    const originalRename = fs.renameSync;
+    let attempts = 0;
+    try {
+      fs.renameSync = (from, to) => {
+        attempts += 1;
+        if (attempts <= 2) throw Object.assign(new Error('sharing violation'), { code: 'EPERM' });
+        return originalRename(from, to);
+      };
+      write();
+    } finally {
+      fs.renameSync = originalRename;
+    }
+    return attempts;
+  };
+
+  let attempts = denyTwice(() => state.writeDaemonState({ dataDir, pid: process.pid }));
+  check('daemon-state.json lands after two EPERM renames',
+    attempts === 3 && state.readDaemonStateFile({ dataDir })?.pid === process.pid, String(attempts));
+
+  attempts = denyTwice(() => stop.requestStop({ dataDir, reason: 'retry test' }));
+  check('a stop request lands after two EPERM renames',
+    attempts === 3 && stop.readStopRequest({ dataDir }).requested === true, String(attempts));
+
+  attempts = denyTwice(() => update.writeStatus({ id: 'retry', phase: 'starting' }, { dataDir }));
+  check('update-status.json lands after two EPERM renames',
+    attempts === 3 && update.readStatus(dataDir)?.id === 'retry', String(attempts));
+
+  const lockDir = scratch('state-retries-lock');
+  const got = lock.acquire({ dataDir: lockDir, mode: 'daemon', version: '9.9.9' });
+  check('the lock is taken for the rename test', got.ok === true, got.reason ?? '');
+  const beforeLock = lock.readLock(lockDir).heartbeatAt;
+  attempts = denyTwice(() => lock.heartbeat({ dataDir: lockDir, now: beforeLock + 1 }));
+  check('the daemon lock lands after two EPERM renames',
+    attempts === 3 && lock.readLock(lockDir).heartbeatAt === beforeLock + 1, String(attempts));
+  lock.release({ dataDir: lockDir });
+
+  const ownerDir = scratch('state-retries-owner');
+  const took = owner.claim({ dataDir: ownerDir, role: 'daemon' });
+  check('the jobs marker is taken for the rename test', took.ok === true, took.reason ?? '');
+  const beforeOwner = owner.readOwner(ownerDir).heartbeatAt;
+  attempts = denyTwice(() => owner.heartbeat({ dataDir: ownerDir, role: 'daemon', now: beforeOwner + 1 }));
+  check('the jobs marker lands after two EPERM renames',
+    attempts === 3 && owner.readOwner(ownerDir).heartbeatAt === beforeOwner + 1, String(attempts));
+  owner.release({ dataDir: ownerDir });
+
+  // A claim takeover is the one claim write that replaces an existing file.
+  const claimDir = scratch('state-retries-claim');
+  const staleClaim = claimPath(null, 'retry-probe', 'down', claimDir);
+  fs.mkdirSync(path.dirname(staleClaim), { recursive: true });
+  fs.writeFileSync(staleClaim, `${JSON.stringify({
+    pid: 2_000_000_000,
+    at: Date.now() - CLAIM_TTL_MS - 1_000,
+  })}\n`);
+  let claimed = null;
+  attempts = denyTwice(() => {
+    claimed = claim({ domain: null, eventType: 'retry-probe', status: 'down', dataDir: claimDir });
+  });
+  check('a claim takeover lands after two EPERM renames',
+    attempts === 3 && claimed?.ok === true && claimed.takeover === true, String(attempts));
+  claimed?.commit?.();
+}
+
+/**
+ * (b) A heartbeat whose state file cannot be replaced at all.
+ *
+ * The 1.4.6 crash was a throw out of this path inside a timer. The contract is:
+ * the beat returns, ownership is kept, ONE warning is written for the streak,
+ * and the next beat tries again.
+ */
+async function testHeartbeatFailures() {
+  setGroup('heartbeats survive a state file that cannot be replaced');
+  const lock = await import(srcUrl('core/daemon/lock.js'));
+  const owner = await import(srcUrl('core/jobs/owner.js'));
+  const { isWindows } = await import(srcUrl('core/platform.js'));
+  const dataDir = scratch('heartbeat-failures');
+
+  const got = lock.acquire({ dataDir, mode: 'daemon', version: '9.9.9' });
+  check('the lock is taken for the heartbeat test', got.ok === true, got.reason ?? '');
+  const took = owner.claim({ dataDir, role: 'daemon' });
+  check('the jobs marker is taken for the heartbeat test', took.ok === true, took.reason ?? '');
+
+  for (const [label, file, beat, read] of [
+    ['daemon lock', lock.lockPath(dataDir), lock.heartbeat, lock.readLock],
+    ['jobs marker', owner.ownerPath(dataDir), owner.heartbeat, owner.readOwner],
+  ]) {
+    const originalRename = fs.renameSync;
+    const originalWarn = console.warn;
+    const warnings = [];
+    const before = read(dataDir).heartbeatAt;
+    let attempts = 0;
+    let firstBeat = null;
+    let secondBeat = null;
+    let escaped = null;
+    try {
+      fs.renameSync = (from, to) => {
+        if (to === file) {
+          attempts += 1;
+          throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' });
+        }
+        return originalRename(from, to);
+      };
+      console.warn = (message) => warnings.push(message);
+
+      try { firstBeat = beat({ dataDir, now: before + 1 }); } catch (err) { escaped = err; }
+      const afterFirst = attempts;
+      try { secondBeat = beat({ dataDir, now: before + 2 }); } catch (err) { escaped = err; }
+
+      check(`${label}: a refused write never throws out of the heartbeat`,
+        escaped === null && firstBeat === true && secondBeat === true, escaped?.message ?? '');
+      check(`${label}: the attempt is retried within the beat`, afterFirst > 1, String(afterFirst));
+      check(`${label}: the next beat tries again`, attempts > afterFirst, `${afterFirst}/${attempts}`);
+      check(`${label}: one warning per failure streak`, warnings.length === 1, String(warnings.length));
+      check(`${label}: the warning names the file`,
+        warnings[0]?.includes(path.basename(file)) === true, warnings[0] ?? '');
+      check(`${label}: the last good record is kept`, read(dataDir).heartbeatAt === before);
+    } finally {
+      fs.renameSync = originalRename;
+      console.warn = originalWarn;
+    }
+
+    check(`${label}: the next successful beat publishes`,
+      beat({ dataDir, now: before + 3 }) && read(dataDir).heartbeatAt === before + 3);
+  }
+
+  // (c) Windows only: the target is held open while a heartbeat runs. Node
+  // opens with FILE_SHARE_DELETE, so this may well succeed — what must never
+  // happen is an exception escaping the beat.
+  if (isWindows) {
+    const file = owner.ownerPath(dataDir);
+    const before = owner.readOwner(dataDir).heartbeatAt;
+    let held;
+    let escaped = null;
+    try {
+      held = fs.openSync(file, 'r');
+      check('the state file is held open for the heartbeat', Number.isInteger(held));
+      owner.heartbeat({ dataDir, now: before + 10 });
+    } catch (err) {
+      escaped = err;
+    } finally {
+      if (held !== undefined) {
+        try { fs.closeSync(held); } catch { /* already closed */ }
+      }
+    }
+    check('holding the state file open never raises out of the heartbeat', escaped === null, escaped?.message ?? '');
+    check('and ownership is unchanged', owner.readOwner(dataDir)?.pid === process.pid);
+  }
+
+  // The same thing with a handle that really denies the rename: Node's own
+  // handles share delete, so this reader asks the OS for a plain read lock.
+  if (isWindows) {
+    const holder = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      "$ErrorActionPreference='Stop'; $f=[IO.File]::Open($env:EZ_TEST_OWNER,'Open','Read','Read'); [Console]::WriteLine('ready'); [Console]::ReadLine() | Out-Null; $f.Dispose()"],
+      { windowsHide: true, env: { ...process.env, EZ_TEST_OWNER: owner.ownerPath(dataDir) } });
+    const closed = once(holder, 'close');
+    try {
+      const ready = await Promise.race([once(holder.stdout, 'data'), closed]);
+      check('a Windows reader obtained a deny-delete handle', String(ready[0]).includes('ready'));
+      const before = owner.readOwner(dataDir).heartbeatAt;
+      check('the heartbeat survives a real Windows sharing violation',
+        owner.heartbeat({ dataDir, now: before + 20 })
+        && owner.readOwner(dataDir).heartbeatAt === before);
+    } finally {
+      holder.stdin.end('release\n');
+      await closed;
+    }
+    check('the heartbeat advances after the Windows reader closes',
+      owner.heartbeat({ dataDir, now: 1234 }) && owner.readOwner(dataDir).heartbeatAt === 1234);
+  }
+
+  lock.release({ dataDir });
+  owner.release({ dataDir });
+}
+
+/**
+ * (d) The REAL daemon entry point, with the rename denied at module level.
+ *
+ * The unit-level tests above prove the functions; this proves the process. A
+ * `--require` preload replaces fs.renameSync for `jobs.owner` and `daemon.lock`
+ * — the same failure the owner's server logged — and the daemon must log it
+ * and keep running through at least two beats.
+ */
+async function testRealDaemonSurvivesRenameDenial() {
+  setGroup('the real daemon entry survives repeated rename denials');
+  const dataDir = scratch('real-daemon-rename');
+  const lock = await import(srcUrl('core/daemon/lock.js'));
+
+  // The child is the real CLI, so it reads its own database. Seed it with the
+  // same isolated paths the rest of this suite uses, or a monitor tick would
+  // probe the nginx installed on this machine.
+  const seed = writeChild('seed-daemon-config.mjs', `
+const { dbSet } = await import(process.argv[2]);
+dbSet('config', {
+  nginxDir: process.argv[3],
+  sslDir: process.argv[4],
+  dashboardPort: 0,
+  dashboardAuth: 'none',
+  dashboardBindAddress: '127.0.0.1',
+  dashboardUi: 'new',
+  dashboardUiMigrated: true,
+  acmeEmail: '',
+});
+dbSet('domains', []);
+`);
+  const seeded = spawnSync(
+    process.execPath,
+    [seed, srcUrl('core/db.js'), path.join(TEST_DATA_DIR, 'no-such-nginx'), path.join(TEST_DATA_DIR, 'no-such-ssl')],
+    { cwd: ROOT, env: { ...process.env, EZ_TEST: '1', EASY_DEVOPS_DATA_DIR: dataDir }, encoding: 'utf8' },
+  );
+  check('the child data directory is seeded without probing this machine',
+    seeded.status === 0, (seeded.stderr ?? '').trim());
+
+  const preload = writeChild('fail-state-renames.cjs', `
+const fs = require('node:fs');
+const path = require('node:path');
+const original = fs.renameSync;
+let remaining = 6;
+fs.renameSync = (from, to) => {
+  const name = path.basename(String(to));
+  if (remaining > 0 && (name === 'jobs.owner' || name === 'daemon.lock')) {
+    remaining -= 1;
+    const error = new Error('EPERM: operation not permitted, rename (simulated)');
+    error.code = 'EPERM';
+    throw error;
+  }
+  return original(from, to);
+};
+`);
+
+  const child = spawn(process.execPath, ['--require', preload, path.join(ROOT, 'src/cli/index.js'), 'daemon'], {
+    cwd: ROOT,
+    env: { ...process.env, EZ_TEST: '1', EASY_DEVOPS_DATA_DIR: dataDir },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { err += d; });
+  const exited = once(child, 'exit').then(() => true).catch(() => true);
+
+  try {
+    const up = await waitUntil(() => lock.inspect({ dataDir }).running, { timeoutMs: 20_000, everyMs: 100 });
+    check('the real daemon entry starts and takes the lock', up, (err || out).slice(-400));
+
+    const firstBeat = lock.readLock(dataDir)?.heartbeatAt ?? 0;
+    // Two five-second beats: the simulated denials land on the first, the next
+    // one must write. The process must still be there at the end.
+    await sleep(11_000);
+    const laterBeat = lock.readLock(dataDir)?.heartbeatAt ?? 0;
+    const stillRunning = child.exitCode === null;
+
+    check('it is still running after two heartbeat intervals', stillRunning, `exit code ${child.exitCode}`);
+    check('it logged the refused write instead of dying',
+      /could not write .*(jobs\.owner|daemon\.lock)/.test(err), err.slice(-400));
+    check('a later beat wrote the lock again', laterBeat > firstBeat, `${firstBeat} -> ${laterBeat}`);
+  } finally {
+    child.kill();
+    await exited;
+  }
+}
+
+/**
+ * Finding A5: "stopped by you" is live state, and a status read never clears
+ * it. The incident was a service RUNNING with no stop file, reported as
+ * "stopped by you" from a recorded database timestamp.
+ */
+async function testStopRequestState() {
+  setGroup('status reports only a live stop request');
+  const svc = await import(srcUrl('core/service/index.js'));
+  const { dbGet, dbSet } = await import(srcUrl('core/db.js'));
+  const lock = await import(srcUrl('core/daemon/lock.js'));
+  const stop = await import(srcUrl('core/daemon/stopRequest.js'));
+  const { getDataDir } = await import(srcUrl('core/platform.js'));
+  const dataDir = getDataDir();
+
+  // The minimum a status() call needs. Every probe is a stub: this test is
+  // about which facts are trusted, not about this machine's service manager.
+  const manager = (running) => ({
+    status: async () => ({ installed: true, running, state: running ? 'running' : 'inactive', crashLooping: false, restarts: 0, acl: { ok: true } }),
+    journal: async () => ({ ok: true, output: '' }),
+    readLogs: () => ({ ok: true, file: 'f', output: '' }),
+  });
+  const deps = (running) => ({
+    systemd: manager(running),
+    windowsService: manager(false),
+    windowsPersonal: {
+      status: () => ({ installed: true, running, warnings: [], crashLooping: false, restarts: 0 }),
+      readLogs: () => ({ ok: true, file: 'f', output: '' }),
+    },
+    inspectRuntime: () => ({ node: null, warnings: [] }),
+    detectLegacy: async () => ({ items: [] }),
+    legacy: { run: async () => ({ success: false, stdout: '', stderr: '' }), startupDir: null },
+  });
+
+  const saved = dbGet('service-state') ?? {};
+  // An hour ago, and definitely not the time of the live request below.
+  const at = new Date(Date.now() - 3_600_000).toISOString();
+  stop.clearStopRequest({ dataDir });
+
+  try {
+    // 1. The incident: a recorded stop, no stop file. History, not state.
+    dbSet('service-state', { ...saved, stoppedAt: at });
+    const stale = await svc.status({ deps: deps(false) });
+    check('a recorded stop alone is not "stopped by you"', stale.stoppedByUser === false);
+    check('and its old timestamp is not published as current', stale.stoppedAt === null);
+
+    // 2. A live request with no daemon IS a deliberate stop, and the live
+    //    request — never the recorded one — supplies the time.
+    stop.requestStop({ dataDir, reason: 'status test' });
+    const liveAt = stop.readStopRequest({ dataDir }).at;
+    const stopped = await svc.status({ deps: deps(false) });
+    check('a live stop request with no daemon is "stopped by you"', stopped.stoppedByUser === true);
+    check('it reports the live request time, not the recorded one',
+      stopped.stoppedAt === liveAt && stopped.stoppedAt !== at, `${stopped.stoppedAt} / ${liveAt}`);
+    check('status leaves the stop request in place', stop.isStopRequested({ dataDir }) === true);
+    check('and says the stop is temporary', stopped.warnings.some((w) => /temporary/i.test(w)));
+
+    // 3. The same file with a live daemon: a start has happened since.
+    const held = lock.acquire({ dataDir, mode: 'daemon', version: 'status-test' });
+    check('the status test can take the daemon lock', held.ok === true, held.reason ?? '');
+    const running = await svc.status({ deps: deps(false) });
+    lock.release({ dataDir });
+    check('a running daemon is not "stopped by you"',
+      running.stoppedByUser === false && running.daemon.running === true);
+    check('a status read does not cancel the stop', stop.isStopRequested({ dataDir }) === true);
+
+    // 4. The exact audit scenario: the manager says running, no heartbeat yet.
+    //    A status poll here used to delete the request and cancel the stop.
+    const incident = await svc.status({ deps: deps(true) });
+    check('a service the manager reports running is not "stopped by you"', incident.stoppedByUser === false);
+    check('and that status read does not delete the stop file', stop.isStopRequested({ dataDir }) === true);
+  } finally {
+    stop.clearStopRequest({ dataDir });
+    dbSet('service-state', { ...saved, stoppedAt: null });
+  }
+}
+
 async function main() {
   process.stdout.write('\nDaemon: ownership, bus and IPC\n');
   process.stdout.write(`data dir: ${TEST_DATA_DIR}\n`);
 
+  await testStateRetries();
   await testBus();
   await testDaemonRole();
   await testHandover();
   await testLockRace();
   await testIpc();
   await testDaemonLifecycle();
+  await testHeartbeatFailures();
+  await testRealDaemonSurvivesRenameDenial();
   await testAsciiOutput();
   await testServiceChangedEvent();
+  await testStopRequestState();
 
   const failed = results.filter((r) => !r.passed);
   process.stdout.write(`\n${'─'.repeat(62)}\n`);

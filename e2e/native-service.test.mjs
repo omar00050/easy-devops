@@ -38,10 +38,12 @@ import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
 import { once } from 'events';
+import { createRequire } from 'module';
 import { fileURLToPath, pathToFileURL } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
+const require = createRequire(import.meta.url);
 
 const results = [];
 let group = '';
@@ -168,6 +170,51 @@ function winswResponse(bytes = 'fresh wrapper bytes') {
  * registration disappears only after `sc delete`. Every other command the
  * install makes is answered here; an unrecognised one fails, like stubRun.
  */
+/**
+ * Answers the two icacls READ-BACK forms with a real-looking ACL because the
+ * code verifies every entry it protects; every mutating form simply succeeds.
+ * The read-back lists the actual files in the temp tree, so the assertion is
+ * about the code's parsing rather than a fixed string.
+ */
+function aclReadback(cmd) {
+  if (!/^icacls "/.test(cmd)) return { success: true, stdout: 'Successfully processed 1 files' };
+  if (/\/save|\/setowner|\/grant|\/inheritance|\/reset|\/restore/.test(cmd)) {
+    return { success: true, stdout: 'Successfully processed 1 files' };
+  }
+  const target = /^icacls "([^"]+)"/.exec(cmd)?.[1] ?? null;
+  if (!target) return { success: true, stdout: 'Successfully processed 1 files' };
+  const tree = cmd.includes('/T') && cmd.includes('/C');
+
+  const line = (file, folder) => {
+    const flags = folder ? '(OI)(CI)' : '(I)';
+    return [
+      `${file} NT AUTHORITY\\SYSTEM:${flags}(F)`,
+      `    BUILTIN\\Administrators:${flags}(F)`,
+      `    BUILTIN\\Users:${flags}(RX)`,
+      `    NT SERVICE\\EasyDevOps:${flags}(RX)`,
+    ].join('\r\n');
+  };
+
+  const lines = [];
+  if (!tree) {
+    lines.push(line(target, true));
+  } else {
+    const root = target.replace(/[\\/]\*$/, '');
+    const pending = [root];
+    while (pending.length) {
+      const dir = pending.pop();
+      let entries = [];
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { /* absent is fine */ }
+      for (const entry of entries) {
+        const child = path.join(dir, entry.name);
+        if (entry.isDirectory()) pending.push(child);
+        else lines.push(line(child, false));
+      }
+    }
+  }
+  return { success: true, stdout: lines.join('\r\n') };
+}
+
 function serviceRun({ registered = false, registerResult = null, qc = 'START_TYPE : 2  AUTO_START' } = {}) {
   const calls = [];
   const state = { registered, sc: registered ? 'RUNNING' : 'MISSING' };
@@ -208,7 +255,7 @@ function serviceRun({ registered = false, registerResult = null, qc = 'START_TYP
       state.sc = 'RUNNING';
       return { success: true, stdout: '', stderr: '' };
     }
-    if (/icacls /.test(cmd)) return { success: true, stdout: 'Successfully processed 1 files' };
+    if (/icacls /.test(cmd)) return aclReadback(cmd);
     if (/ (stop|uninstall|start|restart)$/.test(cmd)) return { success: true, stdout: '', stderr: '' };
 
     return { success: false, stdout: '', stderr: `serviceRun: no rule for: ${cmd}`, unmatched: true };
@@ -321,6 +368,8 @@ async function testSystemdUnit() {
 
   const refreshPath = path.join(scratch('systemd-refresh'), 'easy-devops.service');
   fs.writeFileSync(refreshPath, `[Unit]
+# These belong in [Unit], not [Service]
+Environment=WS_NO_BUFFER_UTIL=1: systemd moved them in v229 and still
 Description=Easy DevOps background service
 
 [Service]
@@ -353,6 +402,9 @@ WantedBy=multi-user.target
   check('repair adds every daemon environment protection to an older unit',
     ['NODE_OPTIONS=', 'NODE_PATH=', 'WS_NO_BUFFER_UTIL=1', 'WS_NO_UTF_8_VALIDATE=1']
       .every((setting) => refreshedUnit.split('\n').includes(`Environment=${setting}`)), refreshedUnit);
+  check('repair keeps environment assignments inside the service section',
+    !refreshedUnit.split('\n[Service]')[0].includes('\nEnvironment=')
+    && !refreshedUnit.includes('=1: systemd'));
   check('repair stages the rewritten unit with direct sudo argv',
     refreshCommands[0]?.[0] === 'sudo' && refreshCommands[0]?.[1] === 'install'
       && refreshCommands[0]?.at(-1) === refreshPath
@@ -1971,10 +2023,12 @@ async function testStopStart() {
 // ─── 22. Status distinguishes "stopped by you" ──────────────────────────────
 
 async function testStoppedByYou() {
-  setGroup('22. status tells a deliberate stop from a crash');
+  setGroup('22. status reports only a live deliberate stop');
 
   const svc = await import(srcUrl('core/service/index.js'));
   const { dbGet, dbSet } = await import(srcUrl('core/db.js'));
+  const lock = await import(srcUrl('core/daemon/lock.js'));
+  const { getDataDir } = await import(srcUrl('core/platform.js'));
 
   const base = {
     systemd: {
@@ -1989,25 +2043,115 @@ async function testStoppedByYou() {
       status: () => ({ installed: true, warnings: [], crashLooping: false, restarts: 0 }),
       readLogs: () => ({ ok: true, file: 'f', output: '' }),
     },
+    inspectRuntime: () => ({ node: null, warnings: [] }),
+    detectLegacy: async () => ({ items: [] }),
     legacy: { run: async () => ({ success: false, stdout: '', stderr: '' }), startupDir: null },
   };
 
   const saved = dbGet('service-state') ?? {};
 
+  const runningBase = {
+    ...base,
+    systemd: {
+      ...base.systemd,
+      status: async () => ({ installed: true, running: true, crashLooping: false, restarts: 0, state: 'active' }),
+    },
+    windowsService: {
+      ...base.windowsService,
+      status: async () => ({ installed: true, running: true, state: 'running', crashLooping: false, restarts: 0, acl: { ok: true } }),
+    },
+    windowsPersonal: {
+      ...base.windowsPersonal,
+      status: () => ({ installed: true, running: true, warnings: [], crashLooping: false, restarts: 0 }),
+    },
+  };
+  const noRequest = () => ({ requested: false, at: null, reason: null });
+
   try {
     // Not stopped by anyone: a service that is down is down.
     dbSet('service-state', { ...saved, stoppedAt: null });
-    const crashed = await svc.status({ deps: { ...base, isStopRequested: () => false } });
+    const crashed = await svc.status({ deps: { ...base, readStopRequest: noRequest } });
     check('without a recorded stop, it is not "stopped by you"', crashed.stoppedByUser === false);
     check('and the warning offers to start it',
       crashed.warnings.some((w) => /ezz service start/.test(w)), crashed.warnings.join(' | '));
 
-    // Stopped deliberately.
+    // The incident fixture: an old database record survived an external start.
+    // The service manager says RUNNING, so status must not trust that record.
     const at = new Date().toISOString();
     dbSet('service-state', { ...saved, stoppedAt: at });
-    const stopped = await svc.status({ deps: { ...base, isStopRequested: () => false } });
-    check('with a recorded stop, it IS "stopped by you"', stopped.stoppedByUser === true);
-    check('the timestamp is reported', stopped.stoppedAt === at);
+    const externallyStarted = await svc.status({ deps: { ...runningBase, readStopRequest: noRequest } });
+    check('a historical stoppedAt record does not override a running service',
+      externallyStarted.stoppedByUser === false);
+    check('the stale timestamp is not published', externallyStarted.stoppedAt === null);
+    check('and status clears the compatibility record', dbGet('service-state')?.stoppedAt === null);
+    check('the running service is not described as stopped',
+      !externallyStarted.warnings.some((w) => /background service is stopped/i.test(w)),
+      externallyStarted.warnings.join(' | '));
+
+    // A request written after the current daemon started is in flight. A status
+    // read must not delete it, or a dashboard refresh can cancel the stop.
+    const dataDir = getDataDir();
+    const held = lock.acquire({ dataDir, mode: 'daemon', version: 'status-test' });
+    check('the stop-state test can take the daemon lock', held.ok === true, held.reason ?? '');
+    let inFlightClears = 0;
+    const inFlight = await svc.status({
+      deps: {
+        ...base,
+        readStopRequest: () => ({
+          requested: true,
+          at: new Date(Number(held.lock?.startedAt) + 1).toISOString(),
+          reason: 'ezz service stop',
+        }),
+        clearStopRequest: () => { inFlightClears += 1; return true; },
+      },
+    });
+    lock.release({ dataDir });
+    check('status does not clear an in-flight stop request',
+      inFlight.stoppedByUser === false && inFlightClears === 0, String(inFlightClears));
+
+    // A request older than the current daemon is stale, but status does not
+    // delete it: the daemon clears it at startup. Status only refuses to
+    // describe a running daemon as stopped by the user.
+    const restarted = lock.acquire({ dataDir, mode: 'daemon', version: 'status-test' });
+    check('the stop-state test can take a replacement daemon lock',
+      restarted.ok === true, restarted.reason ?? '');
+    let staleClears = 0;
+    const afterExternalStart = await svc.status({
+      deps: {
+        ...base,
+        readStopRequest: () => ({
+          requested: true,
+          at: new Date(Number(restarted.lock?.startedAt) - 1).toISOString(),
+          reason: 'ezz service stop',
+        }),
+        clearStopRequest: () => { staleClears += 1; return true; },
+      },
+    });
+    lock.release({ dataDir });
+    // A status read is read-only. The daemon clears the request at startup
+    // (core/daemon/run.js); status must leave the file alone and must not
+    // describe a fresh, running daemon as stopped by the user.
+    check('status leaves a stop request in place and does not report "stopped by you"',
+      afterExternalStart.stoppedByUser === false && staleClears === 0,
+      `${afterExternalStart.stoppedByUser} ${staleClears}`);
+
+    // A database timestamp is not a live request. Even while the manager says
+    // the service is down, status must not invent a deliberate stop from it.
+    dbSet('service-state', { ...saved, stoppedAt: at });
+    const staleWhileDown = await svc.status({ deps: { ...base, readStopRequest: noRequest } });
+    check('a stale recorded stop is ignored while the service is down',
+      staleWhileDown.stoppedByUser === false && staleWhileDown.stoppedAt === null);
+
+    // Personal mode's file request carries its own timestamp and remains the
+    // live source even if the service manager cannot be probed.
+    const stopped = await svc.status({
+      deps: {
+        ...base,
+        readStopRequest: () => ({ requested: true, at, reason: 'ezz service stop' }),
+      },
+    });
+    check('a live stop request IS "stopped by you"', stopped.stoppedByUser === true);
+    check('the live request timestamp is reported', stopped.stoppedAt === at);
     check('the daemon detail says so, not that it crashed',
       /stopped by you/.test(stopped.daemon.detail), stopped.daemon.detail);
     check('the warning says the stop is temporary',
@@ -2017,14 +2161,207 @@ async function testStoppedByYou() {
     check('it does NOT say the service crashed',
       !stopped.warnings.some((w) => /crash loop/i.test(w)));
 
-    // A pending stop request alone is enough, even with no DB record.
-    dbSet('service-state', { ...saved, stoppedAt: null });
-    const byFile = await svc.status({ deps: { ...base, isStopRequested: () => true } });
-    check('a pending stop request alone counts as stopped by you',
-      byFile.stoppedByUser === true);
+    // A removal failure cannot be treated as a successful start: the daemon
+    // would immediately consume the request that is still on disk.
+    let clearFailure;
+    try {
+      await svc.start({
+        deps: {
+          ...base,
+          clearStopRequest: () => false,
+        },
+      });
+    } catch (error) {
+      clearFailure = error;
+    }
+    check('start fails closed when the stop request cannot be cleared',
+      clearFailure?.code === 'EZ_STOP_REQUEST_CLEAR'
+        && /could not clear the stop request/.test(clearFailure.message),
+      clearFailure?.message ?? 'start returned successfully');
+
+    // Server/Linux restarts spawn the replacement daemon inside the manager
+    // call, so the old marker must already be gone when that call begins.
+    dbSet('service-state', { ...saved, mode: 'server' });
+    const restartOrder = [];
+    const restartWithoutLock = async () => {
+      restartOrder.push('manager-restart');
+      return { ok: true };
+    };
+    await svc.restart({
+      deps: {
+        ...base,
+        clearStopRequest: () => { restartOrder.push('clear-stop'); return true; },
+        systemd: { ...base.systemd, restart: restartWithoutLock },
+        windowsService: { ...base.windowsService, restart: restartWithoutLock },
+        startupGraceMs: 20,
+      },
+    });
+    check('restart clears the stop request before the manager can start the replacement daemon',
+      restartOrder[0] === 'clear-stop' && restartOrder.includes('manager-restart'),
+      restartOrder.join(' -> '));
+
+    // Repair is a start path even when the underlying repair then fails.
+    let clears = 0;
+    const failedRepair = async () => ({ ok: false, reason: 'test-only failure' });
+    await svc.repair({
+      deps: {
+        systemd: { repair: failedRepair },
+        windowsService: { repair: failedRepair },
+        windowsPersonal: { repair: () => ({ ok: false, reason: 'test-only failure' }) },
+        resolveOperator: async () => null,
+        clearStopRequest: () => { clears += 1; return true; },
+      },
+    });
+    check('repair clears a superseded stop request before starting', clears === 1, String(clears));
   } finally {
     dbSet('service-state', saved);
   }
+}
+
+// ─── 22b. Database diagnostics before core/db.js opens ──────────────────────
+
+function runCaptured(file, args, env) {
+  return new Promise((resolve) => {
+    const child = spawn(file, args, {
+      cwd: ROOT,
+      env,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', (error) => resolve({ code: null, stdout, stderr: `${stderr}${error.stack ?? error}` }));
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+async function testDatabaseStatusPreflight() {
+  setGroup('22b. service status diagnoses a database that cannot initialize');
+
+  const preflight = await import(srcUrl('cli/serviceStatusPreflight.js'));
+  const Database = require('better-sqlite3');
+
+  const healthyDir = scratch('status-db-healthy');
+  const healthyFile = path.join(healthyDir, preflight.DATABASE_FILE);
+  const healthyDb = new Database(healthyFile);
+  healthyDb.exec('CREATE TABLE health (value TEXT); INSERT INTO health VALUES (\'ok\');');
+  healthyDb.close();
+  const healthy = preflight.inspectServiceStatusDatabase({ dataDir: healthyDir });
+  check('the preflight loads the package native SQLite binding', healthy.package.ok === true,
+    JSON.stringify(healthy.package));
+  check('an existing database opens read-only and answers a query',
+    healthy.ok === true && healthy.readOnly.ok === true, JSON.stringify(healthy.readOnly));
+
+  const emptyDir = scratch('status-db-empty');
+  const missing = preflight.inspectServiceStatusDatabase({ dataDir: emptyDir });
+  check('a database that does not exist yet is left for normal initialization',
+    missing.ok === true && missing.readOnly.skipped === true && missing.file.exists === false);
+
+  const zeroDir = scratch('status-db-zero');
+  fs.writeFileSync(path.join(zeroDir, preflight.DATABASE_FILE), '');
+  const zero = preflight.inspectServiceStatusDatabase({ dataDir: zeroDir });
+  check('a zero-byte database is left for normal initialization',
+    zero.ok === true && zero.readOnly.skipped === true && zero.file.size === 0);
+
+  let deniedDatabaseOpened = false;
+  const denied = preflight.inspectServiceStatusDatabase({
+    dataDir: healthyDir,
+    requireImpl: () => class {
+      constructor() {
+        deniedDatabaseOpened = true;
+        throw new Error('must not be reached');
+      }
+    },
+    fsImpl: {
+      ...fs,
+      lstatSync(file, options) {
+        if (file === healthyFile) {
+          const error = new Error('operation not permitted');
+          error.code = 'EPERM';
+          throw error;
+        }
+        return fs.lstatSync(file, options);
+      },
+    },
+  });
+  check('an EPERM while inspecting the database fails closed without opening it',
+    denied.ok === false && denied.file.error?.code === 'EPERM' && deniedDatabaseOpened === false,
+    JSON.stringify(denied));
+
+  const brokenDir = scratch('status-db-broken');
+  const brokenFile = path.join(brokenDir, preflight.DATABASE_FILE);
+  const brokenBytes = Buffer.from('this is not a SQLite database');
+  fs.writeFileSync(brokenFile, brokenBytes);
+  fs.writeFileSync(`${brokenFile}-wal`, 'wal marker');
+  fs.writeFileSync(`${brokenFile}-shm`, 'shm marker');
+
+  const broken = preflight.inspectServiceStatusDatabase({ dataDir: brokenDir });
+  check('a malformed database fails at the read-only open/query',
+    broken.ok === false && broken.package.ok === true && broken.readOnly.checked === true,
+    JSON.stringify(broken));
+  check('the real SQLite code and message are retained',
+    ['SQLITE_NOTADB', 'SQLITE_CORRUPT'].includes(broken.readOnly.error?.code)
+      && /not a database|malformed/i.test(broken.readOnly.error?.message ?? ''),
+    JSON.stringify(broken.readOnly.error));
+  check('the diagnostic lists the existing WAL and SHM sidecars',
+    broken.sidecars.filter((item) => item.exists).some((item) => item.file.endsWith('-wal'))
+      && broken.sidecars.filter((item) => item.exists).some((item) => item.file.endsWith('-shm')));
+  const rendered = preflight.formatDatabasePreflightFailure(broken);
+  check('the failure text includes the cause, sidecars and a no-data-change warning',
+    /database check/i.test(rendered)
+      && /SQLITE_(?:NOTADB|CORRUPT)|not a database|malformed/i.test(rendered)
+      && /SQLite sidecar/.test(rendered)
+      && /nothing was written, created or deleted/i.test(rendered),
+    rendered);
+
+  const nativeFailure = preflight.inspectServiceStatusDatabase({
+    dataDir: healthyDir,
+    requireImpl: () => {
+      const error = new Error('Cannot find module better-sqlite3');
+      error.code = 'MODULE_NOT_FOUND';
+      throw error;
+    },
+  });
+  check('a missing native package is diagnosed before touching the database',
+    nativeFailure.ok === false && /load better-sqlite3/.test(nativeFailure.step ?? '')
+      && nativeFailure.package.detail.code === 'MODULE_NOT_FOUND', nativeFailure.step);
+
+  const locked = preflight.inspectServiceStatusDatabase({
+    dataDir: healthyDir,
+    requireImpl: () => class {
+      constructor() {
+        const error = new Error('database is locked');
+        error.code = 'SQLITE_BUSY';
+        throw error;
+      }
+    },
+  });
+  check('SQLITE_BUSY is identified as another process holding the database',
+    locked.ok === false && locked.locked === true
+      && /Another process is holding the database/i.test(preflight.formatDatabasePreflightFailure(locked)),
+    preflight.formatDatabasePreflightFailure(locked));
+
+  const cli = await runCaptured(
+    process.execPath,
+    [path.join(ROOT, 'src', 'cli', 'index.js'), 'service', 'status'],
+    {
+      ...process.env,
+      EZ_TEST: '1',
+      EASY_DEVOPS_DATA_DIR: brokenDir,
+    },
+  );
+  const output = `${cli.stdout}${cli.stderr}`;
+  check('service status runs the preflight instead of exiting inside core/db.js',
+    cli.code === 1
+      && /database check/i.test(output)
+      && /SQLITE_(?:NOTADB|CORRUPT)|not a database|malformed/i.test(output),
+    `exit ${cli.code}: ${output}`);
+  check('the status command stops before probing a real service manager',
+    !/Mechanism|Checking the service/.test(output), output);
+  check('the read-only diagnostic leaves the broken database byte-for-byte intact',
+    fs.readFileSync(brokenFile).equals(brokenBytes));
 }
 
 // ─── 23. A status read never starts the user's PM2 daemon ───────────────────
@@ -3130,7 +3467,7 @@ async function testWindowsUninstallAclTimeout() {
       keepOperatorDataAccess: true,
       run,
       log: () => {},
-      stageTimeoutMs: 30,
+      stageTimeoutMs: 400,
     });
     const routedRunFile = stubbed.runFile;
     stubbed.runFile = (file, args, options) => {
@@ -3521,13 +3858,21 @@ async function testStatusAgainstWindows() {
         if (args[0] === 'qc') {
           return { success: true, stdout: 'START_TYPE : 2 AUTO_START' };
         }
+        if (/icacls\.exe$/i.test(file)) {
+          return {
+            success: true,
+            stdout: `${args[0]} NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\r\n`
+              + '    BUILTIN\\Administrators:(OI)(CI)(F)\r\n'
+              + '    NT SERVICE\\EasyDevOps:(OI)(CI)(RX)',
+          };
+        }
         return { success: false, stdout: '', stderr: `unmatched ${args.join(' ')}` };
       },
       granted: [],
     });
     check('production status calls Service Control Manager through direct sc.exe argv',
       directStatus.running === true
-        && directCalls.every((entry) => /sc\.exe$/i.test(entry.file))
+        && directCalls.every((entry) => /sc\.exe$/i.test(entry.file) || /icacls\.exe$/i.test(entry.file))
         && directCalls.some((entry) => JSON.stringify(entry.args) === JSON.stringify(['query', 'EasyDevOps']))
         && directCalls.some((entry) => JSON.stringify(entry.args) === JSON.stringify(['qc', 'EasyDevOps'])),
       JSON.stringify(directCalls));
@@ -3845,7 +4190,7 @@ async function testRepairWhileRunning() {
         return { success: true };
       }
       if (/^sc\.exe delete /.test(cmd)) { state.sc = 'MISSING'; return { success: true }; }
-      if (/icacls /.test(cmd)) return { success: true };
+      if (/icacls /.test(cmd)) return aclReadback(cmd);
       return { success: false, stdout: '', stderr: `unmatched: ${cmd}` };
     };
     run.state = state;
@@ -4211,6 +4556,7 @@ async function main() {
   await testVersionProbe();
   await testStopStart();
   await testStoppedByYou();
+  await testDatabaseStatusPreflight();
   await testStatusNeverStartsPm2();
   await testServiceEndpoints();
   await testServiceFileNames();

@@ -31,6 +31,25 @@
  * anything else, and a clone is told to `git pull` instead — which this tool
  * deliberately does not run on the user's behalf: a pull can conflict, and the
  * working tree may hold work in progress. See core/installSource.js.
+ *
+ * ── The order, and why each step is where it is ────────────────────────────
+ *
+ *   1. read the service state (mode, mechanism) — before anything is touched;
+ *   2. stop, then capture the unit/XML, launchers and Windows runtime copy in
+ *      a journaled transaction (core/service/updateTransaction.js);
+ *   3. npm install -g the target;
+ *   4. run the NEW package's `_post-update` in a fresh process: unit/XML,
+ *      runtime copy, protections and stubs, by the code being installed. A
+ *      target that predates that command falls back to this version's repair;
+ *   5. start, and require the daemon's own heartbeat to report the target
+ *      version — a matching package on disk is not proof;
+ *   6. on any failure: restore the package, unit/XML and runtime together,
+ *      start again, and require the OLD heartbeat.
+ *
+ * Every failure returns through one place, with the step, the error, and the
+ * exact command to run next. Nothing here may end silently with the service
+ * stopped: that is the bug this flow exists to fix (1.4.4-1.4.6 stopped after
+ * "node.exe is already the runtime copy ...; kept" and printed nothing).
  */
 
 import fs from 'fs';
@@ -43,10 +62,13 @@ import { closeDb, initDb } from './db.js';
 import { detectInstallSource, describeUnmanaged } from './installSource.js';
 import { inspect as inspectLock } from './daemon/lock.js';
 import { loadConfig } from './config.js';
-import { copyRuntime, runtimeDir } from './service/runtime.js';
 import { MODES } from './service/index.js';
-import { protectServiceFiles } from './service/operator.js';
-import { isElevated, refreshServiceDefinition } from './service/windowsService.js';
+import { isElevated } from './service/windowsService.js';
+import {
+  captureUpdateState,
+  commitUpdateState,
+  restoreUpdateState,
+} from './service/updateTransaction.js';
 
 const require = createRequire(import.meta.url);
 
@@ -55,6 +77,68 @@ export const PACKAGE = 'easy-devops';
 
 /** How long to wait for the daemon to report in after the restart. */
 export const VERIFY_MS = 10_000;
+
+/** Structured result emitted by the newly installed `_post-update` command. */
+export const POST_UPDATE_RESULT_PREFIX = '__EASY_DEVOPS_POST_UPDATE__';
+
+/**
+ * The first release whose package carries the `_post-update` command.
+ *
+ * An update can be asked to install an OLDER version — a deliberate downgrade,
+ * or a target published before the hand-off existed. Such a package has no
+ * post-update step to run, so the updater falls back to its own repair logic
+ * rather than launching that package's interactive menu by accident.
+ */
+export const POST_UPDATE_SINCE = '1.4.7';
+
+/** The command that shows this machine's service state, by mechanism. */
+export function serviceCheckCommand(mechanism) {
+  if (mechanism === 'systemd') return 'sudo systemctl status easy-devops';
+  if (mechanism === 'winsw') return 'sc.exe query EasyDevOps';
+  return 'ezz service status';
+}
+
+/**
+ * The lines a failed update ends with: the step, the error, the state of the
+ * service, and the exact command to run next.
+ */
+function failureLines({ step, reason, mechanism, untouched, attemptedStop, restored, reinstallFailed }) {
+  const lines = [`Failed at: ${step}`];
+  for (const line of String(reason ?? '').split('\n')) lines.push(line);
+  const check = serviceCheckCommand(mechanism);
+  if (untouched) {
+    lines.push('Nothing was changed.');
+    if (attemptedStop) {
+      // The package is untouched, but a stop that failed may still have
+      // stopped the service. Say which it is rather than assuming.
+      lines.push(restored === true
+        ? 'The service is running again.'
+        : 'The service is NOT confirmed running.');
+      if (restored !== true) {
+        lines.push('To start it: ezz service start');
+        lines.push('To repair it: ezz service recover');
+      }
+    } else {
+      lines.push('The service was left as it was.');
+    }
+    lines.push(`To check it: ${check}`);
+  } else if (reinstallFailed === true) {
+    lines.push(restored
+      ? 'The service is running again, but the previous package could not be reinstalled, so the files on disk'
+        + ' and the running service are not the same version.'
+      : 'The previous package could not be reinstalled and the service is NOT confirmed running.');
+    lines.push(`To check it: ${check}`);
+    lines.push('To repair it: ezz service recover');
+  } else if (restored === true) {
+    lines.push('The service is running the previous version again.');
+    lines.push(`To check it: ${check}`);
+  } else {
+    lines.push('The background service is NOT confirmed running.');
+    lines.push(`To check it: ${check}`);
+    lines.push('To repair it: ezz service recover');
+  }
+  return lines;
+}
 
 /** This package's version, read fresh so a post-update read is accurate. */
 export function currentVersion() {
@@ -81,15 +165,51 @@ function runNpm(args, options, exec = runFile) {
   return { success: false, stderr: 'Could not locate npm-cli.js. Install npm alongside Node and retry.' };
 }
 
-/** -1 / 0 / 1 by semver-ish triple. */
+function parseVersion(value) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(String(value ?? '').trim());
+  if (!match) return null;
+  return {
+    core: [Number(match[1]), Number(match[2]), Number(match[3])],
+    prerelease: match[4] ? match[4].split('.') : null,
+  };
+}
+
+/** -1 / 0 / 1 by SemVer precedence, including prereleases. */
 export function compareVersions(a, b) {
-  const parse = (v) => String(v ?? '').replace(/^v/, '').split('.').map((n) => Number(n) || 0);
-  const pa = parse(a);
-  const pb = parse(b);
+  const pa = parseVersion(a);
+  const pb = parseVersion(b);
+  if (!pa || !pb) return 0;
   for (let i = 0; i < 3; i += 1) {
-    if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) > (pb[i] ?? 0) ? 1 : -1;
+    if (pa.core[i] !== pb.core[i]) return pa.core[i] > pb.core[i] ? 1 : -1;
+  }
+  if (!pa.prerelease && !pb.prerelease) return 0;
+  if (!pa.prerelease) return 1;
+  if (!pb.prerelease) return -1;
+
+  for (let i = 0; i < Math.max(pa.prerelease.length, pb.prerelease.length); i += 1) {
+    const left = pa.prerelease[i];
+    const right = pb.prerelease[i];
+    if (left === undefined) return -1;
+    if (right === undefined) return 1;
+    if (left === right) continue;
+    const leftNumeric = /^\d+$/.test(left);
+    const rightNumeric = /^\d+$/.test(right);
+    if (leftNumeric && rightNumeric) {
+      const difference = Number(left) - Number(right);
+      if (difference !== 0) return difference > 0 ? 1 : -1;
+      continue;
+    }
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return left > right ? 1 : -1;
   }
   return 0;
+}
+
+/** Exact release identity, allowing only the conventional leading `v`. */
+export function sameVersion(a, b) {
+  if (a === null || a === undefined || b === null || b === undefined) return false;
+  const normalized = (value) => String(value).trim().replace(/^v/, '');
+  return normalized(a) === normalized(b);
 }
 
 /**
@@ -138,34 +258,92 @@ export async function performUpdate({
   const service = deps.service ?? (await import('./service/index.js'));
   const source = (deps.detectInstallSource ?? detectInstallSource)();
   const from = deps.currentVersion ? deps.currentVersion() : currentVersion();
+  const exec = deps.runFile ?? runFile;
+
+  let installed = null;
+  let mechanism = null;
+  let recorded = {};
+
+  /**
+   * Every failure leaves through here, so none of them can be silent: the
+   * result carries the step, the error, the state of the service, and the
+   * exact command that checks or repairs it on this machine.
+   */
+  const fail = (fields) => {
+    const untouched = fields.untouched === true;
+    const alive = fields.restored === true;
+    const confirmed = alive && fields.rollbackVersionConfirmed !== false;
+    let next = fields.next;
+    if (!next) {
+      if (untouched) {
+        next = fields.attemptedStop && fields.restored !== true && fields.rollbackVersionConfirmed !== true
+          ? 'ezz service start'
+          : serviceCheckCommand(mechanism);
+      } else if (fields.reinstallFailed === true) next = `npm install -g ${PACKAGE}@${from}`;
+      else if (confirmed) next = serviceCheckCommand(mechanism);
+      else next = 'ezz service recover';
+    }
+    return {
+      ok: false,
+      from,
+      to: version,
+      ...fields,
+      // The advice is in `reason` too, not only in `next`: every caller that
+      // exists today prints the reason, and a failure nobody can act on is the
+      // bug this path was rewritten for.
+      reason: fields.reason ? `${fields.reason}\nNext: ${next}` : `Next: ${next}`,
+      next,
+      lines: fields.lines ?? failureLines({
+        step: fields.step,
+        reason: fields.reason,
+        mechanism,
+        untouched,
+        attemptedStop: fields.attemptedStop === true,
+        restored: confirmed,
+        reinstallFailed: fields.reinstallFailed === true,
+      }),
+    };
+  };
 
   if (!isUpdateVersion(version) || !isUpdateVersion(from)) {
-    return { ok: false, step: 'version', reason: 'Use a valid release or prerelease version.', untouched: true };
+    return fail({
+      step: 'version',
+      reason: 'Use a valid release or prerelease version.',
+      untouched: true,
+    });
   }
-  const exec = deps.runFile ?? runFile;
 
   // 1. Can npm update THIS copy at all?
   if (!source.npmUpdatable) {
-    return {
-      ok: false,
+    return fail({
       step: 'source',
       source,
-      from,
       // Not an error the caller has to phrase: the module that knows why also
       // knows what to run instead.
       lines: describeUnmanaged(source, 'update'),
+      next: source.howToUpdate?.[0] ?? 'npm install -g easy-devops',
       reason: `this copy is ${source.reason}, which npm does not update in place`,
       untouched: true,
-    };
+    });
   }
 
   // 2. What is installed, decided BEFORE the files are replaced.
-  let installed = null;
   try {
     installed = await service.status();
-  } catch { /* unreadable: treated as "no service" below */ }
+  } catch (error) {
+    return fail({
+      step: 'status',
+      reason: `the current service state could not be read, so nothing was changed: ${error.message}`,
+      untouched: true,
+    });
+  }
   const serviceInstalled = Boolean(installed?.service?.installed);
   const serverMode = installed?.mode === MODES.SERVER;
+  // A Server-mode service is always WinSW, so the check command is exact even
+  // for an older status shape that does not report the mechanism.
+  mechanism = installed?.mechanism ?? (serverMode ? 'winsw' : null);
+  try { recorded = service.recordedState?.() ?? {}; } catch { /* optional metadata */ }
+
 
   // 2b. Windows Server mode: the service runs from a copy under ProgramData
   // that only administrators may replace, and that is deliberate (replacing
@@ -174,16 +352,15 @@ export async function performUpdate({
   if (isWindows && serverMode) {
     const elevated = await (deps.isElevated ?? isElevated)({});
     if (elevated === false) {
-      return {
-        ok: false,
+      return fail({
         step: 'elevation',
-        from,
         needsElevation: true,
         untouched: true,
         command: 'ezz update',
+        next: 'ezz update',
         reason: 'Updating a Windows Server-mode install replaces the runtime copy the service runs, which only '
           + 'administrators can change. Run `ezz update` from PowerShell opened with "Run as administrator".',
-      };
+      });
     }
   }
 
@@ -191,19 +368,70 @@ export async function performUpdate({
   // on Windows an open handle makes the install fail rather than wait.
   if (serviceInstalled) {
     log('Stopping the background service...');
-    const stopped = await service.stop({ log });
+    let stopped;
+    try {
+      stopped = await service.stop({ log });
+    } catch (error) {
+      stopped = { ok: false, reason: error.message };
+    }
     if (!stopped.ok && !stopped.alreadyStopped) {
-      return {
-        ok: false,
-        step: 'stop',
+      // A stop that fails may still have stopped it. Put it back either way,
+      // so a failed update never leaves the service down.
+      const back = await restoreStoppedService({
+        service,
+        dataDir,
+        verifyMs: deps.verifyMs,
+        inspectLockFn: deps.inspectLock,
         from,
-        reason: stopped.reason,
+        log,
+      });
+      return fail({
+        step: 'stop',
+        reason: [stopped.reason, back.reason].filter(Boolean).join(' '),
         needsElevation: stopped.needsElevation ?? false,
         untouched: true,
-      };
+        attemptedStop: true,
+        restarted: back.started,
+        restored: back.started,
+        rollbackVersionConfirmed: back.versionConfirmed,
+      });
     }
   } else {
     log('No background service is installed; updating the package only.');
+  }
+
+  // The package is npm-owned and can be reinstalled. The unit/XML and Windows
+  // runtime copy are not. Put a restorable copy aside after the service has
+  // stopped, before npm or the new post-update command can change them.
+  let transaction = { ok: true, root: null };
+  if (serviceInstalled) {
+    try {
+      transaction = await (deps.captureUpdateState ?? captureUpdateState)({
+        dataDir,
+        mode: installed?.mode ?? null,
+        mechanism,
+      });
+    } catch (error) {
+      transaction = { ok: false, reason: error.message };
+    }
+    if (!transaction.ok) {
+      const back = await restoreStoppedService({
+        service,
+        dataDir,
+        verifyMs: deps.verifyMs,
+        inspectLockFn: deps.inspectLock,
+        restoreUpdateStateFn: deps.restoreUpdateState,
+        from,
+        log,
+      });
+      return fail({
+        step: 'snapshot',
+        reason: `the current service files could not be preserved, so nothing was replaced: ${transaction.reason}`,
+        restarted: back.started,
+        restored: back.ok,
+        rollbackReason: back.reason,
+      });
+    }
   }
 
   // 4. Replace the package. The SQLite handle is closed first: on Windows an
@@ -211,129 +439,484 @@ export async function performUpdate({
   closeDb();
 
   log(`Installing ${PACKAGE}@${version}...`);
-  const install = await runNpm(['install', '-g', `${PACKAGE}@${version}`], { timeout: 600_000 }, exec);
-
-  initDb();
-
-  if (!install.success) {
-    const restarted = serviceInstalled ? await service.start({ log }) : { ok: true };
-    return {
-      ok: false,
-      step: 'install',
-      from,
-      reason: `npm install -g ${PACKAGE}@${version} failed:\n${trim(install)}`,
-      restarted: restarted.ok,
-    };
+  let install;
+  try {
+    install = await runNpm(['install', '-g', `${PACKAGE}@${version}`], { timeout: 600_000 }, exec);
+  } catch (error) {
+    install = { success: false, stdout: '', stderr: error.message };
   }
 
-  // 5. Windows Server mode runs from a COPY under ProgramData, so replacing
-  // the package has not changed what the service executes. Refresh it, or the
-  // update silently does nothing to the running service.
-  let copied = null;
-  if (isWindows && serverMode) {
-    log('Refreshing the service runtime copy...');
-    copied = (deps.copyRuntime ?? copyRuntime)({
+  let dbError = null;
+  try { initDb(); } catch (error) { dbError = error; }
+
+  if (!install.success || dbError) {
+    const back = await rollback({
+      version: from,
+      service,
+      exec,
+      serviceInstalled,
+      transaction,
       dataDir,
-      appRoot: source.root,
-      nodeExe: path.join(runtimeDir(dataDir), 'node.exe'),
-      log: (line) => log(`  ${line}`),
+      verifyMs: deps.verifyMs,
+      inspectLockFn: deps.inspectLock,
+      restoreUpdateStateFn: deps.restoreUpdateState,
+      log,
     });
-    if (copied.ok) {
-      const secured = await (deps.protectServiceFiles ?? protectServiceFiles)({ dirs: [copied.dir], log });
-      if (!secured.ok) return { ok: false, step: 'permissions', from, restored: false, reason: 'Runtime permissions could not be secured. Run ezz service repair as administrator before starting.' };
-    }
-    if (copied.ok && serviceInstalled) {
-      try { (deps.refreshServiceDefinition ?? refreshServiceDefinition)({ dataDir, runtime: copied }); }
-      catch (error) { copied = { ok: false, reason: error.message }; }
-    }
-    if (!copied.ok) {
-      const rolled = await rollback({ version: from, service, exec, serviceInstalled, log });
-      return {
-        ok: false,
-        step: 'copy',
-        from,
-        reason: `the package was updated but the service copy could not be refreshed: ${copied.reason}`,
-        rolledBack: rolled.ok,
-        restored: rolled.started,
-      };
-    }
+    return fail({
+      step: 'install',
+      serviceInstalled,
+      reason: [
+        dbError
+          ? `the package was installed but its database could not be reopened: ${dbError.message}`
+          : `npm install -g ${PACKAGE}@${version} failed:\n${trim(install)}`,
+        back.reason,
+      ].filter(Boolean).join(' '),
+      rolledBack: back.ok,
+      reinstallFailed: back.reinstallFailed === true,
+      restarted: back.started,
+      restored: back.started,
+      rollbackVersionConfirmed: back.versionConfirmed,
+      rollbackReason: back.reason,
+    });
   }
 
-  if (serviceInstalled && !(isWindows && serverMode) && service.refreshUserService) {
-    let refreshed;
-    try { refreshed = await service.refreshUserService({ dataDir, log }); }
-    catch (error) { refreshed = { ok: false, reason: error.message }; }
-    if (!refreshed.ok) {
-      const rolled = await rollback({ version: from, service, exec, serviceInstalled, log });
-      return { ok: false, step: 'service', from, reason: refreshed.reason, rolledBack: rolled.ok, restored: rolled.started };
-    }
-  }
-
-  // 6. Start, and wait for the daemon's own heartbeat.
+  // 5. No service means there is nothing for post-update to prepare.
   if (!serviceInstalled) {
     return { ok: true, from, to: version, serviceInstalled: false, source };
   }
 
-  log('Starting the service on the new version...');
-  const started = await service.start({ log });
-  const alive = started.ok
-    ? await service.waitForDaemon({ dataDir, timeoutMs: deps.verifyMs ?? VERIFY_MS })
-    : { alive: false, waitedMs: 0 };
+  // 6. The updater that is running is the OLD package. Start a fresh process
+  // from the NEW package so unit/XML/runtime repair is executed by the code it
+  // is preparing, before any service start.
+  let postUpdate;
+  try {
+    postUpdate = await (deps.runPostUpdate ?? runPostUpdateHandoff)({
+      sourceRoot: source.root,
+      version,
+      dataDir,
+      mode: installed?.mode ?? null,
+      mechanism,
+      nodeExe: transaction.runtimeNodeExe || recorded.nodeExe || process.execPath,
+      runFile: exec,
+    });
+  } catch (error) {
+    postUpdate = { ok: false, step: 'post-update', reason: error.message };
+  }
 
-  if (started.ok && alive.alive) {
-    // The lock carries the version the running daemon reports, which is the
-    // only proof that the NEW code is what came up.
-    const running = (deps.inspectLock ?? inspectLock)({ dataDir }).lock?.version ?? null;
+  // The installed target may predate the post-update command — a deliberate
+  // downgrade, or any release before 1.4.7. Then this update's own repair
+  // logic prepares the service, which is what every release before the
+  // hand-off did.
+  if (postUpdate.ok && postUpdate.fallback) {
+    log(postUpdate.reason || 'The installed version has no post-update step; using this version\'s service repair.');
+    let repaired;
+    try {
+      const repair = deps.runRepair ?? (typeof service.repair === 'function'
+        ? (options) => service.repair(options)
+        : null);
+      if (!repair) throw new Error('this copy has no service repair step to fall back to');
+      repaired = await repair({ log });
+    } catch (error) {
+      repaired = { ok: false, reason: error.message };
+    }
+    if (!repaired?.ok) {
+      postUpdate = {
+        ok: false,
+        step: 'repair',
+        reason: `the installed version has no post-update step, and this version's service repair failed: `
+          + `${repaired?.reason ?? 'no result'}`,
+      };
+    }
+  }
+
+  if (!postUpdate.ok) {
+    const rolled = await rollback({
+      version: from,
+      service,
+      exec,
+      serviceInstalled,
+      transaction,
+      dataDir,
+      verifyMs: deps.verifyMs,
+      inspectLockFn: deps.inspectLock,
+      restoreUpdateStateFn: deps.restoreUpdateState,
+      log,
+    });
+    return fail({
+      step: postUpdate.step || 'post-update',
+      serviceInstalled,
+      reason: [
+        postUpdate.reason || 'the newly installed post-update step failed',
+        rolled.reason,
+      ].filter(Boolean).join(' '),
+      rolledBack: rolled.ok,
+      reinstallFailed: rolled.reinstallFailed === true,
+      restarted: rolled.started,
+      restored: rolled.started,
+      rollbackVersionConfirmed: rolled.versionConfirmed,
+      rollbackReason: rolled.reason,
+    });
+  }
+
+  // 7. Start, wait for the daemon's own heartbeat, and require the heartbeat
+  // to report the target version. A matching package on disk is not proof.
+  log('Starting the service on the new version...');
+  let started;
+  try {
+    started = await service.start({ log });
+  } catch (error) {
+    started = { ok: false, reason: error.message };
+  }
+  let alive;
+  try {
+    alive = started.ok
+      ? await service.waitForDaemon({ dataDir, timeoutMs: deps.verifyMs ?? VERIFY_MS })
+      : { alive: false, waitedMs: 0 };
+  } catch (error) {
+    alive = { alive: false, waitedMs: 0, reason: error.message };
+  }
+  let running = alive.alive ? (alive.lock?.version ?? null) : null;
+  if (alive.alive && !running) {
+    try {
+      running = (deps.inspectLock ?? inspectLock)({ dataDir }).lock?.version ?? null;
+    } catch { /* reported as an unverified heartbeat below */ }
+  }
+  const versionConfirmed = sameVersion(running, version);
+
+  if (started.ok && alive.alive && versionConfirmed) {
+    let committed;
+    try {
+      committed = await (deps.commitUpdateState ?? commitUpdateState)(transaction, { log });
+    } catch (error) {
+      committed = { warnings: [`could not remove the update snapshot: ${error.message}`] };
+      log(`warning: ${committed.warnings[0]}`);
+    }
     return {
       ok: true,
       from,
       to: version,
       serviceInstalled: true,
       runningVersion: running,
-      versionConfirmed: running ? compareVersions(running, version) === 0 : false,
+      versionConfirmed,
       waitedMs: alive.waitedMs,
-      refreshedCopy: Boolean(copied?.ok),
+      refreshedCopy: installed?.mode === MODES.SERVER || installed?.mechanism === 'winsw',
+      cleanupWarnings: committed.warnings ?? [],
       source,
     };
   }
 
-  // 7. It did not come up: put the old version back.
+  // 8. It did not come up as the target version: restore package, definitions
+  // and runtime together, then require the old heartbeat.
   const why = started.ok
-    ? `it started but the daemon did not report in within ${Math.round((deps.verifyMs ?? VERIFY_MS) / 1000)}s`
+    ? alive.alive
+      ? `the daemon reported v${running ?? 'an unknown version'}, not v${version}`
+      : `it started but the daemon did not report in within ${Math.round((deps.verifyMs ?? VERIFY_MS) / 1000)}s`
     : `the service could not be started: ${started.reason}`;
 
   log(`The new version did not come up (${why}). Rolling back to v${from}...`);
-  const rolled = await rollback({ version: from, service, exec, serviceInstalled, log });
+  const rolled = await rollback({
+    version: from,
+    service,
+    exec,
+    serviceInstalled,
+    transaction,
+    dataDir,
+    verifyMs: deps.verifyMs,
+    inspectLockFn: deps.inspectLock,
+    restoreUpdateStateFn: deps.restoreUpdateState,
+    log,
+  });
 
-  return {
-    ok: false,
+  return fail({
     step: 'verify',
-    from,
-    to: version,
-    reason: why,
+    serviceInstalled,
+    reason: [why, rolled.reason].filter(Boolean).join(' '),
     rolledBack: rolled.ok,
+    reinstallFailed: rolled.reinstallFailed === true,
+    restarted: rolled.started,
     restored: rolled.started,
+    rollbackVersionConfirmed: rolled.versionConfirmed,
     rollbackReason: rolled.reason,
+  });
+}
+
+/**
+ * Whether the installed package at `sourceRoot` can run the `_post-update`
+ * hand-off. A package that cannot is not a failure: it is an older target,
+ * and this updater prepares the service itself.
+ */
+export function postUpdateSupport(sourceRoot) {
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(sourceRoot, 'package.json'), 'utf8'));
+  } catch {
+    // No readable manifest — a synthetic or unusual layout. Keep the previous
+    // behaviour and let the hand-off's own exit code decide.
+    return { supported: true, assumed: true, version: null };
+  }
+  const found = String(manifest?.version ?? '');
+  if (!isUpdateVersion(found)) {
+    return { supported: true, assumed: true, version: found || null };
+  }
+  const release = found.replace(/-.*$/, '');
+  if (compareVersions(release, POST_UPDATE_SINCE) < 0) {
+    return {
+      supported: false,
+      version: found,
+      reason: `the installed v${found} has no post-update step (it arrived in v${POST_UPDATE_SINCE}); `
+        + 'using this version\'s service repair instead.',
+    };
+  }
+  if (!fs.existsSync(path.join(sourceRoot, 'src', 'cli', 'menus', 'postUpdate.js'))) {
+    return {
+      supported: false,
+      version: found,
+      reason: `the installed v${found} does not contain its post-update command; `
+        + 'using this version\'s service repair instead.',
+    };
+  }
+  return { supported: true, version: found };
+}
+
+/**
+ * Starts the newly installed package's post-update code in a new process.
+ * Direct argv avoids shell quoting. `stdin: inherit` keeps sudo's password
+ * prompt on the operator's terminal while stdout remains capturable.
+ */
+export async function runPostUpdateHandoff({
+  sourceRoot,
+  version,
+  dataDir,
+  mode,
+  mechanism,
+  nodeExe,
+  runFile: exec = runFile,
+}) {
+  const support = postUpdateSupport(sourceRoot);
+  if (!support.supported) {
+    return { ok: true, fallback: true, step: 'post-update-missing', reason: support.reason };
+  }
+
+  const entry = path.join(sourceRoot, 'src', 'cli', 'index.js');
+  const result = await exec(process.execPath, [entry, '_post-update'], {
+    cwd: sourceRoot,
+    timeout: 1_800_000,
+    stdin: 'inherit',
+    env: {
+      EASY_DEVOPS_DATA_DIR: dataDir,
+      EZ_UPDATE_TARGET: version,
+      EZ_UPDATE_MODE: mode ?? '',
+      EZ_UPDATE_MECHANISM: mechanism ?? '',
+      EZ_UPDATE_NODE_EXE: nodeExe ?? '',
+    },
+  });
+
+  const marker = String(result?.stdout ?? '').split(/\r?\n/)
+    .find((line) => line.startsWith(POST_UPDATE_RESULT_PREFIX));
+  let parsed = null;
+  if (marker) {
+    try {
+      parsed = JSON.parse(marker.slice(POST_UPDATE_RESULT_PREFIX.length));
+    } catch { /* reported below */ }
+  }
+  if (!result?.success || !parsed?.ok) {
+    return {
+      ok: false,
+      step: parsed?.step ?? 'post-update',
+      reason: parsed?.reason
+        || String(result?.stderr ?? '').trim()
+        || 'the newly installed post-update command exited without a result',
+    };
+  }
+  if (!sameVersion(parsed.version, version)) {
+    return {
+      ok: false,
+      step: 'post-update-version',
+      reason: parsed.version
+        ? `the post-update command ran v${parsed.version}, expected v${version}`
+        : `the post-update command did not report the version it loaded; expected v${version}`,
+    };
+  }
+  return parsed;
+}
+
+/** Starts the service and waits for its own heartbeat. Never throws. */
+async function startAndVerify({ service, dataDir, verifyMs, inspectLockFn, expectVersion, log }) {
+  let started;
+  try {
+    started = await service.start({ log });
+  } catch (error) {
+    started = { ok: false, reason: error.message };
+  }
+  let alive;
+  if (started?.ok) {
+    try {
+      alive = await service.waitForDaemon({ dataDir, timeoutMs: verifyMs ?? VERIFY_MS });
+    } catch (error) {
+      alive = { alive: false, reason: error.message };
+    }
+  } else {
+    alive = { alive: false };
+  }
+  let running = alive.alive ? (alive.lock?.version ?? null) : null;
+  if (alive.alive && !running) {
+    try {
+      running = (inspectLockFn ?? inspectLock)({ dataDir }).lock?.version ?? null;
+    } catch { /* reported as an unverified heartbeat below */ }
+  }
+  const versionConfirmed = sameVersion(running, expectVersion);
+  return {
+    started: Boolean(started?.ok && alive.alive),
+    alive: Boolean(alive.alive),
+    startedOk: Boolean(started?.ok),
+    startReason: started?.reason ?? null,
+    runningVersion: running,
+    versionConfirmed,
+    waitedMs: alive.waitedMs ?? null,
+    reason: !started?.ok
+      ? `the service could not be started again: ${started?.reason ?? 'unknown error'}`
+      : !alive.alive
+        ? `the service started but its heartbeat did not return${alive.reason ? `: ${alive.reason}` : ''}`
+        : !versionConfirmed
+          ? `the running service reported v${running ?? 'an unknown version'}, expected v${expectVersion}`
+          : null,
   };
 }
 
-/** Reinstalls a known-good version and starts the service again. */
-async function rollback({ version, service, exec, serviceInstalled, log }) {
-  closeDb();
-  const back = await runNpm(['install', '-g', `${PACKAGE}@${version}`], { timeout: 600_000 }, exec);
-  initDb();
-
-  if (!back.success) {
-    return { ok: false, started: false, reason: `could not reinstall v${version}: ${trim(back)}` };
+async function restoreStoppedService({
+  service,
+  dataDir,
+  verifyMs,
+  inspectLockFn,
+  restoreUpdateStateFn = restoreUpdateState,
+  transaction = null,
+  from,
+  log = () => {},
+}) {
+  let state = { ok: true, restored: true };
+  if (transaction) {
+    try {
+      state = await restoreUpdateStateFn(transaction, { log });
+    } catch (error) {
+      state = { ok: false, reason: error.message };
+    }
   }
 
-  if (!serviceInstalled) return { ok: true, started: true };
+  // Started even when the files could not be restored: a service left stopped
+  // is the failure this whole path exists to prevent, and the new files may
+  // still run where the restored ones could not.
+  const running = await startAndVerify({
+    service,
+    dataDir,
+    verifyMs,
+    inspectLockFn,
+    expectVersion: from,
+    log,
+  });
 
-  const started = await service.start({ log });
-  return { ok: true, started: Boolean(started.ok) };
+  if (!state.ok) {
+    return {
+      ...running,
+      ok: false,
+      stateRestored: false,
+      reason: [`service files could not be restored: ${state.reason}`, running.reason]
+        .filter(Boolean)
+        .join(' '),
+    };
+  }
+  return {
+    ...running,
+    ok: running.started && running.versionConfirmed,
+    stateRestored: true,
+  };
 }
 
-function trim(result) {
+/** Reinstalls the old package and restores every service artifact together. */
+async function rollback({
+  version,
+  service,
+  exec,
+  serviceInstalled,
+  transaction,
+  dataDir,
+  verifyMs,
+  inspectLockFn,
+  restoreUpdateStateFn,
+  log,
+}) {
+  let stopped;
+  try {
+    stopped = serviceInstalled ? await service.stop({ log }) : { ok: true };
+  } catch (error) {
+    stopped = { ok: false, reason: error.message };
+  }
+  if (!stopped.ok && !stopped.alreadyStopped) {
+    // It may be down already: put it back on whatever version it can run and
+    // say so, rather than leaving nothing running.
+    const running = await startAndVerify({
+      service,
+      dataDir,
+      verifyMs,
+      inspectLockFn,
+      expectVersion: version,
+      log,
+    });
+    return {
+      ...running,
+      ok: false,
+      reason: `the failed new service could not be stopped before rollback (${stopped.reason}). `
+        + (running.reason ?? ''),
+    };
+  }
+
+  closeDb();
+  let back;
+  try {
+    back = await runNpm(['install', '-g', `${PACKAGE}@${version}`], { timeout: 600_000 }, exec);
+  } catch (error) {
+    back = { success: false, stdout: '', stderr: error.message };
+  }
+  back ??= { success: false, stdout: '', stderr: 'npm returned no result' };
+  let dbError = null;
+  try { initDb(); } catch (error) { dbError = error; }
+
+  if (!serviceInstalled) {
+    const failures = [];
+    if (!back.success) failures.push(`could not reinstall v${version}: ${trim(back)}`);
+    if (dbError) failures.push(`the package database could not be reopened after rollback: ${dbError.message}`);
+    return {
+      ok: failures.length === 0,
+      started: false,
+      stateRestored: false,
+      versionConfirmed: false,
+      reason: failures.join(' ') || null,
+    };
+  }
+
+  const restored = await restoreStoppedService({
+    service,
+    dataDir,
+    verifyMs,
+    inspectLockFn,
+    restoreUpdateStateFn,
+    transaction,
+    from: version,
+    log,
+  });
+  if (!back.success) {
+    restored.ok = false;
+    restored.reinstallFailed = true;
+    restored.reason = `could not reinstall v${version}: ${trim(back)}`
+      + (restored.reason ? ` ${restored.reason}` : '')
+      + (transaction?.root ? ` The previous service files remain at ${transaction.root}.` : '');
+  } else if (dbError && !restored.versionConfirmed) {
+    restored.ok = false;
+    restored.reason = `the package database could not be reopened after rollback: ${dbError.message}`;
+  }
+  return restored;
+}
+
+function trim(result = {}) {
   return `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim().slice(0, 500);
 }
 

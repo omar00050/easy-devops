@@ -11,6 +11,7 @@
  * interrupted, never as still running.
  */
 
+import { createStateFile, replaceStateFile } from './atomicState.js';
 import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
@@ -146,11 +147,9 @@ export function writeStatus(patch, { dataDir = getDataDir(), replace = false } =
   const next = { ...current, ...patch, updatedAt: Date.now() };
 
   const target = statusPath(dataDir);
-  const temp = `${target}.${process.pid}.tmp`;
 
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(temp, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(temp, target);
+  replaceStateFile(target, `${JSON.stringify(next, null, 2)}\n`);
 
   return next;
 }
@@ -192,18 +191,12 @@ export function claimStartingRun(runId, { dataDir = getDataDir() } = {}) {
   if (typeof runId !== 'string' || runId.length < 1 || runId.length > MAX_ID_LENGTH) return null;
   const claim = claimPath(runId, dataDir);
   fs.mkdirSync(path.dirname(claim), { recursive: true, mode: 0o700 });
-  let fd;
   try {
-    fd = fs.openSync(claim, 'wx', 0o600);
-    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, runId, claimedAt: Date.now() }));
+    createStateFile(claim, JSON.stringify({ pid: process.pid, runId, claimedAt: Date.now() }));
     return claim;
   } catch (error) {
     if (error?.code === 'EEXIST') return null;
     throw error;
-  } finally {
-    if (fd !== undefined) {
-      try { fs.closeSync(fd); } catch { /* already closed */ }
-    }
   }
 }
 

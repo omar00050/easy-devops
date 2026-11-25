@@ -1,10 +1,16 @@
-import { GoodDB, SQLiteDriver } from 'good.db';
 import fs from 'fs';
 import path from 'path';
+import { createRequire } from 'module';
 import { fileURLToPath } from 'url';
-import { getDataDir, isDefaultDataDir } from './platform.js';
+import { getDataDir, isDefaultDataDir, isWindows } from './platform.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const require = createRequire(import.meta.url);
+
+// The folder holding package.json and node_modules/. Its dependencies, the
+// native SQLite addon among them, are rebuilt from here.
+const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
 
 // Resolved once per process. The location lives in core/platform.js so the
 // database, sessions and logs all agree on it — see getDataDir().
@@ -17,9 +23,231 @@ const DB_PATH = path.join(DATA_DIR, 'easy-devops.sqlite');
 // migration has changed what getDataDir() answers.
 let dbPath = DB_PATH;
 
+// ─── Startup failure reporting ───────────────────────────────────────────────
+//
+// A database that will not open used to say one thing: "check that the current
+// user has write access", whether or not that was true. On the real server that
+// produced it (a root install, where permissions were never the problem) it
+// hid the actual cause for days. Every startup failure below prints:
+//
+//   - the step that failed (creating the directory, loading the native addon,
+//     opening the file, its first read, its first write),
+//   - the underlying error's code AND message, and
+//   - a next step that fits THAT cause, naming the command to run.
+//
+// Nothing here writes, moves, deletes or truncates the database or its
+// -wal/-shm/-journal siblings. A database that cannot be opened is kept exactly
+// as it is: it is the only copy of the user's configuration.
+
+const LOCK_CODES = new Set(['SQLITE_BUSY', 'SQLITE_LOCKED', 'SQLITE_BUSY_SNAPSHOT', 'SQLITE_BUSY_RECOVERY', 'EBUSY']);
+const PERMISSION_CODES = new Set(['EACCES', 'EPERM', 'SQLITE_PERM', 'SQLITE_READONLY']);
+const NOT_A_DATABASE = /file is (?:not a database|encrypted)|database disk image is malformed/i;
+const DISK_CODES = new Set(['ENOSPC', 'EDQUOT', 'SQLITE_FULL', 'EIO']);
+const OPEN_CODES = new Set(['SQLITE_CANTOPEN', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EROFS']);
+
+/** `CODE: message`, or just the message when the error carries no code. */
+function describeError(error) {
+  const code = String(error?.code ?? '').trim();
+  const message = String(error?.message ?? error ?? 'unknown error').trim();
+  return { code, message, text: code ? `${code}: ${message}` : message };
+}
+
+/**
+ * The step a failed open reached, named from the SQLite error.
+ *
+ * better-sqlite3 opens the file and then good.db's driver immediately issues
+ * `CREATE TABLE IF NOT EXISTS`, so a single try block covers both. The error
+ * code says which half failed, which is what an operator needs.
+ *
+ * @param {Error} error
+ * @returns {string}
+ */
+function openStepFor(error) {
+  const { code, message } = describeError(error);
+  if (code === 'SQLITE_NOTADB' || code.startsWith('SQLITE_CORRUPT') || NOT_A_DATABASE.test(message)) {
+    return 'first read of the database file (its SQLite header and schema)';
+  }
+  if (code === 'SQLITE_READONLY' || code.startsWith('SQLITE_READONLY_')
+      || DISK_CODES.has(code) || code.startsWith('SQLITE_IOERR') || code === 'SQLITE_FULL') {
+    return 'first write to the database file (creating the schema table)';
+  }
+  if (LOCK_CODES.has(code)) {
+    return 'open the database file and take the write lock';
+  }
+  return 'open the database file';
+}
+
+/**
+ * The next steps that fit one startup failure.
+ *
+ * Deliberately a list of lines rather than one sentence: the operator reads
+ * this in a systemd journal, often through a screenshot, and needs the command
+ * to copy.
+ *
+ * @param {Object} opts
+ * @param {Error} opts.error The underlying error
+ * @param {string} opts.step  The step that failed
+ * @param {string} opts.databasePath
+ * @param {string} opts.dataDir
+ * @param {string} [opts.packageRoot]
+ * @returns {string[]}
+ */
+export function databaseFailureAdvice({
+  error,
+  step,
+  databasePath = DB_PATH,
+  dataDir = DATA_DIR,
+  packageRoot = PACKAGE_ROOT,
+} = {}) {
+  const { code, message, text } = describeError(error);
+  const sidecars = `${path.basename(databasePath)}*`;
+
+  // 1. The module that talks to SQLite is not loadable with this Node.
+  //    The same advice covers a missing prebuilt binary, an addon built for
+  //    another ABI, and a half-copied node_modules: rebuild, do not reinstall.
+  if (step.startsWith('load')
+      || code === 'ERR_DLOPEN_FAILED'
+      || code === 'MODULE_NOT_FOUND'
+      || /NODE_MODULE_VERSION|compiled against a different Node|Could not locate the bindings|invalid ELF header|not a valid Win32 application|undefined symbol/i.test(text)) {
+    const lines = [
+      'The SQLite module does not load with this Node'
+        + ` (${process.version}, ABI ${process.versions.modules}).`,
+      'Rebuild it in the package folder, with the same Node the service uses:',
+      `  cd ${packageRoot} && npm rebuild better-sqlite3`,
+    ];
+    if (/NODE_MODULE_VERSION|compiled against a different Node/i.test(text)) {
+      lines.push(`It was built for another Node version; this one needs ABI ${process.versions.modules}.`);
+    }
+    lines.push(
+      'This is an install problem, not a data problem: leave the database file alone.',
+    );
+    return lines;
+  }
+
+  // 2. Another process holds the database.
+  if (LOCK_CODES.has(code) || /database (?:table )?is locked/i.test(message)) {
+    const lines = ['Another process is holding the database. Find it, then stop it:'];
+    if (isWindows) {
+      lines.push(
+        '  ezz service status          (shows the daemon pid and whether it is running)',
+        '  Get-Process node | Select-Object Id, StartTime   (in PowerShell)',
+      );
+    } else {
+      lines.push(
+        `  fuser -v ${databasePath}*`,
+        `  lsof ${databasePath}        (when fuser is not installed)`,
+      );
+    }
+    lines.push(
+      'Stop the leftover process (for the daemon: `ezz service stop`), then start it again.',
+      'Do not delete the database or its -wal/-shm files: SQLite reuses them safely.',
+    );
+    return lines;
+  }
+
+  // 3. Permissions - the only case where the old hint was the right answer.
+  if (PERMISSION_CODES.has(code) || /permission denied|attempt to write a readonly database/i.test(message)) {
+    return [
+      `The account running this command cannot write to: ${dataDir}`,
+      'Check the folder and its parents with `ls -ld` (Linux) or `icacls` (Windows),',
+      'then run the command again as the account that owns the installation.',
+      isWindows && /^C:\\ProgramData/i.test(dataDir)
+        ? 'For the Windows service (Server mode) run `ezz service repair` from an elevated PowerShell.'
+        : 'If the file itself is read-only, make it writable; never recreate it.',
+    ];
+  }
+
+  // 4. The file is there but is not a SQLite database: a half-written copy, a
+  //    truncated file, or something else was put in its place.
+  if (code === 'SQLITE_NOTADB' || code.startsWith('SQLITE_CORRUPT') || NOT_A_DATABASE.test(message)) {
+    const copy = isWindows
+      ? `Copy-Item "${databasePath}" "${databasePath}.broken"`
+      : `cp "${databasePath}" "${databasePath}.broken"`;
+    return [
+      'The file exists but is not a readable SQLite database.',
+      'Keep it: copy it aside before anything else, for example',
+      `  ${copy}`,
+      'then restore the backup taken before the failed update, or ask for help with the copy.',
+      'Do not delete or recreate the original.',
+    ];
+  }
+
+  // 5. No space, or the filesystem returned an I/O error. The generic write
+  //    hint sent operators looking at permissions that were already correct.
+  if (DISK_CODES.has(code) || code.startsWith('SQLITE_IOERR') || /disk (?:i\/o error|is full)|no space left/i.test(message)) {
+    return [
+      'The storage under the data directory failed the write.',
+      `Check free space and the filesystem: df -h "${dataDir}" and dmesg | tail`,
+      'Free space or fix the volume, then start the service again.',
+      'The database was not modified by this command.',
+    ];
+  }
+
+  // 6. The path itself cannot be opened: a directory in the way, a read-only
+  //    mount, a missing parent.
+  if (OPEN_CODES.has(code) || /unable to open database file/i.test(message)) {
+    return [
+      `The database file cannot be opened: ${databasePath}`,
+      `Check the path, its parent folder and the mount: ls -la "${dataDir}" and df -h "${dataDir}"`,
+      'Then start the service again. If the filesystem is mounted read-only, remount it read-write first.',
+      'Nothing was moved or deleted.',
+    ];
+  }
+
+  return [
+    'The cause above does not match a known pattern.',
+    `Run \`ezz service status\` for a read-only diagnosis of ${sidecars}.`,
+    'Keep the database file: do not delete or recreate it.',
+  ];
+}
+
+/**
+ * The whole startup failure as printable lines.
+ *
+ * @param {Object} opts Passed to databaseFailureAdvice()
+ * @param {string|null} [opts.note] An earlier, non-fatal step that also failed
+ * @returns {string[]}
+ */
+export function diagnoseDatabaseFailure(opts = {}) {
+  const { error, step, databasePath = DB_PATH, note = null } = opts;
+  const { text } = describeError(error);
+  const lines = [`  Step : ${step}`, `  Cause: ${text}`];
+  if (note) lines.push(`  Note : an earlier step also failed: ${note}`);
+  lines.push('');
+  for (const line of databaseFailureAdvice({ ...opts, databasePath })) lines.push(`  ${line}`);
+  lines.push(
+    '',
+    '  Nothing was written, moved or deleted by this command.',
+    '  `ezz service status` runs a read-only check of the same database.',
+  );
+  return lines;
+}
+
+/**
+ * A complete, printable startup failure, header included.
+ *
+ * @param {Object} opts
+ * @param {string} opts.heading First line, e.g. '[ERROR] Failed to initialize database at: ...'
+ * @returns {string}
+ */
+export function formatDatabaseStartupFailure(opts = {}) {
+  const heading = opts.heading ?? `[ERROR] Failed to initialize database at: ${opts.databasePath ?? DB_PATH}`;
+  return `${heading}\n${diagnoseDatabaseFailure(opts).join('\n')}\n`;
+}
+
 // ─── One-time migration from old package-relative location ───────────────────
 const OLD_DATA_DIR = path.join(__dirname, '..', '..', 'data');
 const OLD_DB_PATH = path.join(OLD_DATA_DIR, 'easy-devops.sqlite');
+
+/**
+ * A failure of the one-time migration is still non-fatal - a new install must
+ * start with a fresh database - but it is remembered and printed with any
+ * later failure, because "cannot write the data directory" is often the same
+ * cause twice.
+ * @type {string|null}
+ */
+let migrationFailure = null;
+
 function migrateIfNeeded() {
   // Only ever migrate INTO the default data directory. The migration RENAMES
   // the legacy database, so running against any other directory — `--dev`, a
@@ -41,15 +269,24 @@ function migrateIfNeeded() {
       // Rename old file so migration doesn't run again
       fs.renameSync(OLD_DB_PATH, OLD_DB_PATH + '.migrated');
     }
-  } catch { /* non-fatal — new install will start fresh */ }
+  } catch (err) {
+    // non-fatal — new install will start fresh
+    migrationFailure = describeError(err).text;
+  }
 }
 migrateIfNeeded();
 
 try {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 } catch (err) {
-  process.stderr.write(`[ERROR] Failed to create database directory: ${DATA_DIR}\n`);
-  process.stderr.write(`Hint: Check that the current user has write access to: ${path.dirname(DATA_DIR)}\n`);
+  process.stderr.write(formatDatabaseStartupFailure({
+    heading: `[ERROR] Failed to create database directory: ${DATA_DIR}`,
+    error: err,
+    step: 'create the data directory',
+    databasePath: DB_PATH,
+    dataDir: DATA_DIR,
+    note: migrationFailure,
+  }));
   process.exit(1);
 }
 
@@ -85,11 +322,52 @@ function createDbConnection() {
   });
 }
 
+/**
+ * The native SQLite addon and the database layer, loaded as explicit steps.
+ *
+ * They used to be static imports at the top of this file, which meant a broken
+ * addon - the classic "upgraded while the old process was running" state -
+ * failed with a raw module-resolution stack trace and no idea what to do about
+ * it. Loaded here, the failure is caught, keeps its real code, and names its
+ * step. `require('better-sqlite3')` comes first so the addon's own error
+ * (ERR_DLOPEN_FAILED, NODE_MODULE_VERSION, "Could not locate the bindings
+ * file") is what gets reported, not good.db's wrapper around it.
+ */
+let GoodDB;
+let SQLiteDriver;
+
+try {
+  require('better-sqlite3');
+} catch (err) {
+  process.stderr.write(formatDatabaseStartupFailure({
+    error: err,
+    step: 'load better-sqlite3 (the native SQLite addon)',
+    packageRoot: PACKAGE_ROOT,
+    note: migrationFailure,
+  }));
+  process.exit(1);
+}
+
+try {
+  ({ GoodDB, SQLiteDriver } = await import('good.db'));
+} catch (err) {
+  process.stderr.write(formatDatabaseStartupFailure({
+    error: err,
+    step: 'load good.db (the database layer)',
+    packageRoot: PACKAGE_ROOT,
+    note: migrationFailure,
+  }));
+  process.exit(1);
+}
+
 try {
   db = createDbConnection();
 } catch (err) {
-  process.stderr.write(`[ERROR] Failed to initialize database at: ${DB_PATH}\n`);
-  process.stderr.write(`Hint: Check that the current user has write access to: ${DATA_DIR}\n`);
+  process.stderr.write(formatDatabaseStartupFailure({
+    error: err,
+    step: openStepFor(err),
+    note: migrationFailure,
+  }));
   process.exit(1);
 }
 
@@ -110,6 +388,34 @@ export function closeDb() {
 }
 
 /**
+ * Opens a connection, or throws an error that says what failed and what to do.
+ *
+ * Used by the two entry points that reopen the database inside a live process
+ * (initDb after closeDb, reopenDb after a data-directory change). They cannot
+ * print and exit: the caller owns the process and has its own reporting - see
+ * core/updater.js. The error keeps the SQLite code and carries the same
+ * diagnosis the startup path prints.
+ *
+ * @param {string} file The database file the new connection will use
+ * @returns {Object} The good.db handle
+ */
+function openDatabaseOrThrow(file = dbPath) {
+  try {
+    return createDbConnection();
+  } catch (error) {
+    const failure = new Error(diagnoseDatabaseFailure({
+      error,
+      step: openStepFor(error),
+      databasePath: file,
+      dataDir: path.dirname(file),
+    }).join('\n'));
+    failure.code = error?.code ?? error?.name ?? 'E_DB_OPEN';
+    failure.cause = error;
+    throw failure;
+  }
+}
+
+/**
  * Reinitializes the database connection after it was closed.
  * Call this after closeDb() when you need to use the database again.
  */
@@ -119,7 +425,7 @@ export function initDb() {
     db.driver?.db?.prepare('SELECT 1');
   } catch {
     // Connection is closed, create a new one
-    db = createDbConnection();
+    db = openDatabaseOrThrow();
   }
 }
 
@@ -139,6 +445,6 @@ export function reopenDb() {
   const dir = getDataDir();
   fs.mkdirSync(dir, { recursive: true });
   dbPath = path.join(dir, 'easy-devops.sqlite');
-  db = createDbConnection();
+  db = openDatabaseOrThrow(dbPath);
   return dbPath;
 }

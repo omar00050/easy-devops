@@ -38,6 +38,7 @@
  * pid may still be working, and a stale timestamp alone can mean a slow send.
  */
 
+import { createStateFile, replaceStateFile } from '../atomicState.js';
 import fs from 'fs';
 import path from 'path';
 import { getDataDir } from '../platform.js';
@@ -148,7 +149,7 @@ export function claim({
 
   // The atomic step: creates or fails, never both.
   try {
-    fs.writeFileSync(file, payload, { flag: 'wx', encoding: 'utf8', mode: 0o600 });
+    createStateFile(file, payload);
     return finish(false);
   } catch (err) {
     if (err?.code !== 'EEXIST') {
@@ -162,7 +163,7 @@ export function claim({
     // It vanished between the exclusive create and this read — its owner
     // committed or released. Try once more to take it.
     try {
-      fs.writeFileSync(file, payload, { flag: 'wx', encoding: 'utf8', mode: 0o600 });
+      createStateFile(file, payload);
       return finish(false);
     } catch (err) {
       return { ok: false, heldBy: null, reason: `could not write a claim: ${err.message}` };
@@ -187,7 +188,7 @@ export function claim({
   // processes can reach this point together, and only the one whose pid is in
   // the file afterwards may proceed.
   try {
-    fs.writeFileSync(file, payload, { encoding: 'utf8', mode: 0o600 });
+    replaceStateFile(file, payload);
   } catch (err) {
     return { ok: false, heldBy: held.pid || null, reason: `could not take over the claim: ${err.message}` };
   }

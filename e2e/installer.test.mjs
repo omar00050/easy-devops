@@ -32,7 +32,7 @@ import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -120,6 +120,21 @@ function layout(name, { modulesAt = 'src/lib/installer', withPackageJson = true 
   }
 
   return dir;
+}
+
+/**
+ * A fixture that mirrors the release layout install.sh downloads from:
+ * <base>/src/lib/installer/<module>. Served with a file:// URL, so the test
+ * never touches the network.
+ */
+function helperFixture(name) {
+  const dir = scratch(name);
+  const target = path.join(dir, 'src', 'lib', 'installer');
+  fs.mkdirSync(target, { recursive: true });
+  for (const module of MODULES) {
+    fs.copyFileSync(path.join(ROOT, 'src', 'lib', 'installer', module), path.join(target, module));
+  }
+  return { dir, baseUrl: pathToFileURL(dir).href.replace(/\/$/, '') };
 }
 
 /** Stub executables ahead of PATH, so even a full run installs nothing. */
@@ -288,8 +303,8 @@ async function testPiped(bash) {
   // package.json, which is what used to make the script think it was in an
   // Easy DevOps checkout.
   const dir = scratch('inst-piped');
-  const downloaders = recordingDownloaders('inst-piped-downloaders');
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'someone-elses-app' }));
+  const fixture = helperFixture('inst-piped-fixture');
   const before = snapshot(dir);
 
   const help = await runScript(bash, {
@@ -302,28 +317,46 @@ async function testPiped(bash) {
   check('--help works when piped', help.code === 0 && /Usage:/.test(help.stdout),
     `exit ${help.code}: ${help.stderr.slice(0, 120)}`);
 
-  // Past the flags, with no modules reachable and downloads disabled, it has
-  // to fail with a clear message rather than writing anything.
+  // Past the flags, with no helpers in the current directory, it downloads the
+  // reviewed bundle from the configured base and verifies it. --check-helpers
+  // stops before any install step.
   const run = await runScript(bash, {
     cwd: dir,
     scriptPath: SCRIPT,
-    args: ['--no-service'],
+    args: ['--check-helpers'],
     piped: true,
-    env: { PATH: `${downloaders}${path.delimiter}${process.env.PATH}` },
+    env: { EZ_INSTALLER_BASE_URL: fixture.baseUrl },
   });
 
   const output = run.stdout + run.stderr;
-  check('without modules it refuses rather than guessing', run.code === 1, `exit ${run.code}`);
-  check('naming where it looked', /src\/lib\/installer/.test(output), output.slice(0, 200));
-  check('and how to fix it', /Clone the repository|published easy-devops package/.test(output), output.slice(0, 240));
-  check('it explicitly refuses unpinned helper downloads',
-    /unpinned bytes are unsafe/.test(output), output.slice(0, 240));
-  check('the fake curl was never called', !fs.existsSync(path.join(downloaders, 'curl.called')));
-  check('the fake wget was never called', !fs.existsSync(path.join(downloaders, 'wget.called')));
+  check('a piped run without local helpers loads the verified bundle', run.code === 0,
+    `exit ${run.code}: ${output.slice(0, 260)}`);
+  check('the helpers were verified from the configured base',
+    /check-helpers: verified 5 helper module\(s\).*downloaded from/.test(output), output.slice(0, 260));
+  check('the private helper directory is requested 0700',
+    /requested 0700/.test(output), output.slice(0, 260));
+  if (process.platform !== 'win32') {
+    check('and actually has mode 700 on this platform', /mode 700/.test(output), output.slice(0, 260));
+  }
 
   const created = snapshot(dir).filter((f) => !before.includes(f));
   check('nothing was written into the current directory', created.length === 0, created.join(', '));
   check('specifically no lib/installer', !fs.existsSync(path.join(dir, 'lib')));
+
+  // A base URL that is not https:// or a loopback/file fixture is refused
+  // before any request is made.
+  const refused = await runScript(bash, {
+    cwd: dir,
+    scriptPath: SCRIPT,
+    args: ['--check-helpers'],
+    piped: true,
+    env: { EZ_INSTALLER_BASE_URL: 'http://example.com/not-allowed' },
+  });
+  const refusedOutput = refused.stdout + refused.stderr;
+  check('a plain http base URL is refused', refused.code === 1, `exit ${refused.code}`);
+  check('and the refusal says what is allowed',
+    /loopback/.test(refusedOutput) && /Nothing was downloaded/.test(refusedOutput),
+    refusedOutput.slice(0, 260));
 }
 
 // ─── 4. The legacy layout still works ───────────────────────────────────────
@@ -363,26 +396,37 @@ async function testStaticHardening() {
   const executableShell = withoutCommentLines(text);
   const executableHelper = withoutCommentLines(helper);
 
-  check('install.sh has no main-branch helper URL',
-    !/raw\.githubusercontent\.com\/[^\s"' ]*\/main(?:\/|$)/i.test(text));
-  check('install.sh has no helper downloader path',
-    !/_LIB_BASE\s*=/.test(text) && !/download_lib_dir\s*\(/.test(text));
+  check('install.sh pins the helper download base URL', 
+    /_LIB_BASE_URL_DEFAULT="https:\/\/raw\.githubusercontent\.com\/omar00050\/Easy-DevOps\/main"/.test(text));
+  check('install.sh only accepts https, file and loopback http helper sources',
+    /https:\/\/\?\*\|file:\/\/\?\*/.test(text)
+      && /http:\/\/127\.0\.0\.1/.test(text)
+      && /http:\/\/localhost/.test(text));
+  check('install.sh verifies downloaded helpers before sourcing them',
+    /_lib_dir_verified "\$LIB_DIR"[\s\S]{0,400}\.\s+"\$LIB_DIR\/\$_module"/.test(text));
   check('install.sh never pipes a download into a shell',
     !/\b(?:curl|wget)\b[^\n|]*\|\s*(?:bash|sh)\b/i.test(executableShell));
+  check('nvm-bootstrap pins a release version and leaves the digest for owner review',
+    /NVM_VERSION="v0\.40\.\d+"/.test(helper)
+      && /NVM_INSTALL_SHA256=""\s*\n/.test(helper)
+      && /TODO\(owner\): pin from the reviewed nvm release/.test(helper));
   check('nvm-bootstrap has no mutable installer URL',
-    !/raw\.githubusercontent\.com|nvm-sh\/nvm\/HEAD|\/main\/install\.sh/i.test(helper));
+    !/nvm-sh\/nvm\/(?:HEAD|main)/.test(helper) && !/\/main\/install\.sh/.test(helper));
   check('nvm-bootstrap never pipes a download into a shell',
     !/\b(?:curl|wget)\b[^\n|]*\|\s*(?:bash|sh)\b/i.test(executableHelper));
-  check('README and installation docs contain no raw main-branch helper command',
-    !/(?:curl|wget|Invoke-WebRequest)[^\n]*(?:Easy-DevOps\/main|\/main\/)/i.test(
-      `${readme}\n${docsInstaller}`,
-    ));
-  check('the documented Linux installer is release-pinned with its bundled helpers',
-    /git clone --branch v1\.4\.5 --depth 1 https:\/\/github\.com\/omar00050\/Easy-DevOps\.git/.test(readme)
-      && /git clone --branch v1\.4\.5 --depth 1 https:\/\/github\.com\/omar00050\/Easy-DevOps\.git/.test(docsInstaller));
-  check('documentation does not promise an automatic nvm-windows install while its digest is empty',
-    /Automatic nvm-windows installation is disabled/.test(docsInstaller)
-      && !/Installs nvm-windows, installs Node\.js LTS/.test(docsInstaller));
+
+  const documented = `${readme}\n${docsInstaller}`;
+  check('the documented Linux one-line installer is exact',
+    documented.includes('curl -fsSL https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/install.sh -o install.sh && bash install.sh')
+      && documented.includes('wget -qO install.sh https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/install.sh && bash install.sh'));
+  check('the documented Windows one-line installer is exact',
+    documented.includes('Invoke-WebRequest -Uri "https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/install.ps1" -OutFile "install.ps1"; ./install.ps1'));
+  check('no documentation tells users to clone a non-existent release tag',
+    !/git clone --branch v1\.4\.5/.test(documented));
+  check('the documentation says no automatic nvm-windows install while its digest is empty',
+    /Automatic nvm-windows installation is disabled/.test(docsInstaller));
+  check('the documentation explains the winget Node.js LTS fallback',
+    /winget install --id OpenJS\.NodeJS\.LTS/.test(docsInstaller));
 
   const listed = text.match(/_LIB_MODULES="([^"]+)"/)?.[1]?.split(/\s+/) ?? [];
   const missing = listed.filter((m) => !fs.existsSync(path.join(ROOT, 'src', 'lib', 'installer', m)));
@@ -400,6 +444,14 @@ async function testStaticHardening() {
   });
   check('every bundled module has its final SHA-256 pinned',
     listed.length === pinned.size && mismatched.length === 0, mismatched.join(', '));
+
+  const wingetPin = /\$WINGET_INSTALL_PS1_SHA256\s*=\s*'([0-9a-f]{64})'/.exec(windows)?.[1] ?? '';
+  const wingetBody = fs.readFileSync(
+    path.join(ROOT, 'src', 'lib', 'installer', 'winget-install.ps1'),
+    'utf8',
+  ).replace(/\r\n/g, '\n');
+  check('winget-install.ps1 matches the digest pinned in install.ps1',
+    wingetPin !== '' && wingetPin === sha256(wingetBody), wingetPin);
 
   const files = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).files ?? [];
   check('package.json ships src/, including the reviewed modules',
@@ -512,11 +564,14 @@ async function testNvmBootstrap(bash) {
   const output = result.stdout + result.stderr;
 
   check('missing nvm makes bootstrap fail closed', result.code === 1, `exit ${result.code}`);
-  check('it states that HEAD will not be fetched', /will not fetch nvm from HEAD/.test(output),
-    output.slice(0, 240));
-  check('it gives reviewed-release recovery steps',
-    /github\.com\/nvm-sh\/nvm\/releases/.test(output) && /source .*nvm\.sh/.test(output),
-    output.slice(0, 260));
+  check('it prints the exact official nvm install command',
+    /curl -o- https:\/\/raw\.githubusercontent\.com\/nvm-sh\/nvm\/v0\.40\.\d+\/install\.sh \| bash/.test(output),
+    output.slice(0, 300));
+  check('then source ~/.nvm/nvm.sh and re-run install.sh',
+    /source ~\/\.nvm\/nvm\.sh/.test(output) && /bash install\.sh/.test(output),
+    output.slice(0, 320));
+  check('and offers --keep-node for an already-installed Node.js 18+',
+    /--keep-node/.test(output) && /distro package|18\+/i.test(output), output.slice(0, 320));
   check('the fake curl was never called', !fs.existsSync(path.join(downloaders, 'curl.called')));
   check('the fake wget was never called', !fs.existsSync(path.join(downloaders, 'wget.called')));
   check('user shell rc files were not sourced', !fs.existsSync(rcMarker));

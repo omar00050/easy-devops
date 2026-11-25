@@ -47,7 +47,7 @@ import { loadConfig } from '../config.js';
 import { dbGet, dbSet, closeDb, reopenDb } from '../db.js';
 import { isPidAlive } from '../dashboardProcess.js';
 import { inspect as inspectLock, HEARTBEAT_INTERVAL_MS } from '../daemon/lock.js';
-import { requestStop, clearStopRequest, isStopRequested } from '../daemon/stopRequest.js';
+import { requestStop, clearStopRequest, readStopRequest } from '../daemon/stopRequest.js';
 import { inspect as inspectOwner } from '../jobs/owner.js';
 import { probe, invalidate } from '../probeCache.js';
 
@@ -58,6 +58,7 @@ import * as legacy from './legacy.js';
 import { enableServerMode, disableServerMode, describeOriginal } from './dataDir.js';
 import { linkRuntime, inspectRuntime, runtimeNodePath } from './runtime.js';
 import { resolveOperator, restoreOperatorDataAccess } from './operator.js';
+import { checkDrift } from './versionDrift.js';
 import {
   UNINSTALL_STAGE_TIMEOUT_MS,
   runUninstallStage,
@@ -255,10 +256,21 @@ export function backgroundServiceState({ dataDir = getDataDir(), deps = {} } = {
   });
   const lock = inspectLock({ dataDir });
   const owner = inspectOwner({ dataDir });
-  const recorded = dbGet(STATE_KEY) ?? {};
 
-  const stoppedRequested = isStopRequested({ dataDir });
-  const stoppedByUser = (Boolean(recorded.stoppedAt) || stoppedRequested) && !lock.running;
+  // "Stopped by you" is live state only: a request file that is still there
+  // and no daemon holding the lock. A RECORDED stop (service-state.stoppedAt)
+  // is history and never current state — deriving it from that record is what
+  // showed "stopped by you" while the service was running (finding A5).
+  //
+  // Reading this must never clear the request: a dashboard poll during
+  // `ezz service stop` would cancel the stop it is reporting. The file is
+  // cleared by every start path and by the daemon when it takes the lock.
+  const stopRequest = (deps.readStopRequest ?? readStopRequest)({ dataDir });
+  if (lock.running) {
+    // Drop the pre-1.4.7 compatibility record; the live file is the only source.
+    try { recordStarted(); } catch { /* status must remain readable */ }
+  }
+  const stoppedByUser = stopRequest.requested && !lock.running;
 
   return {
     running: lock.running,
@@ -278,7 +290,7 @@ export function backgroundServiceState({ dataDir = getDataDir(), deps = {} } = {
     startsAt: startsAtFor(mech),
 
     stoppedByUser,
-    stoppedAt: recorded.stoppedAt ?? null,
+    stoppedAt: stoppedByUser ? stopRequest.at ?? null : null,
 
     dataDir,
     serverMode: isServerMode(),
@@ -347,16 +359,31 @@ function startsAtFor(mech = resolveMechanism()) {
   return mech.mode === MODES.SERVER ? 'boot' : 'logon';
 }
 
-/** Records that the user stopped it, so `status` can say so. */
+/** Records a successful stop for status while no service manager is running. */
 function recordStopped() {
   const existing = dbGet(STATE_KEY) ?? {};
   dbSet(STATE_KEY, { ...existing, stoppedAt: new Date().toISOString() });
 }
 
-/** Clears that record. */
+/** Clears a completed deliberate-stop state after any start path. */
 function recordStarted() {
   const existing = dbGet(STATE_KEY) ?? {};
   if (existing.stoppedAt) dbSet(STATE_KEY, { ...existing, stoppedAt: null });
+}
+
+/** A service start ends both the live request and the legacy stop timestamp. */
+export function clearServiceStopState({ dataDir = getDataDir(), deps = {} } = {}) {
+  const cleared = (deps.clearStopRequest ?? clearStopRequest)({ dataDir });
+  if (cleared === false) {
+    const file = path.join(dataDir, 'daemon.stop');
+    const error = new Error(
+      `could not clear the stop request at ${file}. The daemon would exit as soon as it starts. `
+      + 'Close anything holding that file, delete it, then run `ezz service start` again.',
+    );
+    error.code = 'EZ_STOP_REQUEST_CLEAR';
+    throw error;
+  }
+  recordStarted();
 }
 
 /**
@@ -374,8 +401,7 @@ export async function install({ mode = null, removeLegacy = false, log = () => {
   invalidateProbes();
   // A stop request left over from a previous install would make the daemon
   // exit the moment it started. Install is an explicit "I want this running".
-  (deps.clearStopRequest ?? clearStopRequest)({ dataDir: getDataDir() });
-  recordStarted();
+  clearServiceStopState({ dataDir: getDataDir(), deps });
 
   const found = await legacy.detectLegacy(deps.legacy ?? {});
   const legacyResult = { found: found.items, removed: [], failed: [] };
@@ -1054,11 +1080,9 @@ export async function start({ log = () => {}, deps = {} } = {}) {
     };
   }
 
-  // Clearing the request is what makes a stop temporary. Done for every mode:
-  // a stale request from a Personal-mode stop must not silently kill a daemon
-  // started later by any route.
-  (deps.clearStopRequest ?? clearStopRequest)({ dataDir });
-  recordStarted();
+  // Clearing the request is what makes a stop temporary. Do this before the
+  // manager starts the new daemon, which could otherwise consume it.
+  clearServiceStopState({ dataDir, deps });
 
   let result;
 
@@ -1130,6 +1154,11 @@ export async function restart({ log = () => {}, deps = {} } = {}) {
       : { ok: false, reason: started.reason };
   }
 
+  // Server/Linux restarts start the replacement daemon as part of the manager
+  // call. Clear the old marker first so that daemon cannot consume it during
+  // startup. Personal mode above writes its own request, then start clears it.
+  clearServiceStopState({ dataDir, deps });
+
   if (!isWindows) {
     const result = await (deps.systemd ?? systemd).restart(deps.systemdOpts ?? {});
     if (!result.ok) return { ok: false, reason: result.reason };
@@ -1137,11 +1166,6 @@ export async function restart({ log = () => {}, deps = {} } = {}) {
     const result = await (deps.windowsService ?? windowsService).restart(deps.windowsServiceOpts ?? {});
     if (!result.ok) return { ok: false, reason: result.reason, needsElevation: result.needsElevation ?? false };
   }
-
-  // A restart also ends a deliberate stop: the service is running again, so
-  // `status` must stop saying the user stopped it.
-  (deps.clearStopRequest ?? clearStopRequest)({ dataDir });
-  recordStarted();
 
   const alive = await waitForDaemon({ dataDir, timeoutMs: deps.startupGraceMs ?? STARTUP_GRACE_MS });
   return alive.alive
@@ -1233,6 +1257,10 @@ export async function status({ cache = false, coldWaitMs, deps = {} } = {}) {
   // The daemon's own view, which is the authority on whether work is happening.
   const lock = inspectLock({ dataDir });
 
+  // The CLI and the service's runtime copy are two packages in Windows Server
+  // mode. This is a file read, so it is read fresh rather than probed/cached.
+  const versionInfo = (deps.checkDrift ?? checkDrift)({ dataDir });
+
   const out = {
     platform: mech.platform,
     mode: mech.mode,
@@ -1240,6 +1268,9 @@ export async function status({ cache = false, coldWaitMs, deps = {} } = {}) {
     dataDir,
     serverMode: isServerMode(),
     dashboardUi: config.dashboardUi ?? null,
+    serviceVersion: versionInfo.serviceVersion ?? null,
+    cliVersion: versionInfo.cliVersion ?? null,
+    versionDrift: versionInfo.drift === true,
     daemon: {
       running: lock.running,
       pid: lock.lock?.pid ?? null,
@@ -1310,6 +1341,23 @@ export async function status({ cache = false, coldWaitMs, deps = {} } = {}) {
   out.service = manager.value ?? { installed: null, running: null, state: null, pending: true, warnings: [] };
   out.runtime = runtimeRead.value ?? null;
   out.legacy = legacyRead.value?.items ?? [];
+
+  // Version drift (finding A3) and the daemon-start warning from Part 2.6.
+  // Both are re-derived from files and the install record, so status does not
+  // depend on a daemon having written something first.
+  if (out.versionDrift && versionInfo.message) out.warnings.push(versionInfo.message);
+
+  if (isWindows && mech.mode === MODES.SERVER && out.service.installed) {
+    const protections = recorded.protections ?? recorded.protection ?? null;
+    const granted = Array.isArray(recorded.granted) ? recorded.granted : [];
+    const recordedProtections = Boolean((protections && protections.ok !== false) || granted.length > 0);
+    if (!recordedProtections) {
+      out.warnings.push(
+        'The service files have no recorded permission check, so they may be missing or out of date. '
+        + 'Run `ezz service repair` in an Administrator PowerShell before relying on this service.',
+      );
+    }
+  }
 
   if (isWindows && mech.mode === MODES.SERVER && out.service.acl && !out.service.acl.ok) {
     out.warnings.push(out.service.acl.reason);
@@ -1398,20 +1446,31 @@ export async function status({ cache = false, coldWaitMs, deps = {} } = {}) {
     );
   }
 
-  // "Stopped by you" and "not running" look identical to a service manager, and
-  // telling a user their service crashed when they stopped it themselves is
-  // both wrong and alarming. The distinction comes from two recorded facts: an
-  // explicit stop writes `stoppedAt`, and Personal mode also leaves a stop
-  // request file that is the actual reason nothing restarts.
-  const stoppedOnPurpose = Boolean(recorded.stoppedAt)
-    || (deps.isStopRequested ?? isStopRequested)({ dataDir });
+  // "Stopped by you" comes from LIVE state only: a stop request file that is
+  // still on disk and no daemon running. Two rules, both learned from finding
+  // A5 on a real server:
+  //
+  //   1. A recorded stop (service-state.stoppedAt) is HISTORY. Deriving the
+  //      current state from it reported "stopped by you" while the service was
+  //      running; it is only ever cleared here, never read as the answer.
+  //   2. A status read NEVER clears the request. It used to, whenever the
+  //      service manager said "running" and no heartbeat had arrived yet — so a
+  //      dashboard poll during `ezz service stop` cancelled the stop. The file
+  //      is cleared by every start path (service start/restart/repair/install,
+  //      update/recover) and by the daemon itself when it takes the lock.
+  const stopRequest = (deps.readStopRequest ?? readStopRequest)({ dataDir });
+  const activelyRunning = lock.running || out.service.running === true;
+  if (activelyRunning) {
+    try { recordStarted(); } catch { /* keep status readable */ }
+  }
+  const stoppedOnPurpose = stopRequest.requested && !activelyRunning;
 
-  out.stoppedByUser = stoppedOnPurpose && !lock.running;
-  out.stoppedAt = recorded.stoppedAt ?? null;
+  out.stoppedByUser = stoppedOnPurpose;
+  out.stoppedAt = stoppedOnPurpose ? stopRequest.at ?? null : null;
 
   if (out.stoppedByUser) {
-    out.daemon.detail = recorded.stoppedAt
-      ? `stopped by you at ${recorded.stoppedAt}`
+    out.daemon.detail = out.stoppedAt
+      ? `stopped by you at ${out.stoppedAt}`
       : 'stopped by you';
     // Anything on Windows that is not Server mode starts at LOGON, including
     // the case where no mode is recorded yet — Personal is the Windows default.
@@ -1491,6 +1550,11 @@ export async function repair({ log = () => {}, deps = {} } = {}) {
   invalidateProbes();
   const mech = resolveMechanism();
   const dataDir = getDataDir();
+
+  // Repair is a start path. Clear the live marker before a manager or the
+  // Personal supervisor is asked to run, otherwise the daemon can consume a
+  // request that the user has already superseded by asking for repair.
+  clearServiceStopState({ dataDir, deps });
 
   async function finish(result, mechanism) {
     if (result.ok) {

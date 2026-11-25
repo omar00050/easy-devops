@@ -936,6 +936,9 @@ parallel, which took it from about 7.5 s to about 2 s.
   "restarts": 0,
   "crashLooping": false,
   "warnings": [],
+  "serviceVersion": "1.4.6",
+  "cliVersion": "1.4.7",
+  "versionDrift": true,
   "runtime": {
     "systemNode": { "path": "C:\\Program Files\\nodejs\\node.exe", "version": "v22.21.1", "abi": "127" },
     "pinned": { "kind": "recorded", "path": "…", "version": "v22.21.1", "exists": true, "broken": false },
@@ -955,11 +958,23 @@ parallel, which took it from about 7.5 s to about 2 s.
 | `startsAt` | `logon` (Windows Personal) or `boot` |
 | `jobsRunningHere` | This process is the one running the jobs. Exactly one process does, enforced by a marker — see §3.5 |
 | `stoppedByUser` | Stopped deliberately, not crashed. `stoppedAt` is an ISO timestamp when known |
-| `warnings` | Human-readable problems from the service status: a crash loop, a broken runtime pin, ACL paths that changed |
+| `warnings` | Human-readable problems from the service status: a crash loop, a broken runtime pin, ACL paths that changed, a missing recorded permission check |
 | `runtime` | The service's pinned Node next to the system's, so a version-manager break is visible |
+| `serviceVersion` | The version of the package the service actually runs. Windows Server has its own copy under `C:\ProgramData\easy-devops\runtime\app`; Linux and Personal run the CLI package, so the two are equal. `null` when it cannot be read |
+| `cliVersion` | The version of the package this dashboard/CLI is running |
+| `versionDrift` | `true` when `serviceVersion` and `cliVersion` differ. A file read, not a probe, so it is never stale. No automatic repair: the client names `ezz service repair` |
 
 `enabledOnBoot` is `true`, `false`, or **`null` for unknown** (a non-systemd
 Linux, where the boot hook cannot be read).
+
+**Version drift is reported, never repaired automatically.** On Windows Server
+the service runs its own copy of the package, so a plain `npm i -g easy-devops`
+updates only the CLI. `serviceVersion`, `cliVersion` and `versionDrift` let a
+client show "The background service runs vX, the installed package is vY. Run
+`ezz service repair` as administrator." The same fact is published in the Hub's
+`service:state` payload (`versionDrift`) and raised once per version pair as a
+`notification:new` event of type `service_drift`; no new socket event is added.
+The daemon also re-checks it at start and every six hours.
 
 #### Lifecycle: start, stop and restart
 
@@ -1574,7 +1589,7 @@ and there is only one schema.
 |---|---|---|---|
 | `nginx:status` | `{ running, version, pid }` or `{ …, error }` | `core/jobs/monitors.js` — every 5s | **Yes** |
 | `domain:health` | `[{ name, up, port, host }]`, `up: null` for external backends | `core/jobs/monitors.js` — every 60s | **Yes** |
-| `notification:new` | `{ id, type, subtype?, severity, message, domain?, timestamp }` | `core/jobs/monitors.js` via `core/notifications/dispatch.js` — on nginx and domain-health transitions, on certificate expiry, and after each automatic renewal attempt (`type: "cert_expiry"`, `subtype: "renewed"` or `"renew_failed"`) | **Yes** |
+| `notification:new` | `{ id, type, subtype?, severity, message, domain?, timestamp }` | `core/jobs/monitors.js` via `core/notifications/dispatch.js` — on nginx and domain-health transitions, on certificate expiry, and after each automatic renewal attempt (`type: "cert_expiry"`, `subtype: "renewed"` or `"renew_failed"`); also `core/daemon/run.js` once per service/CLI version pair (`type: "service_drift"`, `subtype: "newer_installed"`, plus `serviceVersion` and `installedVersion`) | **Yes** |
 | `logs:line` | `{ line, logFile }` | `socketManager.js` — per line while a tail is active | **No** — a tail exists only for a watching client |
 | `local:changed` | `{ section, source, at, …detail }`, `section` ∈ `domains`, `ssl`, `nginx`, `settings` | `core/hub/agent.js` after it applies a Hub command (`source: "hub"`), and `core/jobs/revisionWatcher.js` when another process moves the change counter (`source: "revision"`) | **Yes** |
 | `service:changed` | the `backgroundService` object from §2.7, identically shaped | `dashboard/lib/daemonBridge.js` — whenever the background service or the jobs owner changes | **No** — it describes the service *as this dashboard sees it* |

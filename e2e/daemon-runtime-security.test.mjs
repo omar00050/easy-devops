@@ -58,8 +58,22 @@ for (const options of [[`--experimental-loader=${loader}`], ...(typeof (await im
 }
 // Exercise the installed transitive dependencies without starting any jobs.
 const boundary = new URL('../src/core/service/runtime-boundary.cjs', import.meta.url);
+const boundaryModule = (await import(boundary.href)).default;
 const realLoader = new URL('../src/core/service/runtime-loader.mjs', import.meta.url);
 const daemon = new URL('../src/core/daemon/run.js', import.meta.url);
+// Node selects its platform default dlopen flags when the caller omits flags.
+const flagsProbe = spawnSync(process.execPath, ['-e', `
+  const assert = require('node:assert/strict');
+  const filename = process.argv[1];
+  const calls = [];
+  process.dlopen = (...args) => calls.push(args);
+  require(filename).install();
+  const addon = { exports: {} };
+  process.dlopen(addon, filename);
+  process.dlopen(addon, filename, 2);
+  assert.deepEqual(calls, [[addon, filename], [addon, filename, 2]]);
+`, fileURLToPath(boundary)], { encoding: 'utf8', timeout: 10000 });
+assert.equal(flagsProbe.status, 0, flagsProbe.stderr);
 const probe = `const { createRequire } = await import('node:module');
   const baseline = new Set(Object.keys(createRequire(${JSON.stringify(boundary.href)}).cache));
   const mod = await import(${JSON.stringify(daemon.href)});
@@ -70,4 +84,32 @@ const real = spawnSync(process.execPath, [`--experimental-loader=${realLoader.hr
   fileURLToPath(boundary), '--input-type=module', '-e', `const boundary = await import(${JSON.stringify(boundary.href)}); boundary.default.install(); ${probe}`],
 { encoding: 'utf8', timeout: 30000 });
 assert.equal(real.status, 0, real.stderr);
+
+// Confinement is a boundary around the PACKAGE, not a list of allowed modules.
+// The real daemon entry must still load the dependencies the package ships,
+// native addons included; a loader that refused better-sqlite3 would be the
+// 1.4.6 database failure all over again. Runs the real loader against the real
+// package root, opening an in-memory database so no file is touched.
+const nativeProbe = spawnSync(process.execPath, [
+  `--experimental-loader=${realLoader.href}`,
+  '--input-type=module',
+  '-e',
+  `const { createRequire } = await import('node:module');
+   const require = createRequire(${JSON.stringify(new URL('../package.json', import.meta.url).href)});
+   require('./src/core/service/runtime-boundary.cjs').install();
+   const Database = require('better-sqlite3');
+   const db = new Database(':memory:');
+   db.exec('create table t (x text)');
+   db.close();
+   process.stdout.write('native-ok');`,
+], { encoding: 'utf8', timeout: 30000 });
+assert.equal(nativeProbe.status, 0, nativeProbe.stderr);
+assert.match(nativeProbe.stdout, /native-ok/);
+
+// A file that is simply not there is not an escape attempt: the check lets the
+// real loader produce its own "cannot find" error, so a broken install is
+// reported as a missing addon rather than as a confinement refusal.
+const realPackageRoot = path.resolve(path.dirname(fileURLToPath(boundary)), '..', '..');
+const absent = path.join(realPackageRoot, 'node_modules', 'absent.node');
+assert.equal(boundaryModule.check(absent), absent);
 console.log('PASS  daemon rejects external CommonJS, ESM and native dependencies, replaces pre-seeded optionals and uses local fallbacks');

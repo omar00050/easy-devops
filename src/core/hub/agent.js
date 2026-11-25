@@ -20,6 +20,7 @@ import { getLastDomainHealth, probeDomains, DOMAIN_HEALTH_POLL_MS } from '../job
 import { isWindows, platformName, isDevDataDir } from '../platform.js';
 import { listAllCerts, getCertExpiry } from '../cert-reader.js';
 import { backgroundServiceState } from '../service/index.js';
+import { checkDrift } from '../service/versionDrift.js';
 import * as runner from '../runner.js';
 import { loadChannels } from '../notifier.js';
 import {
@@ -297,6 +298,10 @@ async function pushServiceState({ target = socket } = {}) {
       pm2Installed: pm2.installed,
       pm2Version: pm2.version,
       uptimeMs: s.startedAt ? Date.now() - s.startedAt : null,
+      // A service running an older runtime copy than the installed CLI package
+      // (Windows Server, after a plain `npm i -g`). One field, so the Hub can
+      // say so without knowing how it was measured.
+      versionDrift: checkDrift(),
     });
   } catch { /* non-fatal */ }
 }

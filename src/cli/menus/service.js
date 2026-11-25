@@ -23,14 +23,14 @@ import { describeLegacy } from '../../core/service/legacy.js';
 import { page, pause } from '../ui/page.js';
 import { requireElevation, offerRelaunchFor } from '../elevation.js';
 
-const ACTIONS = ['install', 'uninstall', 'status', 'start', 'stop', 'restart', 'logs', 'repair'];
+const ACTIONS = ['install', 'uninstall', 'status', 'start', 'stop', 'restart', 'logs', 'repair', 'recover'];
 
 /**
  * Actions that change something, as opposed to read-only ones (`status`,
  * `logs`). Only these get a page heading and hold their result until Enter;
  * the read-only pair must stay pipeable, so it does neither.
  */
-const MUTATING_ACTIONS = new Set(['install', 'uninstall', 'start', 'stop', 'restart', 'repair']);
+const MUTATING_ACTIONS = new Set(['install', 'uninstall', 'start', 'stop', 'restart', 'repair', 'recover']);
 
 /**
  * Entry point for the `service` command.
@@ -55,6 +55,7 @@ export async function serviceCommand(action) {
     case 'stop': code = await doStop(); break;
     case 'restart': code = await doRestart(); break;
     case 'logs': code = await showLogs(); break;
+    case 'recover': code = await doRepair(true); break;
     case 'repair': code = await doRepair(); break;
     default: code = 1;
   }
@@ -193,6 +194,11 @@ export async function showStatus() {
 
   console.log(`  Data directory ${chalk.gray(s.dataDir)}${s.serverMode ? chalk.gray('  (server mode)') : ''}`);
   console.log(`  Dashboard UI   ${chalk.gray(s.dashboardUi ?? 'unknown')}`);
+
+  // In Windows Server mode the service runs its own copy of the package, so
+  // these two can disagree after a plain `npm i -g` (finding A3).
+  console.log(`  Service version${chalk.gray(' ')} ${s.serviceVersion ? chalk.white(s.serviceVersion) : chalk.gray('unknown')}`);
+  console.log(`  CLI version    ${s.cliVersion ? chalk.white(s.cliVersion) : chalk.gray('unknown')}`);
 
   // Server mode: who may start/stop it and use the data without elevation.
   if (s.mode === service.MODES.SERVER && s.service.installed) {
@@ -828,27 +834,72 @@ async function showLogs() {
 
 // ─── repair ───────────────────────────────────────────────────────────────────
 
-async function doRepair() {
-  page(['Service', 'Repair']);
+async function doRepair(recover = false) {
+  const verb = recover ? 'Recover' : 'Repair';
+  page(['Service', verb]);
   console.log();
-  console.log('  ' + chalk.bold('Repair the Easy DevOps service'));
+  console.log('  ' + chalk.bold(`${verb} the Easy DevOps service`));
   console.log('  ' + chalk.gray('─'.repeat(58)));
-  console.log('  ' + chalk.gray('Re-pins the Node runtime, re-applies permissions, and restarts it.'));
+  console.log('  ' + chalk.gray(recover
+    ? 'Restores administrator and service access, then repairs and starts it.'
+    : 'Re-pins the Node runtime, re-applies permissions, and restarts it.'));
   console.log();
 
   if (isWindows && isServerMode()) {
-    const gate = await requireElevation({ args: ['service', 'repair'], what: 'Repairing the Windows service' });
+    const gate = await requireElevation({ args: ['service', recover ? 'recover' : 'repair'], what: `${verb}ing the Windows service` });
     if (!gate.proceed) return gate.code;
   }
 
-  const spinner = ora('Repairing…').start();
+  const spinner = ora(recover ? 'Recovering…' : 'Repairing…').start();
   const lines = [];
+  const log = (line) => { lines.push(line); spinner.text = line; };
+
+  // An update that died mid-transaction is finished first, on both platforms
+  // and for both repair and recover, before anything else is touched.
+  try {
+    const { recoverInterruptedUpdate } = await import('../../core/service/updateTransaction.js');
+    const interrupted = await recoverInterruptedUpdate({ log });
+    if (!interrupted?.ok) {
+      throw new Error(interrupted?.reason ?? 'the interrupted update could not be recovered');
+    }
+  } catch (err) {
+    spinner.fail(`${verb} failed: ${err.message}`);
+    return 1;
+  }
+
+  // Linux recovery is its own path: the unit is regenerated and the service
+  // restarted, which is not something the shared repair flow can do.
+  if (recover && !isWindows) {
+    try {
+      const systemd = await import('../../core/service/systemd.js');
+      if (typeof systemd.recoverService !== 'function') {
+        throw new Error('this build cannot recover the Linux service. Reinstall the package, then run `ezz service recover` again.');
+      }
+      const recovered = await systemd.recoverService({ log });
+      if (!recovered?.ok) throw new Error(recovered?.reason ?? 'the Linux service recovery returned no result');
+    } catch (err) {
+      spinner.fail(`${verb} failed: ${err.message}`);
+      return 1;
+    }
+    spinner.stop();
+    for (const line of lines) console.log('  ' + chalk.gray(line));
+    console.log();
+    console.log('  ' + chalk.green('✓ Recovered.'));
+    console.log();
+    return showStatus();
+  }
 
   let result;
   try {
-    result = await service.repair({ log: (line) => { lines.push(line); spinner.text = line; } });
+    if (recover && isWindows) {
+      if (!isServerMode()) throw new Error('Windows service recovery requires a Server-mode installation.');
+      const { recoverCodePermissions } = await import('../../core/service/windowsService.js');
+      const recovered = await recoverCodePermissions({ log });
+      if (!recovered.ok) throw new Error(recovered.reason);
+    }
+    result = await service.repair({ log });
   } catch (err) {
-    spinner.fail(`Repair failed: ${err.message}`);
+    spinner.fail(`${verb} failed: ${err.message}`);
     return 1;
   }
 
@@ -857,7 +908,7 @@ async function doRepair() {
 
   if (!result.ok) {
     console.log();
-    console.log('  ' + chalk.red('Repair failed.'));
+    console.log('  ' + chalk.red(`${verb} failed.`));
     console.log(String(result.reason).split('\n').map((l) => `  ${l}`).join('\n'));
     if (result.needsElevation) {
       console.log();
@@ -870,7 +921,7 @@ async function doRepair() {
   }
 
   console.log();
-  console.log('  ' + chalk.green('✓ Repaired.'));
+  console.log('  ' + chalk.green(recover ? '✓ Recovered.' : '✓ Repaired.'));
   for (const failure of result.aclFailures ?? []) {
     console.log('  ' + chalk.yellow(`⚠ ${failure.path}: ${failure.reason}`));
   }

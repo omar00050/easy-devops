@@ -98,14 +98,47 @@ const SOURCES = {
   },
 };
 
-function serviceStub({ installed = true, mode = 'personal', startOk = true, stopOk = true, alive = true } = {}) {
+function serviceStub({
+  installed = true,
+  mode = 'personal',
+  startOk = true,
+  stopOk = true,
+  alive = true,
+  version = '1.2.1',
+} = {}) {
   const calls = [];
   return {
     calls,
     async status() { calls.push('status'); return { service: { installed }, mode }; },
     async stop() { calls.push('stop'); return stopOk ? { ok: true } : { ok: false, reason: 'could not stop' }; },
     async start() { calls.push('start'); return startOk ? { ok: true } : { ok: false, reason: 'could not start' }; },
-    async waitForDaemon() { calls.push('wait'); return { alive, waitedMs: alive ? 300 : 10_000 }; },
+    async waitForDaemon() {
+      calls.push('wait');
+      return { alive, waitedMs: alive ? 300 : 10_000, lock: alive ? { version } : null };
+    },
+    recordedState() { return { nodeExe: null }; },
+  };
+}
+
+function transactionDeps(calls = [], overrides = {}) {
+  return {
+    captureUpdateState: async (opts) => {
+      calls.push('snapshot');
+      return { ok: true, root: 'update-snapshot', ...opts, runtimeNodeExe: overrides.runtimeNodeExe ?? null };
+    },
+    restoreUpdateState: async () => {
+      calls.push('restore');
+      return { ok: true, restored: true };
+    },
+    commitUpdateState: () => {
+      calls.push('commit');
+      return { ok: true, warnings: [] };
+    },
+    runPostUpdate: async (opts) => {
+      calls.push('post-update');
+      return overrides.postUpdate ?? { ok: true, step: 'definition', version: opts.version };
+    },
+    ...overrides.deps,
   };
 }
 
@@ -183,8 +216,13 @@ async function testNpmUpdate() {
     async status() { order.push('status'); return { service: { installed: true }, mode: 'personal' }; },
     async stop() { order.push('stop'); return { ok: true }; },
     async start() { order.push('start'); return { ok: true }; },
-    async waitForDaemon() { order.push('wait'); return { alive: true, waitedMs: 250 }; },
+    async waitForDaemon() {
+      order.push('wait');
+      return { alive: true, waitedMs: 250, lock: { version: '1.3.0' } };
+    },
+    recordedState() { return {}; },
   };
+  const transactional = transactionDeps(order);
 
   const result = await updater.performUpdate({
     version: '1.3.0',
@@ -194,9 +232,8 @@ async function testNpmUpdate() {
       service,
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.2.1',
-      // The daemon reports the new version after the restart, which is the
-      // only real proof that the new code is what came up.
       inspectLock: () => ({ lock: { version: '1.3.0' } }),
+      ...transactional,
     },
   });
 
@@ -209,20 +246,49 @@ async function testNpmUpdate() {
   const sequence = order.map((o) => (o.startsWith('run:') ? 'install' : o));
   check('the service is stopped BEFORE npm replaces the files',
     sequence.indexOf('stop') < sequence.indexOf('install'), sequence.join(' -> '));
+  check('the service definition and runtime are preserved after the stop',
+    sequence.indexOf('stop') < sequence.indexOf('snapshot')
+      && sequence.indexOf('snapshot') < sequence.indexOf('install'), sequence.join(' -> '));
   check('and started again after',
     sequence.lastIndexOf('start') > sequence.indexOf('install'), sequence.join(' -> '));
+  check('the NEW package post-update runs after npm and before start',
+    sequence.indexOf('install') < sequence.indexOf('post-update')
+      && sequence.indexOf('post-update') < sequence.indexOf('start'), sequence.join(' -> '));
   check('with the heartbeat waited for last',
     sequence.lastIndexOf('wait') > sequence.lastIndexOf('start'), sequence.join(' -> '));
+  check('and the transaction is committed only after the target heartbeat',
+    sequence.lastIndexOf('commit') > sequence.lastIndexOf('wait'), sequence.join(' -> '));
 
   check('npm was asked for the exact version',
     order.some((o) => o === 'run:npm install -g easy-devops@1.3.0'),
     order.filter((o) => o.startsWith('run:')).join(' | '));
+
+  const unreadableService = serviceStub();
+  unreadableService.status = async () => { throw new Error('SCM query failed'); };
+  const unreadableNpm = recordingRun({ 'npm install': 'installed' });
+  const unreadable = await updater.performUpdate({
+    version: '1.3.0',
+    dataDir: scratch('upd-unreadable-service'),
+    deps: {
+      runFile: unreadableNpm,
+      service: unreadableService,
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.2.1',
+    },
+  });
+  check('an unreadable service state fails closed instead of assuming no service',
+    unreadable.ok === false
+      && unreadable.step === 'status'
+      && unreadable.untouched === true
+      && unreadableService.calls.length === 0
+      && unreadableNpm.commands.length === 0,
+    JSON.stringify(unreadable));
 }
 
-// ─── 3. Windows Server: the runtime copy is refreshed ────────────────────────
+// ─── 3. Windows Server: the NEW package performs the runtime refresh ─────────
 
 async function testServerCopyRefresh() {
-  setGroup('3. Windows Server mode refreshes the runtime copy');
+  setGroup('3. Windows Server mode hands runtime refresh to the new package');
 
   const updater = await import(srcUrl('core/updater.js'));
   const { isWindows } = await import(srcUrl('core/platform.js'));
@@ -233,54 +299,75 @@ async function testServerCopyRefresh() {
   }
 
   const dataDir = scratch('upd-server');
-  const copies = [];
-  const serviceDefinitions = [];
+  const order = [];
+  const posts = [];
+  const transactional = transactionDeps(order, {
+    runtimeNodeExe: path.join(dataDir, 'runtime.previous', 'node.exe'),
+  });
+  const run = async (file, args) => {
+    npmCommand(file, args);
+    order.push('npm-new');
+    return { success: true, stdout: 'ok', stderr: '', exitCode: 0, command: file };
+  };
+  const serverService = serviceStub({ installed: true, mode: 'server', version: '1.3.0' });
+  const serviceStart = serverService.start;
+  serverService.start = async (...args) => {
+    order.push('start');
+    return serviceStart(...args);
+  };
 
   const result = await updater.performUpdate({
     version: '1.3.0',
     dataDir,
     deps: {
-      runFile: recordingRun({ 'npm install': 'installed' }),
-      service: serviceStub({ installed: true, mode: 'server' }),
+      runFile: run,
+      service: serverService,
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.2.1',
-      inspectLock: () => ({ lock: { version: '1.3.0' } }),
-      // Server mode refuses before stopping anything unless this process is
-      // elevated; this test is about the runtime copy, not the gate.
       isElevated: async () => true,
-      protectServiceFiles: async () => ({ ok: true }),
-      refreshServiceDefinition: (opts) => { serviceDefinitions.push(opts); },
-      copyRuntime: (opts) => { copies.push(opts); return { ok: true, dir: 'runtime' }; },
+      ...transactional,
+      runPostUpdate: async (opts) => {
+        order.push('post-update');
+        posts.push(opts);
+        return { ok: true, step: 'definition', version: '1.3.0' };
+      },
     },
   });
 
   check('the update succeeds', result.ok === true, result.reason ?? '');
-  check('the runtime copy was refreshed', copies.length === 1, String(copies.length));
-  check('from the package that npm just updated',
-    copies[0]?.appRoot === SOURCES.npm.root, copies[0]?.appRoot);
-  check('the service definition is rewritten after the copy refreshes',
-    serviceDefinitions.length === 1 && serviceDefinitions[0]?.runtime?.dir === 'runtime');
+  check('exactly one new-package post-update ran', posts.length === 1, String(posts.length));
+  check('it was called after npm and before the service start',
+    order.indexOf('post-update') > order.indexOf('npm-new') && order.indexOf('post-update') < order.indexOf('start'),
+    order.join(' -> '));
+  check('it receives Server mode and the preserved runtime node',
+    posts[0]?.mode === 'server'
+      && posts[0]?.nodeExe === path.join(dataDir, 'runtime.previous', 'node.exe'),
+    JSON.stringify(posts[0]));
   check('and the result says so', result.refreshedCopy === true);
 
-  // Without this the service keeps running the OLD code from the copy, which
-  // is the bug that made this step necessary.
+  const failingService = serviceStub({ installed: true, mode: 'server' });
+  failingService.waitForDaemon = async () => {
+    return { alive: true, waitedMs: 100, lock: { version: '1.2.1' } };
+  };
   const failed = await updater.performUpdate({
     version: '1.3.0',
     dataDir,
     deps: {
       runFile: recordingRun({ 'npm install': 'installed' }),
-      service: serviceStub({ installed: true, mode: 'server' }),
+      service: failingService,
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.2.1',
       isElevated: async () => true,
-      copyRuntime: () => ({ ok: false, reason: 'ProgramData is not writable' }),
+      ...transactionDeps([], {
+        postUpdate: { ok: false, step: 'copy', reason: 'ProgramData is not writable' },
+      }),
     },
   });
 
   check('a copy that cannot be refreshed fails the update',
     failed.ok === false && failed.step === 'copy', failed.step);
   check('rather than leaving the service on the old code silently',
-    /could not be refreshed/.test(failed.reason), failed.reason);
+    /not writable/.test(failed.reason), failed.reason);
   check('and it rolls back to the previous version', failed.rolledBack === true);
 }
 
@@ -291,32 +378,43 @@ async function testUserServiceRefresh() {
 
   const updater = await import(srcUrl('core/updater.js'));
   const dataDir = scratch('upd-user-refresh');
-  const refreshes = [];
-  const service = serviceStub({ installed: true, mode: 'personal' });
-  service.refreshUserService = async (opts) => {
-    service.calls.push('refresh');
-    refreshes.push(opts);
-    return { ok: true };
+  const order = [];
+  const posts = [];
+  const service = serviceStub({ installed: true, mode: 'personal', version: '1.4.4' });
+  const start = service.start;
+  service.start = async (...args) => {
+    order.push('start');
+    return start(...args);
+  };
+  const run = async (file, args) => {
+    npmCommand(file, args);
+    order.push('npm-new');
+    return { success: true, stdout: 'ok', stderr: '', exitCode: 0, command: file };
   };
 
   const result = await updater.performUpdate({
     version: '1.4.4',
     dataDir,
     deps: {
-      runFile: recordingRun({ 'npm install': 'installed' }),
+      runFile: run,
       service,
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.4.3',
-      inspectLock: () => ({ lock: { version: '1.4.4' } }),
+      ...transactionDeps(order),
+      runPostUpdate: async (opts) => {
+        order.push('post-update');
+        posts.push(opts);
+        return { ok: true, step: 'definition', version: '1.4.4' };
+      },
     },
   });
 
   check('the update succeeds', result.ok === true, result.reason ?? '');
-  check('the systemd/Personal service definition is refreshed exactly once',
-    refreshes.length === 1 && refreshes[0]?.dataDir === dataDir, JSON.stringify(refreshes));
+  check('the new Personal service definition refresh runs exactly once',
+    posts.length === 1 && posts[0]?.mode === 'personal', JSON.stringify(posts));
   check('the refresh happens before the service starts',
-    service.calls.indexOf('refresh') !== -1 && service.calls.indexOf('refresh') < service.calls.indexOf('start'),
-    service.calls.join(' -> '));
+    order.indexOf('post-update') !== -1 && order.indexOf('post-update') < order.indexOf('start'),
+    order.join(' -> '));
 }
 
 // ─── 4. Rollback ─────────────────────────────────────────────────────────────
@@ -328,18 +426,50 @@ async function testRollback() {
   const dataDir = scratch('upd-rollback');
 
   // ── npm itself fails ─────────────────────────────────────────────────────
-  const failingNpm = recordingRun({ 'npm install -g easy-devops@1.3.0': null });
+  const failingNpm = recordingRun({
+    'npm install -g easy-devops@1.3.0': null,
+    'npm install -g easy-devops@1.2.1': 'installed',
+  });
   const service = serviceStub();
+  const installCalls = [];
+  const installStart = service.start;
+  const installWait = service.waitForDaemon;
+  service.start = async (...args) => {
+    installCalls.push('start');
+    return installStart(...args);
+  };
+  service.waitForDaemon = async (...args) => {
+    installCalls.push('wait');
+    return installWait(...args);
+  };
 
   const installFailed = await updater.performUpdate({
     version: '1.3.0',
     dataDir,
-    deps: { runFile: failingNpm, service, detectInstallSource: () => SOURCES.npm, currentVersion: () => '1.2.1' },
+    deps: {
+      runFile: failingNpm,
+      service,
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.2.1',
+      ...transactionDeps(installCalls),
+    },
   });
 
   check('a failing npm install is reported', installFailed.ok === false && installFailed.step === 'install',
     installFailed.step);
   check('and the service is started again', installFailed.restarted === true);
+  check('the old package is reinstalled rather than assuming a failed npm is atomic',
+    failingNpm.commands.includes('npm install -g easy-devops@1.2.1'),
+    failingNpm.commands.join(' | '));
+  check('and a verified old heartbeat makes rollback success observable',
+    installFailed.rolledBack === true
+      && installFailed.rollbackVersionConfirmed === true,
+    JSON.stringify(installFailed));
+  check('the captured service files are restored before the old heartbeat',
+    installCalls.indexOf('restore') !== -1
+      && installCalls.indexOf('restore') < installCalls.indexOf('start')
+      && installCalls.indexOf('start') < installCalls.indexOf('wait'),
+    installCalls.join(' -> '));
 
   // ── It installs, but the daemon never reports in ─────────────────────────
   const commands = [];
@@ -348,16 +478,26 @@ async function testRollback() {
     commands.push(command);
     return { success: true, stdout: 'ok', stderr: '', exitCode: 0, command };
   };
+  const rollbackCalls = [];
+  let waits = 0;
+  const flapping = serviceStub({ installed: true, mode: 'personal' });
+  flapping.waitForDaemon = async () => {
+    waits += 1;
+    return waits === 1
+      ? { alive: false, waitedMs: 10_000, lock: null }
+      : { alive: true, waitedMs: 200, lock: { version: '1.2.1' } };
+  };
 
   const verifyFailed = await updater.performUpdate({
     version: '1.3.0',
     dataDir,
     deps: {
       runFile: run,
-      service: serviceStub({ alive: false }),
+      service: flapping,
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.2.1',
       verifyMs: 10_000,
+      ...transactionDeps(rollbackCalls),
     },
   });
 
@@ -367,16 +507,72 @@ async function testRollback() {
     commands.some((c) => c === 'npm install -g easy-devops@1.2.1'),
     commands.join(' | '));
   check('the rollback is reported', verifyFailed.rolledBack === true);
-  check('and so is whether the service came back', typeof verifyFailed.restored === 'boolean');
+  check('and the old heartbeat is verified before the service is called restored',
+    verifyFailed.restored === true && verifyFailed.rollbackVersionConfirmed === true);
+  check('the service snapshot is restored during rollback',
+    rollbackCalls.includes('restore'), rollbackCalls.join(' -> '));
+
+  // ── It comes up, but reports the wrong version ───────────────────────────
+  let wrongVersionWaits = 0;
+  const wrongVersionService = serviceStub({ installed: true, mode: 'personal' });
+  wrongVersionService.waitForDaemon = async () => {
+    wrongVersionWaits += 1;
+    return wrongVersionWaits === 1
+      ? { alive: true, waitedMs: 200, lock: { version: '1.2.2' } }
+      : { alive: true, waitedMs: 200, lock: { version: '1.2.1' } };
+  };
+  const wrongVersion = await updater.performUpdate({
+    version: '1.3.0',
+    dataDir,
+    deps: {
+      runFile: recordingRun({ 'npm install': 'installed' }),
+      service: wrongVersionService,
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.2.1',
+      ...transactionDeps([]),
+    },
+  });
+  check('a live daemon on any version other than the target is not accepted',
+    wrongVersion.ok === false
+      && wrongVersion.step === 'verify'
+      && /reported v1\.2\.2/.test(wrongVersion.reason),
+    wrongVersion.reason);
+  check('and that mismatch also triggers a heartbeat-verified rollback',
+    wrongVersion.rolledBack === true && wrongVersion.rollbackVersionConfirmed === true,
+    JSON.stringify(wrongVersion));
+
+  // ── The old package cannot be reinstalled ────────────────────────────────
+  const failedBack = await updater.performUpdate({
+    version: '1.3.0',
+    dataDir,
+    deps: {
+      runFile: recordingRun({
+        'npm install -g easy-devops@1.3.0': 'installed',
+        'npm install -g easy-devops@1.2.1': null,
+      }),
+      service: serviceStub({ installed: true, mode: 'personal', version: '1.2.1' }),
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.2.1',
+      ...transactionDeps([], {
+        postUpdate: { ok: false, step: 'definition', reason: 'definition failed' },
+      }),
+    },
+  });
+  check('a running old heartbeat cannot make a failed package reinstall look rolled back',
+    failedBack.rolledBack === false
+      && failedBack.restored === true
+      && failedBack.rollbackVersionConfirmed === true,
+    JSON.stringify(failedBack));
 
   // ── The service cannot even be stopped: nothing is replaced ──────────────
   const stuck = recordingRun({ 'npm install': 'installed' });
+  const stuckService = serviceStub({ stopOk: false });
   const cannotStop = await updater.performUpdate({
     version: '1.3.0',
     dataDir,
     deps: {
       runFile: stuck,
-      service: serviceStub({ stopOk: false }),
+      service: stuckService,
       detectInstallSource: () => SOURCES.npm,
       currentVersion: () => '1.2.1',
     },
@@ -387,6 +583,815 @@ async function testRollback() {
   check('with the package left alone',
     !stuck.commands.some((c) => /npm install/.test(c)), stuck.commands.join(' | '));
   check('and it says nothing was touched', cannotStop.untouched === true);
+  check('but the service it may have stopped is started again',
+    stuckService.calls.includes('start') && cannotStop.restarted === true,
+    stuckService.calls.join(' -> '));
+  check('and the message says the service is running, not that it might be dead',
+    /The service is running again/.test(cannotStop.lines.join('\n')),
+    cannotStop.lines.join(' | '));
+
+  // A stop failure whose restart also fails must name the start command.
+  const deadService = serviceStub({ stopOk: false, startOk: false, alive: false });
+  const cannotRestart = await updater.performUpdate({
+    version: '1.3.0',
+    dataDir,
+    deps: {
+      runFile: recordingRun({ 'npm install': 'installed' }),
+      service: deadService,
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.2.1',
+    },
+  });
+  check('a service left down says what to run',
+    cannotRestart.ok === false
+      && cannotRestart.next === 'ezz service start'
+      && /ezz service start/.test(cannotRestart.lines.join('\n')),
+    cannotRestart.lines.join(' | '));
+}
+
+// ─── 4b. The handoff loads code from the newly installed package ─────────────
+
+async function testPostUpdateHandoff() {
+  setGroup('4b. post-update runs from the new package before start');
+
+  const updater = await import(srcUrl('core/updater.js'));
+  const dataDir = scratch('upd-handoff');
+  const sourceRoot = scratch('upd-new-package');
+  let invocation = null;
+  const exec = async (file, args, options) => {
+    invocation = { file, args, options };
+    return {
+      success: true,
+      stdout: `\n${updater.POST_UPDATE_RESULT_PREFIX}${JSON.stringify({
+        ok: true,
+        step: 'definition',
+        version: '1.3.0',
+      })}\n`,
+      stderr: '',
+      exitCode: 0,
+    };
+  };
+
+  const result = await updater.runPostUpdateHandoff({
+    sourceRoot,
+    version: '1.3.0',
+    dataDir,
+    mode: 'server',
+    mechanism: 'winsw',
+    nodeExe: path.join(dataDir, 'runtime.previous', 'node.exe'),
+    runFile: exec,
+  });
+
+  check('the trusted Node binary executes the NEW package entrypoint by argv',
+    result.ok === true
+      && invocation.file === process.execPath
+      && invocation.args[0] === path.join(sourceRoot, 'src', 'cli', 'index.js')
+      && invocation.args[1] === '_post-update',
+    JSON.stringify(invocation?.args));
+  check('the data directory and target version cross the process boundary explicitly',
+    invocation.options.env.EASY_DEVOPS_DATA_DIR === dataDir
+      && invocation.options.env.EZ_UPDATE_TARGET === '1.3.0'
+      && invocation.options.env.EZ_UPDATE_MODE === 'server');
+  check('the child keeps the terminal for sudo prompts',
+    invocation.options.stdin === 'inherit');
+
+  const wrongVersion = await updater.runPostUpdateHandoff({
+    sourceRoot,
+    version: '1.3.0',
+    dataDir,
+    runFile: async () => ({
+      success: true,
+      stdout: `${updater.POST_UPDATE_RESULT_PREFIX}${JSON.stringify({
+        ok: true,
+        version: '1.4.4',
+      })}`,
+    }),
+  });
+  check('a child that loaded the wrong installed version is refused',
+    wrongVersion.ok === false && wrongVersion.step === 'post-update-version',
+    JSON.stringify(wrongVersion));
+
+  const noVersion = await updater.runPostUpdateHandoff({
+    sourceRoot,
+    version: '1.3.0',
+    dataDir,
+    runFile: async () => ({
+      success: true,
+      stdout: `${updater.POST_UPDATE_RESULT_PREFIX}${JSON.stringify({ ok: true, step: 'definition' })}`,
+    }),
+  });
+  check('a success marker without the loaded package version is refused',
+    noVersion.ok === false && noVersion.step === 'post-update-version',
+    JSON.stringify(noVersion));
+
+  // Exercise the actual hidden command module and its structured stdout.
+  const { postUpdateCommand } = await import(srcUrl('cli/menus/postUpdate.js'));
+  const { applyPostUpdate } = await import(srcUrl('core/service/postUpdate.js'));
+  let output = '';
+  const calls = [];
+  let protectOpts = null;
+  const code = await postUpdateCommand({
+    env: {
+      EASY_DEVOPS_DATA_DIR: dataDir,
+      EZ_UPDATE_MODE: 'server',
+      EZ_UPDATE_MECHANISM: 'winsw',
+      EZ_UPDATE_TARGET: '1.3.0',
+      EZ_UPDATE_NODE_EXE: path.join(dataDir, 'node.exe'),
+    },
+    stdout: { write: (chunk, callback) => {
+      output += chunk;
+      callback?.();
+      return true;
+    } },
+    deps: {
+      installedPackageVersion: () => '1.3.0',
+      copyRuntime: (opts) => {
+        calls.push('copy');
+        return { ok: true, dir: path.join(dataDir, 'runtime'), nodeExe: opts.nodeExe };
+      },
+      verifyNativeModules: async () => {
+        calls.push('native');
+        return { ok: true, version: 'v22.0.0', abi: '127' };
+      },
+      protectServiceFiles: async (opts) => {
+        calls.push('protect');
+        protectOpts = opts;
+        return { ok: true };
+      },
+      refreshServiceDefinition: () => {
+        calls.push('definition');
+      },
+    },
+  });
+  check('the command loads and returns the new-version result',
+    code === 0 && /__EASY_DEVOPS_POST_UPDATE__/.test(output), output.trim());
+  check('the command refreshes copy, native modules, protections and definition',
+    calls.join(',') === 'copy,native,protect,definition', calls.join(' -> '));
+  check('the protection pass includes both service code roots',
+    protectOpts?.dirs?.length === 2
+      && path.basename(protectOpts.dirs[0]) === 'runtime'
+      && path.basename(protectOpts.dirs[1]) === 'bin',
+    JSON.stringify(protectOpts?.dirs));
+
+  const thrownCopy = await applyPostUpdate({
+    dataDir,
+    mode: 'server',
+    mechanism: 'winsw',
+    targetVersion: '1.3.0',
+    nodeExe: path.join(dataDir, 'missing-node.exe'),
+    deps: {
+      installedPackageVersion: () => '1.3.0',
+      copyRuntime: async (opts) => {
+        assert.equal(opts.nodeExe, process.execPath);
+        throw new Error('copy exploded');
+      },
+    },
+  });
+  check('a thrown post-update failure retains the failing step and missing-node fallback',
+    thrownCopy.ok === false && thrownCopy.step === 'copy' && /copy exploded/.test(thrownCopy.reason),
+    JSON.stringify(thrownCopy));
+}
+
+// ─── 4c. Service artifacts are restored as one transaction ──────────────────
+
+/** node.exe that "runs", for restores that must prove it. */
+const PROBE_OK = { runFile: async () => ({ success: true, stdout: 'v22.0.0\n', stderr: '', exitCode: 0 }) };
+
+async function testUpdateTransaction() {
+  setGroup('4c. unit/XML and runtime rollback is transactional, with a journal');
+
+  const transaction = await import(srcUrl('core/service/updateTransaction.js'));
+  const root = scratch('upd-transaction-windows');
+  const dataDir = path.join(root, 'data');
+  const runtime = path.join(root, 'runtime');
+  const xml = path.join(root, 'service.xml');
+  const snapshots = path.join(root, 'snapshots');
+  fs.mkdirSync(path.join(runtime, 'app'), { recursive: true });
+  fs.mkdirSync(snapshots, { recursive: true });
+  fs.writeFileSync(path.join(runtime, 'node.exe'), 'old node');
+  fs.writeFileSync(path.join(runtime, 'app', 'version.txt'), '1.2.1');
+  fs.writeFileSync(xml, '<old />');
+
+  const captured = await transaction.captureUpdateState({
+    dataDir,
+    mode: 'server',
+    mechanism: 'winsw',
+    deps: {
+      serviceXmlPath: () => xml,
+      runtimeDir: () => runtime,
+      tmpDir: snapshots,
+    },
+  });
+  check('the Windows runtime is moved aside before the package is replaced',
+    captured.ok === true && !fs.existsSync(runtime) && Boolean(captured.runtimeBackup),
+    JSON.stringify(captured));
+
+  // Finding 1: a crash-safe record exists BEFORE anything moves, and it names
+  // the exact paths a later run needs.
+  const journalFile = path.join(dataDir, 'update-journal.json');
+  check('the journal sits in the service folder, not in user data',
+    captured.journal === journalFile && fs.existsSync(journalFile), captured.journal);
+  const journal = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
+  check('the journal records the moved runtime and the snapshot',
+    journal.runtimeBackup === captured.runtimeBackup
+      && journal.root === captured.root
+      && journal.stage === 'moved',
+    JSON.stringify({ stage: journal.stage, backup: journal.runtimeBackup }));
+
+  fs.mkdirSync(path.join(runtime, 'app'), { recursive: true });
+  fs.writeFileSync(path.join(runtime, 'node.exe'), 'new node');
+  fs.writeFileSync(path.join(runtime, 'app', 'version.txt'), '1.3.0');
+  fs.writeFileSync(xml, '<new />');
+  const restored = await transaction.restoreUpdateState(captured, {
+    deps: { runtimeDir: () => runtime, ...PROBE_OK },
+  });
+  check('rollback restores the old runtime and XML together',
+    restored.ok
+      && fs.readFileSync(path.join(runtime, 'node.exe'), 'utf8') === 'old node'
+      && fs.readFileSync(path.join(runtime, 'app', 'version.txt'), 'utf8') === '1.2.1'
+      && fs.readFileSync(xml, 'utf8') === '<old />',
+    JSON.stringify(restored));
+  check('and removes both the set-aside new runtime and the journal',
+    !fs.existsSync(captured.runtimeBackup) && !fs.existsSync(journalFile));
+
+  // Finding 3: the new copy is not deleted until the old one is proven to run.
+  const brokenRoot = scratch('upd-transaction-unverified');
+  const brokenRuntime = path.join(brokenRoot, 'runtime');
+  const brokenXml = path.join(brokenRoot, 'service.xml');
+  const brokenSnapshots = path.join(brokenRoot, 'snapshots');
+  fs.mkdirSync(path.join(brokenRuntime, 'app'), { recursive: true });
+  fs.mkdirSync(brokenSnapshots, { recursive: true });
+  fs.writeFileSync(path.join(brokenRuntime, 'node.exe'), 'old node');
+  fs.writeFileSync(brokenXml, '<old />');
+  const brokenCapture = await transaction.captureUpdateState({
+    dataDir: path.join(brokenRoot, 'data'),
+    mode: 'server',
+    mechanism: 'winsw',
+    deps: { serviceXmlPath: () => brokenXml, runtimeDir: () => brokenRuntime, tmpDir: brokenSnapshots },
+  });
+  fs.mkdirSync(brokenRuntime, { recursive: true });
+  fs.writeFileSync(path.join(brokenRuntime, 'node.exe'), 'new node');
+  const unverified = await transaction.restoreUpdateState(brokenCapture, {
+    deps: {
+      runtimeDir: () => brokenRuntime,
+      runFile: async () => ({ success: false, stderr: 'EPERM', stdout: '', exitCode: 1 }),
+    },
+  });
+  const keptAside = fs.readdirSync(brokenRoot).filter((name) => /^runtime\.update-new-/.test(name));
+  check('a restore whose node.exe does not run is reported, not called success',
+    unverified.ok === false && /does not work/.test(unverified.reason), unverified.reason);
+  check('and it keeps BOTH copies and names them',
+    fs.readFileSync(path.join(brokenRuntime, 'node.exe'), 'utf8') === 'old node'
+      && keptAside.length === 1
+      && unverified.reason.includes(keptAside[0]),
+    keptAside.join(' | '));
+
+  const unitRoot = scratch('upd-transaction-systemd');
+  const unit = path.join(unitRoot, 'easy-devops.service');
+  const unitSnapshots = path.join(unitRoot, 'snapshots');
+  fs.mkdirSync(unitSnapshots, { recursive: true });
+  fs.writeFileSync(unit, '[Service]\nExecStart=old\n');
+  const commands = [];
+  const capturedUnit = await transaction.captureUpdateState({
+    dataDir: path.join(unitRoot, 'data'),
+    mode: null,
+    mechanism: 'systemd',
+    deps: {
+      unitPath: () => unit,
+      runtimeNodePath: () => path.join(unitRoot, 'missing-node'),
+      tmpDir: unitSnapshots,
+    },
+  });
+  fs.writeFileSync(unit, '[Service]\nExecStart=new\n');
+  const restoredUnit = await transaction.restoreUpdateState(capturedUnit, {
+    deps: {
+      runFile: async (file, args) => {
+        commands.push([file, ...args].join(' '));
+        return { success: true, stdout: '', stderr: '' };
+      },
+    },
+  });
+  check('systemd rollback reinstalls the old unit, then reloads systemd',
+    restoredUnit.ok
+      && commands.length === 2
+      && /^sudo install -m 0644/.test(commands[0])
+      && commands[1] === 'sudo systemctl daemon-reload',
+    commands.join(' | '));
+
+  const personalRoot = scratch('upd-transaction-personal');
+  const launcher = path.join(personalRoot, 'startup.cmd');
+  const supervisor = path.join(personalRoot, 'supervisor.cmd');
+  const personalSnapshots = path.join(personalRoot, 'snapshots');
+  fs.mkdirSync(personalSnapshots, { recursive: true });
+  fs.writeFileSync(launcher, 'old launcher');
+  fs.writeFileSync(supervisor, 'old supervisor');
+  const capturedPersonal = await transaction.captureUpdateState({
+    dataDir: path.join(personalRoot, 'data'),
+    mode: 'personal',
+    mechanism: 'startup-supervisor',
+    deps: {
+      launcherPath: () => launcher,
+      supervisorPath: () => supervisor,
+      tmpDir: personalSnapshots,
+    },
+  });
+  fs.writeFileSync(launcher, 'new launcher');
+  fs.writeFileSync(supervisor, 'new supervisor');
+  const restoredPersonal = await transaction.restoreUpdateState(capturedPersonal);
+  check('Personal-mode rollback restores both launcher scripts together',
+    restoredPersonal.ok
+      && fs.readFileSync(launcher, 'utf8') === 'old launcher'
+      && fs.readFileSync(supervisor, 'utf8') === 'old supervisor',
+    JSON.stringify(restoredPersonal));
+
+  const linkRoot = scratch('upd-transaction-link');
+  const linkPath = path.join(linkRoot, 'runtime', 'node');
+  const linkUnit = path.join(linkRoot, 'easy-devops.service');
+  fs.mkdirSync(path.join(linkRoot, 'runtime'), { recursive: true });
+  fs.writeFileSync(linkUnit, '[Service]\nExecStart=old\n');
+  fs.writeFileSync(path.join(linkRoot, 'old-node'), 'old');
+  fs.writeFileSync(path.join(linkRoot, 'new-node'), 'new');
+  let canLink = true;
+  try {
+    fs.symlinkSync(path.join(linkRoot, 'old-node'), linkPath);
+  } catch {
+    canLink = false;
+  }
+  if (canLink) {
+    const linkCapture = await transaction.captureUpdateState({
+      dataDir: path.join(linkRoot, 'data'),
+      mode: null,
+      mechanism: 'systemd',
+      deps: { unitPath: () => linkUnit, runtimeNodePath: () => linkPath, tmpDir: snapshots },
+    });
+    fs.rmSync(linkPath, { force: true });
+    fs.symlinkSync(path.join(linkRoot, 'new-node'), linkPath);
+    const linkRestore = await transaction.restoreUpdateState(linkCapture, {
+      deps: {
+        runtimeNodePath: () => linkPath,
+        runFile: async () => ({ success: true, stdout: '', stderr: '' }),
+      },
+    });
+    check('a re-pointed runtime link is restored with the unit',
+      linkRestore.ok === true && fs.readlinkSync(linkPath) === path.join(linkRoot, 'old-node'),
+      JSON.stringify(linkRestore));
+  } else {
+    check('a re-pointed runtime link is restored with the unit',
+      true, 'skipped: this machine cannot create symlinks');
+  }
+
+  const missingRoot = scratch('upd-transaction-missing-runtime');
+  const missingRuntime = path.join(missingRoot, 'runtime');
+
+  const missingXml = path.join(missingRoot, 'service.xml');
+  const missingSnapshots = path.join(missingRoot, 'snapshots');
+  fs.mkdirSync(missingRuntime, { recursive: true });
+  fs.mkdirSync(missingSnapshots, { recursive: true });
+  fs.writeFileSync(path.join(missingRuntime, 'node.exe'), 'old node');
+  fs.writeFileSync(missingXml, '<old />');
+  const capturedMissing = await transaction.captureUpdateState({
+    dataDir: path.join(missingRoot, 'data'),
+    mode: 'server',
+    mechanism: 'winsw',
+    deps: {
+      serviceXmlPath: () => missingXml,
+      runtimeDir: () => missingRuntime,
+      tmpDir: missingSnapshots,
+    },
+  });
+  fs.rmSync(capturedMissing.runtimeBackup, { recursive: true, force: true });
+  const missingRestore = await transaction.restoreUpdateState(capturedMissing, {
+    deps: { runtimeDir: () => missingRuntime, ...PROBE_OK },
+  });
+  check('rollback refuses to report success when the preserved runtime is missing',
+    missingRestore.ok === false && /preserved service runtime is missing/.test(missingRestore.reason),
+    JSON.stringify(missingRestore));
+  check('and a restore that could not finish keeps the journal for the next run',
+    fs.existsSync(capturedMissing.journal), capturedMissing.journal);
+}
+
+// ─── 4d. Finding 2: an absent artifact is not a failure ─────────────────────
+
+async function testAbsentArtifacts() {
+  setGroup('4d. an absent launcher or unit is skipped, not an error');
+
+  const transaction = await import(srcUrl('core/service/updateTransaction.js'));
+  const updater = await import(srcUrl('core/updater.js'));
+  const root = scratch('upd-absent');
+  const dataDir = path.join(root, 'data');
+  const snapshots = path.join(root, 'snapshots');
+  fs.mkdirSync(snapshots, { recursive: true });
+  const supervisor = path.join(root, 'daemon-supervisor.cmd');
+
+  const captured = await transaction.captureUpdateState({
+    dataDir,
+    mode: 'personal',
+    mechanism: 'startup-supervisor',
+    deps: { launcherPath: () => null, supervisorPath: () => supervisor, tmpDir: snapshots },
+  });
+  check('a missing Startup launcher is recorded as absent, not an abort',
+    captured.ok === true
+      && captured.files.length === 2
+      && captured.files.every((file) => file.absent === true),
+    JSON.stringify(captured.files));
+  const restored = await transaction.restoreUpdateState(captured);
+  check('restoring an absent artifact succeeds and creates nothing',
+    restored.ok === true && !fs.existsSync(supervisor), JSON.stringify(restored));
+
+  const unitPath = path.join(root, 'easy-devops.service');
+  const unitData = path.join(root, 'unit-data');
+  const unitCapture = await transaction.captureUpdateState({
+    dataDir: unitData,
+    mode: null,
+    mechanism: 'systemd',
+    deps: {
+      unitPath: () => unitPath,
+      runtimeNodePath: () => path.join(root, 'runtime-node'),
+      tmpDir: snapshots,
+    },
+  });
+  check('a missing systemd unit is not an error either',
+    unitCapture.ok === true && unitCapture.files[0]?.absent === true,
+    JSON.stringify(unitCapture.files));
+  const unitRestore = await transaction.restoreUpdateState(unitCapture, {
+    deps: { runFile: async () => ({ success: true, stdout: '', stderr: '' }) },
+  });
+  check('and restoring it leaves no unit behind either',
+    unitRestore.ok === true && !fs.existsSync(unitPath), JSON.stringify(unitRestore));
+
+  // And the whole update proceeds with the launcher absent.
+  const order = [];
+  const service = serviceStub({ installed: true, mode: 'personal', version: '1.4.7' });
+  const start = service.start;
+  service.start = async (...args) => { order.push('start'); return start(...args); };
+  const result = await updater.performUpdate({
+    version: '1.4.7',
+    dataDir,
+    deps: {
+      runFile: recordingRun({ 'npm install': 'installed' }),
+      service,
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.4.6',
+      captureUpdateState: (opts) => transaction.captureUpdateState({
+        ...opts,
+        dataDir,
+        deps: { launcherPath: () => null, supervisorPath: () => supervisor, tmpDir: snapshots },
+      }),
+      restoreUpdateState: (snapshot) => transaction.restoreUpdateState(snapshot),
+      commitUpdateState: transaction.commitUpdateState,
+      runPostUpdate: async () => { order.push('post-update'); return { ok: true, step: 'definition' }; },
+    },
+  });
+  check('an update with no launcher installed still succeeds',
+    result.ok === true, result.reason ?? '');
+  check('and it never starts the service before post-update',
+    order.indexOf('post-update') !== -1 && order.indexOf('post-update') < order.indexOf('start'),
+    order.join(' -> '));
+}
+
+// ─── 4e. Finding 1: an interrupted update is finished by the next run ───────
+
+async function testInterruptedUpdate() {
+  setGroup('4e. an interrupted transaction is recovered on the next run');
+
+  const transaction = await import(srcUrl('core/service/updateTransaction.js'));
+  const root = scratch('upd-interrupted');
+  const dataDir = path.join(root, 'data');
+  const runtime = path.join(root, 'runtime');
+  const xml = path.join(root, 'service.xml');
+  const snapshots = path.join(root, 'snapshots');
+  fs.mkdirSync(path.join(runtime, 'app'), { recursive: true });
+  fs.mkdirSync(snapshots, { recursive: true });
+  fs.writeFileSync(path.join(runtime, 'node.exe'), 'old node');
+  fs.writeFileSync(path.join(runtime, 'app', 'version.txt'), '1.4.3');
+  fs.writeFileSync(xml, '<old />');
+
+  const captured = await transaction.captureUpdateState({
+    dataDir,
+    mode: 'server',
+    mechanism: 'winsw',
+    deps: { serviceXmlPath: () => xml, runtimeDir: () => runtime, tmpDir: snapshots },
+  });
+  check('the update is mid-flight: runtime moved aside and the journal left behind',
+    captured.ok === true && !fs.existsSync(runtime) && fs.existsSync(captured.journal));
+
+  // The crash: post-update copied the new runtime in and rewrote the XML.
+  fs.mkdirSync(path.join(runtime, 'app'), { recursive: true });
+  fs.writeFileSync(path.join(runtime, 'node.exe'), 'new node');
+  fs.writeFileSync(xml, '<new />');
+
+  const recovered = await transaction.recoverInterruptedUpdate({
+    dataDir,
+    deps: { runtimeDir: () => runtime, ...PROBE_OK },
+  });
+  check('the next run finds the journal and puts the previous runtime back',
+    recovered.ok === true && recovered.recovered === true
+      && fs.readFileSync(path.join(runtime, 'node.exe'), 'utf8') === 'old node'
+      && fs.readFileSync(path.join(runtime, 'app', 'version.txt'), 'utf8') === '1.4.3'
+      && fs.readFileSync(xml, 'utf8') === '<old />',
+    JSON.stringify(recovered));
+  check('the journal is gone once the previous state is back',
+    !fs.existsSync(captured.journal));
+  check('the superseded new copy is removed only after the old one was proven',
+    !fs.existsSync(captured.runtimeBackup));
+
+  const again = await transaction.recoverInterruptedUpdate({ dataDir, deps: { runtimeDir: () => runtime, ...PROBE_OK } });
+  check('recovering again is a harmless no-op',
+    again.ok === true && again.recovered === false, JSON.stringify(again));
+
+  // A journal that cannot be read is reported instead of silently ignored.
+  fs.writeFileSync(path.join(dataDir, 'update-journal.json'), '{ not json');
+  const corrupt = await transaction.recoverInterruptedUpdate({ dataDir });
+  check('an unreadable journal is reported, not ignored',
+    corrupt.ok === false && /cannot be read/.test(corrupt.reason), corrupt.reason);
+  fs.rmSync(path.join(dataDir, 'update-journal.json'), { force: true });
+
+  // A journal whose owner is still alive belongs to an update that is running
+  // right now — the post-update child is a different process — and must be
+  // left alone.
+  const liveJournal = path.join(dataDir, 'update-journal.json');
+  fs.writeFileSync(liveJournal, JSON.stringify({
+    version: 1,
+    stage: 'moved',
+    pid: process.ppid,
+    dataDir,
+    root: path.join(root, 'other-snapshot'),
+    files: [],
+    runtimeBackup: path.join(root, 'runtime.other'),
+  }));
+  const live = await transaction.recoverInterruptedUpdate({
+    dataDir,
+    deps: { runtimeDir: () => runtime, ...PROBE_OK },
+  });
+  check('a journal owned by a running update is left untouched',
+    live.ok === true && live.active === true && live.recovered === false && fs.existsSync(liveJournal),
+    JSON.stringify(live));
+
+  const busy = await transaction.captureUpdateState({
+    dataDir,
+    mode: 'server',
+    deps: { serviceXmlPath: () => xml, runtimeDir: () => runtime, tmpDir: snapshots },
+  });
+  check('and a second update refuses to start on top of it',
+    busy.ok === false && /another update is running/.test(busy.reason), busy.reason);
+  fs.rmSync(liveJournal, { force: true });
+}
+
+// ─── 4f. Windows A3: the update must never stop silently ────────────────────
+
+async function testWindowsA3Replay() {
+  setGroup('4f. Windows A3: after the runtime copy, a failure is reported and rolled back');
+
+  const updater = await import(srcUrl('core/updater.js'));
+  const transaction = await import(srcUrl('core/service/updateTransaction.js'));
+  const root = scratch('upd-a3');
+  const dataDir = path.join(root, 'data');
+  const runtime = path.join(root, 'runtime');
+  const xml = path.join(root, 'service.xml');
+  const snapshots = path.join(root, 'snapshots');
+  fs.mkdirSync(path.join(runtime, 'app'), { recursive: true });
+  fs.mkdirSync(snapshots, { recursive: true });
+  fs.writeFileSync(path.join(runtime, 'node.exe'), 'old node');
+  fs.writeFileSync(path.join(runtime, 'app', 'version.txt'), '1.4.5');
+  fs.writeFileSync(xml, '<old />');
+
+  const order = [];
+  const logs = [];
+  const service = serviceStub({ installed: true, mode: 'server', version: '1.4.5' });
+  const start = service.start;
+  const wait = service.waitForDaemon;
+  service.start = async (...args) => { order.push('start'); return start(...args); };
+  service.waitForDaemon = async (...args) => { order.push('wait'); return wait(...args); };
+  const npm = recordingRun({ 'npm install': 'installed' });
+
+  const result = await updater.performUpdate({
+    version: '1.4.7',
+    dataDir,
+    log: (line) => logs.push(line),
+    deps: {
+      runFile: npm,
+      service,
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.4.5',
+      isElevated: async () => true,
+      captureUpdateState: (opts) => {
+        order.push('snapshot');
+        return transaction.captureUpdateState({
+          ...opts,
+          dataDir,
+          deps: { serviceXmlPath: () => xml, runtimeDir: () => runtime, tmpDir: snapshots },
+        });
+      },
+      restoreUpdateState: (snapshot) => {
+        order.push('restore');
+        return transaction.restoreUpdateState(snapshot, {
+          deps: { runtimeDir: () => runtime, ...PROBE_OK },
+        });
+      },
+      commitUpdateState: (snapshot) => { order.push('commit'); return transaction.commitUpdateState(snapshot); },
+      runPostUpdate: async () => {
+        // The measured sequence: the copy step succeeded and said so...
+        order.push('post-update');
+        logs.push('node.exe is already the runtime copy (C:\\ProgramData\\easy-devops\\runtime\\node.exe); kept');
+        fs.mkdirSync(path.join(runtime, 'app'), { recursive: true });
+        fs.writeFileSync(path.join(runtime, 'node.exe'), 'new node');
+        fs.writeFileSync(path.join(runtime, 'app', 'version.txt'), '1.4.7');
+        fs.writeFileSync(xml, '<new />');
+        // ...and then the protection pass failed.
+        return {
+          ok: false,
+          step: 'permissions',
+          reason: 'C:\\ProgramData\\easy-devops\\runtime\\node.exe: EPERM: operation not permitted',
+        };
+      },
+      inspectLock: () => ({ lock: { version: '1.4.5' } }),
+    },
+  });
+
+  check('the update fails instead of stopping silently after the copy',
+    result.ok === false && result.step === 'permissions', result.step);
+  check('the copy step really ran and was logged',
+    logs.some((line) => /is already the runtime copy/.test(line)), logs.join(' | '));
+  check('the output names the step and the error',
+    result.lines.join('\n').includes('Failed at: permissions')
+      && result.lines.join('\n').includes('EPERM'),
+    result.lines.join(' | '));
+  check('the old package is put back', npm.commands.includes('npm install -g easy-devops@1.4.5'),
+    npm.commands.join(' | '));
+  check('the unit/XML and the runtime copy are restored together',
+    fs.readFileSync(xml, 'utf8') === '<old />'
+      && fs.readFileSync(path.join(runtime, 'node.exe'), 'utf8') === 'old node'
+      && fs.readdirSync(root).filter((name) => /^runtime\.update-new-/.test(name)).length === 0,
+    `${fs.readFileSync(xml, 'utf8')} / ${fs.readFileSync(path.join(runtime, 'node.exe'), 'utf8')}`);
+  check('and the service is started and verified on the old version, never left stopped',
+    order.includes('restore')
+      && order.indexOf('restore') < order.indexOf('start')
+      && result.restarted === true
+      && result.rollbackVersionConfirmed === true,
+    order.join(' -> '));
+  check('it ends with the exact command to run next',
+    result.next === 'sc.exe query EasyDevOps' || result.next === 'ezz service recover',
+    result.next);
+  check('and the reason a caller prints carries that command too',
+    new RegExp(`Next: ${result.next.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(result.reason),
+    result.reason);
+  check('no start happened before the new package post-update',
+    order.indexOf('post-update') < order.indexOf('start'), order.join(' -> '));
+}
+
+// ─── 4g. A rollback that cannot prove the old heartbeat says what to run ────
+
+async function testBrokenRollbackMessage() {
+  setGroup('4g. a rollback that does not come back says what is still broken');
+
+  const updater = await import(srcUrl('core/updater.js'));
+  const dataDir = scratch('upd-broken-rollback');
+  const service = serviceStub({ installed: true, mode: 'server', version: '1.4.5' });
+  service.waitForDaemon = async () => ({
+    alive: true,
+    waitedMs: 400,
+    lock: { version: '1.4.6' },
+  });
+
+  const result = await updater.performUpdate({
+    version: '1.4.7',
+    dataDir,
+    deps: {
+      runFile: recordingRun({ 'npm install': 'installed' }),
+      service,
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.4.5',
+      isElevated: async () => true,
+      ...transactionDeps([], {
+        postUpdate: { ok: false, step: 'definition', reason: 'the WinSW XML could not be written' },
+      }),
+      inspectLock: () => ({ lock: { version: '1.4.6' } }),
+    },
+  });
+
+  const message = result.lines.join('\n');
+  check('a daemon reporting the wrong version is not called a successful rollback',
+    result.ok === false && result.rollbackVersionConfirmed === false, JSON.stringify(result).slice(0, 200));
+  check('the message lists what is still broken',
+    /NOT confirmed running/.test(message)
+      && /v1\.4\.6/.test(message)
+      && /v1\.4\.5/.test(message),
+    message.replace(/\n/g, ' | '));
+  check('and what to run: the check command and the repair command',
+    /sc\.exe query EasyDevOps/.test(message) && /ezz service recover/.test(message),
+    message.replace(/\n/g, ' | '));
+  check('the next command is the repair path', result.next === 'ezz service recover', result.next);
+  check('and the printed reason names it as well',
+    /Next: ezz service recover/.test(result.reason), result.reason);
+}
+
+// ─── 4h. An older target has no post-update step: fall back to repair ───────
+
+async function testPostUpdateFallback() {
+  setGroup('4h. an older target falls back to this version\'s repair');
+
+  const updater = await import(srcUrl('core/updater.js'));
+  const dataDir = scratch('upd-fallback');
+  const olderRoot = scratch('upd-fallback-older');
+  fs.writeFileSync(path.join(olderRoot, 'package.json'),
+    JSON.stringify({ name: 'easy-devops', version: '1.4.3' }));
+
+  const handoff = await updater.runPostUpdateHandoff({
+    sourceRoot: olderRoot,
+    version: '1.4.3',
+    dataDir,
+    runFile: async () => { throw new Error('the older package must not be launched'); },
+  });
+  check('a version without the command is detected before it is launched',
+    handoff.ok === true && handoff.fallback === true, JSON.stringify(handoff));
+  check('and the reason says which version introduced it',
+    /1\.4\.7/.test(handoff.reason), handoff.reason);
+
+  const order = [];
+  const service = serviceStub({ installed: true, mode: 'personal', version: '1.4.3' });
+  const start = service.start;
+  service.start = async (...args) => { order.push('start'); return start(...args); };
+
+  const result = await updater.performUpdate({
+    version: '1.4.3',
+    dataDir,
+    deps: {
+      runFile: recordingRun({ 'npm install': 'installed' }),
+      service,
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.4.7',
+      ...transactionDeps(order),
+      runPostUpdate: async () => { order.push('post-update'); return { ok: true, fallback: true, reason: 'no step' }; },
+      runRepair: async () => { order.push('repair'); return { ok: true }; },
+    },
+  });
+  check('the update still succeeds', result.ok === true, result.reason ?? '');
+  check('this version\'s repair runs before the start, in place of the hand-off',
+    order.indexOf('post-update') < order.indexOf('repair')
+      && order.indexOf('repair') < order.indexOf('start'),
+    order.join(' -> '));
+
+  const failing = await updater.performUpdate({
+    version: '1.4.3',
+    dataDir,
+    deps: {
+      runFile: recordingRun({ 'npm install': 'installed' }),
+      // The rollback heartbeat must report the version that was installed
+      // before this update, which is `from`.
+      service: serviceStub({ installed: true, mode: 'personal', version: '1.4.7' }),
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.4.7',
+      ...transactionDeps([]),
+      runPostUpdate: async () => ({ ok: true, fallback: true, reason: 'no step' }),
+      runRepair: async () => ({ ok: false, reason: 'the launcher could not be rewritten' }),
+    },
+  });
+  check('a failed fallback repair rolls back rather than starting blindly',
+    failing.ok === false
+      && failing.step === 'repair'
+      && failing.rolledBack === true
+      && /launcher could not be rewritten/.test(failing.reason),
+    failing.reason);
+}
+
+// ─── 4i. The new package's post-update is idempotent ────────────────────────
+
+async function testPostUpdateIdempotent() {
+  setGroup('4i. the post-update step can run again from repair');
+
+  const { applyPostUpdate } = await import(srcUrl('core/service/postUpdate.js'));
+  const dataDir = scratch('upd-idempotent');
+  const runtimeDirPath = path.join(dataDir, 'runtime');
+
+  const deps = {
+    installedPackageVersion: () => '1.4.7',
+    copyRuntime: (opts) => ({ ok: true, dir: opts.dataDir, nodeExe: opts.nodeExe }),
+    verifyNativeModules: async () => ({ ok: true, version: 'v22.0.0', abi: '127' }),
+    protectServiceFiles: async () => ({ ok: true, protected: [], failed: [] }),
+    refreshServiceDefinition: () => {},
+    recoverInterruptedUpdate: async () => ({ ok: true, recovered: false }),
+  };
+
+  const first = await applyPostUpdate({ dataDir, mode: 'server', mechanism: 'winsw', targetVersion: '1.4.7', deps });
+  const second = await applyPostUpdate({ dataDir, mode: 'server', mechanism: 'winsw', targetVersion: '1.4.7', deps });
+  check('running it twice from repair succeeds both times',
+    first.ok === true && second.ok === true,
+    `${JSON.stringify(first)} / ${JSON.stringify(second)}`);
+  check('it never touches user data', !fs.existsSync(path.join(runtimeDirPath, 'easy-devops.sqlite')));
+
+  const journal = await applyPostUpdate({
+    dataDir,
+    mode: 'server',
+    mechanism: 'winsw',
+    targetVersion: '1.4.7',
+    deps: {
+      ...deps,
+      recoverInterruptedUpdate: async () => ({ ok: false, reason: 'the old runtime is at C:\\x, run `ezz service recover`' }),
+    },
+  });
+  check('an unrecoverable earlier update stops it before it copies anything',
+    journal.ok === false && journal.step === 'journal' && /ezz service recover/.test(journal.reason),
+    JSON.stringify(journal));
 }
 
 // ─── 5. No service installed ─────────────────────────────────────────────────
@@ -436,6 +1441,15 @@ async function testCheck() {
   });
   check('an older registry version is not an update', older.updateAvailable === false);
 
+  const prerelease = await updater.checkForUpdate({
+    deps: {
+      runFile: recordingRun({ 'npm view': '1.3.0' }),
+      currentVersion: () => '1.3.0-rc.2',
+    },
+  });
+  check('a final release supersedes the matching prerelease',
+    prerelease.updateAvailable === true, JSON.stringify(prerelease));
+
   const offline = await updater.checkForUpdate({
     deps: { runFile: recordingRun({ 'npm view': null }), currentVersion: () => '1.2.1' },
   });
@@ -469,6 +1483,14 @@ async function testCheck() {
     updater.compareVersions('1.10.0', '1.9.0') === 1
     && updater.compareVersions('2.0.0', '1.99.99') === 1
     && updater.compareVersions('1.2.1', '1.2.1') === 0);
+  check('prerelease precedence is complete rather than treated as the release',
+    updater.compareVersions('1.3.0-rc.1', '1.3.0-rc.2') === -1
+      && updater.compareVersions('1.3.0-rc.2', '1.3.0') === -1
+      && updater.compareVersions('1.3.0-alpha', '1.3.0-1') === 1);
+  check('heartbeat identity includes the prerelease suffix',
+    updater.sameVersion('v1.3.0', '1.3.0') === true
+      && updater.sameVersion('1.3.0', '1.3.0-rc.2') === false
+      && updater.sameVersion(undefined, '1.3.0') === false);
 }
 
 // ─── 7. The Hub explanation ──────────────────────────────────────────────────
@@ -503,6 +1525,14 @@ async function main() {
   await testServerCopyRefresh();
   await testUserServiceRefresh();
   await testRollback();
+  await testPostUpdateHandoff();
+  await testUpdateTransaction();
+  await testAbsentArtifacts();
+  await testInterruptedUpdate();
+  await testWindowsA3Replay();
+  await testBrokenRollbackMessage();
+  await testPostUpdateFallback();
+  await testPostUpdateIdempotent();
   await testNoService();
   await testCheck();
   await testWhyCliOnly();

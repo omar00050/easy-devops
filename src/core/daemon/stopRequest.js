@@ -32,6 +32,7 @@
  * a marker a restarted service would then obey would break "back at boot".
  */
 
+import { replaceStateFile } from '../atomicState.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -60,10 +61,9 @@ export function requestStop({ dataDir = getDataDir(), reason = 'ezz service stop
 
   try {
     fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(
+    replaceStateFile(
       file,
       `${JSON.stringify({ at: new Date().toISOString(), by: process.pid, reason })}\n`,
-      { encoding: 'utf8', mode: 0o600 },
     );
     return { ok: true, path: file };
   } catch (err) {

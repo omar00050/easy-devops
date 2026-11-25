@@ -31,52 +31,53 @@ No external ACME binaries required — SSL certificates are issued via [`acme-cl
 - **Node.js 18+** (with npm)
 - **Linux** (Debian/Ubuntu/etc.) or **Windows**
 - Windows Server mode needs one Administrator/UAC approval when the service is installed or repaired.
-- Optional: nginx, nvm (the bootstrap installer fails closed when nvm is missing)
+- Optional: nginx, nvm (the bootstrap installer uses nvm only from a pinned release; otherwise it prints the manual commands)
 
 ## Installation
 
 ### Quick Install (One-Line)
 
-If you have **Node.js 18+** installed, run:
+The one-line installers download the reviewed helper files into a private
+directory, check each one against the SHA-256 pinned in the installer, and
+source only the verified copies. Nothing is fetched from a mutable branch, and
+a helper that does not match is refused rather than run.
+
+If you have **Node.js 18+** installed, the npm route is one command:
 
 ```bash
 npm install -g easy-devops && easy-devops
 # Short alias also available: ezz
 ```
 
-The bootstrap installers verify the reviewed helper files that ship beside
-them. They do not download mutable helper scripts or unverified runtimes.
-
 #### Linux
 
 ```bash
-git clone --branch v1.4.5 --depth 1 https://github.com/omar00050/Easy-DevOps.git
-cd Easy-DevOps
-bash install.sh
+curl -fsSL https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/install.sh -o install.sh && bash install.sh
 ```
 
-The tagged checkout includes the helper bundle. If Node.js 18+ is already
-installed, use `bash install.sh --keep-node`. If nvm is required but missing,
-the installer stops with reviewed release instructions instead of fetching
-code from a mutable branch.
+```bash
+wget -qO install.sh https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/install.sh && bash install.sh
+```
+
+Already have Node.js 18+? Add the `--keep-node` hint to skip Node.js
+management: `bash install.sh --keep-node`. If nvm is required but missing, the
+installer prints the exact manual commands instead of fetching nvm.
 
 #### Windows (PowerShell)
 
 ```powershell
-git clone --branch v1.4.5 --depth 1 https://github.com/omar00050/Easy-DevOps.git
-Set-Location Easy-DevOps
-powershell -ExecutionPolicy Bypass -File .\install.ps1
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/install.ps1" -OutFile "install.ps1"; ./install.ps1
 ```
 
-The tagged checkout includes the reviewed installer. Automatic nvm-windows
-installation is disabled in this release because no reviewed executable digest
-is bundled. With Node.js 18+ already installed, add `-KeepNode`.
-If Node.js is missing, install a reviewed Node.js or nvm-windows release first,
-then rerun the installer. Windows Server mode requests UAC approval at the
-service step.
+Already have Node.js 18+? Add `-KeepNode`: `./install.ps1 -KeepNode`.
+Automatic nvm-windows installation is disabled because this release has no
+reviewed executable digest. If Node.js is missing, the installer offers the
+official LTS package (`winget install --id OpenJS.NodeJS.LTS -e`, after asking)
+or points you to the nodejs.org LTS installer. Windows Server mode requests UAC
+approval at the service step; no password is ever asked for.
 
 > **What the installer does:**
-> 1. Checks for Node.js 18+ and an existing reviewed nvm installation when a runtime change is needed
+> 1. Checks for Node.js 18+ (and offers to install the LTS with winget on Windows when it is missing)
 > 2. Installs Easy DevOps globally via npm
 > 3. Launches the interactive CLI
 
@@ -114,7 +115,7 @@ npx easy-devops
 ### CLI Overview
 
 ```
-  ███████╗███████╗     Easy DevOps  v1.4.5
+  ███████╗███████╗     Easy DevOps  v1.4.7
   ██╔════╝╚════██╗     ─────────────────────
   █████╗      ██╔╝     CLI & Web Dashboard
   ██╔══╝     ██╔╝      Nginx · SSL · Domains · Node.js

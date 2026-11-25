@@ -228,9 +228,16 @@ export function getShell() {
 
 /** Execute a native executable with literal arguments and no command interpreter. */
 export function runFile(file, args, options = {}) {
-  const { timeout = 30000, cwd = process.cwd(), env = null, onData = null, replaceEnv = false } = options;
+  const {
+    timeout = 30000,
+    cwd = process.cwd(),
+    env = null,
+    onData = null,
+    replaceEnv = false,
+    stdin = null,
+  } = options;
   return capture((spawnOptions) => spawn(file, args, { ...spawnOptions, shell: false }), {
-    cmd: file, timeout, cwd, env, onData, replaceEnv,
+    cmd: file, timeout, cwd, env, onData, replaceEnv, stdin,
   });
 }
 
@@ -267,7 +274,7 @@ export function run(cmd, options = {}) {
  * @param {(spawnOptions: Object) => import('child_process').ChildProcess} spawnChild
  * @param {{ cmd: string, timeout: number, cwd: string, env: Object|null, onData: Function|null }} opts
  */
-function capture(spawnChild, { cmd, timeout, cwd, env, onData, replaceEnv = false }) {
+function capture(spawnChild, { cmd, timeout, cwd, env, onData, replaceEnv = false, stdin = null }) {
   return new Promise((resolve) => {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeout);
@@ -279,6 +286,7 @@ function capture(spawnChild, { cmd, timeout, cwd, env, onData, replaceEnv = fals
         signal: ac.signal,
         encoding: 'utf8',
         windowsHide: true,
+        ...(stdin ? { stdio: [stdin, 'pipe', 'pipe'] } : {}),
         ...(env ? { env: replaceEnv ? { ...env } : { ...process.env, ...env } } : {}),
       });
     } catch (err) {

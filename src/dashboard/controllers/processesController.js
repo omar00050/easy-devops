@@ -315,6 +315,12 @@ class ProcessesController {
           crashLooping: Boolean(native.service?.crashLooping),
           warnings: native.warnings ?? [],
           runtime: native.runtime ?? null,
+
+          // The service's own package version next to the CLI's, so the banner
+          // can say which is behind (Windows Server keeps a runtime copy).
+          serviceVersion: native.serviceVersion ?? null,
+          cliVersion: native.cliVersion ?? null,
+          versionDrift: native.versionDrift === true,
         },
 
         // ── Still true, still used ────────────────────────────────────────

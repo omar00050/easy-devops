@@ -42,6 +42,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'node:crypto';
 import { createRequire } from 'module';
 
 import { run, runFile } from '../shell.js';
@@ -516,6 +517,23 @@ async function applyLinux({ nodeExe, dataDir, log, deps = {} }) {
 }
 
 /**
+ * Proves a runtime binary in place runs, before anything that is only kept for
+ * rollback is removed.
+ */
+async function verifyRuntimeExe(nodeExe, deps = {}) {
+  if (deps.verifyNode) return deps.verifyNode(nodeExe);
+  let probe;
+  try {
+    probe = await (deps.runFile ?? runFile)(nodeExe, ['--version'], { timeout: 20_000 });
+  } catch (error) {
+    return { ok: false, reason: `${nodeExe} could not be run: ${error.message}` };
+  }
+  return probe.success
+    ? { ok: true, version: String(probe.stdout ?? '').trim() }
+    : { ok: false, reason: `${nodeExe} did not run: ${trimOutput(probe)}` };
+}
+
+/**
  * Windows Server mode: replace node.exe in the admin-only runtime directory,
  * keeping the old one as node.exe.prev, and make the app copy's native modules
  * match the new ABI.
@@ -528,7 +546,7 @@ async function applyLinux({ nodeExe, dataDir, log, deps = {} }) {
  * modules were built by whatever npm the user runs.
  */
 async function applyWindowsServer({ nodeExe, dataDir, log, deps = {} }) {
-  const canWrite = (deps.canWriteProgramData ?? canWriteProgramData)();
+  const canWrite = await (deps.canWriteProgramData ?? canWriteProgramData)();
   if (!canWrite) {
     return {
       ok: false,
@@ -570,14 +588,45 @@ async function applyWindowsServer({ nodeExe, dataDir, log, deps = {} }) {
   }
 
   const rollback = async () => {
-    if (!fs.existsSync(prev)) return { ok: false, reason: 'there is no previous runtime to restore' };
-    try {
-      fs.rmSync(dest, { force: true });
-      fs.renameSync(prev, dest);
-      return { ok: true, detail: `restored ${dest} from ${PREV_SUFFIX}` };
-    } catch (err) {
-      return { ok: false, reason: `could not restore ${dest}: ${err.message}` };
+    if (!fs.existsSync(prev)) {
+      return { ok: false, reason: `there is no previous runtime to restore: ${prev} is missing` };
     }
+    // Rename the failed copy aside, rename the previous one back, prove it
+    // runs, and only then remove the failed copy. Deleting the new binary
+    // first would lose both if the rename back failed.
+    const failed = `${dest}.failed-${randomUUID()}`;
+    let setAside = false;
+    try {
+      if (fs.existsSync(dest)) {
+        fs.renameSync(dest, failed);
+        setAside = true;
+      }
+      fs.renameSync(prev, dest);
+    } catch (err) {
+      if (setAside) {
+        try { fs.renameSync(failed, dest); } catch { /* keep both, reported below */ }
+      }
+      return {
+        ok: false,
+        reason: `could not restore ${dest} from ${prev}: ${err.message}. `
+          + `Both copies are kept: ${dest}${setAside ? ` and ${failed}` : ''}.`,
+      };
+    }
+
+    const verified = await verifyRuntimeExe(dest, deps);
+    if (!verified.ok) {
+      return {
+        ok: false,
+        reason: `the previous runtime was put back at ${dest}, but it does not run: ${verified.reason}. `
+          + `The failed copy is kept at ${failed}. Run \`ezz service repair\` once node.exe runs there.`,
+      };
+    }
+    if (setAside) {
+      try { fs.rmSync(failed, { force: true }); } catch (err) {
+        log(`warning: the failed runtime copy could not be removed (${failed}): ${err.message}`);
+      }
+    }
+    return { ok: true, detail: `restored ${dest} from ${PREV_SUFFIX} (${verified.version ?? 'node runs'})` };
   };
 
   const native = await fixAppCopyModules({ nodeExe: dest, appDir, log, deps });
@@ -765,26 +814,63 @@ export async function update({
     // elevation refusal, a copy error) and after it (the app copy's native
     // modules could not be made to load). The second one leaves a new binary
     // in place, so it hands back a rollback and it has to be used.
-    const back = applied.rollback ? await applied.rollback() : null;
-    const restarted = applied.unsafeRuntime ? { ok: false } : await service.start({ log });
+    let back = null;
+    try {
+      back = applied.rollback ? await applied.rollback() : null;
+    } catch (error) {
+      back = { ok: false, reason: error.message };
+    }
+    let restarted;
+    if (applied.unsafeRuntime) {
+      // Deliberate: an unprotected or unverified runtime copy must not be
+      // started as the service account. The message says what to run.
+      restarted = { ok: false, reason: 'the runtime was left unsecured' };
+    } else {
+      try {
+        restarted = await service.start({ log });
+      } catch (error) {
+        restarted = { ok: false, reason: error.message };
+      }
+    }
+    const next = restarted.ok ? serviceCheck(mech) : 'ezz service recover';
     return {
       ok: false,
       step: 'swap',
-      reason: applied.reason,
+      reason: `${applied.reason}${restarted.ok ? '' : ` The service is NOT running: ${restarted.reason ?? 'it was not started'}.`}`
+        + `\nNext: ${next}`,
       fix: applied.fix,
       needsElevation: applied.needsElevation ?? false,
       rolledBack: back ? back.ok : false,
       rollbackDetail: back ? (back.detail ?? back.reason) : null,
       restarted: restarted.ok,
+      next,
+      lines: [
+        'Failed at: swap',
+        `${applied.reason}`,
+        restarted.ok ? 'The service is running.' : 'The service is NOT confirmed running.',
+        `Next: ${next}`,
+      ],
     };
   }
 
   // 5. Start and verify against the daemon's own heartbeat.
   log('Starting the service on the new runtime...');
-  const started = await service.start({ log });
-  const alive = started.ok
-    ? await (deps.waitForDaemon ?? waitForDaemon)({ dataDir, timeoutMs: deps.verifyMs ?? VERIFY_MS })
-    : { alive: false, waitedMs: 0 };
+  let started;
+  try {
+    started = await service.start({ log });
+  } catch (error) {
+    started = { ok: false, reason: error.message };
+  }
+  let alive;
+  if (started.ok) {
+    try {
+      alive = await (deps.waitForDaemon ?? waitForDaemon)({ dataDir, timeoutMs: deps.verifyMs ?? VERIFY_MS });
+    } catch (error) {
+      alive = { alive: false, waitedMs: 0, reason: error.message };
+    }
+  } else {
+    alive = { alive: false, waitedMs: 0 };
+  }
 
   if (started.ok && alive.alive) {
     log(`  the daemon reported in after ${alive.waitedMs}ms (pid ${alive.lock?.pid ?? '?'}).`);
@@ -805,19 +891,65 @@ export async function update({
     : `it could not be started: ${started.reason}`;
 
   log(`The new runtime did not work (${why}). Rolling back...`);
-  const back = applied.rollback ? await applied.rollback() : { ok: false, reason: 'no rollback was available' };
-  const restarted = back.ok ? await service.start({ log }) : { ok: false };
-  const aliveAgain = restarted.ok
-    ? await (deps.waitForDaemon ?? waitForDaemon)({ dataDir, timeoutMs: deps.verifyMs ?? VERIFY_MS })
-    : { alive: false };
+  let back;
+  try {
+    back = applied.rollback ? await applied.rollback() : { ok: false, reason: 'no rollback was available' };
+  } catch (error) {
+    back = { ok: false, reason: error.message };
+  }
+  // Started even when the runtime rollback failed: a stopped service is the
+  // failure this command exists to prevent, and whatever binary is in place
+  // may still run. If it does not, the result says exactly what to run.
+  let restarted;
+  try {
+    restarted = await service.start({ log });
+  } catch (error) {
+    restarted = { ok: false, reason: error.message };
+  }
+  let aliveAgain;
+  if (restarted.ok) {
+    try {
+      aliveAgain = await (deps.waitForDaemon ?? waitForDaemon)({ dataDir, timeoutMs: deps.verifyMs ?? VERIFY_MS });
+    } catch (error) {
+      aliveAgain = { alive: false, reason: error.message };
+    }
+  } else {
+    aliveAgain = { alive: false };
+  }
+
+  const broken = [];
+  if (!back.ok) broken.push(back.detail ?? back.reason ?? 'the previous runtime could not be restored');
+  if (!restarted.ok) broken.push(`the service could not be started: ${restarted.reason ?? 'unknown error'}`);
+  else if (!aliveAgain.alive) broken.push('the service started but its daemon heartbeat did not return');
+
+  const nextCommand = back.ok && restarted.ok && aliveAgain.alive ? serviceCheck(mech) : 'ezz service recover';
 
   return {
     ok: false,
     step: 'verify',
-    reason: why,
+    reason: `${[why, ...broken].join(' ')}\nNext: ${nextCommand}`,
     rolledBack: back.ok,
     rollbackDetail: back.detail ?? back.reason,
     restored: Boolean(restarted.ok && aliveAgain.alive),
     version: smoke.version,
+    next: nextCommand,
+    lines: [
+      'Failed at: verify',
+      why,
+      back.ok
+        ? `The previous runtime was put back (${back.detail ?? 'ok'}).`
+        : `The previous runtime was NOT put back: ${back.detail ?? back.reason ?? 'unknown error'}.`,
+      Boolean(restarted.ok && aliveAgain.alive)
+        ? 'The service is running.'
+        : 'The service is NOT confirmed running.',
+      ...(back.ok && restarted.ok && aliveAgain.alive ? [] : ['To repair it: ezz service recover']),
+    ],
   };
+}
+
+/** The command that shows this service's state, without a platform check. */
+function serviceCheck(mech = {}) {
+  if (mech.mechanism === 'systemd') return 'sudo systemctl status easy-devops';
+  if (mech.mechanism === 'winsw') return 'sc.exe query EasyDevOps';
+  return 'ezz service status';
 }

@@ -30,13 +30,15 @@
 import { createRequire } from 'module';
 
 import { getDataDir } from '../platform.js';
+import { dbGet } from '../db.js';
 import { startJobs } from '../jobs/index.js';
 import { startIpcServer } from './ipc.js';
 import { inspect } from './lock.js';
-import { watchForStop } from './stopRequest.js';
+import { watchForStop, readStopRequest, clearStopRequest } from './stopRequest.js';
 import { getHubAgentStatus } from '../hub/agent.js';
-import { subscribe } from '../jobs/bus.js';
+import { subscribe, publish } from '../jobs/bus.js';
 import { writeDaemonState, removeDaemonState } from './stateFile.js';
+import { assessStartup, runVersionDriftCheck, DRIFT_CHECK_MS } from '../service/versionDrift.js';
 import { loadConfig } from '../config.js';
 import { ensureCode as ensureSetupCode, describe as describeSetupCode } from '../setupCode.js';
 
@@ -67,7 +69,50 @@ export async function startDaemon({
   // down. Production always wants the exit: it is the signal the supervisor
   // reads to decide not to restart.
   exitOnStop = true,
+  // Injected for tests: the start-up assessment and the notifications it can
+  // raise. Production uses the platform defaults.
+  deps = {},
 } = {}) {
+  // ── Start-up tolerance (Part 2.6) ─────────────────────────────────────────
+  // A service installed by an OLD updater can start this version with its
+  // protections, unit or runtime copy missing or half-applied. That is not a
+  // reason to refuse: it is a reason to say so and keep working. The only
+  // refusal is a state that is actively unsafe, which is decided narrowly in
+  // assessStartup() (a data directory inside the package folder).
+  const pendingStop = readStopRequest({ dataDir });
+
+  let record = null;
+  try {
+    record = dbGet('service-state') ?? null;
+  } catch {
+    // A missing or unreadable record is itself something to report below, not
+    // a crash on the way up.
+  }
+
+  let startup;
+  try {
+    startup = (deps.assessStartup ?? assessStartup)({
+      dataDir,
+      version,
+      record,
+      staleStopRequest: pendingStop.requested,
+      deps: deps.startup ?? {},
+    });
+  } catch (error) {
+    startup = {
+      ok: true,
+      refused: false,
+      warnings: [`the start-up check failed: ${error.message}`],
+      applied: [],
+      drift: null,
+    };
+  }
+
+  if (startup?.refused) {
+    log(`Refusing to start: ${startup.reason}`);
+    return { ok: false, reason: startup.reason, unsafe: true, startup };
+  }
+
   const jobs = startJobs({ role: 'daemon', dataDir, version, intervals, hub });
 
   // startJobs() returns a failure object rather than throwing when another
@@ -80,6 +125,28 @@ export async function startDaemon({
   log(`Easy DevOps daemon v${version}`);
   log(`  data directory : ${dataDir}`);
   log(`  pid            : ${process.pid}`);
+
+  // This process holds the lock, so a stop request written BEFORE now is
+  // spent: it belongs to a daemon that has already gone. Clearing it here is
+  // what covers a start this CLI did not perform — `sc.exe start`,
+  // `systemctl start`, a supervisor restart, or a hand-run `ezz daemon` — and
+  // it is what keeps `ezz service status` from saying "stopped by you" while
+  // this daemon is running (finding A5). The explicit start paths clear it too,
+  // before they ask the manager to start anything.
+  //
+  // It must happen BEFORE stopWatch.check() below, which would otherwise
+  // answer a spent request by exiting immediately.
+  if (pendingStop.requested) {
+    clearStopRequest({ dataDir });
+    log('  stop request   : cleared - this start supersedes it');
+  }
+
+  // Everything the start-up check could not fix without elevation is reported
+  // and then left alone. Status, the Hub payload and the dashboard banner
+  // re-derive the same warnings; this daemon keeps running.
+  for (const warning of startup.warnings ?? []) {
+    log(`  warning        : ${warning}`);
+  }
 
   // The lock is taken by now, which is what an open dashboard watches for. It
   // stands down immediately; this waits until it actually has, so the Hub
@@ -120,7 +187,13 @@ export async function startDaemon({
   // The same agent state, in the data directory, for a CLI that cannot open
   // the pipe — in Windows Server mode it belongs to NT SERVICE\EasyDevOps. See
   // core/daemon/stateFile.js. Rewritten on every transition the bus carries.
-  writeDaemonState({ dataDir, pid: process.pid, version, hub: agent });
+  //
+  // A failure is logged by writeDaemonState() (once per failure streak) and
+  // named here too, because the first write is the one a user reads at start:
+  // dropping it silently is what made a running daemon look stopped.
+  if (!writeDaemonState({ dataDir, pid: process.pid, version, hub: agent })) {
+    log('  daemon state   : could not be written; the daemon keeps running and retries on the next change');
+  }
   const unsubscribeState = subscribe('hub:agentState', (payload) => {
     writeDaemonState({ dataDir, pid: process.pid, version, hub: payload });
   });
@@ -141,17 +214,44 @@ export async function startDaemon({
   log('');
   log('Running. Background jobs are owned by this process.');
 
+  // A newer package installed with npm on a Windows Server updates only the
+  // CLI. Compare this daemon's own version with the installed package at start
+  // and every six hours, and announce a newer one once per version pair. It
+  // never repairs anything: the banner and the notification name
+  // `ezz service repair`.
+  const runDriftCheck = async () => {
+    try {
+      const result = await (deps.runVersionDriftCheck ?? runVersionDriftCheck)({
+        dataDir,
+        version,
+        deps: { ...(deps.drift ?? {}), publish: deps.publish ?? publish },
+      });
+      if (result?.notified) {
+        log(`  version check  : service v${result.serviceVersion}, installed v${result.installedVersion} - reported once`);
+      }
+      return result;
+    } catch (error) {
+      log(`  version check  : failed (${error.message})`);
+      return null;
+    }
+  };
+
+  await runDriftCheck();
+  const driftTimer = setInterval(() => { runDriftCheck(); }, DRIFT_CHECK_MS);
+
   let stopping = null;
 
   const handle = {
     ok: true,
     ipcPath: ipc?.path ?? null,
+    startup,
     state: () => ({
       ...jobs.state(),
       version,
       pid: process.pid,
       ipcPath: ipc?.path ?? null,
       hub: getHubAgentStatus(),
+      startupWarnings: startup.warnings ?? [],
     }),
 
     /** Idempotent: a second signal while shutting down must not run it twice. */
@@ -159,6 +259,7 @@ export async function startDaemon({
       if (stopping) return stopping;
       stopping = (async () => {
         log('Stopping...');
+        clearInterval(driftTimer);
         stopWatch.stop();
         try { unsubscribeState?.(); } catch { /* best effort */ }
         removeDaemonState({ dataDir, pid: process.pid });
@@ -177,9 +278,10 @@ export async function startDaemon({
   // exiting with code 0. The supervisor treats 0 as "asked to stop" and does
   // not restart — which is what makes a stop actually stick.
   //
-  // The file is deliberately NOT cleared here: it is what keeps the supervisor
-  // from starting another daemon. The logon bootstrap and `ezz service start`
-  // clear it, which is what makes a stop temporary rather than permanent.
+  // The STOP ITSELF is never cleared here (the onStop handler below must leave
+  // the file for the supervisor). The START was handled above: a request that
+  // existed when this daemon took the lock is spent and was removed before this
+  // watcher was created.
   const stopWatch = watchForStop({
     dataDir,
     onStop(request) {
@@ -193,9 +295,8 @@ export async function startDaemon({
     },
   });
 
-  // Checked once immediately: a daemon started while a stop is still pending
-  // must not sit there running. Only reachable if something started it without
-  // clearing the request, which `start` and the logon bootstrap both do.
+  // Checked once immediately: a request written after this start still must
+  // stop the daemon, and the check costs one read.
   stopWatch.check();
 
   return handle;

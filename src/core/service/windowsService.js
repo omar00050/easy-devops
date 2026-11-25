@@ -32,6 +32,7 @@ import { run as shellRun, runFile as shellRunFile } from '../shell.js';
 import { programDataDir, isWindows, WINDOWS_SC, windowsElevationCheckCmd } from '../platform.js';
 import {
   SERVICE_ID,
+  SERVICE_ACCOUNT,
   SERVICE_DISPLAY_NAME,
   WINSW_EXE_NAME,
   WINSW_XML_NAME,
@@ -42,15 +43,22 @@ import {
 } from './winsw.js';
 import {
   requiredGrants, applyGrants, revokeGrants, compareGrants, systemTool,
+  aclEntryAllowsReadExecute, parseIcaclsListing,
 } from './acl.js';
 import { runtimeDir, copyRuntime, verifyNativeModules } from './runtime.js';
 import {
+  protectServiceFiles,
   grantOperator,
+  grantServiceControl,
+  ensureServiceDefaults,
+  verifyServiceCodeRoot,
+  removeUnapprovedCodeRootAces,
   revokeOperator,
   revokeServiceControl,
   restoreServiceControl,
   restoreOperatorDataAccess,
   readServiceSddl,
+  resolveOperator,
   operatorAceState,
   prepareProtectedDir,
 } from './operator.js';
@@ -489,7 +497,7 @@ export async function install({
 
   // A real elevation check first; the write probe stays as a second opinion.
   const elevated = await (deps.isElevated ?? (() => isElevated({ run })))();
-  if (elevated === false || !(deps.canWrite ?? canWriteProgramData)()) {
+  if (elevated === false || !await (deps.canWrite ?? canWriteProgramData)()) {
     return { ok: false, reason: elevationMessage(), needsElevation: true };
   }
 
@@ -1123,6 +1131,165 @@ export async function stop({
   return { ok: true };
 }
 
+/**
+ * The exact commands to run the same recovery as LocalSystem. Printed, never
+ * run: this process cannot become SYSTEM, and pretending to would hide the one
+ * step that still needs the operator.
+ */
+function recoveryAsSystem({ dataDir, roots }) {
+  const lines = [
+    'If even this elevated Administrator cannot take ownership, run these exact',
+    'commands as LocalSystem (for example `psexec -s -i powershell`, or a',
+    'one-shot scheduled task running as SYSTEM):',
+    '',
+    `  icacls "${dataDir}" /grant *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F /L /Q`,
+  ];
+  for (const dir of roots) {
+    lines.push(`  icacls "${path.win32.join(dir, '*')}" /setowner *S-1-5-32-544 /T /C /L /Q`);
+    lines.push(`  icacls "${path.win32.join(dir, '*')}" /reset /T /C /L /Q`);
+    lines.push(`  icacls "${dir}" /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F `
+      + `*S-1-5-32-545:(OI)(CI)RX "NT SERVICE\\EasyDevOps:(OI)(CI)RX" /L /Q`);
+    lines.push(`  icacls "${dir}" /inheritance:r /L /Q`);
+    lines.push(`  icacls "${path.win32.join(dir, '*')}" /reset /T /C /L /Q`);
+  }
+  lines.push(`  sc.exe start ${SERVICE_ID}`);
+  return lines.join('\n');
+}
+
+/**
+ * The owner's manual recovery for one executable root: reset the files first
+ * (taking ownership for Administrators when that is refused), make the folder
+ * administrator-only, remove any unapproved explicit ACE, then reset the files
+ * once more so they inherit the FINAL folder list, and verify every entry.
+ */
+async function recoverCodeRoot({ dir, serviceAccount, runFile, log }) {
+  const icacls = systemTool('icacls.exe');
+  const children = path.win32.join(dir, '*');
+  const scope = ['/L', '/Q'];
+  const resetChildren = () => runFile(icacls, [children, '/reset', '/T', '/C', ...scope], { timeout: 600_000 });
+
+  log(`  ${dir}: resetting its files so they inherit from the folder`);
+  let reset = await resetChildren();
+  if (!reset.success && /access is denied/i.test(outputOf(reset))) {
+    log(`  ${dir}: access denied; taking ownership for Administrators first`);
+    const owner = await runFile(icacls, [children, '/setowner', '*S-1-5-32-544', '/T', '/C', ...scope],
+      { timeout: 600_000 });
+    if (!owner.success) {
+      return { ok: false, step: 'taking ownership of the files', detail: outputOf(owner).slice(0, 200) };
+    }
+    reset = await resetChildren();
+  }
+  if (!reset.success) {
+    return { ok: false, step: 'resetting the files', detail: outputOf(reset).slice(0, 200) };
+  }
+
+  log(`  ${dir}: granting SYSTEM, Administrators, Users and the service account`);
+  const grants = ['*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX'];
+  if (serviceAccount) grants.push(`${SERVICE_ACCOUNT}:(OI)(CI)RX`);
+  const grant = await runFile(icacls, [dir, '/grant:r', ...grants, ...scope], { timeout: 120_000 });
+  if (!grant.success) return { ok: false, step: 'granting access to the folder', detail: outputOf(grant).slice(0, 200) };
+  const inherit = await runFile(icacls, [dir, '/inheritance:r', ...scope], { timeout: 120_000 });
+  if (!inherit.success) {
+    return { ok: false, step: 'removing inheritance from the folder', detail: outputOf(inherit).slice(0, 200) };
+  }
+
+  log(`  ${dir}: removing any explicit permission that is not SYSTEM, Administrators, Users or the service`);
+  const cleaned = await removeUnapprovedCodeRootAces({ dir, runFile });
+  if (!cleaned.ok) return { ok: false, step: 'removing unapproved permissions', detail: cleaned.reason };
+
+  // The final folder list must be what the files inherit.
+  log(`  ${dir}: resetting its files onto the final folder permissions`);
+  const finalReset = await resetChildren();
+  if (!finalReset.success) {
+    return { ok: false, step: 'resetting the files onto the final folder permissions', detail: outputOf(finalReset).slice(0, 200) };
+  }
+
+  log(`  ${dir}: verifying SYSTEM, Administrators and the service account can read it`);
+  const verified = await verifyServiceCodeRoot({ dir, serviceAccount, runFile });
+  return verified.ok ? { ok: true } : { ok: false, step: 'verifying the new permissions', detail: verified.reason };
+}
+
+/**
+ * `ezz service recover`, Windows. Runs the owner's manual recovery with direct
+ * icacls/sc argv, read back at every step. It never resets or recurses on the
+ * data root: only an additive grant there, so no user data is touched.
+ *
+ * @returns {Promise<{ ok: boolean, needsElevation?: boolean, reason?: string }>}
+ */
+export async function recoverCodePermissions({
+  run = shellRun,
+  runFile = shellRunFile,
+  log = () => {},
+  operator = undefined,
+  dataDir = programDataDir(),
+} = {}) {
+  if (!isWindows) return { ok: false, reason: 'Recovering the Windows service is Windows-only.' };
+  if (await isElevated({ run }) !== true) {
+    return {
+      ok: false,
+      needsElevation: true,
+      reason: 'Recovering the Windows service needs an Administrator PowerShell.\n\n'
+        + '  Right-click PowerShell → "Run as administrator", then:\n'
+        + '    ezz service recover',
+    };
+  }
+
+  const icacls = systemTool('icacls.exe');
+  const roots = [binDir(), runtimeDir(dataDir), path.join(dataDir, 'runtime.prev')]
+    .filter((dir) => fs.existsSync(dir));
+  if (roots.length === 0) {
+    return { ok: false, reason: `there is no Windows Server installation to recover at ${dataDir}` };
+  }
+  const registered = await isRegistered({ run, runFile });
+  const help = () => recoveryAsSystem({ dataDir, roots });
+
+  // 1. The data directory itself: additive and non-recursive, so no data file
+  //    is ever touched. Never /reset, never /T here.
+  log(`  ${dataDir}: restoring SYSTEM and Administrators full control (additive, not recursive)`);
+  const rootGrant = await runFile(icacls, [
+    dataDir, '/grant', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '/L', '/Q',
+  ], { timeout: 120_000 });
+  if (!rootGrant.success) {
+    return {
+      ok: false,
+      reason: `${dataDir}: could not restore SYSTEM and Administrators access: `
+        + `${outputOf(rootGrant).slice(0, 300)}\n\n${help()}`,
+    };
+  }
+
+  // 2 and 3. Each executable root, then the read-back of every entry.
+  for (const dir of roots) {
+    const recovered = await recoverCodeRoot({ dir, serviceAccount: registered !== false, runFile, log });
+    if (!recovered.ok) {
+      return {
+        ok: false,
+        reason: `${dir}: ${recovered.step} failed: ${recovered.detail}. `
+          + 'The permissions were not changed back automatically.\n\n' + help(),
+      };
+    }
+    log(`  ${dir}: every file keeps SYSTEM and Administrators full control`);
+  }
+
+  // 4. The service security descriptor: the Windows defaults plus the
+  //    installing account's additive start/stop grant, verified.
+  log(`  ${SERVICE_ID}: checking the service security descriptor`);
+  const who = operator === undefined ? await resolveOperator({ run }) : operator;
+  const descriptor = who?.sid
+    ? await grantServiceControl({ sid: who.sid, run, runFile })
+    : await ensureServiceDefaults({ run, runFile });
+  if (!descriptor.ok) {
+    return {
+      ok: false,
+      reason: `the ${SERVICE_ID} service descriptor could not be restored: ${descriptor.reason}\n\n${help()}`,
+    };
+  }
+  log(who?.sid
+    ? `  ${SERVICE_ID}: SYSTEM and Administrators full control verified; ${who.name ?? who.sid} may start and stop it`
+    : `  ${SERVICE_ID}: SYSTEM and Administrators full control verified`);
+
+  return { ok: true };
+}
+
 /** `sc.exe start`. */
 export async function start({
   run = shellRun,
@@ -1138,6 +1305,22 @@ export async function start({
 
   if (result.success) return { ok: true };
 
+  // StartService FAILED 5 is the Service Control Manager reporting that it
+  // opened the service and then could not launch its PROGRAM: on the two real
+  // servers this was an unreadable (empty-DACL) EasyDevOps.exe, not a refusal
+  // against this account. OpenService FAILED 5 is the real refusal.
+  if (/StartService FAILED\s+5\b/i.test(output)
+      || /StartService.*access is denied/i.test(output)) {
+    return {
+      ok: false,
+      reason: 'The service program cannot be read (file permissions), so Windows could not start it.\n\n'
+        + '  Run this from PowerShell opened with "Run as administrator":\n'
+        + '    ezz service recover',
+    };
+  }
+  if (/OpenService FAILED\s+5\b/i.test(output)) {
+    return { ok: false, needsElevation: true, reason: elevationFor('Starting') };
+  }
   if (/Access is denied/i.test(output)) {
     return { ok: false, needsElevation: true, reason: elevationFor('Starting') };
   }
@@ -1251,6 +1434,49 @@ export function countRecentRestarts({
 }
 
 /**
+ * The roots that hold service code; their grants are required, not stale.
+ */
+function codeRootDirs(dataDir) {
+  return [path.join(dataDir, 'bin'), runtimeDir(dataDir), path.join(dataDir, 'runtime.prev')];
+}
+
+function isInsideCodeRoot(dataDir, dir) {
+  return codeRootDirs(dataDir).some((root) =>
+    path.relative(path.resolve(root), path.resolve(dir)) === '');
+}
+
+/**
+ * The service account must keep read & execute on bin and runtime: it runs its
+ * own binary from there. This reads the folders back when a real icacls channel
+ * is available (a string run stub has none) and warns when that is missing.
+ */
+async function codeRootAccessWarnings({ dataDir, run, runFile, fsImpl }) {
+  if (run !== shellRun && runFile === shellRunFile) return [];
+  const warnings = [];
+  for (const dir of [path.join(dataDir, 'bin'), runtimeDir(dataDir)]) {
+    if (!inspectPath(fsImpl, dir).exists) continue;
+    let result;
+    try {
+      result = await runFile(systemTool('icacls.exe'), [dir], { timeout: 60_000 });
+    } catch (error) {
+      warnings.push(`Could not read the permissions of ${dir}: ${error?.message ?? error}`);
+      continue;
+    }
+    if (!result?.success) {
+      warnings.push(`Could not read the permissions of ${dir}: ${outputOf(result).slice(0, 200)}`);
+      continue;
+    }
+    const entries = parseIcaclsListing(result.stdout);
+    const folder = entries.find((entry) => path.resolve(entry.path) === path.resolve(dir)) ?? entries[0];
+    if (!folder || !aclEntryAllowsReadExecute(folder, [SERVICE_ACCOUNT])) {
+      warnings.push(`The service account cannot read ${dir}. Run \`ezz service recover\` `
+        + 'from an Administrator PowerShell.');
+    }
+  }
+  return warnings;
+}
+
+/**
  * The service's state.
  *
  * @param {Object} [opts]
@@ -1350,9 +1576,13 @@ export async function status({
   const startType = `${config2.stdout ?? ''}`.match(/START_TYPE\s*:\s*\d+\s+([\w_]+)/i)?.[1] ?? null;
 
   const loop = countRecentRestarts();
+  const codeWarnings = await codeRootAccessWarnings({ dataDir, run, runFile, fsImpl });
 
   const aclCheck = compareGrants({
-    granted,
+    // bin/runtime/runtime.prev are required to hold the service account's RX
+    // grant; they are not stale data grants, so they never produce the "no
+    // longer needs" warning. Missing access is warned about separately.
+    granted: granted.filter((dir) => !isInsideCodeRoot(dataDir, dir)),
     required: requiredGrants({
       dataDir,
       nginxDir: config.nginxDir ?? null,
@@ -1370,6 +1600,7 @@ export async function status({
       ...(fileInspectionError
         ? [`Could not inspect the service files in ${binDir()}: ${fileInspectionError}`]
         : []),
+      ...codeWarnings,
     ],
     // Registered, but the wrapper or its definition is missing: the service
     // cannot start. A reinstall puts them back.
@@ -1448,7 +1679,7 @@ export async function repair({
   if (!(deps.isWindows ?? isWindows)) return { ok: false, reason: 'Server mode is Windows-only' };
 
   const elevated = await (deps.isElevated ?? (() => isElevated({ run })))();
-  if (elevated !== true || !(deps.canWrite ?? canWriteProgramData)()) {
+  if (elevated !== true || !await (deps.canWrite ?? canWriteProgramData)()) {
     return { ok: false, needsElevation: true, reason: elevationMessage('ezz service repair') };
   }
 

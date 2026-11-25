@@ -7,7 +7,338 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [1.4.7] — 2026-11-25
+
+**Security and availability.** Every security fix from 1.4.4, 1.4.5 and 1.4.6 is
+still here. 1.4.7 repairs the upgrade failures those releases caused: an
+administrator locked out of the Windows service files, a Linux service that
+would not start again after an update, and a Windows service left running an
+older version without saying so. If this server updated to 1.4.4, 1.4.5 or
+1.4.6, read "If you updated to 1.4.4, 1.4.5 or 1.4.6" below first.
+
+### Fixed
+
+- **Windows: an administrator is no longer locked out of the service files.**
+  File protection removed inheritance from the files under `bin` and `runtime`
+  before it wrote the permissions for the folders, so a file that existed, was
+  copied or was renamed while the protection ran could end with an access list
+  that had no entries at all. Nobody could open it — not SYSTEM, not
+  `BUILTIN\Administrators` — which is the `EPERM` reading
+  `bin\EasyDevOps.exe` and the reason the service would not start. Protection
+  now grants the folder first, keeps its files inheriting from it, removes
+  entries nobody approved, and reads the whole tree back. If SYSTEM,
+  Administrators or `NT SERVICE\EasyDevOps` cannot read `EasyDevOps.exe`,
+  `node.exe` or `runtime\app\src\cli\index.js`, it puts the previous
+  permissions back and stops with the command to run.
+- **Windows: the start error names the real problem.** Starting the service
+  failed with "Starting the Windows service was refused for this account" even
+  when the account was fine and the service program itself could not be read.
+  That case now says the service program cannot be read, that it is a file
+  permission problem, and to run `ezz service recover`. The refusal message is
+  kept for a genuine refusal against the service.
+- **Windows Server: the service no longer stays silently on an old version.**
+  A plain `npm i -g easy-devops` updates the command you type, while the
+  service keeps running its own copy in
+  `C:\ProgramData\easy-devops\runtime` — the old code, with its old security
+  problems, and nothing said so. Every `ezz` command now compares the two
+  versions, warns with both, and names `ezz service repair`; in an interactive
+  terminal it also offers the existing "Relaunch as administrator?" flow. (The
+  daemon and the repair and recover commands themselves skip the warning — they
+  are the fix.)
+  `ezz service status` shows `Service version` and `CLI version`. The daemon
+  checks at start and every six hours and reports a newer installed package
+  once — a notification, a field in the Hub's service state and a banner in the
+  dashboard. Nothing repairs itself.
+- **A Windows update no longer ends silently with the service stopped.** The
+  update could stop right after "node.exe is already the runtime copy (...);
+  kept" and print nothing. Every step now fails through one place that prints
+  the step, the error and the exact command to run next, and a service that was
+  stopped is put back before the update returns: it ends running the old
+  version or the new one, never stopped.
+- **The daemon no longer crashes when a state file is being read.** On Windows
+  a rename over a file another process has open is refused with `EPERM`,
+  `EBUSY` or `EACCES`, and the daemon died from it while rewriting
+  `jobs.owner`. Every small state file — `jobs.owner`, `daemon.lock`,
+  `daemon-state.json`, `update-status.json`, notification claims and the stop
+  request — is now written through one module that retries briefly before it
+  gives up, and a failed heartbeat is logged once and retried on the next beat
+  instead of ending the process.
+- **"Stopped by you" is reported only while it is true.** Status showed
+  "stopped by you at ..." while the service was running, because it was taken
+  from an old recorded stop. It now comes only from a live stop request with no
+  running daemon, and every start path clears it — start, restart, install,
+  repair, recover, update, `sc.exe start`, and the daemon taking its lock. A
+  status read never clears it, so a dashboard poll cannot cancel a stop.
+- **Linux: a database startup failure shows the real cause.** The message was
+  the same "check that the current user has write access" whatever had
+  happened; on the real server it ran as root and permissions were fine. The
+  error now prints the step that failed and the original error with its code,
+  and the advice follows the cause: a native module that does not load says how
+  to rebuild it, a lock names `fuser`/`lsof`, a corrupt or non-database file
+  says to copy it aside and keep it, a full disk says so. `ezz service status`
+  runs the same check, read-only: can the package load `better-sqlite3`, can
+  the database be opened read-only, which process is holding it.
+- **Linux: the systemd unit is generated from a template.** The old code
+  inserted text at a `[Service]` header it found inside a comment, so
+  `Environment=` lines landed in `[Unit]` and systemd ignored them. Every key
+  now comes from a structured template and goes in its own section, and the
+  writer refuses a duplicated key or a key that would sit inside a comment.
+  Resource tuning an operator set by hand (`LimitNOFILE` and the like) is
+  carried over instead of dropped.
+- **A rollback leaves a working service.** Rollback reinstalled the previous
+  package but left the new systemd unit or WinSW XML and the new Windows
+  runtime copy in place, so a rollback could leave a service that could not
+  start. Rollback now restores the package, the service definition and the
+  runtime together, starts it, and waits for the old daemon's own heartbeat;
+  success is no longer "the service manager accepted the start". Anything it
+  cannot restore is named, with the command to run.
+- **The new version's own setup runs before its service does.** An update is
+  performed by the version already installed, so the new version's required
+  setup — unit or XML, runtime copy, native-module check, protections, stubs —
+  was never applied before the new daemon started. After `npm install` the
+  updater now runs the newly installed package's own post-update step in a new
+  process, before the service starts. Installing a version older than 1.4.7
+  falls back to this version's repair step.
+- **Installers.** The one-line commands from the README work again:
+  `curl -fsSL .../install.sh -o install.sh && bash install.sh`, the `wget`
+  form, and `Invoke-WebRequest ... -OutFile install.ps1; ./install.ps1`. A
+  standalone copy of `install.sh` downloads the helper modules it is missing
+  into a private `0700` temporary directory and verifies each one against the
+  SHA-256 pinned in the script before using it; an unverified helper is never
+  sourced. `install.ps1` works as a standalone download — it finds the
+  installed package with `npm root -g` and says what to install when it cannot
+  — and on a Windows machine without Node it offers
+  `winget install --id OpenJS.NodeJS.LTS`. `install.bat` maps its flags
+  (`--keep-node`, `--service`, `--no-service`, `--yes`, `--non-interactive`,
+  `--version`) to the PowerShell script.
+
+### Added
+
+- **`ezz service recover`** repairs a service broken by an earlier upgrade.
+  On Windows, from an Administrator PowerShell: it takes ownership for
+  Administrators where that is needed, resets only the files under `bin` and
+  `runtime`, verifies every file keeps SYSTEM and Administrators full control
+  and the service account read and execute, restores the service security
+  descriptor to the Windows defaults plus the installing account's start, stop
+  and query grant, then runs the normal repair. If even the elevated
+  administrator is refused, it prints the exact commands to run as LocalSystem
+  (`psexec -s -i powershell`, or a one-shot scheduled task). It resets only the
+  code folders — `bin`, `runtime` and `runtime.prev` — and on the data folder
+  it only adds SYSTEM and Administrators, never a recursive reset, so no
+  database, setting, certificate or deployment is changed. On Linux it
+  regenerates a valid unit and restarts the service, asking sudo when it is not
+  root. `ezz service repair` and `ezz service recover` also finish an
+  interrupted update first.
+- **An update journal.** Before the package is replaced, the updater records
+  the service definition and (on Windows Server) the runtime copy in
+  `update-journal.json` and puts the originals aside. After a successful start
+  it removes the journal; a new update, `repair` or `recover` uses it to put an
+  interrupted update back before reading or replacing those files. Only the
+  service's own folder, the snapshot and the journal are ever removed — never
+  user data.
+
+### If you updated to 1.4.4, 1.4.5 or 1.4.6
+
+Those releases could lock an administrator out of the Windows service files or
+leave the Linux service unable to start. 1.4.7 repairs both. Two steps:
+
+1. **Update.**
+
+   ```bash
+   npm install -g easy-devops@1.4.7
+   ```
+
+2. **Recover, then look at the result.**
+
+   Windows Server, in an **Administrator PowerShell**:
+
+   ```powershell
+   ezz service recover
+   ezz service status
+   ```
+
+   `ezz service status` must show the same version on `Service version` and
+   `CLI version`, and `C:\ProgramData\easy-devops\logs\EasyDevOps.out.log` must
+   start with `Easy DevOps daemon v1.4.7`.
+
+   Linux:
+
+   ```bash
+   ezz service recover
+   ezz service status
+   ```
+
+   It asks for sudo unless you are root. `systemctl status easy-devops` must
+   report active, and `journalctl -u easy-devops -n 50` must not repeat
+   `Failed to initialize database`.
+
+Nothing else is needed: do not reinstall, do not delete the database, and do
+not re-run the update to "make sure".
+
+**If `ezz` itself cannot run**, do the same recovery by hand. Start with a
+read-only capture, so the state is known before anything changes.
+
+Windows, Administrator PowerShell:
+
+```powershell
+whoami /groups
+sc.exe sdshow EasyDevOps
+icacls "C:\ProgramData\easy-devops"
+icacls "C:\ProgramData\easy-devops\bin"
+icacls "C:\ProgramData\easy-devops\runtime"
+icacls "C:\ProgramData\easy-devops\bin\EasyDevOps.exe"
+icacls "C:\ProgramData\easy-devops\runtime\node.exe"
+icacls "C:\ProgramData\easy-devops\runtime\app\src\cli\index.js"
+```
+
+If a file shows no entries at all, reset only the files under `bin` and
+`runtime`, give the service account read and execute on both folders, and start
+the service:
+
+```powershell
+icacls "C:\ProgramData\easy-devops\bin\*" /reset /T /C /Q
+icacls "C:\ProgramData\easy-devops\runtime\*" /reset /T /C /Q
+icacls "C:\ProgramData\easy-devops\bin" /grant "NT SERVICE\EasyDevOps:(OI)(CI)RX"
+icacls "C:\ProgramData\easy-devops\runtime" /grant "NT SERVICE\EasyDevOps:(OI)(CI)RX"
+sc.exe start EasyDevOps
+```
+
+If a reset is denied with "Access is denied", take ownership of those files for
+Administrators first, then repeat the reset and the grants:
+
+```powershell
+icacls "C:\ProgramData\easy-devops\bin\*" /setowner *S-1-5-32-544 /T /C /Q
+icacls "C:\ProgramData\easy-devops\runtime\*" /setowner *S-1-5-32-544 /T /C /Q
+```
+
+If even that is denied — the elevated token itself is refused — run the same
+reset and grant blocks as LocalSystem, with a PsExec that is already on the
+machine (`psexec -s -i powershell.exe`, `whoami` must print
+`nt authority\system`) or a one-shot scheduled task whose user is SYSTEM.
+These are the commands `ezz service recover` prints for that case. Leave the
+SYSTEM session as soon as the ACLs are repaired.
+
+Linux, on the root install the failure was seen on. Run it as root; if you are
+not root, prefix each command with `sudo`. Only the copy test writes anything,
+and only to `/tmp`:
+
+```bash
+ls -la /root/.config/easy-devops/
+
+cd /usr/lib/node_modules/easy-devops
+npm ls better-sqlite3 good.db
+ls -la node_modules/better-sqlite3/build/Release/
+
+/root/.config/easy-devops/runtime/node -e 'const D=require("better-sqlite3");const db=new D("/root/.config/easy-devops/easy-devops.sqlite",{readonly:true,fileMustExist:true});console.log(db.prepare("select name from sqlite_master").all())'
+
+cp /root/.config/easy-devops/easy-devops.sqlite /tmp/ez-copy.sqlite && node -e 'const D=require("better-sqlite3");new D("/tmp/ez-copy.sqlite").exec("create table if not exists _t(x)");console.log("write OK")'
+
+fuser -v /root/.config/easy-devops/easy-devops.sqlite*
+```
+
+What the answers mean:
+
+- **`better-sqlite3` missing, or the addon built for another Node** — rebuild
+  it in the package folder, with the Node the service runs:
+  `cd /usr/lib/node_modules/easy-devops && sudo npm rebuild better-sqlite3`.
+- **The read-only open fails with `SQLITE_CORRUPT` or `SQLITE_NOTADB`** — stop
+  here. Keep the file and its `-wal`/`-shm` sidecars, take a copy, and report
+  it with the exact error. Never delete or recreate the database.
+- **`fuser` names a process** — that leftover process is holding the database.
+  Identify it, stop only a confirmed leftover Easy DevOps process, then start
+  the service again.
+- **Everything succeeds** — the database is fine: install 1.4.7 and run
+  `ezz service recover` as above.
+
+Never run a recursive ACL reset (`/reset /T`) on `C:\ProgramData\easy-devops`
+itself: the database, settings, certificates, deployments and logs are user
+data, and the reset silently removes their permissions and ownership. And
+never delete or recreate the `.sqlite` file to clear a startup error.
+
+### Upgrading notes
+
+- **The dashboard is reachable only on loopback since 1.4.5.** To use it from
+  your machine, open an SSH tunnel and browse `http://127.0.0.1:6443`:
+
+  ```bash
+  ssh -L 6443:127.0.0.1:6443 user@server
+  ```
+
+  For a permanent address, put an HTTPS reverse proxy in front of it on the
+  server. nginx example (`/etc/nginx/sites-available/easy-devops-dashboard`):
+
+  ```nginx
+  server {
+      listen 443 ssl;
+      server_name easy-devops.example.com;
+
+      ssl_certificate     /etc/ssl/easy-devops/fullchain.pem;
+      ssl_certificate_key /etc/ssl/easy-devops/privkey.pem;
+
+      location / {
+          proxy_pass http://127.0.0.1:6443;
+          proxy_http_version 1.1;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection "upgrade";
+      }
+  }
+  ```
+
+  The two `X-Forwarded-*` headers are what let a loopback-only dashboard answer
+  to a public name; the `Upgrade` headers keep Socket.io working. Remote Hub
+  pairing needs `https`.
+- **Hub permissions are stricter since 1.4.5.** Certificate paths and raw
+  Advanced nginx content need `nginx.config.view`, deployment crash details and
+  captured output need `deploy.logs`, and raw Advanced nginx edits need
+  `nginx.config.edit`. Revoking a permission now removes the data it protected
+  from later telemetry. A Hub that seems to be missing data usually needs the
+  grant, not a reinstall.
+- **If you updated with `npm` on Windows Server, run `ezz service repair` as
+  administrator.** `npm i -g easy-devops` updates only the CLI; the service
+  keeps its own copy under `C:\ProgramData\easy-devops\runtime`. 1.4.7 warns
+  when the two differ and `ezz service status` shows both versions, but it does
+  not repair by itself.
+
+### Known open item
+
+- The nvm release digest is not pinned: the SHA-256 of nvm's `install.sh`
+  (`src/lib/installer/nvm-bootstrap.sh`) and the nvm-windows installer digest
+  (`install.ps1`) are empty behind a `TODO(owner)` until the owner reviews
+  those releases. Until then a fresh Linux server without Node is not given an
+  automatic nvm install: the installer prints the exact manual commands, and
+  `--keep-node` skips Node management when Node 18+ is already installed. On
+  Windows, `install.ps1` offers `winget install --id OpenJS.NodeJS.LTS`.
+
+## [1.4.6] — 2026-11-25
+
+**Not recommended:** the service can fail to start after updating; fixed in
+1.4.7.
+
+### Fixed
+
+- Windows Server uninstall shows the active operation and limits every stage to
+  five minutes. A stalled stage stops with an error that names the operation
+  instead of leaving the CLI waiting indefinitely.
+- Windows Server uninstall removes the service account from a preflighted data,
+  nginx and SSL tree with one recursive permissions operation instead of
+  starting one permissions process per file.
+- Keeping Server data during uninstall performs no copy or move and leaves the
+  database and Server-mode marker in place. Moving data copies and verifies
+  user files only, excludes runtime and wrapper folders, and keeps a backup. A
+  copy, verification, activation or deadline failure restores the live source
+  before the database is reopened. If Windows blocks a rollback, the error
+  names both paths so the data remains recoverable.
+
 ## [1.4.5] — 2026-11-25
+
+**Not recommended:** shares the upgrade failure fixed in 1.4.7 — the service
+can fail to start after updating, and on Windows an administrator can be
+locked out of the service files. Update to 1.4.7, then run
+`ezz service recover`.
 
 ### Security
 
@@ -60,18 +391,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   instead of merging into existing content. Optional WebSocket package stubs
   are recreated from admin-owned temporary packages even when an old package or
   link already exists.
-- Windows Server uninstall now shows the active operation and limits every
-  stage to five minutes. A stalled stage stops with an error that names the
-  operation instead of leaving the CLI waiting indefinitely.
-- Windows Server uninstall removes the service account from a preflighted data,
-  nginx, and SSL tree with one recursive permissions operation instead of
-  starting one permissions process per file.
-- Keeping Server data during uninstall performs no copy or move and leaves the
-  database and Server-mode marker in place. Moving data copies and verifies
-  user files only, excludes runtime and wrapper folders, and keeps a backup.
-  A copy, verification, activation, or deadline failure restores the live
-  source before the database is reopened. If Windows blocks a rollback, the
-  error names both paths so the data remains recoverable.
 - Linux systemd installation stages its unit in a fresh directory with mode
   `0700`, creates the file exclusively with mode `0600`, passes `sudo install`
   direct arguments, and removes the staging directory on every outcome.

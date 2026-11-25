@@ -28,6 +28,13 @@
 .PARAMETER NoService
   Do not install the background service, and do not ask.
 
+.PARAMETER Yes
+  Answer yes to the winget Node.js LTS install prompt. Nothing else is
+  auto-confirmed.
+
+.PARAMETER NonInteractive
+  Never prompt. Print the exact command to run instead of asking about Node.js.
+
 .EXAMPLE
   .\install.ps1                  # Interactive install
   .\install.ps1 -Version 20      # Install Node.js 20.x (latest patch via nvm)
@@ -38,18 +45,31 @@ param(
   [string]$Version  = "",
   [switch]$KeepNode,
   [switch]$Service,
-  [switch]$NoService
+  [switch]$NoService,
+  [switch]$Yes,
+  [switch]$NonInteractive
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Directory of this script. Set once, before the functions below, so they also
+# work when the file is dot-sourced by the e2e harness (functions-only mode).
+$scriptDir = $PSScriptRoot
+
 $REQUIRED_NODE_MAJOR = 18
 $NVM_WINDOWS_VERSION = '1.1.12'
+# TODO(owner): pin the nvm-windows digest from the reviewed release
 # No reviewed nvm-windows digest is established in this repository. Never
 # derive this value from the downloaded file or release metadata. Keep it
 # empty until a trusted release digest is reviewed and pinned.
 $NVM_WINDOWS_SHA256  = ''
+
+# The reviewed winget bootstrap helper that ships beside this script. This
+# installer does not download or run it; the digest is pinned so a modified
+# copy in a checkout cannot pass for the reviewed one.
+$WINGET_INSTALL_PS1_SHA256 = '44972db6280d6f1bb7e7bb62ef6da2cb98393ce694e52882775e1393ac7aa3c5'
+
 $NODE_FALLBACK       = '20'
 
 # ─── Summary tracking (mirrors install.sh add_result) ────────────────────────
@@ -155,6 +175,10 @@ function Print-Help {
   Write-Host "  -Version <ver>   Skip the version picker; install specified Node.js major"
   Write-Host "                   Example: -Version 20"
   Write-Host "  -KeepNode        Skip Node.js management; use current Node.js on PATH"
+  Write-Host "  -Service         Install the background service without asking"
+  Write-Host "  -NoService       Do not install the background service, and do not ask"
+  Write-Host "  -Yes             Install Node.js LTS with winget without asking"
+  Write-Host "  -NonInteractive  Never prompt; print the command to run instead"
   Write-Host ""
   Write-Host "Exit codes:"
   Write-Host "  0  Installation completed successfully"
@@ -344,6 +368,140 @@ function Install-NvmWindowsVerified {
   }
 }
 
+# ─── Resolving the installed package (standalone download) ───────────────────
+#
+# A one-line install downloads this file alone, so src\cli\index.js is not
+# beside it. Fall back to the package npm installs globally: `npm root -g`
+# plus easy-devops\src\cli\index.js, verified to exist.
+
+function Get-EzNpmRoot {
+  try {
+    $root = (& npm root -g 2>$null | Select-Object -First 1)
+  } catch {
+    return ''
+  }
+  if ([string]::IsNullOrWhiteSpace($root)) { return '' }
+  return $root.Trim()
+}
+
+function Get-EzCliEntryPath {
+  $local = Join-Path $scriptDir 'src\cli\index.js'
+  if (Test-Path -LiteralPath $local -PathType Leaf) {
+    return (Get-Item -LiteralPath $local -Force).FullName
+  }
+
+  $npmRoot = Get-EzNpmRoot
+  if ([string]::IsNullOrWhiteSpace($npmRoot)) { return $null }
+  $entry = Join-Path $npmRoot 'easy-devops\src\cli\index.js'
+  if (Test-Path -LiteralPath $entry -PathType Leaf) {
+    return (Get-Item -LiteralPath $entry -Force).FullName
+  }
+  return $null
+}
+
+function Get-EzServiceInvocation {
+  $node = Get-Command 'node.exe' -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $node) {
+    Write-Host "  Node.js is not on PATH, so the service was not installed." -ForegroundColor Yellow
+    Write-Host "  Install Node.js 18+ and retry: ezz service install" -ForegroundColor Cyan
+    return $null
+  }
+
+  $local = Join-Path $scriptDir 'src\cli\index.js'
+  if (Test-Path -LiteralPath $local -PathType Leaf) {
+    $entry = (Get-Item -LiteralPath $local -Force).FullName
+    return [pscustomobject]@{
+      ExecPath = $node.Source
+      Args = @($entry, 'service', 'install')
+      Cwd = $scriptDir
+    }
+  }
+
+  # Standalone download: this copy has no src/ beside it.
+  $entry = Get-EzCliEntryPath
+  if (-not $entry) {
+    $npmRoot = Get-EzNpmRoot
+    $where = if ($npmRoot) {
+      Join-Path $npmRoot 'easy-devops\src\cli\index.js'
+    } else {
+      '<npm root -g>\easy-devops\src\cli\index.js'
+    }
+    Write-Host "  Could not find the installed Easy DevOps package at:" -ForegroundColor Yellow
+    Write-Host "    $where" -ForegroundColor Yellow
+    Write-Host "  Install it first:  npm install -g easy-devops" -ForegroundColor Cyan
+    Write-Host "  Then run:          ezz service install" -ForegroundColor Cyan
+    return $null
+  }
+
+  return [pscustomobject]@{
+    ExecPath = $node.Source
+    Args = @($entry, 'service', 'install')
+    Cwd = (Split-Path -Parent $entry)
+  }
+}
+
+# ─── Node.js LTS fallback when there is no Node and no nvm digest ────────────
+
+function Invoke-NodeLtsFallback {
+  param(
+    [switch]$NonInteractive,
+    [switch]$Yes
+  )
+
+  $wingetArgs = @('install', '--id', 'OpenJS.NodeJS.LTS', '-e', '--accept-source-agreements', '--accept-package-agreements')
+  $wingetCommand = 'winget ' + ($wingetArgs -join ' ')
+
+  Write-Host "  Node.js $REQUIRED_NODE_MAJOR+ is required to install Easy DevOps." -ForegroundColor Yellow
+  Write-Host "  Install it with:" -ForegroundColor Gray
+  Write-Host "    winget install --id OpenJS.NodeJS.LTS -e" -ForegroundColor Cyan
+  Write-Host "    or the LTS installer from https://nodejs.org/en/download (18 or newer)" -ForegroundColor Cyan
+
+  $winget = Get-Command 'winget' -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $winget) {
+    Write-Info "winget is not available here. Install Node.js LTS from nodejs.org, then re-run install.ps1."
+    return $false
+  }
+
+  $run = $false
+  if ($Yes) {
+    $run = $true
+  } elseif ($NonInteractive -or [Console]::IsInputRedirected) {
+    $run = $false
+  } else {
+    $answer = Read-Host "  Install Node.js LTS with winget now? [Y/n]"
+    if ($answer -notmatch '^(n|no)$') { $run = $true }
+  }
+
+  if (-not $run) {
+    Write-Info "Not installing automatically. Run the command above, then run install.ps1 again."
+    return $false
+  }
+
+  Write-Info "Running: $wingetCommand"
+  & $winget.Source @wingetArgs
+  if ($LASTEXITCODE -ne 0) {
+    Write-Err "winget exited with code $LASTEXITCODE; Node.js was not installed."
+    Write-Info "Install Node.js LTS from https://nodejs.org/en/download, then run install.ps1 again."
+    return $false
+  }
+
+  Refresh-Path
+  $raw = ''
+  try { $raw = (& node --version 2>$null).Trim() } catch {}
+  if ($raw -match '^v') {
+    $major = Get-NodeMajor $raw
+    if ($major -ge $REQUIRED_NODE_MAJOR) {
+      Write-OK "Node.js $raw installed and compatible"
+      return $true
+    }
+    Write-Warn "Node.js $raw is still older than v$REQUIRED_NODE_MAJOR; install a newer LTS."
+    return $false
+  }
+  Write-Warn "Node.js is still not on PATH in this window; open a new terminal and run install.ps1 again."
+  return $false
+}
+
 # E2E loads only the installer functions above, then replaces download and
 # process-launch dependencies with recording stubs. This path performs no
 # install work and cannot supply or override a production digest.
@@ -423,7 +581,8 @@ function Select-NodeVersion {
 # update  = easy-devops already on PATH                  -> skip install steps
 # npm     = downloaded installer standalone              -> npm install -g easy-devops
 
-$scriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
+# $scriptDir is set once near the top, before the helper functions, so it also
+# works when this file is dot-sourced by the e2e harness.
 $packageJson = Join-Path $scriptDir 'package.json'
 
 $isSourceMode       = $false
@@ -685,10 +844,19 @@ if ($NODE_ACTION -eq "keep") {
         Write-Info "No trusted SHA-256 for nvm-windows $NVM_WINDOWS_VERSION is pinned in this installer."
         Write-Info "No downloaded file was executed."
         Write-Info "Review the release at: https://github.com/coreybutler/nvm-windows/releases"
-        Write-Info "Install nvm-windows manually after verifying its published artifact."
-        Write-Info "Then run: nvm install $NODE_TARGET"
         Add-Result "nvm-windows" $false "No reviewed SHA-256"
-        if (-not $nodeOK) { exit 1 }
+
+        # TODO(owner): pin the nvm-windows digest from the reviewed release
+        # No Node and no pinned nvm digest is not a dead end. Offer the official
+        # Node.js LTS package instead of exiting, then continue the install.
+        if (-not $nodeOK) {
+          if (Invoke-NodeLtsFallback -NonInteractive:$NonInteractive -Yes:$Yes) {
+            $nodeOK = $true
+            $nvmReady = $false
+          } else {
+            Write-Info "Node.js is still required. Install an LTS release, then run install.ps1 again."
+          }
+        }
       } elseif (Install-NvmWindowsVerified -Url $nvmUrl -ExpectedSha256 $NVM_WINDOWS_SHA256) {
         Write-OK "nvm-windows $NVM_WINDOWS_VERSION installed"
         Add-Result "nvm-windows" $true $NVM_WINDOWS_VERSION
@@ -696,7 +864,6 @@ if ($NODE_ACTION -eq "keep") {
         Refresh-Path
       } else {
         Add-Result "nvm-windows" $false "Download or verification failed"
-        if (-not $nodeOK) { exit 1 }
       }
     }
   }
@@ -772,7 +939,8 @@ if ($NODE_ACTION -eq "keep") {
     Add-Result "Node.js install" $true "Using existing $nodeVersion"
   } else {
     Write-Warn "No Node.js installed and nvm not available."
-    Write-Info "Install Node.js manually from: https://nodejs.org"
+    Write-Info "Install Node.js LTS with: winget install --id OpenJS.NodeJS.LTS -e"
+    Write-Info "or from https://nodejs.org/en/download, then run install.ps1 again."
     Add-Result "Node.js install" $false "Manual install required"
   }
 }
@@ -828,14 +996,14 @@ if ($isAlreadyInstalled) {
       & npm link
       if ($LASTEXITCODE -ne 0) {
         Write-Warn "npm link failed -- CLI won't be globally available"
-        Write-Warn "You can still run:  node cli/index.js"
+        Write-Warn "You can still run:  node `"$scriptDir\src\cli\index.js`""
         Add-Result "CLI registered" $false "Exit code $LASTEXITCODE"
       } else {
         Write-OK "easy-devops command linked globally"
         Add-Result "CLI registered" $true ""
       }
     } catch {
-      Write-Warn "npm link failed: $_ -- run: node cli/index.js"
+      Write-Warn "npm link failed: $_ -- run: node `"$scriptDir\src\cli\index.js`""
       Add-Result "CLI registered" $false "$_"
     } finally {
       Pop-Location
@@ -910,7 +1078,16 @@ if ($allOK) {
   Write-Host "  Some steps need attention -- see warnings above." -ForegroundColor Yellow
   Write-Host ""
   Write-Host "  Fallback:" -ForegroundColor White
-  Write-Host "    node src/cli/index.js" -ForegroundColor Cyan
+
+  # Name the real entry point: the checkout beside the script in source mode,
+  # or the package npm installed globally for a standalone download. Never a
+  # path that only exists in one of the two layouts.
+  $fallbackEntry = Get-EzCliEntryPath
+  if ($fallbackEntry) {
+    Write-Host "    node `"$fallbackEntry`"" -ForegroundColor Cyan
+  } else {
+    Write-Host "    ezz" -ForegroundColor Cyan
+  }
 }
 Write-Host ""
 
@@ -950,19 +1127,6 @@ function Get-IsWindowsServer {
     return ($key.InstallationType -like 'Server*')
   } catch {
     return $false
-  }
-}
-
-function Get-EzServiceInvocation {
-  $local = Join-Path $scriptDir 'src\cli\index.js'
-  if (-not (Test-Path -LiteralPath $local -PathType Leaf)) { return $null }
-  $node = Get-Command 'node.exe' -CommandType Application -ErrorAction SilentlyContinue |
-    Select-Object -First 1
-  if (-not $node) { return $null }
-  return [pscustomobject]@{
-    ExecPath = $node.Source
-    Args = @($local, 'service', 'install')
-    Cwd = $scriptDir
   }
 }
 

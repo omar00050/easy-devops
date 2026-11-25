@@ -1,4 +1,3 @@
-import { pathToFileURL } from 'node:url';
 /**
  * core/service/systemd.js
  *
@@ -15,21 +14,40 @@ import { pathToFileURL } from 'node:url';
  * with specific sudoers rules, so the daemon does not need to be root to
  * reload nginx.
  *
+ * ── Why the unit is GENERATED, never edited ────────────────────────────────
+ *
+ * The unit is built from the data in `unitSections()` and serialized by
+ * `serializeUnit()`, in one place, every time. Nothing inserts a line into an
+ * existing file. 1.4.4-1.4.6 did insert: they searched for the literal text
+ * `[Service]`, found it inside an explanatory comment in `[Unit]`, and wrote
+ * `Environment=` assignments into that comment —
+ *
+ *   Environment=WS_NO_BUFFER_UTIL=1: systemd moved them in v229 and still
+ *
+ * which systemd treats as a comment, so the protections were silently not
+ * applied. A repair that added them again added a duplicate every time. A
+ * template cannot make that mistake: comments are whole lines, a comment may
+ * not contain a `Key=value` pattern, and the serializer refuses to emit one
+ * that does.
+ *
  * ── Why sudo is asked for by sudo ──────────────────────────────────────────
  *
  * Writing to `/etc/systemd/system` needs root. The command is run with
- * `runInteractive`, so sudo prompts on the user's own terminal and the
- * password never passes through this process. Nothing here ever reads,
- * stores, or asks for a password itself.
+ * `runInteractive` (or, for file copies, `sudo install` with argv), so sudo
+ * prompts on the user's own terminal and the password never passes through
+ * this process. Nothing here ever reads, stores, or asks for a password
+ * itself.
  */
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 import { run, runFile, runInteractive } from '../shell.js';
-import { isDefaultDataDir } from '../platform.js';
-import { runtimeNodePath } from './runtime.js';
+import { getDataDir, isDefaultDataDir } from '../platform.js';
+import { clearStopRequest, readStopRequest, stopRequestPath } from '../daemon/stopRequest.js';
+import { linkRuntime, runtimeNodePath } from './runtime.js';
 
 /** Unit name and path. One unit, one name, no per-user variants. */
 export const UNIT_NAME = 'easy-devops.service';
@@ -37,6 +55,24 @@ export const UNIT_PATH = `/etc/systemd/system/${UNIT_NAME}`;
 
 /** How long to wait for the daemon's heartbeat after starting the service. */
 export const STARTUP_GRACE_MS = 10_000;
+
+/**
+ * How long a recovery waits for the heartbeat.
+ *
+ * Longer than a plain status wait: recovery is the command someone runs when
+ * the service is already broken, and the first start of a freshly pinned
+ * runtime is routinely slow. Giving up at ten seconds would report failure for
+ * a daemon that reports in at twelve.
+ */
+export const RECOVER_STARTUP_GRACE_MS = 45_000;
+
+/**
+ * The `ezz` entry script, resolved from this file rather than from `cwd`.
+ *
+ * A unit records an absolute path, so it has to be the installed package's own
+ * location — `process.argv[1]` would be whatever shim the user invoked.
+ */
+const ENTRY_SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'cli', 'index.js');
 
 /**
  * The package root for an entry script, used as the unit's WorkingDirectory.
@@ -76,8 +112,113 @@ export async function hasSystemd({ runner = run } = {}) {
   return probe.success;
 }
 
+// ─── The unit, as data ───────────────────────────────────────────────────────
+
 /**
- * The unit file.
+ * Escapes one value for a systemd assignment.
+ *
+ * systemd expands `%` specifiers and `$` variables in most values, so both are
+ * doubled. Anything outside the conservative safe set is quoted, which is the
+ * form systemd parses as a single argument.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function unitArg(value) {
+  if (/[\r\n\0]/.test(value)) throw new Error('Invalid systemd argument');
+  const escaped = String(value).replaceAll('%', '%%').replaceAll('$', '$$');
+  return /^[=a-zA-Z0-9_./:-]+$/.test(escaped) ? escaped : JSON.stringify(escaped);
+}
+
+/** Keys systemd accepts more than once in one section. */
+const REPEATABLE_KEYS = new Set([
+  'Environment', 'EnvironmentFile', 'ExecStartPre', 'ExecStartPost', 'ExecStart', 'ExecStop',
+  'ExecReload', 'After', 'Before', 'Wants', 'Requires', 'Documentation', 'ReadWritePaths',
+]);
+
+/** systemd directive names are a letter followed by letters and digits. */
+const UNIT_KEY_RE = /^[A-Za-z][A-Za-z0-9]*$/;
+
+/** A `Key=value` pattern, which must never appear in a comment line. */
+const KEY_VALUE_RE = /(^|[^A-Za-z0-9_])[A-Za-z][A-Za-z0-9]*=/;
+
+/**
+ * Resource and scheduling settings an operator may have tuned by hand.
+ *
+ * Only these are carried over from an installed unit, and only from its
+ * `[Service]` section: they are the knobs a deployment with many domains
+ * raises (open files, tasks, memory, scheduling), and a repair that silently
+ * reset one of them would break a working server.
+ */
+const TUNING_KEY_RE = /^(Limit[A-Z]+|Nice|OOMScoreAdjust|TasksMax|Memory[A-Za-z]+|CPU[A-Za-z]+|IO[A-Za-z]+)$/;
+
+/**
+ * What a carried-over value may contain.
+ *
+ * No line breaks, and no comment marker, quote, backtick, dollar sign or
+ * backslash: each of those would need real quoting, start a comment, or be
+ * expanded by systemd. A value failing this is dropped rather than guessed at.
+ */
+const TUNING_VALUE_RE = /^[^\r\n#;"'`$\\]+$/;
+
+/**
+ * The tuning directives to keep, read from the OLD unit — structurally.
+ *
+ * Section headers are recognised only on their own line, so the literal text
+ * `[Service]` inside a comment (which is what broke 1.4.4-1.4.6) is not a
+ * section. Comment lines are skipped outright. Anything outside `[Service]` is
+ * ignored, so the malformed `Environment=` lines those releases put in `[Unit]`
+ * cannot ride along.
+ *
+ * @param {string|null} text
+ * @param {(line: string) => void} [log]
+ * @returns {Array<[string, string]>}
+ */
+function tuningFromUnit(text, log = () => {}) {
+  if (typeof text !== 'string') return [];
+
+  const kept = new Map();
+  let section = null;
+
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue;
+
+    const header = /^\[([^\]]+)\]$/.exec(line);
+    if (header) {
+      section = header[1];
+      continue;
+    }
+
+    if (section !== 'Service') continue;
+
+    const equals = line.indexOf('=');
+    if (equals <= 0) continue;
+
+    const key = line.slice(0, equals).trim();
+    const value = line.slice(equals + 1).trim();
+    if (!TUNING_KEY_RE.test(key)) continue;
+
+    if (!TUNING_VALUE_RE.test(value)) {
+      log(`dropped ${key} from the old unit`);
+      continue;
+    }
+
+    // A repeated key keeps its first position and its last value, which is how
+    // systemd reads a repeated scalar setting. serializeUnit() refuses a
+    // duplicate, so this has to be resolved here.
+    kept.set(key, value);
+  }
+
+  return [...kept.entries()];
+}
+
+/**
+ * The unit, as data: sections in order, each with ordered items.
+ *
+ * An item is either a whole-line comment (a string beginning with `#`) or an
+ * ordered `[key, value]` pair. An empty string is a blank line. That is the
+ * entire format — there is no second place where unit text is written.
  *
  * Choices worth knowing:
  *
@@ -87,10 +228,12 @@ export async function hasSystemd({ runner = run } = {}) {
  *    `nginx.service` is ordering only — a machine without nginx as a service
  *    still starts, because it is not listed under `Requires`.
  *  - `Restart=always` with `RestartSec=5`: a crash loop is handled by
- *    `StartLimitBurst` below rather than by giving up after one failure.
+ *    `StartLimitBurst` rather than by giving up after one failure.
  *  - `StartLimitIntervalSec`/`StartLimitBurst` let systemd stop restarting a
  *    daemon that cannot start at all, which is what makes `status` able to
- *    report a crash loop instead of showing "activating" for ever.
+ *    report a crash loop instead of showing "activating" for ever. They belong
+ *    in the unit section: systemd moved them there in v229 and still accepts
+ *    the old position only with a deprecation warning.
  *  - No `ExecStop`: the daemon handles SIGTERM, releases the lock and closes
  *    the database. systemd's default is exactly that signal.
  *
@@ -100,66 +243,175 @@ export async function hasSystemd({ runner = run } = {}) {
  * @param {string} opts.user
  * @param {string} opts.dataDir
  * @param {string} [opts.workingDir]
- * @returns {string}
+ * @param {Array<[string, string]>} [opts.tuning] Operator settings carried over, in order
+ * @returns {Array<{ name: string, items: Array<string|string[]> }>}
  */
-function unitArg(value) {
-  if (/[\r\n\0]/.test(value)) throw new Error('Invalid systemd argument');
-  const escaped = value.replaceAll('%', '%%').replaceAll('$', '$$');
-  return /^[=a-zA-Z0-9_./:-]+$/.test(escaped) ? escaped : JSON.stringify(escaped);
-}
+export function unitSections({ nodeExe, entry, user, dataDir, workingDir = null, tuning = [] }) {
+  if (!nodeExe) throw new Error('the unit needs the path of the pinned runtime (nodeExe)');
+  if (!entry) throw new Error('the unit needs the entry script path (entry)');
+  if (!user) throw new Error('the unit needs the user the daemon runs as');
 
-export function buildUnit({ nodeExe, entry, user, dataDir, workingDir = null }) {
+  const loader = `--experimental-loader=${pathToFileURL(
+    path.resolve(path.dirname(entry), '../core/service/runtime-loader.mjs'),
+  ).href}`;
+
   // Only passed when it is NOT the default. A unit that sets it to the very
   // directory the code already resolves on its own adds nothing, and the one
   // that did set it needlessly turned the service into a dev run — staging
   // certificates on real domains. See isDevDataDir() in core/platform.js.
-  const dataDirLine = isDefaultDataDir(dataDir)
+  const dataDirItem = isDefaultDataDir(dataDir)
     ? '# EASY_DEVOPS_DATA_DIR is not set: this is the default directory.'
-    : `Environment=${unitArg(`EASY_DEVOPS_DATA_DIR=${dataDir}`)}`;
+    : ['Environment', unitArg(`EASY_DEVOPS_DATA_DIR=${dataDir}`)];
 
-  return `[Unit]
-Description=Easy DevOps background service
-Documentation=https://github.com/farghaly/easy-devops
-After=network-online.target nginx.service
-Wants=network-online.target
+  // Carried over from the installed unit by refreshUnit(): limits and
+  // scheduling an operator raised by hand. Emitted like every other directive,
+  // from data, never pasted into an existing file.
+  const tuningItems = (Array.isArray(tuning) ? tuning : []).length === 0
+    ? []
+    : [
+      '',
+      '# Operator resource tuning, carried over unchanged from the previous unit.',
+      ...tuning.map(([key, value]) => [key, value]),
+    ];
 
-# These belong in [Unit], not [Service]: systemd moved them in v229 and still
-# accepts the old position only with a deprecation warning in the journal.
-# Stop restarting after 5 failures inside 60s, so a daemon that cannot start
-# ends in a state 'systemctl status' reports plainly instead of thrashing.
-StartLimitIntervalSec=60
-StartLimitBurst=5
+  return [
+    {
+      name: 'Unit',
+      items: [
+        ['Description', 'Easy DevOps background service'],
+        ['Documentation', 'https://github.com/farghaly/easy-devops'],
+        '',
+        '# The daemon probes domains and reaches the Hub as soon as it starts, so',
+        '# wait for the network. nginx is ordering only: a machine without nginx',
+        '# still runs.',
+        ['After', 'network-online.target nginx.service'],
+        ['Wants', 'network-online.target'],
+        '',
+        '# Stop restarting after 5 failures inside 60s, so a daemon that cannot',
+        "# start ends in a state 'systemctl status' reports plainly instead of",
+        '# thrashing. These two live here, not in the service section below:',
+        '# systemd moved them in v229 and the old position is deprecated.',
+        ['StartLimitIntervalSec', '60'],
+        ['StartLimitBurst', '5'],
+        '',
+      ],
+    },
+    {
+      name: 'Service',
+      items: [
+        ['Type', 'simple'],
+        ['User', unitArg(user)],
+        ['WorkingDirectory', unitArg(workingDir ?? packageRootFor(entry))],
+        '',
+        '# The pinned runtime, not whatever "node" resolves to in a shell. A version',
+        '# manager can change that at any time; this path is ours. The daemon also',
+        '# starts through the runtime boundary loader, which confines it to its own',
+        '# package.',
+        ['ExecStart', `${unitArg(nodeExe)} ${unitArg(loader)} ${unitArg(entry)} daemon`],
+        '',
+        '# Ambient Node settings and the optional ws accelerators are switched off,',
+        '# so a daemon started from an unusual environment cannot behave differently.',
+        '# These are service settings: systemd reads them from this section only, and',
+        '# an assignment placed elsewhere is ignored.',
+        ['Environment', unitArg('NODE_OPTIONS=')],
+        ['Environment', unitArg('NODE_PATH=')],
+        ['Environment', unitArg('WS_NO_BUFFER_UTIL=1')],
+        ['Environment', unitArg('WS_NO_UTF_8_VALIDATE=1')],
+        ['Environment', unitArg('NODE_ENV=production')],
+        dataDirItem,
+        '',
+        ['Restart', 'always'],
+        ['RestartSec', '5'],
+        '',
+        '# Give the daemon time to release its lock and close the database.',
+        ['TimeoutStopSec', '20'],
+        ['KillSignal', 'SIGTERM'],
+        ...tuningItems,
+        '',
+        ['StandardOutput', 'journal'],
+        ['StandardError', 'journal'],
+        ['SyslogIdentifier', 'easy-devops'],
+        '',
+      ],
+    },
+    {
+      name: 'Install',
+      items: [
+        ['WantedBy', 'multi-user.target'],
+      ],
+    },
+  ];
+}
 
-[Service]
-Type=simple
-User=${unitArg(user)}
-WorkingDirectory=${unitArg(workingDir ?? packageRootFor(entry))}
+/**
+ * Turns the sections into the unit file's text. The only writer of unit text.
+ *
+ * It refuses the two mistakes that produced the broken 1.4.6 units rather than
+ * trusting every future caller: a comment line that contains a `Key=value`
+ * pattern (systemd would ignore the value, silently), and a directive that
+ * would be a duplicate in a section where systemd treats a second occurrence
+ * as a conflict.
+ *
+ * @param {Array<{ name: string, items: Array<string|string[]> }>} sections
+ * @returns {string}
+ */
+export function serializeUnit(sections) {
+  if (!Array.isArray(sections) || sections.length === 0) throw new Error('the unit template has no sections');
 
-# The pinned runtime, not whatever "node" resolves to in a shell. A version
-# manager can change that at any time; this path is ours.
-ExecStart=${unitArg(nodeExe)} ${unitArg(`--experimental-loader=${pathToFileURL(path.resolve(path.dirname(entry), '../core/service/runtime-loader.mjs')).href}`)} ${unitArg(entry)} daemon
+  const lines = [];
+  const seen = new Set();
 
-Environment=NODE_OPTIONS=
-Environment=NODE_PATH=
-Environment=WS_NO_BUFFER_UTIL=1
-Environment=WS_NO_UTF_8_VALIDATE=1
-Environment=NODE_ENV=production
-${dataDirLine}
+  for (const section of sections) {
+    if (!UNIT_KEY_RE.test(section?.name ?? '')) {
+      throw new Error(`invalid unit section name: ${section?.name}`);
+    }
+    lines.push(`[${section.name}]`);
 
-Restart=always
-RestartSec=5
+    for (const item of section.items ?? []) {
+      if (typeof item === 'string') {
+        if (item === '') {
+          lines.push('');
+          continue;
+        }
+        if (!item.startsWith('#')) {
+          throw new Error(`a unit line is neither a comment nor a directive: ${item}`);
+        }
+        if (KEY_VALUE_RE.test(item)) {
+          throw new Error(`a unit comment must not contain a Key=value pattern: ${item}`);
+        }
+        lines.push(item);
+        continue;
+      }
 
-# Give the daemon time to release its lock and close the database.
-TimeoutStopSec=20
-KillSignal=SIGTERM
+      const [key, raw] = item ?? [];
+      if (!UNIT_KEY_RE.test(key ?? '')) throw new Error(`invalid unit directive name: ${key}`);
+      const value = String(raw ?? '');
+      if (/[\r\n\0]/.test(value)) throw new Error(`invalid value for ${key}: a line break inside a unit value`);
 
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=easy-devops
+      if (!REPEATABLE_KEYS.has(key)) {
+        const id = `${section.name}\u0000${key}`;
+        if (seen.has(id)) throw new Error(`${key} appears twice in [${section.name}], which systemd rejects`);
+        seen.add(id);
+      }
 
-[Install]
-WantedBy=multi-user.target
-`;
+      lines.push(`${key}=${value}`);
+    }
+  }
+
+  // A trailing newline: systemd accepts a file without one, but every text
+  // tool a user opens it with is happier, and `diff` against a rewrite is
+  // clean only when both end the same way.
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * The generated unit for a given install.
+ *
+ * @param {Object} opts See unitSections()
+ * @returns {string}
+ */
+export function buildUnit({ nodeExe, entry, user, dataDir, workingDir = null, tuning = [] }) {
+  return serializeUnit(unitSections({ nodeExe, entry, user, dataDir, workingDir, tuning }));
 }
 
 /** What to print when systemd is absent. */
@@ -243,7 +495,97 @@ export async function install({
   return { ok: true, unitPath };
 }
 
-async function writeUnit(unit, { fileRunner = runFile, interactive = runInteractive, unitPath = UNIT_PATH, log = () => {} } = {}) {
+/** Reads a text file, answering null when it is not there. */
+function readTextFile(file) {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+/**
+ * Keeps the previous unit as `<unitPath>.prev`, beside it.
+ *
+ * The updater's transaction also snapshots the unit (core/service/
+ * updateTransaction.js), but that snapshot lives in a temporary directory and
+ * disappears with the transaction. This one stays: it is what a person can
+ * copy back by hand after a bad unit, which is the situation 1.4.6 created.
+ * systemd ignores the suffix, so the file cannot become a second unit.
+ *
+ * Written directly when the folder is writable (a root install, and every
+ * test's temporary unit path), and through `sudo install` otherwise — the same
+ * escalation the unit write itself uses, so it costs no second password
+ * prompt.
+ *
+ * @returns {Promise<{ ok: boolean, path: string, reason?: string }>}
+ */
+async function backupUnit(previous, {
+  unitPath = UNIT_PATH,
+  stagingDir = null,
+  fileRunner = runFile,
+  stdin = 'inherit',
+} = {}) {
+  const backupPath = `${unitPath}.prev`;
+  if (typeof previous !== 'string' || previous === '') return { ok: true, path: backupPath, skipped: true };
+
+  // Written to a temporary name and renamed, so a failed write cannot leave a
+  // truncated `.prev` behind — that file may be the only copy of a working
+  // unit that a person can restore by hand.
+  const temporary = `${backupPath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporary, previous, { mode: 0o600 });
+    fs.renameSync(temporary, backupPath);
+    return { ok: true, path: backupPath };
+  } catch { /* the folder needs sudo; fall through */ }
+  try { fs.rmSync(temporary, { force: true }); } catch { /* nothing to clean up */ }
+
+  if (!stagingDir) return { ok: false, path: backupPath, reason: 'no staging directory for the backup' };
+
+  const staged = path.join(stagingDir, `${UNIT_NAME}.prev`);
+  try {
+    fs.writeFileSync(staged, previous, { flag: 'wx', mode: 0o600 });
+  } catch (error) {
+    return { ok: false, path: backupPath, reason: error.message };
+  }
+
+  const copied = await fileRunner('sudo', ['install', '-m', '0600', '--', staged, backupPath], {
+    timeout: 300_000,
+    stdin,
+  });
+  return copied.success
+    ? { ok: true, path: backupPath }
+    : { ok: false, path: backupPath, reason: copied.stderr || 'sudo install failed' };
+}
+
+/**
+ * Writes one generated unit to `unitPath`, after keeping the previous one.
+ *
+ * Nothing here reads the old unit and edits it: the caller hands over complete
+ * text that came from buildUnit(), and this function only stages, backs up and
+ * copies it.
+ *
+ * @param {string} unit
+ * @param {Object} [opts]
+ * @param {Function} [opts.fileRunner]  argv runner for `sudo install`
+ * @param {Function} [opts.interactive] used for `systemctl daemon-reload` only
+ * @param {string}   [opts.unitPath]
+ * @param {(line: string) => void} [opts.log]
+ * @param {boolean}  [opts.reload]  run daemon-reload here (default true)
+ * @param {string|null} [opts.previousUnit] already-read previous text
+ * @param {string}   [opts.stdin]   stdio for the sudo child, so it can prompt
+ * @returns {Promise<{ ok: boolean, reason?: string, backup?: string, warning?: string }>}
+ */
+async function writeUnit(unit, {
+  fileRunner = runFile,
+  interactive = runInteractive,
+  unitPath = UNIT_PATH,
+  log = () => {},
+  reload = true,
+  previousUnit = undefined,
+  stdin = 'inherit',
+} = {}) {
   let stagingDir;
   try {
     let staged;
@@ -256,37 +598,302 @@ async function writeUnit(unit, { fileRunner = runFile, interactive = runInteract
       return { ok: false, reason: `could not stage the unit file: ${err.message}` };
     }
 
+    const previous = previousUnit === undefined ? readTextFile(unitPath) : previousUnit;
+    const backup = await backupUnit(previous, { unitPath, stagingDir, fileRunner, stdin });
+    // A backup that cannot be written must not block the repair: without it
+    // the update transaction's snapshot is still the rollback path, and a
+    // refused repair would leave the service broken. Say so instead of
+    // failing silently.
+    const warning = backup.ok ? undefined : `could not keep a copy of the previous unit at ${backup.path}: ${backup.reason}`;
+    if (warning) log(`warning: ${warning}`);
+    else if (!backup.skipped) log(`Previous unit kept as ${backup.path}`);
+
     log(`Installing ${unitPath} (sudo will ask for your password)`);
     // sudo reads passwords directly from its controlling terminal.
-    const copy = await fileRunner('sudo', ['install', '-m', '0644', '--', staged, unitPath], { timeout: 300_000 });
+    const copy = await fileRunner('sudo', ['install', '-m', '0644', '--', staged, unitPath], { timeout: 300_000, stdin });
     if (!copy.success) {
       return { ok: false, reason: `could not write ${unitPath}. sudo exited ${copy.exitCode ?? 'non-zero'}.` };
     }
 
-    const reload = await interactive('sudo systemctl daemon-reload');
-    if (!reload.success) return { ok: false, reason: 'systemctl daemon-reload failed' };
+    if (reload) {
+      const reloaded = await interactive('sudo systemctl daemon-reload');
+      if (!reloaded.success) return { ok: false, reason: 'systemctl daemon-reload failed' };
+    }
 
-    return { ok: true };
+    return { ok: true, backup: backup.skipped ? null : backup.path, ...(warning ? { warning } : {}) };
   } finally {
     if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true });
   }
 }
 
-// Preserve the installed service identity, limits and other operator settings.
-export async function refreshUnit({ entry, dataDir, unitPath = UNIT_PATH, ...options }) {
-  const original = fs.readFileSync(unitPath, 'utf8');
-  if (!/^\[Service\]$/m.test(original) || !/^ExecStart=.* daemon$/m.test(original)) {
-    return { ok: false, reason: 'Unrecognized service definition. Review the unit before repair.' };
+/**
+ * The user an installed unit runs as, if it has one that can be trusted.
+ *
+ * Read from the unit's own `[Service]` section — never from a comment, which
+ * is how the broken units came about — and only when the value looks like a
+ * plain account name. A unit written for `deploy` must keep running as
+ * `deploy` even when an update is applied by root through sudo.
+ *
+ * @param {string|null} text
+ * @returns {string|null}
+ */
+function installedUser(text) {
+  if (typeof text !== 'string') return null;
+
+  let section = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue;
+
+    const header = /^\[([^\]]+)\]$/.exec(line);
+    if (header) {
+      section = header[1];
+      continue;
+    }
+    if (section !== 'Service') continue;
+
+    const match = /^User\s*=\s*(.*)$/.exec(line);
+    if (!match) continue;
+
+    const value = match[1].trim().replace(/^"(.*)"$/, '$1');
+    return /^[A-Za-z0-9_][A-Za-z0-9_.@-]*\$?$/.test(value) ? value : null;
   }
-  let updated = original;
-  for (const setting of ['WS_NO_BUFFER_UTIL=1', 'WS_NO_UTF_8_VALIDATE=1', 'NODE_OPTIONS=', 'NODE_PATH=']) {
-    if (!updated.split('\n').includes(`Environment=${setting}`)) updated = updated.replace('[Service]', `[Service]\nEnvironment=${setting}`);
+
+  return null;
+}
+
+/**
+ * Rewrites the installed unit from the template, keeping its identity and the
+ * operator's resource tuning.
+ *
+ * This is the repair, the update and the recovery path, and it always writes a
+ * freshly generated unit: the previous file is read for exactly two things —
+ * which account the service runs as, and the resource limits an operator set
+ * by hand (LimitNOFILE, TasksMax, Nice, …). It is never edited. That is what
+ * turns a 1.4.6 unit with `Environment=` assignments inside a comment into a
+ * valid one, and what makes a second repair byte-identical (identical text is
+ * not written at all).
+ *
+ * The pinned values come from the code, not from the old file: the runtime
+ * link, the loader URL, the package root as the working directory, and the
+ * daemon's environment. A stale `WorkingDirectory` after a package move is
+ * therefore fixed rather than preserved. Operator tuning comes from the old
+ * unit's own `[Service]` section only — see tuningFromUnit().
+ *
+ * @param {Object} opts
+ * @param {string} opts.entry
+ * @param {string} opts.dataDir
+ * @param {string} [opts.unitPath]
+ * @param {string} [opts.user] Explicit owner; otherwise the installed one, otherwise this user
+ * @param {(line: string) => void} [opts.log]
+ * @param {Object} [opts] Rest forwarded to writeUnit (fileRunner, interactive, reload, stdin)
+ * @returns {Promise<{ ok: boolean, unchanged?: boolean, unitPath?: string, reason?: string, backup?: string }>}
+ */
+export async function refreshUnit({
+  entry,
+  dataDir,
+  unitPath = UNIT_PATH,
+  user = null,
+  log = () => {},
+  ...options
+} = {}) {
+  const previous = readTextFile(unitPath);
+  const owner = user ?? installedUser(previous) ?? os.userInfo().username;
+  const tuning = tuningFromUnit(previous, log);
+
+  const unit = buildUnit({ nodeExe: runtimeNodePath(dataDir), entry, dataDir, user: owner, tuning });
+  if (previous === unit) {
+    log(`${unitPath} is already up to date`);
+    return { ok: true, unitPath, unchanged: true };
   }
-  if (!/^ExecStart=.*--experimental-loader=/m.test(updated)) {
-    const line = buildUnit({ nodeExe: runtimeNodePath(dataDir), entry, dataDir, user: 'unused' }).match(/^ExecStart=.*$/m)[0];
-    updated = updated.replace(/^ExecStart=.* daemon$/m, () => line);
+
+  return writeUnit(unit, { ...options, unitPath, log, previousUnit: previous });
+}
+
+/**
+ * Whether this process already has root's power, so sudo adds nothing.
+ *
+ * A minimal server can run the daemon and this CLI as root with no `sudo`
+ * installed at all; asking for `sudo systemctl` there fails with ENOENT even
+ * though nothing extra is needed. There is no shared helper for this — the
+ * only other uid read in the code base (core/permissions.js) is about file
+ * ownership — so it is read here, from the account, never from the platform.
+ *
+ * @returns {boolean}
+ */
+function isRootUser() {
+  try {
+    return os.userInfo().uid === 0;
+  } catch {
+    return false;
   }
-  return updated === original ? { ok: true } : writeUnit(updated, { ...options, unitPath });
+}
+
+/**
+ * Puts a Linux install broken by 1.4.4-1.4.6 back into a working state.
+ *
+ * The steps, in this order, and each one is reported if it fails:
+ *
+ *   1. re-point the pinned runtime link at the running Node;
+ *   2. regenerate the unit from the template (which replaces a malformed one);
+ *   3. `systemctl daemon-reload`;
+ *   4. clear a stale stop request, so the daemon cannot exit again at once;
+ *   5. `systemctl restart`;
+ *   6. wait for the daemon's own heartbeat — not the service manager's word.
+ *
+ * Nothing here prompts by itself and nothing touches user data: sudo may ask
+ * for its own password on the terminal, and the only file removed is the
+ * daemon's stop request. Run as root, every privileged command goes out
+ * directly instead of through sudo. On failure the answer carries the last
+ * journal lines and the exact command to run next.
+ *
+ * @param {Object} [opts]
+ * @param {string} [opts.dataDir]
+ * @param {string} [opts.entry]            The entry script to record in the unit
+ * @param {string} [opts.unitPath]
+ * @param {(line: string) => void} [opts.log]
+ * @param {Function} [opts.run]            Shell runner, for journalctl
+ * @param {Function} [opts.runFile]        argv runner, for `sudo` / `systemctl`
+ * @param {Function} [opts.waitForDaemon]  Injected for tests
+ * @param {number} [opts.startupGraceMs]
+ * @param {number} [opts.journalLines]
+ * @param {Object} [opts.deps]             Injected for tests
+ * @returns {Promise<{ ok: boolean, reason?: string, step?: string, next?: string, journal?: string|null, pid?: number|null }>}
+ */
+export async function recoverService({
+  dataDir = getDataDir(),
+  entry = ENTRY_SCRIPT,
+  unitPath = UNIT_PATH,
+  log = () => {},
+  run: runner = run,
+  runFile: fileRunner = runFile,
+  waitForDaemon: waiter = null,
+  startupGraceMs = RECOVER_STARTUP_GRACE_MS,
+  journalLines = 25,
+  stdin = 'inherit',
+  deps = {},
+} = {}) {
+  const fail = async (step, reason, next) => {
+    let output = null;
+    // Before the unit is written there is nothing new in the journal, and a
+    // stale tail would be read as the cause of this failure.
+    if (step !== 'unit') {
+      try {
+        output = (await journal({ lines: journalLines, runner })).output || null;
+      } catch { /* the reason is still worth returning without the log tail */ }
+    }
+    const tail = output ? `\n\nLast log lines:\n${output}` : '';
+    return { ok: false, step, reason: `${reason}${tail}\n\nNext: ${next}`, next, journal: output };
+  };
+
+  // Root already has the privilege sudo would ask for — and a minimal server
+  // may not even have sudo. Every privileged call below goes through this one
+  // function, so dropping the wrapper is the whole difference.
+  const asRoot = (deps.isRoot ?? isRootUser)() === true;
+  if (asRoot) log('Running as root: privileged commands go out directly, without sudo.');
+  const privileged = asRoot
+    ? (file, args, options = {}) => (file === 'sudo'
+      ? fileRunner(args[0], args.slice(1), options)
+      : fileRunner(file, args, options))
+    : fileRunner;
+
+  // ── 1. The pinned runtime ────────────────────────────────────────────────
+  log('Re-pointing the pinned Node runtime…');
+  try {
+    const linked = await (deps.linkRuntime ?? linkRuntime)({ dataDir });
+    if (linked?.ok) log(`  ${linked.link} → ${linked.target}`);
+    else log(`  warning: could not re-point the runtime link: ${linked?.reason ?? 'no result'}`);
+  } catch (error) {
+    log(`  warning: could not re-point the runtime link: ${error.message}`);
+  }
+
+  // ── 2. The unit ──────────────────────────────────────────────────────────
+  log(`Regenerating ${unitPath}…`);
+  let refreshed;
+  try {
+    refreshed = await refreshUnit({ entry, dataDir, unitPath, log, fileRunner: privileged, reload: false, stdin });
+  } catch (error) {
+    return fail(
+      'unit',
+      `could not regenerate ${unitPath}: ${error.message}`,
+      'ezz service recover   (from a terminal where sudo can ask for your password)',
+    );
+  }
+  if (!refreshed.ok) {
+    return fail(
+      'unit',
+      `could not write ${unitPath}: ${refreshed.reason}`,
+      'ezz service recover   (from a terminal where sudo can ask for your password)',
+    );
+  }
+  if (refreshed.unchanged) log('  the installed unit was already the generated one');
+
+  // ── 3. daemon-reload ─────────────────────────────────────────────────────
+  log('Reloading systemd…');
+  const reloaded = await privileged('sudo', ['systemctl', 'daemon-reload'], { timeout: 300_000, stdin });
+  if (!reloaded?.success) {
+    return fail(
+      'reload',
+      `\`systemctl daemon-reload\` failed${reloaded?.stderr ? `: ${reloaded.stderr}` : ''}`,
+      `systemd-analyze verify ${unitPath}`,
+    );
+  }
+
+  // ── 4. A stop request left behind would stop the new daemon at once ──────
+  const request = (deps.readStopRequest ?? readStopRequest)({ dataDir });
+  const cleared = (deps.clearStopRequest ?? clearStopRequest)({ dataDir });
+  if (cleared === false) {
+    return fail(
+      'stop-request',
+      `could not clear the stop request at ${stopRequestPath(dataDir)}; the daemon would stop again as soon as it starts`,
+      `rm -f ${stopRequestPath(dataDir)}`,
+    );
+  }
+  if (request.requested) log('Cleared a stop request that would have stopped the daemon again.');
+
+  // ── 5. Restart ───────────────────────────────────────────────────────────
+  log(`Restarting ${UNIT_NAME}…`);
+  const restarted = await privileged('sudo', ['systemctl', 'restart', UNIT_NAME], { timeout: 300_000, stdin });
+  if (!restarted?.success) {
+    return fail(
+      'restart',
+      `\`systemctl restart ${UNIT_NAME}\` failed${restarted?.stderr ? `: ${restarted.stderr}` : ''}`,
+      'ezz service logs',
+    );
+  }
+
+  // ── 6. The daemon's own heartbeat, not the manager's word ────────────────
+  log('Waiting for the daemon to report in…');
+  let wait = waiter;
+  if (!wait) {
+    const svc = await import('./index.js');
+    wait = svc.waitForDaemon;
+  }
+
+  const alive = await wait({
+    dataDir,
+    timeoutMs: startupGraceMs,
+    onProgress: (waited, limit) => log(`  still waiting… ${Math.round(waited / 1000)}s of ${Math.round(limit / 1000)}s`),
+  });
+
+  if (!alive?.alive) {
+    const seconds = Math.round((alive?.waitedMs ?? startupGraceMs) / 1000);
+    return fail(
+      'heartbeat',
+      `the unit was regenerated and ${UNIT_NAME} was restarted, but the daemon did not report in within `
+        + `${seconds}s — so it is starting and failing.`,
+      'ezz service logs   (then `ezz service status` for the database and runtime diagnostics)',
+    );
+  }
+
+  log(`The daemon is running (pid ${alive.lock?.pid ?? 'unknown'}).`);
+  return {
+    ok: true,
+    unitPath,
+    pid: alive.lock?.pid ?? null,
+    waitedMs: alive.waitedMs,
+    backup: refreshed.backup ?? null,
+  };
 }
 
 /**
@@ -463,8 +1070,6 @@ export async function status({ runner = run } = {}) {
  * which is the entire reason it is a link.
  */
 export async function repair({ dataDir, entry, nodeExe = process.execPath, log = () => {}, interactive = runInteractive } = {}) {
-  const { linkRuntime } = await import('./runtime.js');
-
   const linked = linkRuntime({ dataDir, nodeExe });
   if (!linked.ok) return { ok: false, reason: linked.reason };
   log(`Runtime link → ${linked.target}`);

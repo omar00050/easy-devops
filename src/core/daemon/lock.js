@@ -26,6 +26,13 @@
  * while "two" is not.
  */
 
+import {
+  createStateFile,
+  moveIntoPlace,
+  replaceStateFile,
+  reportStateWriteFailure,
+  reportStateWriteSuccess,
+} from '../atomicState.js';
 import fs from 'fs';
 import path from 'path';
 import { getDataDir } from '../platform.js';
@@ -55,8 +62,8 @@ const RECOVERY_GUARD_STALE_MS = 30_000;
  * How long an empty, unreadable lock file may exist before another process may
  * treat it as abandoned.
  *
- * Creating a lock is `writeFileSync(path, data, { flag: 'wx' })`, which creates
- * the file and THEN writes it — so a brand-new lock is briefly empty. A reader
+ * Creating a lock is createStateFile() (`open(..., 'wx')`), which creates the
+ * file and THEN writes it — so a brand-new lock is briefly empty. A reader
  * in that window must not "recover" a lock created microseconds earlier.
  */
 const UNREADABLE_GRACE_MS = 2_000;
@@ -332,7 +339,7 @@ function acquireRecoveryGuard({ dataDir, now }) {
 
   const attempt = () => {
     try {
-      fs.writeFileSync(file, `${JSON.stringify(payload)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      createStateFile(file, `${JSON.stringify(payload)}\n`);
       return { ok: true };
     } catch (err) {
       return { ok: false, code: err?.code ?? 'UNKNOWN', message: err?.message ?? String(err) };
@@ -390,46 +397,26 @@ function replaceLock({ dataDir, payload }) {
   const body = `${JSON.stringify(payload)}\n`;
 
   try {
-    fs.writeFileSync(candidate, body, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    createStateFile(candidate, body);
   } catch (err) {
     return { ok: false, message: err?.message ?? String(err) };
   }
 
-  const moved = renameWithRetry(candidate, target);
+  const moved = (() => {
+    try {
+      moveIntoPlace(candidate, target);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, message: err?.message ?? String(err) };
+    }
+  })();
+
   if (!moved.ok) {
     try { fs.unlinkSync(candidate); } catch { /* already gone */ }
     return { ok: false, message: moved.message };
   }
 
   return { ok: true };
-}
-
-/**
- * `rename`, retried briefly while Windows refuses it.
- *
- * On Windows a file another process currently has open for reading cannot be
- * replaced — the rename fails with EPERM/EBUSY until that handle closes. Every
- * reader in this module reads and closes immediately, so a bounded retry is
- * enough; bounded, so a genuinely stuck file can never hang an acquisition.
- *
- * @param {string} from
- * @param {string} to
- * @returns {{ ok: true } | { ok: false, message: string }}
- */
-function renameWithRetry(from, to, attempts = 200, waitMs = 1) {
-  for (let i = 0; ; i++) {
-    try {
-      fs.renameSync(from, to);
-      return { ok: true };
-    } catch (err) {
-      const transient = err?.code === 'EPERM' || err?.code === 'EBUSY' || err?.code === 'EACCES';
-      if (!transient || i >= attempts) {
-        return { ok: false, message: err?.message ?? String(err) };
-      }
-      // A real blocking pause: no busy spin, no async in a synchronous path.
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
-    }
-  }
 }
 
 /**
@@ -440,13 +427,24 @@ function renameWithRetry(from, to, attempts = 200, waitMs = 1) {
  * run jobs after losing the lock is exactly the duplicate-work case the lock
  * exists to prevent.
  *
+ * A failed WRITE is different: on Windows a rename over a lock a reader has
+ * open can be refused. That is a momentary denial, not a lost lock, so it is
+ * logged once and retried on the next beat — the daemon must not die from it,
+ * which is what happened in 1.4.6 (finding A4).
+ *
  * @returns {boolean} True while this process still owns the lock
  */
 export function heartbeat({ dataDir = getDataDir(), version = null, mode = 'daemon', now = Date.now() } = {}) {
   const current = readLock(dataDir);
   if (!current || current.pid !== process.pid) return false;
 
-  write({ dataDir, version, mode, now, startedAt: current.startedAt });
+  const file = lockPath(dataDir);
+  try {
+    write({ dataDir, version, mode, now, startedAt: current.startedAt });
+    reportStateWriteSuccess(file);
+  } catch (err) {
+    reportStateWriteFailure(file, err, 'It will be retried on the next heartbeat.');
+  }
   return true;
 }
 
@@ -542,11 +540,7 @@ export function watchLock({ dataDir = getDataDir(), onChange, debounceMs = 50 } 
 function createExclusive(dataDir, payload) {
   try {
     fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(lockPath(dataDir), `${JSON.stringify(payload)}\n`, {
-      encoding: 'utf8',
-      mode: 0o600,
-      flag: 'wx',
-    });
+    createStateFile(lockPath(dataDir), `${JSON.stringify(payload)}\n`);
     return { ok: true };
   } catch (err) {
     return { ok: false, code: err?.code ?? 'UNKNOWN', message: err?.message ?? String(err) };
@@ -571,11 +565,9 @@ function write({ dataDir, version, mode, now, startedAt }) {
   };
 
   const target = lockPath(dataDir);
-  const temp = `${target}.${process.pid}.tmp`;
 
   fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(temp, `${JSON.stringify(payload)}\n`, { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(temp, target);
+  replaceStateFile(target, `${JSON.stringify(payload)}\n`);
 
   return payload;
 }

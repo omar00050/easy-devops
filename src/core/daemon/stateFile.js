@@ -32,6 +32,7 @@
  * leftover from a crashed or stopped daemon is never reported as current.
  */
 
+import { replaceStateFile, reportStateWriteFailure, reportStateWriteSuccess } from '../atomicState.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -46,8 +47,14 @@ export function stateFilePath(dataDir) {
 
 /**
  * Writes the state atomically: a temporary file, then a rename, so a reader
- * never sees half a JSON document. Never throws — the daemon's work must not
- * depend on a status file.
+ * never sees half a JSON document.
+ *
+ * A failure is REPORTED, not swallowed. It used to fall back to writing the
+ * target directly, which defeated the atomic write; when that fallback was
+ * removed the error started disappearing instead, so a daemon whose data
+ * directory is briefly unwritable looked idle to every CLI and to the
+ * dashboard. The daemon keeps running — a status file is not worth an exit —
+ * but the log says which file, why, and that the next write retries.
  *
  * @param {Object} opts
  * @param {string} opts.dataDir
@@ -73,20 +80,17 @@ export function writeDaemonState({ dataDir, pid, version = null, hub }) {
       : null,
   })}\n`;
 
-  const temp = `${file}.${pid}.tmp`;
   try {
-    fs.writeFileSync(temp, body, 'utf8');
-    try {
-      fs.renameSync(temp, file);
-    } catch {
-      // Windows refuses a rename over a file a reader has open at that
-      // instant. A direct write is still whole for a document this small.
-      fs.writeFileSync(file, body, 'utf8');
-      fs.rmSync(temp, { force: true });
-    }
+    replaceStateFile(file, body);
+    reportStateWriteSuccess(file);
     return true;
-  } catch {
-    try { fs.rmSync(temp, { force: true }); } catch { /* nothing to clean */ }
+  } catch (err) {
+    reportStateWriteFailure(
+      file,
+      err,
+      'The daemon keeps running, but `ezz service status`, `ezz hub status` and the dashboard '
+      + 'will not see this state until the next write succeeds.',
+    );
     return false;
   }
 }

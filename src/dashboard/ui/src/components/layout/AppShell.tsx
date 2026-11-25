@@ -3,6 +3,7 @@ import { Outlet, useLocation } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { Topbar } from './Topbar';
 import { ServiceBanner } from './ServiceBanner';
+import { VersionDriftBanner } from './VersionDriftBanner';
 import { BlockedBanner } from './BlockedBanner';
 import { ErrorBoundary } from '../ErrorBoundary';
 import { findNavItem } from '../../lib/navigation';
@@ -54,6 +55,7 @@ export function AppShell() {
           <div className="relative isolate mx-auto w-full max-w-[var(--ez-content-max)] px-3 py-4 sm:px-5 sm:py-5 lg:px-7 lg:py-6">
             <div className="dashboard-ambient -z-10" aria-hidden="true" />
             <ServiceBanner />
+            <VersionDriftBanner />
             <BlockedBanner />
             <div key={pathname} className="page-enter">
               <ErrorBoundary area={item?.title}>

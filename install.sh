@@ -46,16 +46,22 @@ EASYDEVOPS_DIR="${EASYDEVOPS_DIR:-${SCRIPT_DIR:-$PWD}}"
 # Lib modules
 #
 # The modules live at src/lib/installer in the repository and in the published
-# npm package (package.json ships `src/`). They are released as one reviewed
-# unit: this installer never downloads helpers from a mutable branch. Every
-# module is checked against a digest fixed in this file before it is sourced.
+# npm package (package.json ships `src/`). A copy beside the script always wins.
+# A standalone download, or `curl ... | bash`, has no bundle beside it, so the
+# installer downloads the same files from the release channel into a private
+# 0700 directory and verifies each one against the digest fixed in this file
+# BEFORE it is sourced. There is no fallback to unverified code.
 #
 # Defined as functions and called AFTER the flags are parsed, so `--help` costs
 # no network request and writes nothing.
 # ---------------------------------------------------------------------------
 _LIB_MODULES="progress.sh detect.sh node-versions.sh picker.sh nvm-bootstrap.sh"
+_LIB_BASE_URL_DEFAULT="https://raw.githubusercontent.com/omar00050/Easy-DevOps/main"
 LIB_DIR=""
 _LIB_VERIFIED_DIR=""
+_LIB_SOURCE=""
+_LIB_DIR_MODE=""
+CHECK_HELPERS=false
 
 _lib_dir_complete() {
   local dir="$1" _m
@@ -72,7 +78,7 @@ _lib_expected_sha256() {
     detect.sh)        printf '%s\n' '1870557130425bc851587da774f5ece78b2319d99bd10521bd9aca6c260f0742' ;;
     node-versions.sh) printf '%s\n' 'e05267a04edccc249e236e6945d6cb3146e804086af400db8611c56cee7d6c84' ;;
     picker.sh)        printf '%s\n' 'd43092378a324beb3f0002c0e4cc176a1e0144c2c8bfb079f04b5902d3e911c1' ;;
-    nvm-bootstrap.sh) printf '%s\n' 'e41c1e6390d2f1e65e199eb3dedfd59c5ecf8e11a2599c195ee5b3a54bb8d58b' ;;
+    nvm-bootstrap.sh) printf '%s\n' '5fb6404c543c941372495d4e2b9002a0e37e5b6fc6544d13177245be784ec7cf' ;;
     *) return 1 ;;
   esac
 }
@@ -100,10 +106,89 @@ _lib_dir_verified() {
       printf 'Error: installer module %s does not match the reviewed release.\n' "$_m" >&2
       printf '  expected: %s\n' "$_expected" >&2
       printf '  actual:   %s\n' "$_actual" >&2
+      printf 'The file is damaged or was replaced. Download the installer again from\n' >&2
+      printf 'the official release (https://github.com/omar00050/Easy-DevOps/releases)\n' >&2
+      printf 'and retry. If it still fails, report it:\n' >&2
+      printf '  https://github.com/omar00050/Easy-DevOps/issues\n' >&2
       return 1
     fi
   done
   return 0
+}
+
+# Test hook: EZ_INSTALLER_BASE_URL lets a test serve the helper bundle from a
+# local fixture (a file:// URL or a loopback HTTP server the test starts)
+# instead of the network. It exists only for tests. Anything that is not
+# https://, file://, or loopback http:// is refused before a request is made.
+_lib_base_url() {
+  local base="${EZ_INSTALLER_BASE_URL:-$_LIB_BASE_URL_DEFAULT}"
+  base="${base%/}"
+  case "$base" in
+    https://?*|file://?*|http://127.0.0.1|http://127.0.0.1[:/]*|http://localhost|http://localhost[:/]*)
+      printf '%s\n' "$base"
+      ;;
+    *)
+      printf 'Error: refusing installer helper source %s\n' "${base:-<empty>}" >&2
+      printf 'Helpers may only come from https://, file://, or loopback\n' >&2
+      printf 'http://127.0.0.1 / http://localhost. Nothing was downloaded.\n' >&2
+      return 1
+      ;;
+  esac
+}
+
+_lib_private_dir() {
+  _LIB_VERIFIED_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easy-devops-installer.XXXXXX")" || {
+    printf 'Error: could not create a private directory for the installer helpers.\n' >&2
+    return 1
+  }
+  chmod 700 "$_LIB_VERIFIED_DIR" || {
+    printf 'Error: could not protect the private installer helper directory.\n' >&2
+    return 1
+  }
+
+  # Prove the mode rather than assuming chmod succeeded. Every byte that will be
+  # sourced must live in a directory only this account can write to. Git Bash on
+  # Windows cannot express POSIX modes on NTFS, so there the requested 0700 is
+  # recorded while the directory stays private to the account under %TEMP%.
+  local _mode
+  _mode="$(stat -c '%a' -- "$_LIB_VERIFIED_DIR" 2>/dev/null || stat -f '%Lp' -- "$_LIB_VERIFIED_DIR" 2>/dev/null || true)"
+  _LIB_DIR_MODE="$_mode"
+  case "$_mode" in
+    700|0700) ;;
+    *)
+      case "$(uname -s 2>/dev/null || true)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *)
+          printf 'Error: private installer directory %s has mode %s, expected 700.\n' \
+            "$_LIB_VERIFIED_DIR" "${_mode:-unknown}" >&2
+          return 1
+          ;;
+      esac
+      ;;
+  esac
+
+  _cleanup_verified_lib() {
+    if [ -n "${_LIB_VERIFIED_DIR:-}" ] && [ -d "$_LIB_VERIFIED_DIR" ]; then
+      rm -rf -- "$_LIB_VERIFIED_DIR"
+    fi
+  }
+  trap '_cleanup_verified_lib' EXIT
+  return 0
+}
+
+# Download one helper into the private directory. curl is preferred; wget is
+# the fallback for minimal images. The caller verifies the bytes afterwards.
+_lib_download() {
+  local url="$1" dest="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$dest"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$dest" "$url"
+  else
+    printf 'Error: neither curl nor wget is available to download %s.\n' "$(basename "$dest")" >&2
+    printf 'Install curl, or download the release manually and run install.sh from it.\n' >&2
+    return 1
+  fi
 }
 
 # Every layout the modules can legitimately be in: a clone or the published
@@ -127,45 +212,45 @@ resolve_lib_dir() {
 }
 
 source_lib_modules() {
-  if ! resolve_lib_dir; then
-    printf 'Error: the reviewed installer modules were not found.\n' >&2
-    printf 'Expected them at:\n' >&2
-    printf '  %s/src/lib/installer\n' "${EASYDEVOPS_DIR:-$PWD}" >&2
-    printf 'Downloading helper scripts is disabled because unpinned bytes are unsafe.\n' >&2
-    printf 'Clone the repository or install the published easy-devops package, then rerun install.sh from it.\n' >&2
-    exit 1
-  fi
+  local _module _base _url
 
   # Hash and source the same bytes. A pathname by itself is not a stable
   # identity: another writer could replace a module after the digest check and
-  # before the shell opens it. Copy the complete bundle into a fresh 0700
-  # directory, verify that private snapshot, and source only from there.
-  _LIB_VERIFIED_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easy-devops-installer.XXXXXX")" || {
-    printf 'Error: could not create a private directory for the reviewed installer modules.\n' >&2
+  # before the shell opens it. Copy or download the complete bundle into a fresh
+  # 0700 directory, verify that private snapshot, and source only from there.
+  if ! _lib_private_dir; then
     exit 1
-  }
-  chmod 700 "$_LIB_VERIFIED_DIR" || {
-    printf 'Error: could not protect the private installer module directory.\n' >&2
-    exit 1
-  }
-  _cleanup_verified_lib() {
-    if [ -n "${_LIB_VERIFIED_DIR:-}" ] && [ -d "$_LIB_VERIFIED_DIR" ]; then
-      rm -rf -- "$_LIB_VERIFIED_DIR"
-    fi
-  }
-  trap '_cleanup_verified_lib' EXIT
+  fi
 
-  local _module
-  for _module in $_LIB_MODULES; do
-    cp -- "$LIB_DIR/$_module" "$_LIB_VERIFIED_DIR/$_module" || {
-      printf 'Error: could not snapshot installer module %s.\n' "$_module" >&2
-      exit 1
-    }
-  done
+  if resolve_lib_dir; then
+    for _module in $_LIB_MODULES; do
+      cp -- "$LIB_DIR/$_module" "$_LIB_VERIFIED_DIR/$_module" || {
+        printf 'Error: could not snapshot installer module %s.\n' "$_module" >&2
+        exit 1
+      }
+    done
+    _LIB_SOURCE="local files beside the installer"
+  else
+    _base="$(_lib_base_url)" || exit 1
+    for _module in $_LIB_MODULES; do
+      _url="$_base/src/lib/installer/$_module"
+      printf '  Downloading installer helper %s\n' "$_module"
+      if ! _lib_download "$_url" "$_LIB_VERIFIED_DIR/$_module"; then
+        printf 'Error: could not download installer helper %s from %s\n' "$_module" "$_url" >&2
+        printf 'Check the network connection and retry. If the problem persists,\n' >&2
+        printf 'download the release again from:\n' >&2
+        printf '  https://github.com/omar00050/Easy-DevOps/releases\n' >&2
+        printf 'and run install.sh from that download.\n' >&2
+        exit 1
+      fi
+    done
+    _LIB_SOURCE="downloaded from $_base"
+  fi
 
   LIB_DIR="$_LIB_VERIFIED_DIR"
   if ! _lib_dir_verified "$LIB_DIR"; then
-    printf 'Error: the installer modules do not match this installer release.\n' >&2
+    printf 'Error: the installer helpers do not match this installer release.\n' >&2
+    printf 'Nothing from an unverified helper was run.\n' >&2
     exit 1
   fi
 
@@ -239,6 +324,11 @@ Options:
   --service            Install the background service without asking
   --no-service         Do not install the background service, and do not ask
 
+Testing:
+  --check-helpers      Load (fetching them when they are not beside the script)
+                       and verify the installer helper modules, then exit 0.
+                       Nothing is installed and no Node.js step runs.
+
 Exit codes:
   0  Installation completed successfully
   1  Unrecoverable error (network failure, permission denied, etc.)
@@ -291,6 +381,10 @@ while [ "$#" -gt 0 ]; do
       SERVICE_CHOICE="no"
       shift
       ;;
+    --check-helpers)
+      CHECK_HELPERS=true
+      shift
+      ;;
     *)
       printf 'Unknown option: %s\n' "$1" >&2
       printf 'Run "bash install.sh --help" for usage.\n' >&2
@@ -301,6 +395,20 @@ done
 
 # Only now: --help above costs no network request and writes nothing.
 source_lib_modules
+
+# --check-helpers: prove the helper bundle loaded, downloaded and verified, then
+# stop before any install step. Documented in --help; used by the e2e suite.
+if [ "$CHECK_HELPERS" = "true" ]; then
+  _check_count=0
+  for _check_module in $_LIB_MODULES; do
+    _check_count=$((_check_count + 1))
+  done
+  _check_mode="$(stat -c '%a' -- "$_LIB_VERIFIED_DIR" 2>/dev/null || stat -f '%Lp' -- "$_LIB_VERIFIED_DIR" 2>/dev/null || printf 'unknown')"
+  printf 'check-helpers: verified %s helper module(s) in a private directory (requested 0700, mode %s) from %s\n' \
+    "$_check_count" "${_LIB_DIR_MODE:-$_check_mode}" "$_LIB_SOURCE"
+  printf 'check-helpers: directory %s\n' "$_LIB_VERIFIED_DIR"
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Install mode detection (mirrors install.ps1 3-mode logic)
@@ -630,7 +738,7 @@ if [ "$_allOK" = "true" ]; then
 else
   printf '  Some steps need attention -- see warnings above.\n\n'
   printf '  Fallback:\n'
-  printf '    node cli/index.js\n'
+  printf '    node src/cli/index.js\n'
 fi
 printf '\n'
 

@@ -429,6 +429,10 @@ export interface BackgroundServiceStatus extends BackgroundServiceLiveStatus {
   crashLooping: boolean;
   warnings: string[];
   runtime: ServiceRuntime | null;
+  /** Windows Server runs its own copy of the package, which can lag the CLI. */
+  serviceVersion?: string | null;
+  cliVersion?: string | null;
+  versionDrift?: boolean;
 }
 
 /**
@@ -437,7 +441,20 @@ export interface BackgroundServiceStatus extends BackgroundServiceLiveStatus {
  * and a merge keeps the last known values.
  */
 export type BackgroundServiceEvent = BackgroundServiceLiveStatus &
-  Partial<Pick<BackgroundServiceStatus, 'state' | 'enabledOnBoot' | 'restarts' | 'crashLooping' | 'warnings' | 'runtime'>>;
+  Partial<
+    Pick<
+      BackgroundServiceStatus,
+      | 'state'
+      | 'enabledOnBoot'
+      | 'restarts'
+      | 'crashLooping'
+      | 'warnings'
+      | 'runtime'
+      | 'serviceVersion'
+      | 'cliVersion'
+      | 'versionDrift'
+    >
+  >;
 
 /** Structured form of the CLI install instructions. */
 export interface ServiceInstallInfo {

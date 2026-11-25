@@ -238,13 +238,22 @@ export function startJobs({
 
     // The marker has to be refreshed or it goes stale in 20 seconds and
     // another process would be entitled to take the jobs from under us.
+    //
+    // The whole callback is guarded: a throw from a state write inside a timer
+    // is an uncaught exception, and in 1.4.6 that killed the daemon on Windows
+    // (finding A4). heartbeatOwner() already logs a failed write and retries on
+    // the next beat; this is the belt to that braces.
     handles.ownerBeat = setInterval(() => {
       if (stopped || !running) return;
-      if (!heartbeatOwner({ ...lockOpts, role })) {
-        // Someone else owns the jobs now. Standing down is the safe direction,
-        // for the same reason the daemon stands down when it loses its lock.
-        console.error('[jobs] lost the jobs marker - standing down');
-        stopRunning('another process holds the jobs');
+      try {
+        if (!heartbeatOwner({ ...lockOpts, role })) {
+          // Someone else owns the jobs now. Standing down is the safe direction,
+          // for the same reason the daemon stands down when it loses its lock.
+          console.error('[jobs] lost the jobs marker - standing down');
+          stopRunning('another process holds the jobs');
+        }
+      } catch (err) {
+        console.error('[jobs] jobs marker heartbeat failed:', err?.message ?? String(err));
       }
     }, OWNER_HEARTBEAT_MS);
 
@@ -327,18 +336,25 @@ export function startJobs({
 
     beat = setInterval(() => {
       if (stopped) return;
-      const stillMine = heartbeat({ ...lockOpts, version, mode: 'daemon' });
-      if (stillMine) return;
+      // A failed lock write is logged and retried on the next beat; a throw
+      // here would be an uncaught exception in a timer and would take the
+      // daemon down (finding A4).
+      try {
+        const stillMine = heartbeat({ ...lockOpts, version, mode: 'daemon' });
+        if (stillMine) return;
 
-      // Someone else took the lock — a stale-lock recovery that fired while we
-      // were paused, or a second daemon started by a service manager that
-      // thought we were dead. Standing down is the safe direction: the other
-      // process is the one the lock file names, and two daemons competing for
-      // the hub socket is worse than one.
-      console.error('[jobs] lost the daemon lock - standing down');
-      stopRunning('another process holds the daemon lock');
-      clearInterval(beat);
-      beat = null;
+        // Someone else took the lock — a stale-lock recovery that fired while we
+        // were paused, or a second daemon started by a service manager that
+        // thought we were dead. Standing down is the safe direction: the other
+        // process is the one the lock file names, and two daemons competing for
+        // the hub socket is worse than one.
+        console.error('[jobs] lost the daemon lock - standing down');
+        stopRunning('another process holds the daemon lock');
+        clearInterval(beat);
+        beat = null;
+      } catch (err) {
+        console.error('[jobs] daemon lock heartbeat failed:', err?.message ?? String(err));
+      }
     }, HEARTBEAT_INTERVAL_MS);
   }
 

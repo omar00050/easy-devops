@@ -279,6 +279,53 @@ async function explainDatabaseError(err) {
   return true;
 }
 
+/**
+ * One warning when the CLI package and the service's runtime copy disagree.
+ *
+ * Windows Server mode gives the service its own copy under ProgramData, so a
+ * plain `npm i -g easy-devops` updates only the CLI and the service keeps
+ * running the old code with no sign of it (finding A3). Reading it is one
+ * `package.json`, so it costs nothing worth measuring on a normal command.
+ *
+ * Never repairs by itself: the warning names `ezz service repair`, and the
+ * existing "Relaunch as administrator?" flow is offered only in an interactive
+ * terminal. A pipe, a script or CI gets the warning alone.
+ *
+ * @returns {Promise<void>}
+ */
+async function warnOnServiceVersionDrift() {
+  let drift;
+  try {
+    const { checkDrift } = await import('../core/service/versionDrift.js');
+    drift = checkDrift();
+  } catch {
+    // A drift check must never be why a command fails.
+    return;
+  }
+
+  if (!drift?.drift) return;
+
+  process.stderr.write(`\n  Warning: ${drift.message}\n\n`);
+
+  // Only Windows Server has a separate runtime copy, and only a terminal can
+  // answer a UAC prompt. Every other case is warning-only.
+  if (drift.mode !== 'server') return;
+  if (!(process.stdin.isTTY && process.stdout.isTTY)) return;
+
+  try {
+    const { requireElevation } = await import('./elevation.js');
+    const gate = await requireElevation({
+      args: ['service', 'repair'],
+      what: 'Updating the background service',
+    });
+    // Handed off: the elevated window owns the repair, so this one must not
+    // also run the command the user asked for. Declining continues normally.
+    if (gate.proceed === false && gate.code === 0) process.exit(0);
+  } catch {
+    // A failed prompt is not a failed command; the warning has been printed.
+  }
+}
+
 // Errors thrown later, from callbacks the dispatch below does not await. Not
 // for the daemon or the dashboard: they own their crash handling (releasing
 // the lock and the jobs marker), and an exit from here would pre-empt it.
@@ -291,6 +338,15 @@ if (command !== 'daemon' && !flags.has('dash')) {
 }
 
 try {
+  // Version drift first, so a user whose service is behind hears it before
+  // the command they typed does its work. Skipped for the commands that are
+  // themselves the fix, and for the long-running processes that report it
+  // through status instead.
+  const skipsDriftWarning = command === 'daemon'
+    || command === '_post-update'
+    || (command === 'service' && (args[0] === 'repair' || args[0] === 'recover'));
+  if (!skipsDriftWarning) await warnOnServiceVersionDrift();
+
   if (flags.has('dash')) {
     const { runDashboard } = await import('./dash.js');
     await runDashboard();
@@ -305,14 +361,30 @@ try {
     const { runDaemon } = await import('../core/daemon/run.js');
     process.exit(await runDaemon());
   } else if (command === 'service') {
+    const action = args[0] ?? 'status';
+    if (action === 'status') {
+      const { getDataDir } = await import('../core/platform.js');
+      const {
+        inspectServiceStatusDatabase,
+        formatDatabasePreflightFailure,
+      } = await import('./serviceStatusPreflight.js');
+      const report = inspectServiceStatusDatabase({ dataDir: getDataDir() });
+      if (!report.ok) {
+        process.stderr.write(formatDatabasePreflightFailure(report));
+        process.exit(1);
+      }
+    }
     const { serviceCommand } = await import('./menus/service.js');
-    process.exit(await serviceCommand(args[0] ?? 'status'));
+    process.exit(await serviceCommand(action));
   } else if (command === 'runtime') {
     const { runtimeCommand } = await import('./menus/runtime.js');
     process.exit(await runtimeCommand(args[0] ?? 'status', { yes: flags.has('yes') }));
   } else if (command === 'update') {
     const { updateCommand } = await import('./menus/update.js');
     process.exit(await updateCommand({ yes: flags.has('yes') }));
+  } else if (command === '_post-update') {
+    const { postUpdateCommand } = await import('./menus/postUpdate.js');
+    process.exit(await postUpdateCommand());
   } else if (command === 'hub') {
     const { hubCommand } = await import('./menus/hub.js');
     process.exit(await hubCommand(args[0] ?? 'status', args.slice(1), { yes: flags.has('yes') }));

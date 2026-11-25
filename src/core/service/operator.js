@@ -37,11 +37,22 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
+import { randomUUID } from 'node:crypto';
 
 import { run as shellRun, runFile as shellRunFile } from '../shell.js';
 import { WINDOWS_SC, programDataDir, windowsCurrentUserCmd } from '../platform.js';
-import { checkedAclDirectory, systemTool, walkAclTree } from './acl.js';
+import {
+  aclAceIsInherited,
+  aclEntryAllowsFullControl,
+  aclEntryAllowsReadExecute,
+  aclEntryExcessPermission,
+  checkedAclDirectory,
+  parseIcaclsListing,
+  systemTool,
+  walkAclTree,
+} from './acl.js';
 import { SERVICE_ID, SERVICE_ACCOUNT } from './winsw.js';
 import {
   UNINSTALL_STAGE_TIMEOUT_MS,
@@ -194,7 +205,120 @@ export async function readServiceSddl({
 }
 
 /**
+ * The Windows defaults for the service's DACL. A descriptor we write always
+ * carries both: losing them is what made an elevated administrator unable to
+ * read the wrapper or start the service.
+ */
+export const SERVICE_SYSTEM_DEFAULT = '(A;;CCLCSWRPWPDTLOCRRC;;;SY)';
+export const SERVICE_ADMINS_DEFAULT = '(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)';
+
+const SERVICE_SYSTEM_RIGHTS = ['CC', 'LC', 'SW', 'RP', 'WP', 'DT', 'LO', 'CR', 'RC'];
+const SERVICE_ADMINS_RIGHTS = ['CC', 'DC', 'LC', 'SW', 'RP', 'WP', 'DT', 'LO', 'CR', 'SD', 'RC', 'WD', 'WO'];
+
+/** The two-letter rights an ACE grants, or null when it cannot be read. */
+function aceRights(mask) {
+  const value = String(mask ?? '').toUpperCase();
+  if (value === 'GA' || value === 'FA') return { all: true, rights: [] };
+  // A hex mask carries the same rights in a form we do not decode. Treating it
+  // as unknown adds the explicit default, which can never lose access.
+  if (/^0X/i.test(value)) return null;
+  return { all: false, rights: value.match(/[A-Z]{2}/g) ?? [] };
+}
+
+function aceAllows(ace, trustee, required) {
+  if (!ace.startsWith('(A;')) return false;
+  if (aceTrustee(ace).toUpperCase() !== trustee) return false;
+  const rights = aceRights(ace.slice(1, -1).split(';')[2]);
+  if (!rights) return false;
+  return rights.all || required.every((code) => rights.rights.includes(code));
+}
+
+/**
+ * Which Windows defaults an SDDL descriptor is missing: `SY`, `BA`, or both.
+ * An empty array means the descriptor is safe to write.
+ *
+ * @param {string} sddl
+ * @returns {string[]}
+ */
+export function missingServiceDefaults(sddl) {
+  const parts = splitDacl(sddl ?? '');
+  if (!parts) return ['SY', 'BA'];
+  const missing = [];
+  if (!parts.aces.some((ace) => aceAllows(ace, 'SY', SERVICE_SYSTEM_RIGHTS))) missing.push('SY');
+  if (!parts.aces.some((ace) => aceAllows(ace, 'BA', SERVICE_ADMINS_RIGHTS))) missing.push('BA');
+  return missing;
+}
+
+/**
+ * The descriptor with any missing Windows default ACE added. Every other ACE
+ * and the SACL tail are kept byte-for-byte.
+ *
+ * @param {string} sddl
+ * @returns {string}
+ */
+export function withServiceDefaults(sddl) {
+  const parts = splitDacl(sddl ?? '');
+  if (!parts) throw new Error('the service security descriptor has no DACL');
+  const missing = missingServiceDefaults(sddl);
+  if (missing.length === 0) return sddl;
+  const added = [];
+  if (missing.includes('SY')) added.push(SERVICE_SYSTEM_DEFAULT);
+  if (missing.includes('BA')) added.push(SERVICE_ADMINS_DEFAULT);
+  return `${parts.head}${parts.aces.join('')}${added.join('')}${parts.tail}`;
+}
+
+const SDDL_SAFE = /^[A-Za-z0-9:;()-]+$/;
+
+/**
+ * Writes one descriptor with direct `sc.exe sdset` argv and reads it back.
+ * Refuses to send anything that is not plain SDDL, and never returns success
+ * unless the read-back still carries both Windows defaults.
+ *
+ * @returns {Promise<{ ok: boolean, sddl?: string, reason?: string }>}
+ */
+async function writeServiceDescriptor(sddl, { run, runFile }) {
+  if (typeof sddl !== 'string' || !SDDL_SAFE.test(sddl)) {
+    return { ok: false, reason: 'the service permissions contained unexpected characters; nothing was changed' };
+  }
+  const result = await runFile(systemTool(WINDOWS_SC), ['sdset', SERVICE_ID, sddl], { timeout: 20_000 });
+  if (!result.success) {
+    return {
+      ok: false,
+      reason: `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300) || 'sc.exe sdset failed',
+    };
+  }
+  const readback = await readServiceSddl({ run, runFile });
+  if (!readback) {
+    return { ok: false, written: true, reason: 'the service descriptor could not be read back after it was written' };
+  }
+  const missing = missingServiceDefaults(readback);
+  if (missing.length) {
+    return {
+      ok: false,
+      written: true,
+      reason: `the written service descriptor lost ${missing.join(' and ')} access; `
+        + 'it was not accepted',
+    };
+  }
+  return { ok: true, sddl: readback };
+}
+
+/** Writes the previous descriptor back with the defaults it must never lose. */
+async function rollbackServiceDescriptor(current, { run, runFile }) {
+  let target;
+  try {
+    target = withServiceDefaults(current);
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+  return writeServiceDescriptor(target, { run, runFile });
+}
+
+/**
  * Lets `sid` start, stop and query the service. Needs elevation.
+ *
+ * The computed DACL always keeps (or gains) the Windows defaults for SYSTEM
+ * and Administrators, and the user's start/stop ACE is added on top.
  *
  * @returns {Promise<{ ok: boolean, reason?: string }>}
  */
@@ -206,25 +330,38 @@ export async function grantServiceControl({ sid, run = shellRun, runFile = shell
 
   let next;
   try {
-    next = withOperatorAce(current, sid);
+    next = withServiceDefaults(withOperatorAce(current, sid));
   } catch (err) {
     return { ok: false, reason: err.message };
   }
-  // Only the supported SDDL grammar is accepted;
-  // anything else means it was not read correctly, and it is not sent.
-  if (!/^[A-Za-z0-9:;()-]+$/.test(next)) {
+  if (!SDDL_SAFE.test(next)) {
     return { ok: false, reason: 'the service permissions contained unexpected characters; nothing was changed' };
   }
 
-  const result = await runFile(systemTool(WINDOWS_SC), ['sdset', SERVICE_ID, next], { timeout: 20_000 });
-  if (!result.success) {
-    return { ok: false, reason: `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300) || 'sc.exe sdset failed' };
+  const written = await writeServiceDescriptor(next, { run, runFile });
+  if (!written.ok) {
+    if (!written.written) return { ok: false, reason: written.reason };
+    const restored = await rollbackServiceDescriptor(current, { run, runFile });
+    return {
+      ok: false,
+      reason: 'The service descriptor lost SYSTEM or Administrators access when it was written. '
+        + (restored.ok ? 'Previous descriptor restored.'
+          : `Previous descriptor could not be restored: ${restored.reason}`),
+    };
   }
 
-  const after = operatorAceState(await readServiceSddl({ run, runFile }), sid);
-  return after.granted && !after.excessive
-    ? { ok: true }
-    : { ok: false, reason: 'the permission was written but does not read back as expected' };
+  const after = operatorAceState(written.sddl, sid);
+  if (after.granted && !after.excessive) return { ok: true };
+
+  // The ACE did not read back as intended. Put the previous descriptor back,
+  // with the defaults it must never lose, and verify that too.
+  const restored = await rollbackServiceDescriptor(current, { run, runFile });
+  return {
+    ok: false,
+    reason: 'The service descriptor does not read back as expected. '
+      + (restored.ok ? 'Previous descriptor restored.'
+        : `Previous descriptor could not be restored: ${restored.reason}`),
+  };
 }
 
 /**
@@ -250,24 +387,35 @@ export async function revokeServiceControl({
     return { ok: false, reason: error.message };
   }
   if (!next.changed) return { ok: true, changed: false };
-  if (!/^[A-Za-z0-9:;()-]+$/.test(next.sddl)) {
+
+  let target;
+  try {
+    // Even a removal never writes a descriptor without the Windows defaults.
+    target = withServiceDefaults(next.sddl);
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+  if (!SDDL_SAFE.test(target)) {
     return { ok: false, reason: 'the service permissions contained unexpected characters; nothing was changed' };
   }
 
-  const written = await runFile(systemTool(WINDOWS_SC), [
-    'sdset', SERVICE_ID, next.sddl,
-  ], { timeout: 20_000 });
-  if (!written.success) {
+  const written = await writeServiceDescriptor(target, { run, runFile });
+  if (!written.ok) {
+    if (!written.written) return { ok: false, reason: written.reason };
+    const restored = await restoreServiceControl({ sid, sddl: current, run, runFile });
     return {
       ok: false,
-      reason: `${written.stdout ?? ''}${written.stderr ?? ''}`.trim().slice(0, 300)
-        || 'sc.exe sdset failed',
+      reason: 'The service descriptor lost SYSTEM or Administrators access when it was written. '
+        + (restored.ok ? 'Previous descriptor restored.' : restored.reason),
     };
   }
-  const after = operatorAceState(await readServiceSddl({ run, runFile }), sid);
-  return after.granted
-    ? { ok: false, reason: 'the permission was removed but the service DACL still grants it' }
-    : { ok: true, changed: true, previousSddl: current };
+  if (operatorAceState(written.sddl, sid).granted === false) {
+    return { ok: true, changed: true, previousSddl: current };
+  }
+
+  const restored = await restoreServiceControl({ sid, sddl: current, run, runFile });
+  return { ok: false, reason: 'Revoked service permissions did not read back. '
+    + (restored.ok ? 'Previous descriptor restored.' : restored.reason) };
 }
 
 /** Restore the exact DACL read before a temporary operator hold. */
@@ -278,27 +426,46 @@ export async function restoreServiceControl({
   runFile = shellRunFile,
 } = {}) {
   if (!isAccountSid(sid)) return { ok: false, reason: 'no user account to restore' };
-  if (typeof sddl !== 'string' || !/^[A-Za-z0-9:;()-]+$/.test(sddl)) {
+  if (typeof sddl !== 'string' || !SDDL_SAFE.test(sddl)) {
     return { ok: false, reason: 'the saved service permissions are not valid SDDL; nothing was changed' };
   }
   if (!operatorAceState(sddl, sid).granted) {
     return { ok: false, reason: 'the saved service permissions do not contain the expected operator grant' };
   }
 
-  const written = await runFile(systemTool(WINDOWS_SC), [
-    'sdset', SERVICE_ID, sddl,
-  ], { timeout: 20_000 });
-  if (!written.success) {
-    return {
-      ok: false,
-      reason: `${written.stdout ?? ''}${written.stderr ?? ''}`.trim().slice(0, 300)
-        || 'sc.exe sdset failed',
-    };
+  let target;
+  try {
+    target = withServiceDefaults(sddl);
+  } catch (error) {
+    return { ok: false, reason: error.message };
   }
-  const after = await readServiceSddl({ run, runFile });
-  return after === sddl
+
+  const written = await writeServiceDescriptor(target, { run, runFile });
+  if (!written.ok) return { ok: false, reason: written.reason };
+  return operatorAceState(written.sddl, sid).granted
     ? { ok: true }
-    : { ok: false, reason: 'the service DACL was written but did not read back exactly as saved' };
+    : { ok: false, reason: 'the service DACL was written but the operator grant did not read back' };
+}
+
+/**
+ * Makes sure the service descriptor carries the Windows defaults, without
+ * touching any other ACE. Used by `ezz service recover` when the installing
+ * account cannot be identified (or has no grant to renew).
+ *
+ * @returns {Promise<{ ok: boolean, reason?: string, changed?: boolean }>}
+ */
+export async function ensureServiceDefaults({ run = shellRun, runFile = shellRunFile } = {}) {
+  const current = await readServiceSddl({ run, runFile });
+  if (!current) return { ok: false, reason: `could not read the ${SERVICE_ID} service permissions` };
+  let target;
+  try {
+    target = withServiceDefaults(current);
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+  if (target === current) return { ok: true, changed: false };
+  const written = await writeServiceDescriptor(target, { run, runFile });
+  return written.ok ? { ok: true, changed: true } : { ok: false, reason: written.reason };
 }
 
 // ─── The data directory ──────────────────────────────────────────────────────
@@ -399,6 +566,231 @@ export function buildProtectCommands(
 }
 
 /**
+ * Whether `dir` is one of the machine's executable roots. Those are protected
+ * differently: a constant number of icacls calls for the whole tree, never one
+ * per file, and never a window in which a file has an empty DACL.
+ */
+function isServiceCodeRoot(dir) {
+  const base = programDataDir();
+  const target = path.win32.resolve(dir);
+  return ['bin', 'runtime', 'runtime.prev'].some((name) =>
+    path.win32.resolve(path.win32.join(base, name)) === target);
+}
+
+/** Trustees as icacls prints them, including SID form on localized Windows. */
+const SYSTEM_TRUSTEES = ['NT AUTHORITY\\SYSTEM', 'SYSTEM', 'S-1-5-18', '*S-1-5-18'];
+const ADMIN_TRUSTEES = ['BUILTIN\\Administrators', 'Administrators', 'S-1-5-32-544', '*S-1-5-32-544'];
+const USERS_TRUSTEES = ['BUILTIN\\Users', 'Users', 'S-1-5-32-545', '*S-1-5-32-545'];
+const SERVICE_TRUSTEES = [SERVICE_ACCOUNT];
+
+function normalizeTrustee(value) {
+  return String(value ?? '').trim().replace(/^\*/, '').toUpperCase();
+}
+
+/** The trustee exactly as icacls printed it, if it is safe as one argv value. */
+function removableTrustee(trustee) {
+  const value = String(trustee ?? '').trim();
+  if (!value || /["\x00-\x1f]/.test(value)) return null;
+  return value;
+}
+
+/**
+ * Removes every explicit ACE on the folder for an account that is not SYSTEM,
+ * Administrators, Users or the service account.
+ *
+ * `/grant:r` replaces only the trustees it names, so an explicit
+ * `Everyone:(OI)(CI)F` from an earlier install would otherwise survive and give
+ * that account write access to code the service runs.
+ *
+ * @returns {Promise<{ ok: boolean, removed?: string[], reason?: string }>}
+ */
+export async function removeUnapprovedCodeRootAces({ dir, runFile }) {
+  const icacls = systemTool('icacls.exe');
+  const read = await runFile(icacls, [dir], { timeout: 120_000 });
+  if (!read.success) {
+    return { ok: false, reason: `could not read the folder permissions: ${icaclsOutput(read).slice(0, 200)}` };
+  }
+  const entries = parseIcaclsListing(read.stdout);
+  const folder = entries.find((entry) => samePath(entry.path, dir)) ?? entries[0];
+  if (!folder) return { ok: false, reason: `the read-back of ${dir} contained no entry for the folder` };
+
+  const allowed = new Set([
+    ...SYSTEM_TRUSTEES, ...ADMIN_TRUSTEES, ...USERS_TRUSTEES, ...SERVICE_TRUSTEES,
+  ].map(normalizeTrustee));
+  const removed = [];
+  const seen = new Set();
+  for (const ace of folder.aces) {
+    if (aclAceIsInherited(ace)) continue;
+    const trustee = removableTrustee(ace.trustee);
+    if (!trustee) {
+      return { ok: false, reason: `refusing an unusual trustee on ${dir}: ${JSON.stringify(ace.trustee)}` };
+    }
+    const key = normalizeTrustee(trustee);
+    if (allowed.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    const result = await runFile(icacls, [dir, '/remove:g', trustee, '/L', '/Q'], { timeout: 120_000 });
+    if (!result.success) {
+      return { ok: false, reason: `could not remove ${trustee} from ${dir}: ${icaclsOutput(result).slice(0, 200)}` };
+    }
+    removed.push(trustee);
+  }
+  return { ok: true, removed };
+}
+
+function icaclsOutput(result) {
+  return `${result?.stdout ?? ''}${result?.stderr ?? ''}`.trim();
+}
+
+function isAccessDenied(result) {
+  return /access is denied/i.test(icaclsOutput(result));
+}
+
+function samePath(left, right) {
+  return path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase();
+}
+
+/**
+ * Reads a protected tree back and checks every entry: a non-empty DACL with
+ * SYSTEM and Administrators full control, and the service account able to read
+ * and execute when it is registered.
+ *
+ * @returns {Promise<{ ok: boolean, reason?: string }>}
+ */
+export async function verifyServiceCodeRoot({ dir, serviceAccount, runFile }) {
+  const icacls = systemTool('icacls.exe');
+  const children = path.win32.join(dir, '*');
+  const folder = await runFile(icacls, [dir], { timeout: 120_000 });
+  if (!folder.success) return { ok: false, reason: `could not read back ${dir}: ${icaclsOutput(folder).slice(0, 200)}` };
+  const listing = await runFile(icacls, [children, '/T', '/C'], { timeout: 600_000 });
+  if (!listing.success) {
+    return { ok: false, reason: `could not read back the files under ${dir}: ${icaclsOutput(listing).slice(0, 200)}` };
+  }
+
+  const entries = [...parseIcaclsListing(folder.stdout), ...parseIcaclsListing(listing.stdout)];
+  if (entries.length === 0) return { ok: false, reason: `the read-back of ${dir} contained no entries` };
+
+  const serviceTrustees = [SERVICE_ACCOUNT];
+  for (const entry of entries) {
+    if (entry.aces.length === 0) {
+      return { ok: false, reason: `${entry.path} has an empty ACL` };
+    }
+    if (!aclEntryAllowsFullControl(entry, SYSTEM_TRUSTEES)) {
+      return { ok: false, reason: `${entry.path} does not give SYSTEM full control` };
+    }
+    if (!aclEntryAllowsFullControl(entry, ADMIN_TRUSTEES)) {
+      return { ok: false, reason: `${entry.path} does not give Administrators full control` };
+    }
+    if (serviceAccount && !aclEntryAllowsReadExecute(entry, serviceTrustees)) {
+      return { ok: false, reason: `${entry.path} cannot be read by ${SERVICE_ACCOUNT}` };
+    }
+    const excess = aclEntryExcessPermission(entry, [...SYSTEM_TRUSTEES, ...ADMIN_TRUSTEES]);
+    if (excess) {
+      return {
+        ok: false,
+        reason: `${entry.path} gives ${excess.trustee} more than read and execute `
+          + `(${excess.permissions.join('')})`,
+      };
+    }
+  }
+
+  // The three files whose unreadable DACLs broke real servers: when they exist
+  // they must be present in the read-back and pass the same checks.
+  const probes = [path.win32.join(dir, 'EasyDevOps.exe'), path.win32.join(dir, 'node.exe'),
+    path.win32.join(dir, 'app', 'src', 'cli', 'index.js')];
+  for (const probe of probes) {
+    if (!fs.existsSync(probe)) continue;
+    const entry = entries.find((candidate) => samePath(candidate.path, probe));
+    if (!entry) return { ok: false, reason: `${probe} is missing from the read-back` };
+    if (!aclEntryAllowsFullControl(entry, SYSTEM_TRUSTEES)
+        || !aclEntryAllowsFullControl(entry, ADMIN_TRUSTEES)
+        || (serviceAccount && !aclEntryAllowsReadExecute(entry, serviceTrustees))) {
+      return { ok: false, reason: `${probe} does not keep SYSTEM, Administrators and the service account` };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * Protects one executable root with a constant number of icacls calls.
+ *
+ * Order is deliberate: the folder's explicit grants are written BEFORE
+ * inheritance is removed, so it is never empty; the children are then reset so
+ * they inherit that list instead of keeping whatever a previous run left. On
+ * any failure the saved tree is restored and the caller gets one clear message.
+ *
+ * @returns {Promise<{ ok: boolean, reason?: string }>}
+ */
+async function protectCodeRoot(dir, { serviceAccount, runFile }) {
+  const icacls = systemTool('icacls.exe');
+  const target = safePath(dir);
+  const children = path.win32.join(target, '*');
+  const parent = path.dirname(target);
+  const saved = path.join(os.tmpdir(), `ez-acl-${process.pid}-${randomUUID()}.acl`);
+  const scope = ['/L', '/Q'];
+  const grants = [
+    `${SID_SYSTEM}:(OI)(CI)F`,
+    `${SID_ADMINISTRATORS}:(OI)(CI)F`,
+    `${SID_USERS}:(OI)(CI)RX`,
+    ...(serviceAccount ? [`${SERVICE_ACCOUNT}:(OI)(CI)RX`] : []),
+  ];
+
+  let step = 'saving the current permissions';
+  const run = (args, timeout = 600_000) => runFile(icacls, args, { timeout });
+
+  try {
+    const save = await run([target, '/save', saved, '/T', '/C', ...scope]);
+    if (!save.success) throw new Error(`saving the current permissions failed: ${icaclsOutput(save).slice(0, 200)}`);
+
+    step = 'taking ownership for Administrators';
+    const owner = await run([target, '/setowner', SID_ADMINISTRATORS, ...scope]);
+    if (!owner.success) throw new Error(`taking ownership failed: ${icaclsOutput(owner).slice(0, 200)}`);
+
+    step = 'granting SYSTEM, Administrators, Users and the service account';
+    // Grant first, remove inheritance second: the folder is never left empty.
+    const grant = await run([target, '/grant:r', ...grants, ...scope]);
+    if (!grant.success) throw new Error(`granting access failed: ${icaclsOutput(grant).slice(0, 200)}`);
+
+    step = 'removing inheritance from the folder';
+    const inherit = await run([target, '/inheritance:r', ...scope]);
+    if (!inherit.success) throw new Error(`removing inheritance failed: ${icaclsOutput(inherit).slice(0, 200)}`);
+
+    step = 'removing unapproved explicit permissions';
+    const cleaned = await removeUnapprovedCodeRootAces({ dir: target, runFile });
+    if (!cleaned.ok) throw new Error(cleaned.reason);
+
+    step = 'resetting the files so they inherit from the folder';
+    let reset = await run([children, '/reset', '/T', '/C', ...scope]);
+    if (!reset.success && isAccessDenied(reset)) {
+      step = 'taking ownership of the files';
+      const take = await run([children, '/setowner', SID_ADMINISTRATORS, '/T', '/C', ...scope]);
+      if (!take.success) throw new Error(`taking ownership of the files failed: ${icaclsOutput(take).slice(0, 200)}`);
+      step = 'resetting the files so they inherit from the folder';
+      reset = await run([children, '/reset', '/T', '/C', ...scope]);
+    }
+    if (!reset.success) throw new Error(`resetting the files failed: ${icaclsOutput(reset).slice(0, 200)}`);
+
+    step = 'verifying the new permissions';
+    const verified = await verifyServiceCodeRoot({ dir: target, serviceAccount, runFile });
+    if (!verified.ok) throw new Error(verified.reason);
+  } catch (error) {
+    let restored = false;
+    try {
+      const result = await run([parent, '/restore', saved, '/C', ...scope]);
+      restored = result.success;
+    } catch { /* reported below */ }
+    return {
+      ok: false,
+      reason: `${target}: ${step} failed: ${error.message}. `
+        + (restored ? 'The previous permissions were restored.' : 'The previous permissions could not be restored.')
+        + ' Run `ezz service recover` from an Administrator PowerShell.',
+    };
+  } finally {
+    try { fs.rmSync(saved, { force: true }); } catch { /* a temp file is not worth failing over */ }
+  }
+  return { ok: true };
+}
+
+/**
  * Makes the runtime and wrapper folders administrator-only to change.
  *
  * Runs on install and on every repair: a repair replaces the runtime folder
@@ -425,6 +817,25 @@ export async function protectServiceFiles({
     let error = null;
     let commands = [];
     try {
+      if (isServiceCodeRoot(dir)) {
+        // A missing root is reported, never created here.
+        let stat = null;
+        try {
+          stat = fs.lstatSync(dir, { throwIfNoEntry: false }) ?? null;
+        } catch (err) {
+          throw new Error(`could not inspect the directory: ${err.code ?? err.message}`);
+        }
+        if (!stat) throw new Error('the directory does not exist');
+        if (stat.isSymbolicLink() || !stat.isDirectory()) {
+          throw new Error('refusing a reparse point or non-directory');
+        }
+        const result = await protectCodeRoot(dir, { serviceAccount, runFile });
+        if (!result.ok) throw new Error(result.reason);
+        done.push(dir);
+        log(`  ${dir}: administrators only (read & execute for the service and users); `
+          + 'every file inherits it and was verified');
+        continue;
+      }
       await walkAclTree(dir, async (target, objectType) => {
         const isRoot = path.resolve(target) === path.resolve(dir);
         commands = buildProtectCommands(target, sid, {
@@ -447,12 +858,14 @@ export async function protectServiceFiles({
     }
     if (error) {
       failed.push({ path: dir, reason: error });
-      log(`  ${dir}: could not be protected`);
+      log(`  ${dir}: could not be protected: ${error}`);
     } else {
       done.push(dir);
-      log(`  ${dir}: administrators only (${usersRead ? 'read & execute for the service and users' : `${
-        serviceAccess === 'M' ? 'modify' : 'read & execute'
-      } for the service`})`);
+      if (!isServiceCodeRoot(dir)) {
+        log(`  ${dir}: administrators only (${usersRead ? 'read & execute for the service and users' : `${
+          serviceAccess === 'M' ? 'modify' : 'read & execute'
+        } for the service`})`);
+      }
     }
   }
   return { ok: failed.length === 0, protected: done, failed };

@@ -109,6 +109,129 @@ export function systemTool(name) {
 
 export const WINDOWS_POWERSHELL = systemTool('WindowsPowerShell\\v1.0\\powershell.exe');
 
+// ─── Reading an icacls listing back ─────────────────────────────────────────
+
+const ACE_TAIL = /^(?:\([^()]*\))+$/;
+
+// A trustee as icacls prints it at the end of a line. SID form is included
+// because a localized Windows may not resolve a name for every account.
+const TRUSTEE_AT_END = new RegExp(
+  '('
+  + '(?:\\*?S-1-[0-9-]+)'
+  + '|(?:NT AUTHORITY\\\\[^\\\\:]+)'
+  + '|(?:NT SERVICE\\\\[^\\\\:]+)'
+  + '|(?:BUILTIN\\\\[^\\\\:]+)'
+  + '|(?:APPLICATION PACKAGE AUTHORITY\\\\[^\\\\:]+)'
+  + '|(?:CREATOR OWNER)'
+  + '|(?:Everyone)'
+  + '|(?:[^\\s\\\\]+\\\\[^\\s:]+)'
+  + ')\\s*$',
+  'i',
+);
+
+function parseIcaclsAce(line) {
+  const colon = line.lastIndexOf(':');
+  if (colon === -1) return null;
+  const tail = line.slice(colon + 1).trim();
+  if (!ACE_TAIL.test(tail)) return null;
+  const before = line.slice(0, colon);
+  const match = TRUSTEE_AT_END.exec(before);
+  if (!match) return null;
+  return {
+    prefix: before.slice(0, match.index).trim(),
+    trustee: match[1].trim(),
+    permissions: [...tail.matchAll(/\(([^()]*)\)/g)].map((entry) => entry[1].trim()),
+  };
+}
+
+/**
+ * Parses `icacls <path>` and `icacls <path>\* /T /C` output.
+ *
+ * The first line of an entry carries the path, followed by its first ACE;
+ * further ACEs are indented. A path with no ACE line is an EMPTY DACL, which
+ * is exactly the broken state this read-back must catch, so it is kept.
+ *
+ * @param {string} output
+ * @returns {Array<{ path: string, aces: Array<{ trustee: string, permissions: string[] }> }>}
+ */
+export function parseIcaclsListing(output) {
+  const entries = [];
+  let current = null;
+  for (const raw of String(output ?? '').split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim()) continue;
+    if (/^\s*(?:Successfully processed|Failed processing)\b/i.test(line)) continue;
+    if (/^\s*(?:The system cannot find|Access is denied|No mapping between)\b/i.test(line)) continue;
+    const ace = parseIcaclsAce(line);
+    if (!ace) {
+      current = { path: line.trim(), aces: [] };
+      entries.push(current);
+      continue;
+    }
+    if (ace.prefix) {
+      current = { path: ace.prefix, aces: [{ trustee: ace.trustee, permissions: ace.permissions }] };
+      entries.push(current);
+    } else if (current) {
+      current.aces.push({ trustee: ace.trustee, permissions: ace.permissions });
+    }
+  }
+  return entries;
+}
+
+function normalizeTrustee(value) {
+  return String(value ?? '').trim().replace(/^\*/, '').toUpperCase();
+}
+
+function entryAllows(entry, trustees, levels) {
+  const wanted = trustees.map(normalizeTrustee);
+  return (entry?.aces ?? []).some((ace) => {
+    if (ace.permissions.some((permission) => /^deny$/i.test(permission))) return false;
+    return wanted.includes(normalizeTrustee(ace.trustee))
+      && ace.permissions.some((permission) => levels.test(permission));
+  });
+}
+
+/** Whether one parsed entry grants full control to any of `trustees`. */
+export function aclEntryAllowsFullControl(entry, trustees) {
+  return entryAllows(entry, trustees, /^(?:F|GA)$/i);
+}
+
+/** Whether one parsed entry grants read and execute to any of `trustees`. */
+export function aclEntryAllowsReadExecute(entry, trustees) {
+  return entryAllows(entry, trustees, /^(?:F|M|RX|R|GA)$/i);
+}
+
+/** ACE permission tokens that icacls uses for more than read and execute. */
+const WRITE_PERMISSIONS = new Set(['W', 'M', 'F', 'D', 'WD', 'AD', 'WA', 'WEA', 'DC', 'GA', 'GW']);
+
+/** Whether an ACE is marked inherited by icacls (`(I)`). */
+export function aclAceIsInherited(ace) {
+  return (ace?.permissions ?? []).some((permission) => /^I$/i.test(permission));
+}
+
+/**
+ * The first ACE in an entry that gives a trustee outside `allowedTrustees`
+ * anything beyond read and execute. `SYSTEM` and Administrators must be in
+ * `allowedTrustees` by the caller; anyone else with write access is a
+ * privilege-escalation path into a runtime the service executes from.
+ *
+ * @returns {{ trustee: string, permissions: string[] }|null}
+ */
+export function aclEntryExcessPermission(entry, allowedTrustees) {
+  const allowed = (allowedTrustees ?? []).map(normalizeTrustee);
+  for (const ace of entry?.aces ?? []) {
+    if (ace.permissions.some((permission) => /^deny$/i.test(permission))) continue;
+    if (allowed.includes(normalizeTrustee(ace.trustee))) continue;
+    const excessive = ace.permissions.some((permission) => {
+      const value = String(permission ?? '').trim().toUpperCase();
+      // A hex rights mask cannot be read here; fail closed rather than guess.
+      return WRITE_PERMISSIONS.has(value) || /^0X/i.test(value);
+    });
+    if (excessive) return { trustee: ace.trustee, permissions: ace.permissions };
+  }
+  return null;
+}
+
 function inside(dir, base) {
   const rel = path.relative(base, dir);
   return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel));
@@ -275,6 +398,9 @@ export async function walkAclTree(root, visit, {
 
     for (const entry of entries) {
       const target = path.join(directory, entry.name);
+      // Executable subtrees have their own protected root and RX policy.
+      if (sameDirectory(directory, programDataDir()) &&
+          ['bin', 'runtime', 'runtime.prev'].includes(entry.name.toLowerCase())) continue;
       let stat;
       try {
         stat = await fsApi.promises.lstat(target);
@@ -309,7 +435,7 @@ export async function walkAclTree(root, visit, {
  * reparse point and hard-linked file before icacls runs. The deadline is
  * checked throughout the scan, so a large tree cannot hold uninstall open.
  */
-async function validateAclTreeForBulkRevoke(root, {
+export async function validateAclTreeForBulkRevoke(root, {
   runFile = shellRunFile,
   fsApi = fs,
   deadline = Infinity,

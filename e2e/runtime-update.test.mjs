@@ -401,6 +401,45 @@ async function testRollbackOnVerifyFailure() {
     order.filter((o) => o === 'start').length === 2, order.join(' -> '));
   check('the rollback happened before that restart',
     order.indexOf('rollback') < order.lastIndexOf('start'), order.join(' -> '));
+
+  // ── The rollback itself fails: the service must still be started ────────
+  const failedOrder = [];
+  let failedRollback = false;
+  const failed = await ru.update({
+    target: { version: '22.11.0', source: 'nvm' },
+    dataDir,
+    deps: {
+      run: recordingRun(),
+      service: {
+        async stop() { failedOrder.push('stop'); return { ok: true }; },
+        async start() { failedOrder.push('start'); return { ok: true }; },
+      },
+      mechanism: { platform: 'linux', mode: null, mechanism: 'systemd' },
+      installTarget: async () => ({ ok: true, nodeExe: '/opt/node22/bin/node' }),
+      smokeTest: async () => ({ ok: true, version: '22.11.0', abi: '127' }),
+      applyRuntime: async () => ({
+        ok: true,
+        detail: 'swapped',
+        rollback: async () => {
+          failedRollback = true;
+          failedOrder.push('rollback');
+          return { ok: false, reason: 'the previous link could not be restored' };
+        },
+      }),
+      waitForDaemon: async () => ({ alive: false, waitedMs: 10_000 }),
+      verifyMs: 10_000,
+    },
+  });
+
+  check('a failed runtime rollback does not leave the service stopped',
+    failedRollback === true
+      && failedOrder.filter((o) => o === 'start').length === 2,
+    failedOrder.join(' -> '));
+  check('and the result says what is broken and what to run',
+    failed.ok === false
+      && /could not be restored/.test(failed.reason)
+      && /ezz service recover/.test((failed.lines ?? []).join('\n')),
+    failed.reason);
 }
 
 // ─── 7. The Windows Server swap, against a redirected ProgramData ────────────
@@ -448,6 +487,9 @@ async function testWindowsServerSwap() {
         canWriteProgramData: () => true,
         // The app copy's modules load under the new binary: nothing to fix.
         verifyNativeModules: async () => ({ ok: true, abi: '127' }),
+        // node.exe here is a text file; the real binary is what runs in
+        // production, and this is the only thing stubbed.
+        verifyNode: async () => ({ ok: true, version: 'v22.11.0' }),
       },
     });
 
@@ -460,6 +502,35 @@ async function testWindowsServerSwap() {
     check('rollback restores it', back.ok === true && fs.readFileSync(dest, 'utf8') === 'OLD-NODE',
       back.reason ?? '');
     check('and removes the .prev it consumed', !fs.existsSync(`${dest}${ru.PREV_SUFFIX}`));
+    check('and the failed copy is gone once the previous one ran',
+      fs.readdirSync(path.dirname(dest)).filter((name) => /^node\.exe\.failed-/.test(name)).length === 0,
+      fs.readdirSync(path.dirname(dest)).join(' | '));
+
+    // ── A rollback whose binary does not run keeps both and says so ───────
+    fs.writeFileSync(dest, 'OLD-NODE');
+    try { fs.rmSync(`${dest}${ru.PREV_SUFFIX}`, { force: true }); } catch { /* fine */ }
+    const unverifiedSwap = await ru.applyRuntime({
+      nodeExe: incoming,
+      dataDir,
+      mech: { platform: 'windows', mode: 'server', mechanism: 'winsw' },
+      deps: {
+        run: recordingRun(),
+        protectServiceFiles: async () => ({ ok: true }),
+        canWriteProgramData: () => true,
+        verifyNativeModules: async () => ({ ok: true, abi: '127' }),
+        verifyNode: async () => ({ ok: false, reason: 'spawn EPERM' }),
+      },
+    });
+    const unverifiedBack = await unverifiedSwap.rollback();
+    const failedCopies = fs.readdirSync(path.dirname(dest)).filter((name) => /^node\.exe\.failed-/.test(name));
+    check('a rollback that cannot prove the binary runs is not called success',
+      unverifiedBack.ok === false && /does not run/.test(unverifiedBack.reason), unverifiedBack.reason);
+    check('and both binaries are kept, with their paths named',
+      fs.readFileSync(dest, 'utf8') === 'OLD-NODE'
+        && failedCopies.length === 1
+        && unverifiedBack.reason.includes(failedCopies[0]),
+      failedCopies.join(' | '));
+    try { fs.rmSync(path.join(path.dirname(dest), failedCopies[0] ?? 'none'), { force: true }); } catch { /* fine */ }
 
     // ── The native-module fix ────────────────────────────────────────────
     fs.writeFileSync(dest, 'OLD-NODE');
@@ -501,7 +572,7 @@ async function testWindowsServerSwap() {
       mech: { platform: 'windows', mode: 'server', mechanism: 'winsw' },
       deps: {
         run: recordingRun(),
-        canWriteProgramData: () => false,
+        canWriteProgramData: async () => false,
         verifyNativeModules: async () => ({ ok: true }),
       },
     });
