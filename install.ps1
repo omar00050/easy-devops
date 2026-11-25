@@ -3,8 +3,10 @@
   Easy DevOps Bootstrap Installer for Windows
 
 .DESCRIPTION
-  Installs Node.js (via nvm-windows), project dependencies, and registers
-  the easy-devops CLI command globally.
+  Checks for Node.js 18+, can switch versions through an already-installed
+  nvm-windows, installs project dependencies, and registers the easy-devops
+  CLI command globally. Automatic nvm-windows download stays disabled until
+  this release carries a reviewed executable digest.
 
 .PARAMETER Help
   Print this help message and exit.
@@ -44,6 +46,10 @@ $ErrorActionPreference = 'Stop'
 
 $REQUIRED_NODE_MAJOR = 18
 $NVM_WINDOWS_VERSION = '1.1.12'
+# No reviewed nvm-windows digest is established in this repository. Never
+# derive this value from the downloaded file or release metadata. Keep it
+# empty until a trusted release digest is reviewed and pinned.
+$NVM_WINDOWS_SHA256  = ''
 $NODE_FALLBACK       = '20'
 
 # ─── Summary tracking (mirrors install.sh add_result) ────────────────────────
@@ -74,6 +80,10 @@ function Write-Err  { param([string]$msg) Write-Host "      ERROR   $msg" -Foreg
 function Write-Info { param([string]$msg) Write-Host "             $msg"  -ForegroundColor Gray   }
 
 function Refresh-Path {
+  # Do not trust variables that happened to be present in this shell. Read the
+  # persisted user/machine values below.
+  Remove-Item Env:NVM_HOME,Env:NVM_SYMLINK -ErrorAction SilentlyContinue
+
   # Read NVM vars from User scope, fall back to Machine scope
   # (nvm-windows writes to Machine on system-wide installs)
   $nvmHome = [System.Environment]::GetEnvironmentVariable('NVM_HOME', 'User')
@@ -110,8 +120,10 @@ function Find-NvmExe {
 
   $candidates = @()
   if ($env:NVM_HOME)    { $candidates += Join-Path $env:NVM_HOME    'nvm.exe' }
-  if ($env:APPDATA)     { $candidates += Join-Path $env:APPDATA     'nvm\nvm.exe' }
-  if ($env:ProgramData) { $candidates += Join-Path $env:ProgramData 'nvm\nvm.exe' }
+  $appData = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+  $commonAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+  if ($appData) { $candidates += Join-Path $appData 'nvm\nvm.exe' }
+  if ($commonAppData) { $candidates += Join-Path $commonAppData 'nvm\nvm.exe' }
   $candidates += 'C:\ProgramData\nvm\nvm.exe'
 
   foreach ($c in $candidates) {
@@ -190,6 +202,152 @@ function Download-File {
   try   { $wc.DownloadFile($Url, $Dest) }
   finally { $wc.Dispose() }
 }
+
+function Remove-NvmAttempt {
+  param(
+    [Parameter(Mandatory = $true)][string]$TempRoot,
+    [Parameter(Mandatory = $true)][string]$TempDir,
+    [AllowEmptyString()][string]$Installer = ''
+  )
+
+  $resolvedRoot = [System.IO.Path]::GetFullPath($TempRoot)
+  if (-not $resolvedRoot.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+    $resolvedRoot += [System.IO.Path]::DirectorySeparatorChar
+  }
+  $resolvedTempDir = [System.IO.Path]::GetFullPath($TempDir)
+  $leaf = Split-Path -Leaf $resolvedTempDir
+  if (-not $resolvedTempDir.StartsWith($resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+      -not $leaf.StartsWith('easy-devops-nvm-', [System.StringComparison]::Ordinal)) {
+    throw "Refusing to clean an unexpected temporary path: $resolvedTempDir"
+  }
+
+  $tempInfo = New-Object System.IO.DirectoryInfo -ArgumentList $resolvedTempDir
+  if (-not $tempInfo.Exists) {
+    return
+  }
+  if (($tempInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Refusing to clean a replaced temporary directory: $resolvedTempDir"
+  }
+
+  $entries = @([System.IO.Directory]::EnumerateFileSystemEntries($resolvedTempDir))
+  if ($entries.Count -gt 0) {
+    if (-not $Installer) {
+      throw "The temporary attempt directory contains an unexpected entry: $($entries[0])"
+    }
+    $expectedInstaller = [System.IO.Path]::GetFullPath(
+      (Join-Path $resolvedTempDir 'nvm-setup.exe'))
+    $resolvedInstaller = [System.IO.Path]::GetFullPath($Installer)
+    if (-not [string]::Equals(
+        $resolvedInstaller,
+        $expectedInstaller,
+        [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw "Refusing to remove an unexpected file: $resolvedInstaller"
+    }
+    $unexpected = @($entries | Where-Object {
+      -not [string]::Equals(
+        [System.IO.Path]::GetFullPath($_),
+        $expectedInstaller,
+        [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($unexpected.Count -gt 0) {
+      throw "The temporary attempt directory contains an unexpected entry: $($unexpected[0])"
+    }
+    if ([System.IO.File]::Exists($resolvedInstaller)) {
+      [System.IO.File]::Delete($resolvedInstaller)
+    }
+  }
+
+  $remaining = @([System.IO.Directory]::EnumerateFileSystemEntries($resolvedTempDir))
+  if ($remaining.Count -ne 0) {
+    throw "The temporary attempt directory is not empty after cleanup: $($remaining[0])"
+  }
+  [System.IO.Directory]::Delete($resolvedTempDir, $false)
+}
+
+function Install-NvmWindowsVerified {
+  param(
+    [Parameter(Mandatory = $true)][string]$Url,
+    [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ExpectedSha256
+  )
+
+  $ExpectedSha256 = $ExpectedSha256.Trim().ToLowerInvariant()
+  if ($ExpectedSha256 -notmatch '^[0-9a-f]{64}$') {
+    Write-Err "No reviewed SHA-256 is pinned for nvm-windows $NVM_WINDOWS_VERSION."
+    Write-Info "Nothing was downloaded or executed."
+    return $false
+  }
+
+  # A unique directory prevents a stale, predictable TEMP\nvm-setup.exe from
+  # becoming the launch target. New-Item is deliberately not passed -Force, so
+  # a colliding path is refused instead of reused.
+  $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+  $tempDir = Join-Path $tempRoot ('easy-devops-nvm-' + [Guid]::NewGuid().ToString('N'))
+  $null = New-Item -ItemType Directory -Path $tempDir -ErrorAction Stop
+  $installer = $null
+  $hashStream = $null
+
+  try {
+    $installer = Join-Path $tempDir 'nvm-setup.exe'
+    if (Test-Path -LiteralPath $installer) {
+      throw "The fresh download path already exists: $installer"
+    }
+
+    Download-File -Url $Url -Dest $installer -Label "nvm-windows $NVM_WINDOWS_VERSION"
+    if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+      throw 'The download did not create the expected installer file.'
+    }
+
+    $actualSha256 = ''
+    # Deny write and delete sharing until the process has been created. Closing
+    # after hashing and reopening by pathname would leave a replacement window
+    # between the digest check and execution.
+    $hashStream = [System.IO.File]::Open(
+      $installer,
+      [System.IO.FileMode]::Open,
+      [System.IO.FileAccess]::Read,
+      [System.IO.FileShare]::Read
+    )
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      $hashBytes = $hasher.ComputeHash($hashStream)
+      $actualSha256 = [System.BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
+    } finally {
+      $hasher.Dispose()
+    }
+    if ($actualSha256 -ne $ExpectedSha256) {
+      throw "SHA-256 mismatch. Expected $ExpectedSha256, got $actualSha256."
+    }
+
+    Write-Info "Running verified installer silently..."
+    $proc = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
+    if ($null -eq $proc) {
+      throw 'The installer process did not return an exit status.'
+    }
+    if ($proc.ExitCode -ne 0) {
+      Write-Err "Installer exited with code $($proc.ExitCode)"
+      return $false
+    }
+    return $true
+  } catch {
+    Write-Err "nvm-windows install refused: $_"
+    return $false
+  } finally {
+    if ($null -ne $hashStream) {
+      $hashStream.Dispose()
+      $hashStream = $null
+    }
+
+    # Clean the one file this function created, then remove only the empty,
+    # non-reparse attempt directory. Never recurse through a path that could
+    # have been replaced by another principal.
+    Remove-NvmAttempt -TempRoot $tempRoot -TempDir $tempDir -Installer ([string]$installer)
+  }
+}
+
+# E2E loads only the installer functions above, then replaces download and
+# process-launch dependencies with recording stubs. This path performs no
+# install work and cannot supply or override a production digest.
+if ($env:EZ_INSTALLER_TEST_FUNCTIONS_ONLY -ne '1') {
 
 # ─── Fetch Node.js LTS versions from nodejs.org ───────────────────────────────
 
@@ -520,41 +678,25 @@ if ($NODE_ACTION -eq "keep") {
     }
 
     if (-not $skipNvm) {
-      $installer = "$env:TEMP\nvm-setup.exe"
-      $nvmUrl    = "https://github.com/coreybutler/nvm-windows/releases/download/$NVM_WINDOWS_VERSION/nvm-setup.exe"
+      $nvmUrl = "https://github.com/coreybutler/nvm-windows/releases/download/$NVM_WINDOWS_VERSION/nvm-setup.exe"
 
-      try {
-        Download-File -Url $nvmUrl -Dest $installer -Label "nvm-windows $NVM_WINDOWS_VERSION"
-        Write-OK "Downloaded"
-      } catch {
-        Write-Err "Download failed: $_"
-        Write-Info "Manual: https://github.com/coreybutler/nvm-windows/releases"
-        Add-Result "nvm-windows" $false "Download failed"
+      if ([string]::IsNullOrWhiteSpace($NVM_WINDOWS_SHA256)) {
+        Write-Err "Automatic nvm-windows installation is disabled."
+        Write-Info "No trusted SHA-256 for nvm-windows $NVM_WINDOWS_VERSION is pinned in this installer."
+        Write-Info "No downloaded file was executed."
+        Write-Info "Review the release at: https://github.com/coreybutler/nvm-windows/releases"
+        Write-Info "Install nvm-windows manually after verifying its published artifact."
+        Write-Info "Then run: nvm install $NODE_TARGET"
+        Add-Result "nvm-windows" $false "No reviewed SHA-256"
         if (-not $nodeOK) { exit 1 }
-      }
-
-      if (Test-Path $installer) {
-        try {
-          Write-Info "Running installer silently..."
-          $proc = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
-          if ($proc.ExitCode -ne 0) {
-            Write-Err "Installer exited with code $($proc.ExitCode)"
-            Add-Result "nvm-windows" $false "Exit code $($proc.ExitCode)"
-            if (-not $nodeOK) { exit 1 }
-          } else {
-            Write-OK "nvm-windows $NVM_WINDOWS_VERSION installed"
-            Add-Result "nvm-windows" $true $NVM_WINDOWS_VERSION
-            $nvmReady = $true
-          }
-        } catch {
-          Write-Err "Installer failed: $_"
-          Add-Result "nvm-windows" $false "$_"
-          if (-not $nodeOK) { exit 1 }
-        } finally {
-          try { Remove-Item $installer -Force -ErrorAction SilentlyContinue } catch {}
-        }
-
+      } elseif (Install-NvmWindowsVerified -Url $nvmUrl -ExpectedSha256 $NVM_WINDOWS_SHA256) {
+        Write-OK "nvm-windows $NVM_WINDOWS_VERSION installed"
+        Add-Result "nvm-windows" $true $NVM_WINDOWS_VERSION
+        $nvmReady = $true
         Refresh-Path
+      } else {
+        Add-Result "nvm-windows" $false "Download or verification failed"
+        if (-not $nodeOK) { exit 1 }
       }
     }
   }
@@ -811,21 +953,91 @@ function Get-IsWindowsServer {
   }
 }
 
-function Get-EzCommand {
-  foreach ($name in @('ezz', 'easy-devops')) {
-    $found = Get-Command $name -ErrorAction SilentlyContinue
-    if ($found) { return $name }
-  }
+function Get-EzServiceInvocation {
   $local = Join-Path $scriptDir 'src\cli\index.js'
-  if (Test-Path $local) { return "node `"$local`"" }
-  return $null
+  if (-not (Test-Path -LiteralPath $local -PathType Leaf)) { return $null }
+  $node = Get-Command 'node.exe' -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $node) { return $null }
+  return [pscustomobject]@{
+    ExecPath = $node.Source
+    Args = @($local, 'service', 'install')
+    Cwd = $scriptDir
+  }
+}
+
+function Invoke-EzServiceInstall {
+  param([pscustomobject]$Invocation)
+  & $Invocation.ExecPath @($Invocation.Args)
+  return ($LASTEXITCODE -eq 0 -or $null -eq $LASTEXITCODE)
+}
+
+function Start-ElevatedServiceInstall {
+  param([pscustomobject]$Invocation)
+
+  $payload = ConvertTo-Json -Compress -InputObject ([pscustomobject]@{
+    execPath = $Invocation.ExecPath
+    args = @($Invocation.Args)
+    cwd = $Invocation.Cwd
+  })
+  $payloadBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
+
+  # The path and argument list travel as data in one base64 payload. PowerShell
+  # parses none of them as code, and every inherited machine/loader variable is
+  # replaced from Windows APIs or the machine registry before Node starts.
+  $body = @'
+$ErrorActionPreference = 'Stop'
+$p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__EASY_DEVOPS_PAYLOAD__')) |
+  ConvertFrom-Json
+Get-ChildItem Env: | Remove-Item -ErrorAction SilentlyContinue
+$env:SystemRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+$env:ProgramData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+$env:USERPROFILE = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+$env:APPDATA = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+$env:LOCALAPPDATA = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+$env:ProgramFiles = [Environment]::GetEnvironmentVariable('ProgramFiles', 'Machine')
+${env:ProgramFiles(x86)} = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)', 'Machine')
+$env:CommonProgramFiles = [Environment]::GetEnvironmentVariable('CommonProgramFiles', 'Machine')
+$env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+$env:PATHEXT = [Environment]::GetEnvironmentVariable('PATHEXT', 'Machine')
+$env:TEMP = [Environment]::GetEnvironmentVariable('TEMP', 'Machine')
+$env:TMP = [Environment]::GetEnvironmentVariable('TMP', 'Machine')
+if (-not $env:TEMP) { $env:TEMP = Join-Path $env:SystemRoot 'Temp' }
+if (-not $env:TMP) { $env:TMP = $env:TEMP }
+$env:ComSpec = Join-Path $env:SystemRoot 'System32\cmd.exe'
+$env:PSModulePath = @(
+  (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'),
+  (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules')
+) -join ';'
+Set-Location -LiteralPath $env:SystemRoot -ErrorAction Stop
+$nodeItem = Get-Item -LiteralPath $p.execPath -Force -ErrorAction Stop
+if ($nodeItem.PSIsContainer) { throw 'The selected node.exe is not a file.' }
+$p.execPath = $nodeItem.FullName
+$nodeSignature = Get-AuthenticodeSignature -FilePath $p.execPath -ErrorAction Stop
+if ($nodeSignature.Status -ne 'Valid') {
+  throw 'The selected node.exe does not have a valid Authenticode signature.'
+}
+& $p.execPath @($p.args)
+$exitCode = $LASTEXITCODE
+if ($exitCode -ne 0) {
+  Write-Host "Easy DevOps service install failed (exit code $exitCode)."
+  Read-Host 'Press Enter to close'
+  exit $exitCode
+}
+'@
+  $body = $body.Replace('__EASY_DEVOPS_PAYLOAD__', $payloadBase64)
+  $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($body))
+  return Start-Process `
+    -FilePath 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
+    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) `
+    -Verb RunAs -Wait -PassThru -ErrorAction Stop
 }
 
 function Invoke-ServiceInstall {
   param([string]$Mode)
 
-  $ez = Get-EzCommand
-  if (-not $ez) {
+  $invocation = Get-EzServiceInvocation
+  if (-not $invocation) {
     Write-Host "  Could not find the ezz command, so the service was not installed." -ForegroundColor Yellow
     Write-Host "  Open a new terminal and run: ezz service install" -ForegroundColor Cyan
     return $false
@@ -843,13 +1055,10 @@ function Invoke-ServiceInstall {
     Write-Host ""
 
     try {
-      # -Verb RunAs is what raises the UAC prompt. The child keeps its window
-      # open on failure so the user can read the error; a window that vanishes
-      # is the usual complaint about elevated helpers.
-      $inner = "$ez service install; if (`$LASTEXITCODE -ne 0) { Read-Host 'Press Enter to close' }"
-      $proc = Start-Process -FilePath 'powershell.exe' `
-        -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $inner `
-        -Verb RunAs -Wait -PassThru -ErrorAction Stop
+      # -Verb RunAs is what raises the UAC prompt. All caller-controlled paths
+      # travel as decoded data, and the child rebuilds its environment before
+      # invoking the fixed local CLI entry point with a direct argument array.
+      $proc = Start-ElevatedServiceInstall -Invocation $invocation
 
       if ($proc.ExitCode -eq 0) { return $true }
 
@@ -869,8 +1078,7 @@ function Invoke-ServiceInstall {
   # Personal mode, or already elevated: run it here so the prompts appear in
   # this window.
   try {
-    Invoke-Expression "$ez service install"
-    return ($LASTEXITCODE -eq 0 -or $null -eq $LASTEXITCODE)
+    return Invoke-EzServiceInstall -Invocation $invocation
   } catch {
     Write-Host "  The service install failed: $($_.Exception.Message)" -ForegroundColor Yellow
     return $false
@@ -947,3 +1155,4 @@ function Invoke-ServiceOffer {
 }
 
 Invoke-ServiceOffer
+}

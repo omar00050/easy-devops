@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — Easy DevOps Bootstrap Installer (Linux / macOS)
+# install.sh — Easy DevOps Bootstrap Installer (Linux)
 #
 # Usage:
 #   bash install.sh [OPTIONS]
@@ -46,32 +46,62 @@ EASYDEVOPS_DIR="${EASYDEVOPS_DIR:-${SCRIPT_DIR:-$PWD}}"
 # Lib modules
 #
 # The modules live at src/lib/installer in the repository and in the published
-# npm package (package.json ships `src/`). They used to be looked for at
-# lib/installer, which exists in neither — so a clone failed, and the fallback
-# then `mkdir -p`'d an empty lib/installer into whatever directory the user
-# happened to be in. Both halves of that are fixed here: every real layout is
-# searched, and a download goes to a temporary directory that is cleaned up.
+# npm package (package.json ships `src/`). They are released as one reviewed
+# unit: this installer never downloads helpers from a mutable branch. Every
+# module is checked against a digest fixed in this file before it is sourced.
 #
 # Defined as functions and called AFTER the flags are parsed, so `--help` costs
 # no network request and writes nothing.
 # ---------------------------------------------------------------------------
-_LIB_BASE="https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/src/lib/installer"
 _LIB_MODULES="progress.sh detect.sh node-versions.sh picker.sh nvm-bootstrap.sh"
 LIB_DIR=""
-_LIB_TMP=""
-
-# Set EZ_INSTALL_NO_DOWNLOAD=1 to require the modules locally. The installer
-# tests use it to prove the failure is a clear message rather than a stray
-# directory.
-_lib_download_allowed() {
-  [ "${EZ_INSTALL_NO_DOWNLOAD:-0}" != "1" ]
-}
+_LIB_VERIFIED_DIR=""
 
 _lib_dir_complete() {
   local dir="$1" _m
   [ -n "$dir" ] || return 1
   for _m in $_LIB_MODULES; do
     [ -f "$dir/$_m" ] || return 1
+  done
+  return 0
+}
+
+_lib_expected_sha256() {
+  case "$1" in
+    progress.sh)      printf '%s\n' 'f6922cecd8f55a5f9a2b5e3794da58eeebee31eb04bc1a41dd8ba3db699c15b9' ;;
+    detect.sh)        printf '%s\n' '1870557130425bc851587da774f5ece78b2319d99bd10521bd9aca6c260f0742' ;;
+    node-versions.sh) printf '%s\n' 'e05267a04edccc249e236e6945d6cb3146e804086af400db8611c56cee7d6c84' ;;
+    picker.sh)        printf '%s\n' 'd43092378a324beb3f0002c0e4cc176a1e0144c2c8bfb079f04b5902d3e911c1' ;;
+    nvm-bootstrap.sh) printf '%s\n' 'e41c1e6390d2f1e65e199eb3dedfd59c5ecf8e11a2599c195ee5b3a54bb8d58b' ;;
+    *) return 1 ;;
+  esac
+}
+
+_lib_file_sha256() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sed 's/\r$//' "$file" | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    sed 's/\r$//' "$file" | shasum -a 256 | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    sed 's/\r$//' "$file" | openssl dgst -sha256 | awk '{print $NF}'
+  else
+    printf 'Error: no SHA-256 tool is available (expected sha256sum, shasum, or openssl).\n' >&2
+    return 1
+  fi
+}
+
+_lib_dir_verified() {
+  local dir="$1" _m _expected _actual
+  for _m in $_LIB_MODULES; do
+    _expected="$(_lib_expected_sha256 "$_m")" || return 1
+    _actual="$(_lib_file_sha256 "$dir/$_m")" || return 1
+    if [ "$_actual" != "$_expected" ]; then
+      printf 'Error: installer module %s does not match the reviewed release.\n' "$_m" >&2
+      printf '  expected: %s\n' "$_expected" >&2
+      printf '  actual:   %s\n' "$_actual" >&2
+      return 1
+    fi
   done
   return 0
 }
@@ -96,65 +126,49 @@ resolve_lib_dir() {
   return 1
 }
 
-_cleanup_lib_tmp() {
-  [ -n "$_LIB_TMP" ] && [ -d "$_LIB_TMP" ] && rm -rf "$_LIB_TMP"
-}
-
-download_lib_dir() {
-  local downloader=""
-  if command -v curl >/dev/null 2>&1; then downloader="curl"
-  elif command -v wget >/dev/null 2>&1; then downloader="wget"
-  else
-    printf 'Error: the installer modules are not present and neither curl nor wget is available.\n' >&2
-    printf 'Clone the repository and run it from there:\n' >&2
-    printf '  git clone https://github.com/omar00050/Easy-DevOps.git\n' >&2
-    printf '  bash Easy-DevOps/install.sh\n' >&2
-    return 1
-  fi
-
-  # A temporary directory, never the current one: this used to create
-  # ./lib/installer wherever it was run.
-  _LIB_TMP="$(mktemp -d 2>/dev/null || mktemp -d -t ezinstall)" || {
-    printf 'Error: could not create a temporary directory for the installer modules.\n' >&2
-    return 1
-  }
-  trap _cleanup_lib_tmp EXIT
-
-  printf 'Installer modules not found locally — downloading...\n'
-  local _module
-  for _module in $_LIB_MODULES; do
-    if [ "$downloader" = "curl" ]; then
-      curl -fsSL "$_LIB_BASE/$_module" -o "$_LIB_TMP/$_module" 2>/dev/null || true
-    else
-      wget -q "$_LIB_BASE/$_module" -O "$_LIB_TMP/$_module" 2>/dev/null || true
-    fi
-  done
-
-  if ! _lib_dir_complete "$_LIB_TMP"; then
-    printf 'Error: could not download the installer modules from GitHub.\n' >&2
-    printf '  %s\n' "$_LIB_BASE" >&2
-    printf 'Check your internet connection, or clone the repository and run install.sh from it.\n' >&2
-    return 1
-  fi
-
-  LIB_DIR="$_LIB_TMP"
-  printf 'Modules downloaded.\n\n'
-  return 0
-}
-
 source_lib_modules() {
   if ! resolve_lib_dir; then
-    if ! _lib_download_allowed; then
-      printf 'Error: the installer modules were not found and downloading is disabled.\n' >&2
-      printf 'Expected them at:\n' >&2
-      printf '  %s/src/lib/installer\n' "${EASYDEVOPS_DIR:-$PWD}" >&2
-      printf 'Clone the repository and run install.sh from it, or allow the download.\n' >&2
-      exit 1
-    fi
-    download_lib_dir || exit 1
+    printf 'Error: the reviewed installer modules were not found.\n' >&2
+    printf 'Expected them at:\n' >&2
+    printf '  %s/src/lib/installer\n' "${EASYDEVOPS_DIR:-$PWD}" >&2
+    printf 'Downloading helper scripts is disabled because unpinned bytes are unsafe.\n' >&2
+    printf 'Clone the repository or install the published easy-devops package, then rerun install.sh from it.\n' >&2
+    exit 1
   fi
 
+  # Hash and source the same bytes. A pathname by itself is not a stable
+  # identity: another writer could replace a module after the digest check and
+  # before the shell opens it. Copy the complete bundle into a fresh 0700
+  # directory, verify that private snapshot, and source only from there.
+  _LIB_VERIFIED_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easy-devops-installer.XXXXXX")" || {
+    printf 'Error: could not create a private directory for the reviewed installer modules.\n' >&2
+    exit 1
+  }
+  chmod 700 "$_LIB_VERIFIED_DIR" || {
+    printf 'Error: could not protect the private installer module directory.\n' >&2
+    exit 1
+  }
+  _cleanup_verified_lib() {
+    if [ -n "${_LIB_VERIFIED_DIR:-}" ] && [ -d "$_LIB_VERIFIED_DIR" ]; then
+      rm -rf -- "$_LIB_VERIFIED_DIR"
+    fi
+  }
+  trap '_cleanup_verified_lib' EXIT
+
   local _module
+  for _module in $_LIB_MODULES; do
+    cp -- "$LIB_DIR/$_module" "$_LIB_VERIFIED_DIR/$_module" || {
+      printf 'Error: could not snapshot installer module %s.\n' "$_module" >&2
+      exit 1
+    }
+  done
+
+  LIB_DIR="$_LIB_VERIFIED_DIR"
+  if ! _lib_dir_verified "$LIB_DIR"; then
+    printf 'Error: the installer modules do not match this installer release.\n' >&2
+    exit 1
+  fi
+
   for _module in $_LIB_MODULES; do
     # shellcheck source=/dev/null
     . "$LIB_DIR/$_module"
@@ -500,7 +514,7 @@ else
   step_running "${STEPS[3]}"
   if ! bootstrap_nvm; then
     die "${STEPS[3]}" "nvm installation failed" \
-      "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/HEAD/install.sh | bash" \
+      "Install nvm from a reviewed release: https://github.com/nvm-sh/nvm/releases" \
       "source ~/.nvm/nvm.sh" \
       "bash install.sh --version $NODE_TARGET"
   fi
@@ -621,38 +635,17 @@ fi
 printf '\n'
 
 # ---------------------------------------------------------------------------
-# Source nvm into the current session so node/npm/easy-devops work immediately
-# (only when nvm was actually used, i.e. NODE_ACTION != "keep")
-# ---------------------------------------------------------------------------
-if [ "$NODE_ACTION" != "keep" ]; then
-  export NVM_DIR="$HOME/.nvm"
-  if [ -s "$NVM_DIR/nvm.sh" ]; then
-    . "$NVM_DIR/nvm.sh"
-  fi
-
-  # Also source shell config to pick up PATH changes
-  if [ -f "$HOME/.bashrc" ]; then
-    . "$HOME/.bashrc" 2>/dev/null || true
-  elif [ -f "$HOME/.bash_profile" ]; then
-    . "$HOME/.bash_profile" 2>/dev/null || true
-  elif [ -f "$HOME/.zshrc" ]; then
-    . "$HOME/.zshrc" 2>/dev/null || true
-  fi
-fi
-
-# ---------------------------------------------------------------------------
 # Offer to install the background service
 #
 # Asked LAST, after Node and the package are in place, because `ezz` has to be
 # runnable for the answer to mean anything.
 #
-# Reading from /dev/tty rather than stdin is what makes this work under
-#   curl -fsSL .../install.sh | bash
-# where stdin is the pipe carrying the script itself. A plain `read` there
-# consumes script text, or sees EOF and silently takes the default — and this
-# is the one question whose default decides whether the user's server is
-# monitored at all. If there is no terminal (a CI run, a Dockerfile), the
-# prompt is skipped and the command is printed instead.
+# Reading from /dev/tty rather than stdin keeps the prompt reliable when the
+# installer is driven by another program. A plain `read` can consume that
+# stream, or see EOF and silently take the default — and this is the one
+# question whose default decides whether the user's server is monitored at
+# all. If there is no terminal (a CI run, a Dockerfile), the prompt is skipped
+# and the command is printed instead.
 # ---------------------------------------------------------------------------
 maybe_install_service() {
   # An explicit flag means do not ask.
