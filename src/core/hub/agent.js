@@ -37,6 +37,12 @@ import {
   checkCommandAllowed,
 } from '../hubPermissions.js';
 import { startDeployProgress, stopDeployProgress } from './deployProgress.js';
+import {
+  describeDeployAppsForHub,
+  projectDomainForHub,
+  projectRunForHub,
+  projectServerInfoForHub,
+} from './telemetry.js';
 
 /** How often the agent checks the shared revision counter. */
 const REVISION_POLL_MS = 3_000;
@@ -115,21 +121,34 @@ async function getDiskPercent() {
 
 // ─── Event pushers ─────────────────────────────────────────────────────────────
 
-async function pushNginxStatus() {
-  if (!socket?.connected) return;
+async function pushServerInfo({ target = socket } = {}) {
+  if (!target?.connected) return;
   try {
-    const status = await getStatus();
-    socket.emit('nginx:status', { running: status.running, version: status.version ?? null });
+    const { sslDir } = loadConfig();
+    target.emit('server:info', projectServerInfoForHub(
+      { platform: platformName, sslDir: sslDir ?? '' },
+      getPermissions(),
+    ));
   } catch { /* non-fatal */ }
 }
 
-async function pushResources() {
-  if (!socket?.connected) return;
+async function pushNginxStatus({ target = socket } = {}) {
+  if (!target?.connected) return;
+  try {
+    const status = await getStatus();
+    if (!target.connected) return;
+    target.emit('nginx:status', { running: status.running, version: status.version ?? null });
+  } catch { /* non-fatal */ }
+}
+
+async function pushResources({ target = socket } = {}) {
+  if (!target?.connected) return;
   try {
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
     const disk = await getDiskPercent();
-    socket.emit('server:resources', {
+    if (!target.connected) return;
+    target.emit('server:resources', {
       cpu: getCpuPercent(),
       ram: Math.round((1 - freeMem / totalMem) * 100),
       disk,
@@ -137,8 +156,8 @@ async function pushResources() {
   } catch { /* non-fatal */ }
 }
 
-async function pushDomainHealth() {
-  if (!socket?.connected) return;
+async function pushDomainHealth({ target = socket } = {}) {
+  if (!target?.connected) return;
   try {
     const domains = dbGet('domains') || [];
 
@@ -152,7 +171,8 @@ async function pushDomainHealth() {
 
     // `enabled` travels separately so the Hub never has to infer it from
     // health. A disabled domain has no health to report: `up: null`.
-    socket.emit('domain:health', domains.map(d => {
+    if (!target.connected) return;
+    target.emit('domain:health', domains.map(d => {
       const enabled = d.enabled !== false;
       return { name: d.name, enabled, up: enabled ? (upByName.get(d.name) ?? null) : null };
     }));
@@ -162,35 +182,39 @@ async function pushDomainHealth() {
 /**
  * Adds the certificate state the dashboard already knows to each domain.
  *
- * Only the status and its label travel — never a path or a certificate body.
- * A configured domain whose certificate directory does not exist yet reports
- * `not_issued`, which is what the Hub needs to say "Not issued yet" instead of
- * showing an error.
+ * This scan adds only the status and its label, never a path or certificate
+ * body. Configured paths already on the domain follow projectDomainForHub(),
+ * which exposes them only with nginx.config.view. A configured domain whose
+ * certificate directory does not exist yet reports `not_issued`, which is what
+ * the Hub needs to say "Not issued yet" instead of showing an error.
  */
-async function domainsWithCertState(domains) {
-  if (!Array.isArray(domains)) return domains;
+export async function domainsWithCertState(
+  domains,
+  {
+    listCertificates = listAllCerts,
+    certificateStatus = getCertExpiry,
+    permissions = getPermissions,
+  } = {},
+) {
+  if (!Array.isArray(domains)) return [];
 
   const certByName = new Map();
   try {
-    for (const cert of await listAllCerts({ includeUnusable: true })) {
+    for (const cert of await listCertificates({ includeUnusable: true })) {
       certByName.set(cert.domain, cert);
     }
   } catch { /* an unreadable certificate directory is not fatal */ }
 
-  const out = [];
+  const entries = [];
   for (const domain of domains) {
-    if (!domain || typeof domain !== 'object') {
-      out.push(domain);
-      continue;
-    }
-
+    if (!domain || typeof domain !== 'object' || Array.isArray(domain)) continue;
     const known = certByName.get(domain.name);
     let certStatus = known?.status ?? null;
     let certLabel = known?.label ?? null;
 
     if (!known && domain.name) {
       try {
-        const info = await getCertExpiry(domain.name);
+        const info = await certificateStatus(domain.name);
         if (info.state === 'not_issued') {
           certStatus = 'not_issued';
           certLabel = 'Not issued yet';
@@ -200,7 +224,17 @@ async function domainsWithCertState(domains) {
       } catch { /* no certificate information for this name */ }
     }
 
-    const next = { ...domain };
+    entries.push({ domain, certStatus, certLabel });
+  }
+
+  // Every await is complete. Snapshot once, project and return without another
+  // yield, so a revocation observed by this process cannot be followed by a
+  // privileged payload built from the earlier grant.
+  const current = permissions();
+  const out = [];
+  for (const { domain, certStatus, certLabel } of entries) {
+    const next = projectDomainForHub(domain, current);
+    if (!next) continue;
     if (certStatus) next.certStatus = certStatus;
     if (certLabel) next.certLabel = certLabel;
     out.push(next);
@@ -208,19 +242,20 @@ async function domainsWithCertState(domains) {
   return out;
 }
 
-async function pushDomainConfigs() {
-  if (!socket?.connected) return;
+async function pushDomainConfigs({ target = socket } = {}) {
+  if (!target?.connected) return;
   try {
     const domains = dbGet('domains') || [];
-    socket.emit('domain:configs', await domainsWithCertState(domains));
+    const projected = await domainsWithCertState(domains);
+    if (target.connected) target.emit('domain:configs', projected);
   } catch { /* non-fatal */ }
 }
 
-async function pushChannelsList() {
-  if (!socket?.connected) return;
+async function pushChannelsList({ target = socket } = {}) {
+  if (!target?.connected) return;
   try {
     const channels = loadChannels();
-    socket.emit('channels:list', channels.map(ch => ({ id: ch.id, name: ch.name, type: ch.type })));
+    target.emit('channels:list', channels.map(ch => ({ id: ch.id, name: ch.name, type: ch.type })));
   } catch { /* non-fatal */ }
 }
 
@@ -235,8 +270,8 @@ async function pushChannelsList() {
  * existsSync calls, and the PM2 probe never starts a PM2 daemon — so a server
  * that does not use PM2 is not given one just because it is paired with a Hub.
  */
-async function pushServiceState() {
-  if (!socket?.connected) return;
+async function pushServiceState({ target = socket } = {}) {
+  if (!target?.connected) return;
   try {
     // The NATIVE service, not the PM2 app. This used to report a PM2
     // installation, which made "offline means really down" a much weaker
@@ -245,7 +280,8 @@ async function pushServiceState() {
     const s = backgroundServiceState();
     const pm2 = await runner.detect({ probeVersion: false });
 
-    socket.emit('service:state', {
+    if (!target.connected) return;
+    target.emit('service:state', {
       installed: s.installed,
       running: s.running,
       status: s.detail,
@@ -275,31 +311,33 @@ async function pushServiceState() {
  * Skipped entirely when the PM2 daemon is not running, so that reporting never
  * starts one.
  */
-async function pushProcesses() {
-  if (!socket?.connected) return;
+async function pushProcesses({ target = socket } = {}) {
+  if (!target?.connected) return;
   try {
     if (!runner.isDaemonRunning()) {
-      socket.emit('processes:list', { daemonRunning: false, apps: [] });
+      target.emit('processes:list', { daemonRunning: false, apps: [] });
       return;
     }
     const pm2 = await runner.detect({ probeVersion: false });
     if (!pm2.installed) {
-      socket.emit('processes:list', { daemonRunning: false, apps: [] });
+      target.emit('processes:list', { daemonRunning: false, apps: [] });
       return;
     }
     const listed = await runner.list({ pm2Path: pm2.path ?? 'pm2' });
-    socket.emit('processes:list', {
+    if (!target.connected) return;
+    target.emit('processes:list', {
       daemonRunning: true,
       apps: listed.ok ? listed.apps : [],
     });
   } catch { /* non-fatal */ }
 }
 
-async function pushCertExpiry() {
-  if (!socket?.connected) return;
+async function pushCertExpiry({ target = socket } = {}) {
+  if (!target?.connected) return;
   try {
     const certs = await listAllCerts({ includeUnusable: true });
-    socket.emit('cert:expiry', certs.map(c => ({
+    if (!target.connected) return;
+    target.emit('cert:expiry', certs.map(c => ({
       domain: c.domain,
       expiresAt: c.expiry ?? null,
       daysLeft: c.daysLeft ?? null,
@@ -352,7 +390,18 @@ const PROGRESS_STATUSES = new Set(['running', 'ok', 'failed', 'skipped']);
  * @param {string|null} requestId
  * @returns {(step: string, status: 'running'|'ok'|'failed'|'skipped', detail?: string, domain?: string) => void}
  */
-export function createCommandProgress(requestId) {
+export function createCommandProgress(
+  requestId,
+  {
+    target = socket,
+    isAllowed = () => true,
+    isConnected = () => Boolean(target?.connected),
+    getRevision = getHubRevision,
+    emit: deliver = (payload) => {
+      if (target?.connected) target.emit('command:progress', payload);
+    },
+  } = {},
+) {
   if (!requestId) return () => {};
 
   let windowStartedAt = 0;
@@ -360,17 +409,37 @@ export function createCommandProgress(requestId) {
   let timer = null;
   // step -> newest event held back by the throttle
   const deferred = new Map();
+  const startedAtRevision = (() => {
+    try {
+      return getRevision();
+    } catch {
+      // The caller may still perform the command, but an event whose authority
+      // cannot be tied to a revision must not be emitted.
+      return Symbol('revision-unavailable');
+    }
+  })();
+
+  const stillAuthorized = () => {
+    try {
+      return isAllowed() && getRevision() === startedAtRevision;
+    } catch {
+      return false;
+    }
+  };
 
   const emit = (payload) => {
     try {
-      if (socket?.connected) socket.emit('command:progress', payload);
+      if (stillAuthorized()) deliver(payload);
     } catch { /* a progress event must never break the command */ }
   };
 
   const flush = () => {
     timer = null;
     try {
-      if (!deferred.size) return;
+      if (!deferred.size || !stillAuthorized()) {
+        deferred.clear();
+        return;
+      }
       const now = Date.now();
       if (now - windowStartedAt >= PROGRESS_WINDOW_MS) {
         windowStartedAt = now;
@@ -390,7 +459,8 @@ export function createCommandProgress(requestId) {
 
   return function onProgress(step, status, detail, domain) {
     try {
-      if (!socket?.connected) return;
+      if (!isConnected()) return;
+      if (!stillAuthorized()) return;
       if (!PROGRESS_STATUSES.has(status)) return;
 
       const now = Date.now();
@@ -445,7 +515,7 @@ function refusalError(result, fallback) {
 }
 
 /** Emits the acknowledgement the Hub and its browser clients wait for. */
-function sendResult(requestId, ok, { error = null, data = null } = {}, ack = null) {
+function sendResult(requestId, ok, { error = null, data = null } = {}, ack = null, target = socket) {
   if (!requestId) return;
   const payload = { requestId, ok, error, data };
 
@@ -458,7 +528,7 @@ function sendResult(requestId, ok, { error = null, data = null } = {}, ack = nul
     try { ack(payload); } catch { /* a stale ack must never break the handler */ }
   }
 
-  if (socket?.connected) socket.emit('command:result', payload);
+  if (target?.connected) target.emit('command:result', payload);
 }
 
 /**
@@ -479,6 +549,26 @@ function logCommandTiming(command, startedAt, ok) {
   console.log(`[hubAgent] ${command} ${Math.max(0, Date.now() - startedAt)}ms ${ok ? 'ok' : 'error'}`);
 }
 
+function commandVerdict(command, payload) {
+  return checkCommandAllowed(command, payload, getPermissions());
+}
+
+function assertCommandStillAllowed(command, payload) {
+  const verdict = commandVerdict(command, payload);
+  if (!verdict.allowed) {
+    const error = new Error(`Permission was revoked while the command was running: ${verdict.reason}`);
+    error.code = 'HUB_PERMISSION_REVOKED';
+    throw error;
+  }
+}
+
+function guardSideEffect(command, payload, fn) {
+  return (...args) => {
+    if (!commandVerdict(command, payload).allowed) return;
+    return fn(...args);
+  };
+}
+
 /**
  * Runs one hub command: permission check, execution, acknowledgement.
  *
@@ -486,46 +576,59 @@ function logCommandTiming(command, startedAt, ok) {
  * @param {Object} payload  May carry a requestId added by the Hub
  * @param {(payload: Object) => Promise<Object|void>} fn
  * @param {Function|null} [ack] socket.io acknowledgement, when the Hub waits
+ * @param {{target?: Object}} [options] the exact connection that dispatched it
  */
-async function runCommand(command, payload, fn, ack = null) {
-  const requestId = payload?.requestId ?? null;
+export async function runCommand(command, payload, fn, ack = null, { target = socket } = {}) {
+  const commandPayload = payload ?? {};
+  const requestId = commandPayload.requestId ?? null;
   const startedAt = Date.now();
 
-  const verdict = checkCommandAllowed(command, payload, getPermissions());
+  const verdict = commandVerdict(command, commandPayload);
   if (!verdict.allowed) {
     console.warn('[hubAgent] refused', command, '-', verdict.reason);
     logCommandTiming(command, startedAt, false);
-    sendResult(requestId, false, { error: verdict.reason }, ack);
+    sendResult(requestId, false, { error: verdict.reason }, ack, target);
     return;
   }
 
   try {
-    const data = await fn(payload ?? {});
+    const stillAllowed = () => assertCommandStillAllowed(command, commandPayload);
+    const data = await fn(commandPayload, stillAllowed, { target });
+    // Recheck after the final await and immediately before the acknowledgement.
+    stillAllowed();
     logCommandTiming(command, startedAt, true);
-    sendResult(requestId, true, { data: data ?? null }, ack);
+    sendResult(requestId, true, { data: data ?? null }, ack, target);
   } catch (err) {
-    console.error('[hubAgent]', command, 'failed:', err.message);
+    const current = commandVerdict(command, commandPayload);
+    const message = current.allowed
+      ? err.message
+      : 'Permission was revoked while the command was running, so its result was withheld.';
+    console.error('[hubAgent]', command, 'failed:', message);
     logCommandTiming(command, startedAt, false);
     // A handler may attach a structured refusal (refusalError above) so the
     // Hub can show it as well as the message.
-    sendResult(requestId, false, { error: err.message, data: err.data ?? null }, ack);
+    sendResult(requestId, false, {
+      error: message,
+      data: current.allowed ? (err.data ?? null) : null,
+    }, ack, target);
   }
 }
 
-async function handleReloadNginx(payload, ack) {
-  return runCommand('hub:reloadNginx', payload, async () => {
+async function handleReloadNginx(payload, ack, { target = socket } = {}) {
+  return runCommand('hub:reloadNginx', payload, async (_body, stillAllowed) => {
     // Reuse the dashboard's reload path instead of rebuilding the command
     // here: it resolves the nginx.exe path on Windows and uses `sudo -n`.
     const r = await nginxReload();
-    pushNginxStatus();
+    stillAllowed();
+    pushNginxStatus({ target });
     notifyLocalDashboard('nginx');
     if (!r?.success) throw new Error(r?.output || 'nginx reload failed');
     return { output: r.output ?? '' };
-  }, ack);
+  }, ack, { target });
 }
 
-async function handleNginxAction(payload, ack) {
-  return runCommand('hub:nginxAction', payload, async ({ action }) => {
+async function handleNginxAction(payload, ack, { target = socket } = {}) {
+  return runCommand('hub:nginxAction', payload, async ({ action }, stillAllowed) => {
     const actions = {
       start: nginxStart, stop: nginxStop, restart: nginxRestart, test: nginxTest,
     };
@@ -533,26 +636,32 @@ async function handleNginxAction(payload, ack) {
     if (!fn) throw new Error(`Unknown nginx action: ${action}`);
 
     const r = await fn();
-    pushNginxStatus();
+    stillAllowed();
+    pushNginxStatus({ target });
     notifyLocalDashboard('nginx');
     if (r && r.success === false) throw new Error(r.output || `nginx ${action} failed`);
     return { action, output: r?.output ?? '' };
-  }, ack);
+  }, ack, { target });
 }
 
-async function handleGetConfigs(payload, ack) {
-  return runCommand('hub:getConfigs', payload, async () => {
-    const files = await listConfigs();
+export async function handleGetConfigs(
+  payload,
+  ack,
+  { list = listConfigs, read = getConfig, target = socket } = {},
+) {
+  return runCommand('hub:getConfigs', payload, async (_body, stillAllowed) => {
+    const files = await list();
     const configs = [];
     for (const f of files) {
       try {
-        const result = await getConfig(f);
+        const result = await read(f);
         configs.push({ name: f, content: result.content });
       } catch { configs.push({ name: f, content: '' }); }
     }
-    if (socket?.connected) socket.emit('nginx:configs', configs);
+    stillAllowed();
+    if (target?.connected) target.emit('nginx:configs', configs);
     return { count: configs.length };
-  }, ack);
+  }, ack, { target });
 }
 
 /**
@@ -590,20 +699,29 @@ export function resolveSaveConfigReload(payload, permissions) {
   };
 }
 
-async function handleSaveConfig(payload, ack) {
-  return runCommand('hub:saveConfig', payload, async (body) => {
+export async function handleSaveConfig(
+  payload,
+  ack,
+  {
+    save = saveConfig,
+    reload = nginxReload,
+    permissions = getPermissions,
+    target = socket,
+  } = {},
+) {
+  return runCommand('hub:saveConfig', payload, async (body, stillAllowed) => {
     const { filename, content } = body;
     if (typeof filename !== 'string' || !filename.trim()) throw new Error('filename is required');
     if (typeof content !== 'string') throw new Error('content must be a string');
 
     // Decided BEFORE the write, so the answer cannot depend on anything the
     // save itself changes.
-    const wanted = resolveSaveConfigReload(body, getPermissions());
+    const wanted = resolveSaveConfigReload(body, permissions());
 
     // saveConfig() validates the filename, keeps the write inside the nginx
     // config directory, tests with isNginxTestOk() and restores the previous
     // bytes when nginx rejects the result.
-    const r = await saveConfig(filename, content);
+    const r = await save(filename, content);
     if (!r?.success) throw new Error(r?.output || 'nginx rejected the config');
 
     const result = {
@@ -614,12 +732,18 @@ async function handleSaveConfig(payload, ack) {
       reloadDetail: wanted.reason,
     };
 
-    if (wanted.requested && wanted.allowed) {
+    // The save can take long enough for nginx.reload to be revoked. Saving and
+    // affecting live traffic are separate capabilities, so ask again at the
+    // instant the second side effect is about to happen.
+    const reloadStillAllowed = wanted.requested
+      && wanted.allowed
+      && checkCommandAllowed('hub:reloadNginx', body, permissions()).allowed;
+    if (reloadStillAllowed) {
       // The config has already passed `nginx -t`, so this is the only step
       // left. A reload that fails does NOT undo the save: the file on disk is
       // valid, and rolling it back would discard a good edit over a transient
       // reload problem. It is reported instead.
-      const reloaded = await nginxReload();
+      const reloaded = await reload();
       result.reloaded = Boolean(reloaded?.success);
       result.reloadDetail = result.reloaded
         ? (reloaded.output ?? '').trim() || 'nginx reloaded'
@@ -628,48 +752,70 @@ async function handleSaveConfig(payload, ack) {
       result.reloadDetail = 'no reload was requested; the new config takes effect on the next reload';
     }
 
-    pushNginxStatus();
-    pushDomainConfigs();
+    stillAllowed();
+    pushNginxStatus({ target });
+    pushDomainConfigs({ target });
     notifyLocalDashboard('nginx');
     return result;
-  }, ack);
+  }, ack, { target });
 }
 
-async function handleGetLogs(payload, ack) {
-  return runCommand('hub:getLogs', payload, async ({ lines }) => {
-    const result = await getLogs(lines ?? 200);
-    if (socket?.connected) socket.emit('nginx:logs', result);
+export async function handleGetLogs(payload, ack, { read = getLogs, target = socket } = {}) {
+  return runCommand('hub:getLogs', payload, async ({ lines }, stillAllowed) => {
+    const result = await read(lines ?? 200);
+    stillAllowed();
+    if (target?.connected) target.emit('nginx:logs', result);
     return { lines: result?.lines?.length ?? 0 };
-  }, ack);
+  }, ack, { target });
 }
 
-async function handleManageDomain(payload, ack) {
-  return runCommand('hub:manageDomain', payload, async (p) => {
-    const { handleHubDomainCommand } = await import('../domains-db.js');
-    const result = await handleHubDomainCommand(p);
+export async function handleManageDomain(
+  payload,
+  ack,
+  { loadCommand = () => import('../domains-db.js'), target = socket } = {},
+) {
+  return runCommand('hub:manageDomain', payload, async (p, stillAllowed) => {
+    const { handleHubDomainCommand } = await loadCommand();
+    stillAllowed();
+    const result = await handleHubDomainCommand(p, { recheck: stillAllowed });
     if (result && result.ok === false) throw refusalError(result, 'domain command failed');
 
     // Re-sync to the hub and refresh any open local dashboard tab.
-    pushDomainHealth();
-    pushDomainConfigs();
+    stillAllowed();
+    pushDomainHealth({ target });
+    pushDomainConfigs({ target });
     notifyLocalDashboard('domains');
     return result ?? null;
-  }, ack);
+  }, ack, { target });
 }
 
-async function handleManageSSL(payload, ack) {
-  return runCommand('hub:manageSSL', payload, async (p) => {
-    const { handleHubSslCommand } = await import('../cert-operations.js');
+export async function handleManageSSL(
+  payload,
+  ack,
+  { loadCommand = () => import('../cert-operations.js'), target = socket } = {},
+) {
+  return runCommand('hub:manageSSL', payload, async (p, stillAllowed) => {
+    const { handleHubSslCommand } = await loadCommand();
+    stillAllowed();
     const result = await handleHubSslCommand(p, {
-      onProgress: createCommandProgress(p?.requestId),
+      recheck: stillAllowed,
+      onProgress: guardSideEffect(
+        'hub:manageSSL',
+        p,
+        createCommandProgress(p?.requestId, {
+          target,
+          isAllowed: () => commandVerdict('hub:manageSSL', p).allowed,
+        }),
+      ),
     });
     if (result && result.ok === false) throw refusalError(result, 'ssl command failed');
 
-    pushCertExpiry();
-    pushDomainConfigs();
+    stillAllowed();
+    pushCertExpiry({ target });
+    pushDomainConfigs({ target });
     notifyLocalDashboard('ssl');
     return result ?? null;
-  }, ack);
+  }, ack, { target });
 }
 
 /**
@@ -679,39 +825,144 @@ async function handleManageSSL(payload, ack) {
  * publicApp() is what makes that safe — environment variable NAMES, never
  * values, and no credentials of any kind.
  */
-async function pushDeployApps() {
-  if (!socket?.connected) return;
+let lastProjectedDeployApps = [];
+let lastDeployLogsGranted = null;
+
+/**
+ * Re-projects the last emitted deployment list when log access is revoked.
+ *
+ * Loading a fresh PM2 snapshot can take seconds on Windows. Waiting for it
+ * would leave diagnostics already accepted by the Hub visible after the local
+ * grant was revoked. The cached list contains only an earlier explicit
+ * projection, and projectRunForHub() removes every diagnostic field here before
+ * the synchronous emit.
+ */
+export function emitCachedDeployAppsAfterRevocation(
+  permissions,
+  { target = socket, remember = true } = {},
+) {
+  if (!target?.connected || permissions?.['deploy.logs'] === true) return false;
+  if (lastDeployLogsGranted !== true || lastProjectedDeployApps.length === 0) {
+    if (remember) lastDeployLogsGranted = false;
+    return false;
+  }
+
+  const redacted = lastProjectedDeployApps.map((app) => ({
+    ...app,
+    lastRun: app?.lastRun ? projectRunForHub(app.lastRun, permissions) : null,
+  }));
+  target.emit('deploy:apps', redacted);
+  if (remember) {
+    lastProjectedDeployApps = redacted;
+    lastDeployLogsGranted = false;
+  }
+  return true;
+}
+
+export async function pushDeployApps({
+  describe = describeDeployAppsForHub,
+  target = socket,
+  remember = true,
+} = {}) {
+  if (!target?.connected) return;
   try {
-    const { describeApps } = await import('../deploy/status.js');
-    const { publicApp } = await import('../deploy/apps.js');
-    socket.emit('deploy:apps', await describeApps({ view: publicApp }));
+    let logsGranted = false;
+    const apps = await describe(async () => {
+      const { describeApps } = await import('../deploy/status.js');
+      const { publicApp } = await import('../deploy/apps.js');
+      return describeApps({
+        view: publicApp,
+        runView: (run) => run,
+      });
+    }, () => {
+      const permissions = getPermissions();
+      logsGranted = permissions['deploy.logs'] === true;
+      return permissions;
+    });
+    if (!target.connected) return;
+    target.emit('deploy:apps', apps);
+    if (remember) {
+      lastProjectedDeployApps = apps;
+      lastDeployLogsGranted = logsGranted;
+    }
   } catch { /* non-fatal */ }
 }
 
-async function handleManageDeploy(payload, ack) {
-  return runCommand('hub:manageDeploy', payload, async (p) => {
-    const { handleHubDeployCommand } = await import('../deploy/hubCommands.js');
+export async function handleManageDeploy(
+  payload,
+  ack,
+  {
+    handleHubDeployCommand = null,
+    loadHubDeployCommand = () => import('../deploy/hubCommands.js'),
+    target = socket,
+  } = {},
+) {
+  return runCommand('hub:manageDeploy', payload, async (p, stillAllowed) => {
+    if (!handleHubDeployCommand) {
+      ({ handleHubDeployCommand } = await loadHubDeployCommand());
+    }
+    stillAllowed();
+    const permissions = getPermissions();
+    const startedWithLogs = permissions['deploy.logs'] === true;
+    const progress = createCommandProgress(p?.requestId, {
+      target,
+      isAllowed: () => commandVerdict('hub:manageDeploy', p).allowed,
+    });
     try {
-      return await handleHubDeployCommand(p, {
-        onFinished: () => { pushDeployApps(); },
-        onProgress: createCommandProgress(p?.requestId),
+      const result = await handleHubDeployCommand(p, {
+        permissions,
+        recheck: stillAllowed,
+        onFinished: () => {
+          if (commandVerdict('hub:manageDeploy', p).allowed) pushDeployApps({ target });
+        },
+        onProgress: guardSideEffect('hub:manageDeploy', p, progress),
       });
+      if (startedWithLogs && getPermissions()['deploy.logs'] !== true) {
+        const error = new Error('Permission was revoked while the deployment command was running, so its result was withheld.');
+        error.code = 'HUB_PERMISSION_REVOKED';
+        throw error;
+      }
+      return result;
     } finally {
       // Whatever the action was, the list is the thing that may have changed.
-      if (!['list', 'detail', 'run', 'github', 'getEnv'].includes(p?.action)) pushDeployApps();
+      const allowedNow = commandVerdict('hub:manageDeploy', p).allowed;
+      if (allowedNow && !['list', 'detail', 'run', 'github', 'getEnv'].includes(p?.action)) {
+        pushDeployApps({ target });
+      }
       // Linking or deleting with a domain changes the domain list too.
-      if (['linkDomain', 'delete'].includes(p?.action)) { pushDomainConfigs(); pushDomainHealth(); notifyLocalDashboard('domains'); }
+      if (allowedNow && ['linkDomain', 'delete'].includes(p?.action)) {
+        pushDomainConfigs({ target }); pushDomainHealth({ target }); notifyLocalDashboard('domains');
+      }
     }
-  }, ack);
+  }, ack, { target });
 }
 
-async function handleDeployHook(payload, ack) {
-  return runCommand('hub:deployHook', payload, async (p) => {
-    const { handleHubDeployHook } = await import('../deploy/hubCommands.js');
-    const result = await handleHubDeployHook(p, { onFinished: () => { pushDeployApps(); } });
-    if (result?.started) pushDeployApps();
+export async function handleDeployHook(
+  payload,
+  ack,
+  { loadHubDeployHook = () => import('../deploy/hubCommands.js'), target = socket } = {},
+) {
+  return runCommand('hub:deployHook', payload, async (p, stillAllowed) => {
+    const { handleHubDeployHook } = await loadHubDeployHook();
+    stillAllowed();
+    const startedWithLogs = getPermissions()['deploy.logs'] === true;
+    const result = await handleHubDeployHook(p, {
+      permissions: getPermissions(),
+      onFinished: () => {
+          if (commandVerdict('hub:deployHook', p).allowed) pushDeployApps({ target });
+      },
+    });
+    if (startedWithLogs && getPermissions()['deploy.logs'] !== true) {
+      const error = new Error('Permission was revoked while the CI status was loading, so its result was withheld.');
+      error.code = 'HUB_PERMISSION_REVOKED';
+      throw error;
+    }
+    if (result?.started) {
+      stillAllowed();
+      pushDeployApps({ target });
+    }
     return result;
-  }, ack);
+  }, ack, { target });
 }
 
 /**
@@ -724,48 +975,55 @@ async function handleDeployHook(payload, ack) {
  * pushed. The agent is the only place that sees the real PM2 state of this
  * machine.
  */
-const PROCESS_ACTIONS = {
-  // PM2 "start" for an app that exists is a restart.
-  start: runner.restart,
-  restart: runner.restart,
-  stop: runner.stop,
-};
-
-async function handleManageProcess(payload) {
-  return runCommand('hub:manageProcess', payload, async ({ action, name }) => {
-    const fn = PROCESS_ACTIONS[action];
+export async function handleManageProcess(
+  payload,
+  ack,
+  { runner: processRunner = runner, target = socket } = {},
+) {
+  return runCommand('hub:manageProcess', payload, async ({ action, name }, stillAllowed) => {
+    const processActions = {
+      // PM2 "start" for an app that exists is a restart.
+      start: processRunner.restart,
+      restart: processRunner.restart,
+      stop: processRunner.stop,
+    };
+    const fn = processActions[action];
     if (!fn) throw new Error(`Unknown process action: ${action}`);
     if (typeof name !== 'string' || !name.trim()) throw new Error('A process name is required');
     if (name.length > 200) throw new Error('That process name is too long');
 
-    const pm2 = await runner.detect();
+    const pm2 = await processRunner.detect();
     if (!pm2.installed) throw new Error('PM2 is not installed on this server');
     const pm2Path = pm2.path ?? 'pm2';
 
     // Only act on something PM2 actually knows, so a typo cannot be reported
     // as a success.
-    const listed = await runner.list({ pm2Path });
+    const listed = await processRunner.list({ pm2Path });
     if (!listed.ok) throw new Error(listed.error || 'Could not read the PM2 process list');
     const app = listed.apps.find((a) => a.name === name);
     if (!app) throw new Error(`PM2 has no process named "${name}"`);
 
     // PM2 keeps one process list per OS user; another account's app may be
     // visible but cannot be controlled from this process.
-    if (app.user && app.user !== runner.currentUser()) {
+    if (app.user && app.user !== processRunner.currentUser()) {
       throw new Error(
-        `"${name}" belongs to OS user "${app.user}", not "${runner.currentUser()}". `
+        `"${name}" belongs to OS user "${app.user}", not "${processRunner.currentUser()}". `
         + 'PM2 keeps a separate process list per user. Sign in as that user to control it.',
       );
     }
 
+    // detect() and list() can both be slow on a cold Windows host. A
+    // revocation that arrived during discovery must prevent the mutation.
+    stillAllowed();
     const result = await fn(name, { pm2Path });
     if (!result.ok) throw new Error(result.output || `pm2 ${action} failed`);
 
     // The Hub's process table is fed by this push; without it the row would
     // keep showing the old status until the next 60-second heartbeat.
-    pushProcesses();
+    stillAllowed();
+    pushProcesses({ target });
     return { name, action, managed: Boolean(app.managed), output: result.output ?? '' };
-  }, ack);
+  }, ack, { target });
 }
 
 // ─── Permission + revision sync ───────────────────────────────────────────────
@@ -775,10 +1033,10 @@ async function handleManageProcess(payload) {
  * Called on connect and whenever permissions change, so the Hub UI can grey
  * out actions immediately instead of waiting for a poll.
  */
-export function pushPermissions() {
-  if (!socket?.connected) return;
+export function pushPermissions({ target = socket } = {}) {
+  if (!target?.connected) return;
   try {
-    socket.emit('permissions:state', {
+    target.emit('permissions:state', {
       tree: PERMISSION_TREE,
       permissions: getHubPermissions(),
       comingSoon: COMING_SOON_PERMISSION_IDS,
@@ -796,20 +1054,85 @@ export function pushPermissions() {
  */
 let lastRevision = -1;
 
-async function checkRevision() {
-  if (!socket?.connected) return;
-  try {
-    const rev = getHubRevision();
-    if (rev === lastRevision) return;
-    lastRevision = rev;
+/**
+ * Serialize revision refreshes and collapse requests that arrive while one is
+ * running into one follow-up pass. The follow-up re-reads the counter, so an
+ * older, slower telemetry build can never finish after a newer revision.
+ */
+export function createSerializedRevisionRunner(runOnce, { isConnected = () => true } = {}) {
+  let current = null;
+  let queued = false;
 
-    pushPermissions();
-    pushDomainConfigs();
-    pushDomainHealth();
-    pushCertExpiry();
-    pushServiceState();
-  } catch { /* non-fatal */ }
+  return function requestRun() {
+    if (current) {
+      queued = true;
+      return current;
+    }
+    current = (async () => {
+      do {
+        queued = false;
+        await runOnce();
+      } while (queued && isConnected());
+    })().finally(() => {
+      current = null;
+    });
+    return current;
+  };
 }
+
+export async function refreshRevisionOnce({
+  target = socket,
+  revision = getHubRevision(),
+  permissionSnapshot = null,
+  pushServerInfoFn = pushServerInfo,
+  pushDomainConfigsFn = pushDomainConfigs,
+  pushDomainHealthFn = pushDomainHealth,
+  pushCertExpiryFn = pushCertExpiry,
+  pushServiceStateFn = pushServiceState,
+  pushDeployAppsFn = pushDeployApps,
+} = {}) {
+  if (!target?.connected) return;
+  const rev = revision;
+  if (rev === lastRevision) return;
+  lastRevision = rev;
+
+  pushPermissions({ target });
+  const permissions = permissionSnapshot ?? getPermissions();
+  // Revocation is time-sensitive and does not need a PM2 call. Redact the
+  // already-emitted snapshot now, then refresh PM2 state in the background.
+  emitCachedDeployAppsAfterRevocation(permissions, { target });
+  // `sslDir` is configuration data too. Re-send it so a view revocation
+  // replaces a path the Hub already learned instead of waiting for the next
+  // reconnect, and a grant makes it available without a restart.
+  await Promise.all([
+    pushServerInfoFn({ target }),
+    pushDomainConfigsFn({ target }),
+    pushDomainHealthFn({ target }),
+    pushCertExpiryFn({ target }),
+    pushServiceStateFn({ target }),
+    pushDeployAppsFn({ target }),
+  ]);
+}
+
+/**
+ * Re-reads the shared revision for every serialized pass. If revision N+1
+ * arrives while N is still refreshing, the queued pass sees N+1 rather than
+ * repeating the stale value captured by the caller.
+ */
+export function createHubRevisionRefreshRunner({
+  readRevision = getHubRevision,
+  refresh = refreshRevisionOnce,
+  isConnected = () => Boolean(socket?.connected),
+} = {}) {
+  return createSerializedRevisionRunner(async () => {
+    try {
+      const revision = readRevision();
+      await refresh({ revision, target: socket });
+    } catch { /* non-fatal telemetry refresh */ }
+  }, { isConnected });
+}
+
+const checkRevision = createHubRevisionRefreshRunner();
 
 /**
  * Tells any open dashboard that something changed, so the UI refreshes the
@@ -834,6 +1157,8 @@ function notifyLocalDashboard(section) {
 
 function startHeartbeats() {
   stopHeartbeats(); // clear any existing intervals first
+  lastProjectedDeployApps = [];
+  lastDeployLogsGranted = null;
 
   // Forget the revision we had last pushed. Anything could have changed while
   // the socket was down, and the hub may have been restarted or re-seeded, so
@@ -879,7 +1204,19 @@ function cancelRejoin() {
   rejoinDelay = 0;
 }
 
-export function initHubAgent() {
+/**
+ * Binds one command to the exact socket instance that received it.
+ *
+ * Socket.IO handlers live for the lifetime of their client. Re-pairing replaces
+ * that client, so a handler that later writes through the module-level
+ * `socket` would deliver an old command's result or progress to the new Hub.
+ * Keeping the source instance in the handler context prevents that hand-off.
+ */
+export function bindCommandSocket(target, event, handler) {
+  target.on(event, (payload, ack) => handler(payload, ack, { target }));
+}
+
+export function initHubAgent({ commandHandlers = null } = {}) {
   const link = getHubLink();
   if (!link) {
     setState(HUB_AGENT_STATUS.NOT_LINKED, null, 0);
@@ -931,9 +1268,7 @@ export function initHubAgent() {
     console.log('[hubAgent] Connected to hub');
     cancelRejoin();
     setState(HUB_AGENT_STATUS.CONNECTED, null, 0);
-    // Push server metadata so the hub can tailor the domain form (SSL paths, etc.)
-    const { sslDir } = loadConfig();
-    self.emit('server:info', { platform: platformName, sslDir: sslDir ?? '' });
+    pushServerInfo();
     startHeartbeats();
     startDeployProgress({
       emit: (event, payload) => {
@@ -1014,16 +1349,22 @@ export function initHubAgent() {
     console.error('[hubAgent] Connection error:', message);
   });
 
-  self.on('hub:reloadNginx', handleReloadNginx);
-  self.on('hub:manageDomain', handleManageDomain);
-  self.on('hub:manageSSL', handleManageSSL);
-  self.on('hub:nginxAction', handleNginxAction);
-  self.on('hub:getConfigs', handleGetConfigs);
-  self.on('hub:saveConfig', handleSaveConfig);
-  self.on('hub:getLogs', handleGetLogs);
-  self.on('hub:manageDeploy', handleManageDeploy);
-  self.on('hub:deployHook', handleDeployHook);
-  self.on('hub:manageProcess', handleManageProcess);
+  const handlers = {
+    'hub:reloadNginx': handleReloadNginx,
+    'hub:manageDomain': handleManageDomain,
+    'hub:manageSSL': handleManageSSL,
+    'hub:nginxAction': handleNginxAction,
+    'hub:getConfigs': handleGetConfigs,
+    'hub:saveConfig': handleSaveConfig,
+    'hub:getLogs': handleGetLogs,
+    'hub:manageDeploy': handleManageDeploy,
+    'hub:deployHook': handleDeployHook,
+    'hub:manageProcess': handleManageProcess,
+    ...(commandHandlers ?? {}),
+  };
+  for (const [event, handler] of Object.entries(handlers)) {
+    if (typeof handler === 'function') bindCommandSocket(self, event, handler);
+  }
 }
 
 /**

@@ -35,6 +35,7 @@ import {
 } from '../../core/deploy/apps.js';
 import { startDeployment, startRollback, removeRelease, removeApp, moveApp } from '../../core/deploy/engine.js';
 import { readRun, readLogTail, isId, deployRoot } from '../../core/deploy/store.js';
+import { isRedactedDeployRun } from '../../core/deploy/logSecurity.js';
 import { linkDomain, unlinkDomain } from '../../core/deploy/domainLink.js';
 import { resolveOpId, createSslProgress } from '../../core/ssl/progress.js';
 import { publish } from '../../core/jobs/bus.js';
@@ -292,8 +293,20 @@ class DeploymentsController {
       const run = isId(req.params.runId) ? readRun(app.id, req.params.runId) : null;
       if (!run) return res.status(404).json({ error: 'No such run.' });
 
-      const log = readLogTail(app.id, run.id);
-      return res.json({ ...run, log: log.text, logTruncated: log.truncated });
+      const available = isRedactedDeployRun(run);
+      const log = available ? readLogTail(app.id, run.id) : { text: '', truncated: false };
+      return res.json({
+        ...run,
+        // Unmarked runs have no proof that free-form fields were written by
+        // the redacting writer. Suppress them on every local surface too.
+        error: available ? run.error : null,
+        reason: available ? run.reason : null,
+        warnings: available && Array.isArray(run.warnings) ? run.warnings : [],
+        logTail: available && Array.isArray(run.logTail) ? run.logTail : [],
+        log: log.text,
+        logTruncated: log.truncated,
+        logUnavailable: available ? undefined : 'legacy-format',
+      });
     } catch (error) {
       return next(error);
     }

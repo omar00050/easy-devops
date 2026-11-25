@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import crypto from 'crypto';
 import session from 'express-session';
-import { loadConfig, UI_MODES } from '../core/config.js';
+import { loadConfig, UI_MODES, BIND_LOOPBACK, isLoopbackBind } from '../core/config.js';
 import { dbGet, dbSet, closeDb } from '../core/db.js';
 import { getDataDir, isDevDataDir, TEST_MODE_ENV } from '../core/platform.js';
 import authRouter from './routes/auth.js';
@@ -22,7 +22,7 @@ import { ensureCode as ensureSetupCode, describe as describeSetupCode } from '..
 import { warmProbes } from './controllers/processesController.js';
 import { stopSslController } from './controllers/sslController.js';
 import { initSocket, stopSocket } from './socketManager.js';
-import { requireLocalRequest } from './lib/localRequest.js';
+import { requireLocalRequest, isLoopbackAddress } from './lib/localRequest.js';
 import { startJobs } from '../core/jobs/index.js';
 import { startDaemonBridge, daemonStatus } from './lib/daemonBridge.js';
 
@@ -38,6 +38,26 @@ app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
 app.use(express.json({ limit: '1mb' }));
+
+// ─── Listener configuration ───────────────────────────────────────────────────
+
+const startupConfig = loadConfig();
+const { dashboardPort, dashboardBindAddress } = startupConfig;
+const port = Number(process.env.DASHBOARD_PORT) || dashboardPort;
+const requestedBindAddress = process.env.DASHBOARD_BIND_ADDRESS?.trim() || dashboardBindAddress;
+
+// The dashboard has no TLS listener of its own. It therefore always binds to
+// loopback; remote operators reach it through an HTTPS reverse proxy or secure
+// tunnel running on this machine. Ignoring a stale service environment value
+// as well as a stale database keeps this true after an upgrade.
+const bindAddress = isLoopbackBind(requestedBindAddress) ? requestedBindAddress : BIND_LOOPBACK;
+const droppedUnsafeBind = requestedBindAddress !== bindAddress;
+
+// Only a loopback peer is a trusted TLS terminator. This lets express-session,
+// req.secure, the login rate limiter and the local-request guard see the real
+// HTTPS scheme and client address from a local proxy without allowing a direct
+// remote client to spoof X-Forwarded-* headers.
+app.set('trust proxy', (address) => isLoopbackAddress(address));
 
 // ─── Session secret — generated once, persisted in SQLite ────────────────────
 let sessionSecret = dbGet('session_secret');
@@ -63,25 +83,17 @@ const sessionMiddleware = session({
   resave: false,
   saveUninitialized: false,
   store: sessionStore,
+  proxy: true,
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
+    // express-session emits Secure when req.secure is true. `auto` therefore
+    // protects proxied HTTPS without making loopback HTTP development unusable.
+    secure: 'auto',
   },
 });
 
 app.use(sessionMiddleware);
-
-// ─── Listener configuration ───────────────────────────────────────────────────
-
-const startupConfig = loadConfig();
-const { dashboardPort, dashboardBindAddress } = startupConfig;
-const port = Number(process.env.DASHBOARD_PORT) || dashboardPort;
-
-// Which interfaces to accept connections on. New Linux installs default to
-// loopback only; existing installs keep listening on every interface, so an
-// upgrade cannot silently cut off a dashboard someone reaches over the
-// network. See core/config.js.
-const bindAddress = process.env.DASHBOARD_BIND_ADDRESS?.trim() || dashboardBindAddress;
 
 /** The port actually bound, known only once listening (tests may pass 0). */
 let boundPort = null;
@@ -97,12 +109,7 @@ let boundPort = null;
  * loopback rule is the safe direction.
  */
 function currentBinding() {
-  let configured = bindAddress;
-  try {
-    configured = loadConfig().dashboardBindAddress ?? bindAddress;
-  } catch { /* unreadable config: fall back to what we started with */ }
-
-  return { port: boundPort ?? port, bindAddress: configured };
+  return { port: boundPort ?? port, bindAddress };
 }
 
 // ─── Which UI is served at / ─────────────────────────────────────────────────
@@ -304,7 +311,7 @@ const jobs = startJobs({
  * issued it: nothing stores the cleartext, which is the point.
  */
 async function announceSetupCode() {
-  const state = await ensureSetupCode({ config: loadConfig() });
+  const state = await ensureSetupCode({ config: loadConfig });
   if (!state.pending) return;
   for (const line of describeSetupCode(state)) process.stdout.write(`${line}\n`);
 }
@@ -323,6 +330,19 @@ const whenListening = new Promise((resolve, reject) => {
     boundPort = bound;
     if (isDevDataDir()) {
       process.stdout.write(`DEV MODE (data: ${getDataDir()})\n`);
+    }
+    if (droppedUnsafeBind) {
+      process.stdout.write(
+        `Ignoring non-loopback dashboard bind ${requestedBindAddress}; listening on ${bindAddress}. `
+        + 'Use a local HTTPS reverse proxy or secure tunnel for remote access.\n',
+      );
+    }
+    if (startupConfig.dashboardAuthMigration) {
+      process.stdout.write(
+        'Dashboard authentication was tightened during upgrade: this installation previously '
+        + 'allowed network access, so a password is now required. Use the one-time setup code '
+        + 'printed below or run `ezz dashboard setup-code`.\n',
+      );
     }
     process.stdout.write(`Dashboard running on port ${bound} (bound to ${bindAddress})\n`);
     process.stdout.write(

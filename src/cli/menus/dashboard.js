@@ -58,31 +58,35 @@ async function issueSetupCode() {
   const { loadConfig } = await import('../../core/config.js');
   const setupCode = await import('../../core/setupCode.js');
 
-  const config = loadConfig();
+  return setupCode.withSetupCodeLock(async () => {
+    // Re-read setup state under the same cross-process lock as issuance. A
+    // dashboard can finish setup between an unlocked check and this write.
+    const config = loadConfig();
 
-  if (!setupCode.setupPending(config)) {
-    console.log();
-    console.log('  ' + chalk.white('The dashboard is already set up.'));
-    console.log('  ' + chalk.gray('A setup code only applies before the first password is set.'));
-    console.log('  ' + chalk.gray('Change the password in the dashboard under Settings.'));
-    console.log();
-    // Any leftover code is removed rather than left outstanding.
-    if (setupCode.clear()) {
-      console.log('  ' + chalk.gray('An outstanding code was cleared.'));
+    if (!setupCode.setupPending(config)) {
       console.log();
+      console.log('  ' + chalk.white('The dashboard is already set up.'));
+      console.log('  ' + chalk.gray('A setup code only applies before the first password is set.'));
+      console.log('  ' + chalk.gray('Change the password in the dashboard under Settings.'));
+      console.log();
+      // Any leftover code is removed rather than left outstanding.
+      if (await setupCode.clear()) {
+        console.log('  ' + chalk.gray('An outstanding code was cleared.'));
+        console.log();
+      }
+      return 0;
     }
+
+    const issued = await setupCode.issue();
+
+    for (const line of setupCode.describe({ code: issued.code, expiresAt: issued.expiresAt })) {
+      console.log(line);
+    }
+    console.log('  ' + chalk.gray('This replaces any code issued earlier.'));
+    console.log();
+
     return 0;
-  }
-
-  const issued = await setupCode.issue();
-
-  for (const line of setupCode.describe({ code: issued.code, expiresAt: issued.expiresAt })) {
-    console.log(line);
-  }
-  console.log('  ' + chalk.gray('This replaces any code issued earlier.'));
-  console.log();
-
-  return 0;
+  });
 }
 
 /**

@@ -21,7 +21,12 @@ import { pathToFileURL } from 'url';
 import { getDataDir } from '../core/platform.js';
 import { isUpdateVersion, performUpdate, currentVersion } from '../core/updater.js';
 import { loadConfig } from '../core/config.js';
-import { readStatus, writeStatus } from '../core/updateStatus.js';
+import {
+  claimStartingRun,
+  readStatus,
+  releaseRunClaim,
+  writeStatus,
+} from '../core/updateStatus.js';
 import { startDashboard, stopDashboard, isPidAlive } from '../core/dashboardProcess.js';
 
 const runId = parseRunId(process.argv.slice(2));
@@ -76,7 +81,24 @@ export async function runPendingUpdate({ dataDir, runId, apply = applyUpdate }) 
     return 1;
   }
 
-  return apply(run);
+  const claim = claimStartingRun(run.id, { dataDir });
+  if (!claim) {
+    process.stderr.write('update worker: another worker owns this run\n');
+    return 1;
+  }
+
+  try {
+    // Recheck after the atomic claim. A stale first read must not let a worker
+    // act on a record that was replaced while it was waiting.
+    const current = readStatus(dataDir);
+    if (!current || current.id !== run.id || current.phase !== 'starting') {
+      process.stderr.write('update worker: this run has been superseded\n');
+      return 1;
+    }
+    return await apply(current);
+  } finally {
+    releaseRunClaim(claim);
+  }
 }
 
 async function applyUpdate(run) {

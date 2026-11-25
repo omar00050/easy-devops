@@ -236,8 +236,12 @@ export async function waitForDaemonGone({ dataDir, timeoutMs = STOP_GRACE_MS } =
  * @param {Object} [opts]
  * @returns {Object}
  */
-export function backgroundServiceState({ dataDir = getDataDir() } = {}) {
-  const mech = resolveMechanism();
+export function backgroundServiceState({ dataDir = getDataDir(), deps = {} } = {}) {
+  const mech = deps.mechanism ?? resolveMechanism();
+  const installedState = inspectInstalled({
+    mech,
+    fsImpl: deps.fs ?? fs,
+  });
   const lock = inspectLock({ dataDir });
   const owner = inspectOwner({ dataDir });
   const recorded = dbGet(STATE_KEY) ?? {};
@@ -259,7 +263,7 @@ export function backgroundServiceState({ dataDir = getDataDir() } = {}) {
 
     mechanism: mech.mechanism,
     mode: mech.mode,
-    installed: isInstalled({ mech, dataDir }),
+    installed: installedState.installed,
     startsAt: startsAtFor(mech),
 
     stoppedByUser,
@@ -267,7 +271,9 @@ export function backgroundServiceState({ dataDir = getDataDir() } = {}) {
 
     dataDir,
     serverMode: isServerMode(),
-    detail: lock.reason,
+    detail: installedState.detail
+      ? (lock.reason ? `${lock.reason}; ${installedState.detail}` : installedState.detail)
+      : lock.reason,
   };
 }
 
@@ -275,16 +281,52 @@ export function backgroundServiceState({ dataDir = getDataDir() } = {}) {
  * Whether a native service is installed, by the only cheap evidence there is:
  * the artifact each mechanism leaves behind.
  */
-function isInstalled({ mech = resolveMechanism(), dataDir = getDataDir() } = {}) {
+function inspectInstalled({ mech = resolveMechanism(), fsImpl = fs } = {}) {
+  const inspect = (file) => {
+    if (!file) return { exists: false, detail: null };
+    try {
+      const stat = fsImpl.lstatSync(file, { throwIfNoEntry: false });
+      return { exists: Boolean(stat), detail: null };
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { exists: false, detail: null };
+      if (error?.code === 'EACCES' || error?.code === 'EPERM') {
+        return {
+          exists: null,
+          detail: `Could not inspect the installed service at ${file}: ${error.message}`,
+        };
+      }
+      return {
+        exists: null,
+        detail: `Could not inspect the installed service at ${file}: ${error?.message ?? String(error)}`,
+      };
+    }
+  };
+
   try {
-    if (!isWindows) return fs.existsSync(systemd.UNIT_PATH);
+    if (!isWindows) {
+      const unit = inspect(systemd.UNIT_PATH);
+      return { installed: unit.exists, detail: unit.detail };
+    }
     if (mech.mode === MODES.SERVER) {
-      return fs.existsSync(windowsService.winswPath()) && fs.existsSync(windowsService.serviceXmlPath());
+      const wrapper = inspect(windowsService.winswPath());
+      const xml = inspect(windowsService.serviceXmlPath());
+      if (wrapper.exists === false || xml.exists === false) {
+        return { installed: false, detail: wrapper.detail ?? xml.detail };
+      }
+      if (wrapper.exists === null || xml.exists === null) {
+        return { installed: null, detail: wrapper.detail ?? xml.detail };
+      }
+      return { installed: true, detail: null };
     }
     const launcher = windowsPersonal.launcherPath();
-    return Boolean(launcher && fs.existsSync(launcher));
-  } catch {
-    return false;
+    if (!launcher) return { installed: false, detail: null };
+    const file = inspect(launcher);
+    return { installed: file.exists, detail: file.detail };
+  } catch (error) {
+    return {
+      installed: null,
+      detail: `Could not inspect the installed service: ${error?.message ?? String(error)}`,
+    };
   }
 }
 
@@ -1091,11 +1133,22 @@ export async function status({ cache = false, coldWaitMs, deps = {} } = {}) {
   const legacyProbe = () => (deps.detectLegacy ?? legacy.detectLegacy)(deps.legacy ?? {});
 
   const read = async (key, producer) => {
-    if (!cache) return { value: await producer(), ageMs: 0, fresh: true, pending: false, refreshing: false };
-    return probe(key, producer, {
-      ttlMs: PROBE_TTL_MS[key],
-      ...(coldWaitMs === undefined ? {} : { coldWaitMs }),
-    });
+    try {
+      if (!cache) return { value: await producer(), ageMs: 0, fresh: true, pending: false, refreshing: false };
+      return await probe(key, producer, {
+        ttlMs: PROBE_TTL_MS[key],
+        ...(coldWaitMs === undefined ? {} : { coldWaitMs }),
+      });
+    } catch (error) {
+      return {
+        value: null,
+        error: error?.message ?? String(error),
+        ageMs: 0,
+        fresh: false,
+        pending: false,
+        refreshing: false,
+      };
+    }
   };
 
   const [manager, runtimeRead, legacyRead] = await Promise.all([
@@ -1103,6 +1156,10 @@ export async function status({ cache = false, coldWaitMs, deps = {} } = {}) {
     read(PROBE_KEYS.runtime, runtimeProbe),
     read(PROBE_KEYS.legacy, legacyProbe),
   ]);
+
+  if (manager.error) out.warnings.push(`Could not read the service state: ${manager.error}`);
+  if (runtimeRead.error) out.warnings.push(`Could not inspect the pinned Node runtime: ${runtimeRead.error}`);
+  if (legacyRead.error) out.warnings.push(`Could not inspect legacy service leftovers: ${legacyRead.error}`);
 
   // A pending probe must not become a crash or a lie. The shape stays the
   // same and `probes` below says which parts are not measured yet, so a client
@@ -1144,9 +1201,7 @@ export async function status({ cache = false, coldWaitMs, deps = {} } = {}) {
       );
     }
   }
-  if (isWindows && mech.mode !== MODES.SERVER) {
-    out.warnings.push(...(out.service.warnings ?? []));
-  }
+  out.warnings.push(...(out.service.warnings ?? []));
   out.warnings.push(...(out.runtime?.warnings ?? []));
 
   // What the caller needs to know about the measurement itself: how old it is,

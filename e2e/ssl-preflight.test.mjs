@@ -5,7 +5,7 @@
  *
  * No real DNS, HTTP, TLS or ACME request is made. DNS resolvers, the HTTP
  * probe, the challenge listener, the ACME client and the nginx shell runner
- * are all injected. Only temporary files under the runner's data directory
+ * are all injected. Only temporary files under the runner's temporary area
  * are written.
  */
 
@@ -103,7 +103,34 @@ function challengeMock({ onGet = null, throwOnStart = null } = {}) {
   };
 }
 
+let stubCertificatePair;
+function validStubCertificatePair() {
+  if (stubCertificatePair) return stubCertificatePair;
+  const forge = require('node-forge');
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  });
+  const cert = forge.pki.createCertificate();
+  cert.publicKey = forge.pki.publicKeyFromPem(publicKey);
+  cert.serialNumber = '02';
+  cert.validity.notBefore = new Date(Date.now() - DAY);
+  cert.validity.notAfter = new Date(Date.now() + DAY);
+  const subject = [{ name: 'commonName', value: 'stage.example.com' }];
+  cert.setSubject(subject);
+  cert.setIssuer(subject);
+  cert.setExtensions([{ name: 'subjectAltName', altNames: [{ type: 2, value: 'stage.example.com' }] }]);
+  cert.sign(forge.pki.privateKeyFromPem(privateKey), forge.md.sha256.create());
+  stubCertificatePair = {
+    privateKey,
+    certificate: forge.pki.certificateToPem(cert),
+  };
+  return stubCertificatePair;
+}
+
 function acmeStub(auto) {
+  const pair = validStubCertificatePair();
   return {
     directory: {
       letsencrypt: {
@@ -113,11 +140,11 @@ function acmeStub(auto) {
     },
     crypto: {
       createPrivateKey: () => 'stub-account-key',
-      createCsr: async () => [Buffer.from('stub-domain-key'), Buffer.from('stub-csr')],
+      createCsr: async () => [Buffer.from(pair.privateKey), Buffer.from('stub-csr')],
     },
     Client: class {
       constructor(options) { this.options = options; }
-      auto(args) { return auto(args); }
+      auto(args) { return auto(args, pair); }
     },
   };
 }
@@ -129,14 +156,17 @@ const fakeRun = async (cmd) => {
   return { success: true, stdout: '', stderr: '', exitCode: 0 };
 };
 
-const successAcme = () => acmeStub(async (args) => {
+const successAcme = () => acmeStub(async (args, pair) => {
   await args.challengeCreateFn({}, { token: 'tok' }, 'tok.keyauth');
   await args.challengeRemoveFn?.({}, { token: 'tok' });
-  return '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----';
+  return pair.certificate;
 });
 
 async function main() {
-  const scratch = path.join(TEST_DATA_DIR, 'ssl-preflight');
+  // Keep certificates beside the temporary data directory. Easy DevOps
+  // refuses an sslDir that overlaps its dataDir, and this fixture must use the
+  // same supported layout as an installed service.
+  const scratch = path.join(path.dirname(TEST_DATA_DIR), 'ssl-preflight');
   const sslDir = path.join(scratch, 'ssl');
   const nginxDir = path.join(scratch, 'nginx');
   assertInsideTestDataDir(sslDir, 'create the preflight ssl dir');

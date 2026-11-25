@@ -16,6 +16,10 @@
  * CommandResult shape (returned by run()):
  * { success: boolean, stdout: string, stderr: string, exitCode: number|null, command: string }
  *
+ * stdout and stderr contain at most SHELL_CAPTURE_TAIL_BYTES each. They are
+ * the newest bytes, so a noisy command cannot grow the caller's memory without
+ * bound. `onData`, when supplied, still receives every chunk.
+ *
  * CommandOptions (accepted by run() and runLive()):
  * { timeout?: number, cwd?: string }
  * Defaults: timeout = 30 000 ms, cwd = process.cwd()
@@ -25,11 +29,182 @@
  */
 
 import { spawn } from 'child_process';
+import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 
 // ─── internal helpers ─────────────────────────────────────────────────────────
 
+/**
+ * Maximum bytes retained for each captured stream. Callers receive only the
+ * newest bytes, while `onData` still sees every chunk as it arrives.
+ */
+export const SHELL_CAPTURE_TAIL_BYTES = 64 * 1024;
+
 function stripAnsi(str) {
   return str.replace(/\x1B\[[0-9;]*[mGKHFJ]/g, '');
+}
+
+function asBuffer(chunk) {
+  if (Buffer.isBuffer(chunk)) return chunk;
+  if (ArrayBuffer.isView(chunk)) {
+    return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  }
+  return Buffer.from(String(chunk), 'utf8');
+}
+
+/**
+ * Drops an incomplete leading UTF-8 sequence from a bounded tail.
+ *
+ * The ring keeps an exact byte suffix. That suffix can begin after the first
+ * byte of a multibyte character, in which case Node would turn each orphaned
+ * continuation byte into U+FFFD. The character is already incomplete, so the
+ * safe representation is to begin with the next complete character.
+ */
+function validUtf8Tail(buffer) {
+  let start = 0;
+  while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start += 1;
+  return start === 0 ? buffer : buffer.subarray(start);
+}
+
+/** Keeps the newest bytes in a fixed circular buffer. */
+function createBoundedTail(limit = SHELL_CAPTURE_TAIL_BYTES) {
+  const ring = Buffer.allocUnsafe(limit);
+  let start = 0;
+  let bytes = 0;
+
+  return {
+    append(chunk) {
+      const incoming = asBuffer(chunk);
+      if (incoming.length === 0) return;
+
+      if (incoming.length >= limit) {
+        incoming.copy(ring, 0, incoming.length - limit);
+        start = 0;
+        bytes = limit;
+        return;
+      }
+
+      const overflow = Math.max(0, bytes + incoming.length - limit);
+      if (overflow > 0) {
+        start = (start + overflow) % limit;
+        bytes -= overflow;
+      }
+
+      const writeAt = (start + bytes) % limit;
+      const first = Math.min(incoming.length, limit - writeAt);
+      incoming.copy(ring, writeAt, 0, first);
+      if (first < incoming.length) incoming.copy(ring, 0, first);
+      bytes += incoming.length;
+    },
+
+    toString() {
+      if (bytes === 0) return '';
+      if (start + bytes <= limit) {
+        return validUtf8Tail(ring.subarray(start, start + bytes)).toString('utf8');
+      }
+
+      const ordered = Buffer.allocUnsafe(bytes);
+      const first = limit - start;
+      ring.copy(ordered, 0, start, limit);
+      ring.copy(ordered, first, 0, bytes - first);
+      return validUtf8Tail(ordered).toString('utf8');
+    },
+  };
+}
+
+function capturedText(tail) {
+  return stripAnsi(tail.toString()).trim();
+}
+
+/**
+ * Decode one byte stream incrementally.
+ *
+ * A UTF-8 character may be split across pipe chunks. Decoding each Buffer on
+ * its own replaces both halves before redaction can see the secret. The
+ * StringDecoder preserves the partial character until the next chunk, and
+ * finish() flushes it before the captured tail is returned.
+ */
+function createTextCapture(limit, onText) {
+  const decoder = new StringDecoder('utf8');
+  const tail = createBoundedTail(limit);
+
+  const appendText = (text) => {
+    if (!text) return;
+    tail.append(Buffer.from(text, 'utf8'));
+    if (!onText) return;
+    try { onText(text); } catch { /* a listener cannot change the command result */ }
+  };
+
+  return {
+    append(chunk) {
+      appendText(decoder.write(asBuffer(chunk)));
+    },
+    finish() {
+      appendText(decoder.end());
+      return capturedText(tail);
+    },
+  };
+}
+
+const COMMON_COMMAND_ENV = Object.freeze([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LANGUAGE', 'TZ',
+  'TMPDIR', 'TEMP', 'TMP', 'TERM',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY',
+  'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy',
+  'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+  'CURL_CA_BUNDLE', 'REQUESTS_CA_BUNDLE', 'GIT_SSL_CAINFO',
+]);
+
+const WINDOWS_COMMAND_ENV = Object.freeze([
+  'Path', 'PATHEXT', 'ComSpec', 'SystemRoot', 'SystemDrive', 'WINDIR',
+  'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA',
+  'ProgramData', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432',
+  'CommonProgramFiles', 'CommonProgramFiles(x86)', 'CommonProgramW6432',
+  'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE',
+]);
+
+/**
+ * Environment for a repository-authored install/build/hook command.
+ *
+ * The daemon environment can contain credentials belonging to unrelated
+ * services. A project command receives only OS essentials, proxy/TLS settings
+ * and the app's explicitly configured `env`. This is a replacement
+ * environment, not a merge over `process.env`.
+ */
+export function commandEnvironment(overrides = {}, source = process.env) {
+  const names = [...COMMON_COMMAND_ENV, ...(process.platform === 'win32' ? WINDOWS_COMMAND_ENV : [])];
+  const wanted = new Set(names.map((name) => process.platform === 'win32' ? name.toLowerCase() : name));
+  const result = {};
+
+  for (const [name, value] of Object.entries(source ?? {})) {
+    if (value === undefined) continue;
+    const key = process.platform === 'win32' ? name.toLowerCase() : name;
+    if (wanted.has(key) || (process.platform !== 'win32' && name.startsWith('LC_'))) {
+      result[name] = String(value);
+    }
+  }
+
+  for (const [name, value] of Object.entries(overrides ?? {})) {
+    if (value === undefined || value === null) continue;
+    result[name] = String(value);
+  }
+  result.GIT_TERMINAL_PROMPT ??= '0';
+  return result;
+}
+
+/** Credentials embedded in proxy URLs are echoed by `env`; redact them too. */
+export function commandEnvironmentSecrets(env = {}) {
+  const values = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (!/(?:https?|all)_proxy$/i.test(name)) continue;
+    const text = String(value ?? '');
+    try {
+      const url = new URL(text);
+      if (url.username) values.push(url.username);
+      if (url.password) values.push(url.password);
+    } catch { /* a non-URL proxy value is not treated as a secret */ }
+  }
+  return values;
 }
 
 // ─── getShell ─────────────────────────────────────────────────────────────────
@@ -43,16 +218,19 @@ function stripAnsi(str) {
  */
 export function getShell() {
   if (process.platform === 'win32') {
-    return { shell: 'powershell', flag: '-Command' };
+    return {
+      shell: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+      flag: '-Command',
+    };
   }
   return { shell: 'bash', flag: '-c' };
 }
 
 /** Execute a native executable with literal arguments and no command interpreter. */
 export function runFile(file, args, options = {}) {
-  const { timeout = 30000, cwd = process.cwd(), env = null, onData = null } = options;
+  const { timeout = 30000, cwd = process.cwd(), env = null, onData = null, replaceEnv = false } = options;
   return capture((spawnOptions) => spawn(file, args, { ...spawnOptions, shell: false }), {
-    cmd: file, timeout, cwd, env, onData,
+    cmd: file, timeout, cwd, env, onData, replaceEnv,
   });
 }
 
@@ -73,10 +251,13 @@ export function runFile(file, args, options = {}) {
  * @returns {Promise<{ success: boolean, stdout: string, stderr: string, exitCode: number|null, command: string }>}
  */
 export function run(cmd, options = {}) {
-  const { timeout = 30000, cwd = process.cwd(), env = null, onData = null } = options;
+  const { timeout = 30000, cwd = process.cwd(), env = null, onData = null, replaceEnv = false } = options;
   const { shell, flag } = getShell();
 
-  return capture((spawnOptions) => spawn(shell, [flag, cmd], spawnOptions), { cmd, timeout, cwd, env, onData });
+  return capture(
+    (spawnOptions) => spawn(shell, [flag, cmd], spawnOptions),
+    { cmd, timeout, cwd, env, onData, replaceEnv },
+  );
 }
 
 /**
@@ -86,37 +267,54 @@ export function run(cmd, options = {}) {
  * @param {(spawnOptions: Object) => import('child_process').ChildProcess} spawnChild
  * @param {{ cmd: string, timeout: number, cwd: string, env: Object|null, onData: Function|null }} opts
  */
-function capture(spawnChild, { cmd, timeout, cwd, env, onData }) {
+function capture(spawnChild, { cmd, timeout, cwd, env, onData, replaceEnv = false }) {
   return new Promise((resolve) => {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeout);
 
-    const child = spawnChild({
-      cwd,
-      signal: ac.signal,
-      encoding: 'utf8',
-      windowsHide: true,
-      ...(env ? { env: { ...process.env, ...env } } : {}),
+    let child;
+    try {
+      child = spawnChild({
+        cwd,
+        signal: ac.signal,
+        encoding: 'utf8',
+        windowsHide: true,
+        ...(env ? { env: replaceEnv ? { ...env } : { ...process.env, ...env } } : {}),
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      resolve({
+        success: false,
+        stdout: '',
+        stderr: err.message,
+        exitCode: null,
+        command: cmd,
+      });
+      return;
+    }
+
+    const stdoutCapture = createTextCapture(
+      SHELL_CAPTURE_TAIL_BYTES,
+      onData ? (text) => onData(stripAnsi(text), 'stdout') : null,
+    );
+    const stderrCapture = createTextCapture(
+      SHELL_CAPTURE_TAIL_BYTES,
+      onData ? (text) => onData(stripAnsi(text), 'stderr') : null,
+    );
+
+    child.stdout.on('data', (chunk) => {
+      stdoutCapture.append(chunk);
     });
-
-    let stdoutBuf = '';
-    let stderrBuf = '';
-
-    // A listener that throws must not lose the command's result.
-    const tell = (chunk, stream) => {
-      if (!onData) return;
-      try { onData(stripAnsi(String(chunk)), stream); } catch { /* ignore */ }
-    };
-
-    child.stdout.on('data', (chunk) => { stdoutBuf += chunk; tell(chunk, 'stdout'); });
-    child.stderr.on('data', (chunk) => { stderrBuf += chunk; tell(chunk, 'stderr'); });
+    child.stderr.on('data', (chunk) => {
+      stderrCapture.append(chunk);
+    });
 
     child.on('close', (exitCode) => {
       clearTimeout(timer);
       resolve({
         success: exitCode === 0,
-        stdout: stripAnsi(stdoutBuf).trim(),
-        stderr: stripAnsi(stderrBuf).trim(),
+        stdout: stdoutCapture.finish(),
+        stderr: stderrCapture.finish(),
         exitCode,
         command: cmd,
       });
@@ -127,7 +325,7 @@ function capture(spawnChild, { cmd, timeout, cwd, env, onData }) {
       if (err.name === 'AbortError') {
         resolve({
           success: false,
-          stdout: '',
+          stdout: stdoutCapture.finish(),
           stderr: `Timeout after ${timeout}ms`,
           exitCode: null,
           command: cmd,
@@ -135,7 +333,7 @@ function capture(spawnChild, { cmd, timeout, cwd, env, onData }) {
       } else {
         resolve({
           success: false,
-          stdout: '',
+          stdout: stdoutCapture.finish(),
           stderr: err.message,
           exitCode: null,
           command: cmd,
@@ -170,8 +368,17 @@ function capture(spawnChild, { cmd, timeout, cwd, env, onData }) {
  * @returns {Promise<{ success: boolean, stdout: string, stderr: string, exitCode: number|null, command: string }>}
  */
 export function runCommandLine(cmd, options = {}) {
-  const { timeout = 900000, cwd = process.cwd(), env = null, onData = null } = options;
-  return capture((spawnOptions) => spawn(cmd, [], { ...spawnOptions, shell: true }), { cmd, timeout, cwd, env, onData });
+  const {
+    timeout = 900000,
+    cwd = process.cwd(),
+    env = null,
+    onData = null,
+    replaceEnv = false,
+  } = options;
+  return capture(
+    (spawnOptions) => spawn(cmd, [], { ...spawnOptions, shell: true }),
+    { cmd, timeout, cwd, env, onData, replaceEnv },
+  );
 }
 
 // ─── runLive ──────────────────────────────────────────────────────────────────
@@ -196,12 +403,20 @@ export function runLive(cmd, options = {}) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeout);
 
-    const child = spawn(shell, [flag, cmd], {
-      cwd,
-      signal: ac.signal,
-      stdio: [stdin, 'inherit', 'inherit'],
-      windowsHide: true,
-    });
+    let child;
+    try {
+      child = spawn(shell, [flag, cmd], {
+        cwd,
+        signal: ac.signal,
+        stdio: [stdin, 'inherit', 'inherit'],
+        windowsHide: true,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      if (err.name !== 'AbortError') process.stderr.write(err.message);
+      resolve(null);
+      return;
+    }
 
     child.on('close', (exitCode) => {
       clearTimeout(timer);
@@ -244,11 +459,17 @@ export function runInteractive(cmd, options = {}) {
 
 export function runInteractiveFile(file, args, { cwd = process.cwd() } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(file, args, {
-      cwd,
-      stdio: 'inherit',
-      windowsHide: true,
-    });
+    let child;
+    try {
+      child = spawn(file, args, {
+        cwd,
+        stdio: 'inherit',
+        windowsHide: true,
+      });
+    } catch {
+      resolve({ success: false, exitCode: null });
+      return;
+    }
 
     child.on('close', (exitCode) => {
       resolve({ success: exitCode === 0, exitCode });
@@ -267,6 +488,7 @@ export function runInteractiveFile(file, args, { cwd = process.cwd() } = {}) {
  * Intended for commands like `sudo -S` that read input from stdin.
  *
  * Never throws. The returned Promise always resolves with a CommandResult.
+ * Captured stdout and stderr each contain only the newest bounded byte tail.
  *
  * @param {string} cmd - The executable to spawn (e.g. 'sudo').
  * @param {string[]} argsArray - Arguments passed directly to the executable.
@@ -275,16 +497,28 @@ export function runInteractiveFile(file, args, { cwd = process.cwd() } = {}) {
  */
 export function runWithStdin(cmd, argsArray, stdinData = '') {
   return new Promise((resolve) => {
-    const child = spawn(cmd, argsArray, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
+    let child;
+    try {
+      child = spawn(cmd, argsArray, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } catch (err) {
+      resolve({
+        success: false,
+        stdout: '',
+        stderr: err.message,
+        exitCode: null,
+        command: cmd,
+      });
+      return;
+    }
 
-    let stdoutBuf = '';
-    let stderrBuf = '';
+    const stdoutCapture = createTextCapture(SHELL_CAPTURE_TAIL_BYTES);
+    const stderrCapture = createTextCapture(SHELL_CAPTURE_TAIL_BYTES);
 
-    child.stdout.on('data', (chunk) => { stdoutBuf += chunk; });
-    child.stderr.on('data', (chunk) => { stderrBuf += chunk; });
+    child.stdout.on('data', (chunk) => stdoutCapture.append(chunk));
+    child.stderr.on('data', (chunk) => stderrCapture.append(chunk));
 
     child.stdin.write(stdinData);
     child.stdin.end();
@@ -292,8 +526,8 @@ export function runWithStdin(cmd, argsArray, stdinData = '') {
     child.on('close', (exitCode) => {
       resolve({
         success: exitCode === 0,
-        stdout: stripAnsi(stdoutBuf).trim(),
-        stderr: stripAnsi(stderrBuf).trim(),
+        stdout: stdoutCapture.finish(),
+        stderr: stderrCapture.finish(),
         exitCode,
         command: cmd,
       });
@@ -302,7 +536,7 @@ export function runWithStdin(cmd, argsArray, stdinData = '') {
     child.on('error', (err) => {
       resolve({
         success: false,
-        stdout: '',
+        stdout: stdoutCapture.finish(),
         stderr: err.message,
         exitCode: null,
         command: cmd,

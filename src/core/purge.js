@@ -44,6 +44,16 @@ import { closeDb, initDb } from './db.js';
 import { runtimeDir, runtimeNodePath, inspectLink } from './service/runtime.js';
 import { detectInstallSource } from './installSource.js';
 import { PACKAGE } from './updater.js';
+import {
+  describeManagedCertificates,
+  removeManagedCertificateArtifacts,
+  pathIsInside,
+} from './ssl/managed-artifacts.js';
+import {
+  acquireArtifactLock,
+  SSL_ARTIFACT_LIFECYCLE_LOCK,
+} from './ssl/artifact-lock.js';
+import { retireLegacyDeployLogs } from './deploy/logRetirement.js';
 
 const require = createRequire(import.meta.url);
 
@@ -74,24 +84,41 @@ export function exportBackup({
   now = new Date(),
   log = () => {},
 } = {}) {
-  const dest = path.join(into, backupName(now));
-
   if (!fs.existsSync(dataDir)) {
     return { ok: false, reason: `there is no data directory at ${dataDir}` };
   }
 
-  // Refusing rather than merging into something that already exists: a second
-  // purge in the same second is unlikely, but overwriting a backup is exactly
-  // the kind of thing that is only noticed when it is needed.
-  if (fs.existsSync(dest)) {
-    return { ok: false, reason: `${dest} already exists` };
+  let dest;
+  try {
+    fs.mkdirSync(into, { recursive: true, mode: 0o700 });
+    if (process.platform !== 'win32') fs.chmodSync(into, 0o700);
+    const base = backupName(now);
+    for (let suffix = 1; suffix < 10_000; suffix += 1) {
+      const candidate = path.join(into, suffix === 1 ? base : `${base}-${suffix}`);
+      if (pathIsInside(dataDir, candidate)) {
+        return {
+          ok: false,
+          reason: `the backup destination ${candidate} is inside the data directory`,
+        };
+      }
+      try {
+        fs.mkdirSync(candidate, { recursive: false, mode: 0o700 });
+        if (process.platform !== 'win32') fs.chmodSync(candidate, 0o700);
+        dest = candidate;
+        break;
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error;
+      }
+    }
+    if (!dest) throw new Error('could not reserve a unique backup directory');
+  } catch (error) {
+    return { ok: false, reason: `could not create the backup directory: ${error.message}` };
   }
 
   const config = safeConfig();
 
   closeDb();
   try {
-    fs.mkdirSync(dest, { recursive: true });
     fs.cpSync(dataDir, path.join(dest, 'data'), { recursive: true });
   } catch (err) {
     return { ok: false, reason: `could not copy ${dataDir}: ${err.message}` };
@@ -187,6 +214,23 @@ function dirSize(target) {
   return total;
 }
 
+function containmentPath(target) {
+  try {
+    return fs.realpathSync.native(target);
+  } catch {
+    return path.resolve(target);
+  }
+}
+
+function pathsOverlap(parent, child) {
+  const realParent = containmentPath(parent);
+  const realChild = containmentPath(child);
+  return pathIsInside(parent, child)
+    || pathIsInside(child, parent)
+    || pathIsInside(realParent, realChild)
+    || pathIsInside(realChild, realParent);
+}
+
 /**
  * What a purge would remove and what it would keep, without doing anything.
  *
@@ -216,7 +260,31 @@ export function plan({ dataDir = getDataDir(), certificates = 'keep', config = l
   ];
 
   if (certificates === 'remove') {
-    removes.push({ what: 'the certificates', path: config.sslDir ?? '(not configured)' });
+    const certificatePlan = describeManagedCertificates({
+      dataDir,
+      configuredSslDir: config.sslDir ?? null,
+    });
+    for (const root of certificatePlan.roots) {
+      removes.push({ what: 'managed certificate files and keys', path: root });
+    }
+    for (const root of certificatePlan.unmanaged) {
+      keeps.push({ what: 'unmanaged certificates and keys', path: root });
+    }
+    for (const root of certificatePlan.refused ?? []) {
+      keeps.push({ what: 'unsafe or unrecognized certificates and keys', path: root.path });
+    }
+    if (certificatePlan.roots.length) {
+      keeps.push({
+        what: 'unmanaged certificate files and unrelated content in managed roots',
+        path: certificatePlan.roots.join(', '),
+      });
+    }
+    if (!certificatePlan.ok) {
+      keeps.push({
+        what: 'certificates that could not be verified against the managed-certificate manifest',
+        path: certificatePlan.manifestPath,
+      });
+    }
   } else {
     keeps.push({ what: 'the certificates and keys', path: config.sslDir ?? '(not configured)' });
   }
@@ -233,7 +301,29 @@ export function plan({ dataDir = getDataDir(), certificates = 'keep', config = l
  * @param {(line: string) => void} [opts.log]
  * @returns {Promise<Object>}
  */
-export async function purge({
+export async function purge(options = {}) {
+  const dataDir = options.dataDir ?? getDataDir();
+  if (!fs.existsSync(dataDir)) return purgeUnlocked({ ...options, dataDir });
+  const purgeLock = await acquireArtifactLock({
+    dataDir,
+    key: 'easy-devops-purge',
+    timeoutMs: 10_000,
+  });
+  let lifecycleLock = null;
+  try {
+    lifecycleLock = await acquireArtifactLock({
+      dataDir,
+      key: SSL_ARTIFACT_LIFECYCLE_LOCK,
+      timeoutMs: 60_000,
+    });
+    return await purgeUnlocked({ ...options, dataDir });
+  } finally {
+    lifecycleLock?.release();
+    purgeLock.release();
+  }
+}
+
+async function purgeUnlocked({
   dataDir = getDataDir(),
   certificates = 'keep',
   backupDir = defaultBackupDir(),
@@ -243,6 +333,59 @@ export async function purge({
   const service = deps.service ?? (await import('./service/index.js'));
   const config = deps.config ?? loadConfig();
   const source = (deps.detectInstallSource ?? detectInstallSource)();
+
+  // A backup copies the whole data directory. Refuse before that copy if an
+  // existing configuration or ownership manifest places private-key material
+  // inside it. Managed cleanup later cannot repair a backup that already
+  // contains that material.
+  if (certificates === 'remove') {
+    const certificatePlan = describeManagedCertificates({
+      dataDir,
+      configuredSslDir: config.sslDir ?? null,
+    });
+    const roots = [
+      config.sslDir,
+      ...(certificatePlan.roots ?? []).map((entry) => entry.path),
+      ...(certificatePlan.refused ?? []).map((entry) => entry.path),
+      ...(certificatePlan.unmanaged ?? []),
+    ].filter(Boolean);
+    const overlap = roots.find((root) => pathsOverlap(dataDir, root));
+    if (overlap) {
+      return {
+        ok: false,
+        step: 'certificate-preflight',
+        reason: `The certificate root ${overlap} overlaps the Easy DevOps data directory. Move it outside the data directory before removing certificates or creating a backup.`,
+        untouched: true,
+        hint: 'Nothing was backed up or removed. Change sslDir in Settings, then run the purge again.',
+        certificatePlan,
+      };
+    }
+  }
+
+  // A backup must never preserve a pre-1.4.5 raw deployment log. This runs
+  // before exportBackup, and an active deployment blocks the purge instead of
+  // producing a backup whose safety cannot be proven.
+  log('Retiring unsafe legacy deployment logs...');
+  let logRetirement;
+  try {
+    logRetirement = (deps.retireLegacyDeployLogs ?? retireLegacyDeployLogs)({ dataDir });
+  } catch (error) {
+    logRetirement = { ok: false, errors: [{ reason: error.message }], activeApps: [] };
+  }
+  if (!logRetirement.ok || logRetirement.activeApps.length > 0) {
+    const active = logRetirement.activeApps.length > 0
+      ? ` Active deployment(s): ${logRetirement.activeApps.join(', ')}.`
+      : '';
+    const detail = logRetirement.errors?.map((entry) => entry.reason).filter(Boolean).join('; ');
+    return {
+      ok: false,
+      step: 'log-security',
+      reason: `Unsafe legacy deployment logs could not be retired.${active}${detail ? ` ${detail}` : ''}`,
+      untouched: true,
+      hint: 'Wait for active deployments to finish, fix the reported file error, and retry the purge.',
+      logRetirement,
+    };
+  }
 
   // 1. The backup. Nothing is removed if this fails.
   log('Exporting a backup of the data directory...');
@@ -257,8 +400,10 @@ export async function purge({
     };
   }
 
+  const finalKeeps = plan({ dataDir, certificates, config }).keeps;
   const removed = [];
   const failed = [];
+  let certificateCleanup = null;
 
   // 2. The service. Attempted before the files it points at are deleted, so
   // the service manager is not left with an entry for a missing binary.
@@ -305,15 +450,24 @@ export async function purge({
     }
   }
 
-  // 4. The certificates, only if asked.
-  if (certificates === 'remove' && config.sslDir) {
-    if (fs.existsSync(config.sslDir)) {
-      try {
-        fs.rmSync(config.sslDir, { recursive: true, force: true });
-        removed.push({ what: 'the certificates', detail: config.sslDir });
-      } catch (err) {
-        failed.push({ what: 'the certificates', reason: err.message });
-      }
+  // 4. The certificates, only if asked. This deletes manifest-owned files and
+  // empty recorded directories one by one. It never recursively removes sslDir.
+  if (certificates === 'remove') {
+    certificateCleanup = await removeManagedCertificateArtifacts({
+      dataDir,
+      unmanagedSslDir: config.sslDir ?? null,
+    });
+    for (const file of certificateCleanup.removedFiles) {
+      removed.push({ what: 'managed certificate file', detail: file });
+    }
+    for (const directory of certificateCleanup.removedDirectories) {
+      removed.push({ what: 'managed certificate directory', detail: directory });
+    }
+    for (const error of certificateCleanup.errors) {
+      failed.push({ what: 'managed certificate cleanup', reason: `${error.path}: ${error.reason}` });
+    }
+    if (!certificateCleanup.removedFiles.length && !certificateCleanup.removedDirectories.length) {
+      log('No manifest-owned certificate files were found; unmanaged certificate data was kept.');
     }
   }
 
@@ -324,30 +478,64 @@ export async function purge({
   // the directory that was just deleted, which is the one thing a purge must
   // not do. It IS reopened when the removal failed, so a failed purge leaves a
   // working process rather than one that throws on its next read.
-  log('Removing the data directory...');
-  closeDb();
-  let databaseClosed = true;
-  try {
-    fs.rmSync(dataDir, { recursive: true, force: true });
-    removed.push({ what: 'the data directory', detail: dataDir });
-  } catch (err) {
-    failed.push({ what: 'the data directory', reason: err.message });
-    initDb();
-    databaseClosed = false;
+  const protectedCertificateRoots = [
+    config.sslDir,
+    ...(certificateCleanup?.roots?.map((entry) => entry.path) ?? []),
+  ].filter(Boolean);
+  const nestedCertificateRoot = protectedCertificateRoots
+    .find((root) => pathsOverlap(dataDir, root));
+  let databaseClosed = false;
+  const certificateLedgerUnsafe = certificates === 'remove' && certificateCleanup?.ok !== true;
+  if (certificateLedgerUnsafe) {
+    failed.push({
+      what: 'the data directory',
+      reason: 'certificate cleanup did not complete safely, so the data directory and its managed-artifact manifest were kept for a safe retry',
+    });
+  } else if (nestedCertificateRoot) {
+    failed.push({
+      what: 'the data directory',
+      reason: `refusing recursive deletion because it overlaps certificate data at ${nestedCertificateRoot}; move sslDir outside the Easy DevOps data directory and retry`,
+    });
+  } else {
+    log('Removing the data directory...');
+    closeDb();
+    databaseClosed = true;
+    try {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+      removed.push({ what: 'the data directory', detail: dataDir });
+    } catch (err) {
+      failed.push({ what: 'the data directory', reason: err.message });
+      initDb();
+      databaseClosed = false;
+    }
   }
 
   // The machine-wide directory in Server mode, which is a second location.
   if (isWindows) {
     const machine = programDataDir();
     if (fs.existsSync(machine) && path.resolve(machine) !== path.resolve(dataDir)) {
-      try {
-        fs.rmSync(machine, { recursive: true, force: true });
-        removed.push({ what: 'the machine-wide data directory', detail: machine });
-      } catch (err) {
+      const nestedMachineCertificateRoot = protectedCertificateRoots
+        .find((root) => pathsOverlap(machine, root));
+      if (certificateLedgerUnsafe) {
         failed.push({
           what: 'the machine-wide data directory',
-          reason: `${err.message} (needs an Administrator terminal)`,
+          reason: 'certificate cleanup did not complete safely, so the machine-wide data directory and its managed-artifact manifest were kept for a safe retry',
         });
+      } else if (nestedMachineCertificateRoot) {
+        failed.push({
+          what: 'the machine-wide data directory',
+          reason: `refusing recursive deletion because it overlaps certificate data at ${nestedMachineCertificateRoot}`,
+        });
+      } else {
+        try {
+          fs.rmSync(machine, { recursive: true, force: true });
+          removed.push({ what: 'the machine-wide data directory', detail: machine });
+        } catch (err) {
+          failed.push({
+            what: 'the machine-wide data directory',
+            reason: `${err.message} (needs an Administrator terminal)`,
+          });
+        }
       }
     }
   }
@@ -358,10 +546,11 @@ export async function purge({
     backup,
     removed,
     failed,
+    certificateCleanup,
     // The caller is expected to exit after this: the data directory is gone
     // and nothing in this process can read or write settings any more.
     databaseClosed,
-    kept: plan({ dataDir, certificates, config }).keeps,
+    kept: finalKeeps,
     // The package itself cannot remove the package: npm would be deleting the
     // files it is running from. So the last step is the user's.
     finalCommand: source.kind === 'clone'

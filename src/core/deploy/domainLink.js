@@ -20,9 +20,10 @@ import { findDomain, handleHubDomainCommand } from '../domains-db.js';
 import { validateDomainName, validateBoolean, validateBehindCloudflare } from '../validators.js';
 import { findCertificateForDomain, normalizeForMatch, wildcardCovers } from '../cert-suggest.js';
 import { issueCertificate, prepareDomainForHttpChallenge, reloadNginx, describeIssuance, verifyServedCertificate } from '../ssl-issuer.js';
+import { openVerifiedChild } from '../safe-file.js';
 
 import { getApp, setAppDomain } from './apps.js';
-import { readState, releaseDir } from './store.js';
+import { readEngineJson, readState, releaseDir } from './store.js';
 
 /**
  * The port an app listens on: what is set on the app, else what its live
@@ -37,7 +38,16 @@ export function appPort(app) {
   try {
     const current = readState(app.id).current;
     if (!current) return null;
-    const meta = JSON.parse(fs.readFileSync(path.join(releaseDir(app.id, current), 'ez.release.json'), 'utf8'));
+    let meta = readEngineJson(app.id, current, 'ez.release.json');
+    if (!meta) {
+      const directory = releaseDir(app.id, current);
+      const opened = openVerifiedChild(path.join(directory, 'ez.release.json'), { expectedDirectory: directory });
+      try {
+        meta = JSON.parse(fs.readFileSync(opened.fd, 'utf8'));
+      } finally {
+        opened.close();
+      }
+    }
     return Number.isInteger(meta.port) && meta.port > 0 ? meta.port : null;
   } catch {
     return null;
@@ -148,8 +158,12 @@ export async function linkDomain(appId, input = {}, deps = {}) {
     suggest = findCertificateForDomain,
     verify = verifyServedCertificate,
     onProgress = null,
+    recheck = null,
   } = deps;
   const progress = typeof onProgress === 'function' ? onProgress : () => {};
+  const authorize = () => {
+    if (typeof recheck === 'function') recheck();
+  };
 
   const {
     domain,
@@ -226,6 +240,7 @@ export async function linkDomain(appId, input = {}, deps = {}) {
   }
 
   progress('domain', 'running');
+  authorize();
   const result = existing
     ? await domainCommand({ action: 'update', name, domain: record })
     : await domainCommand({ action: 'create', domain: { name, ...record } });
@@ -236,6 +251,7 @@ export async function linkDomain(appId, input = {}, deps = {}) {
     return { ok: false, status: 500, error };
   }
 
+  authorize();
   setAppDomain(appId, name);
   progress('domain', 'ok');
 
@@ -246,13 +262,18 @@ export async function linkDomain(appId, input = {}, deps = {}) {
     // The HTTP config must be live before the ACME challenge is attempted.
     // This reload belongs to the certificate step; the final one is reported
     // as its own `nginx reload` stage below.
+    authorize();
     reloaded = await reload();
+    authorize();
     sslResult = await requestCertificate(name, {
-      www, redirect, domainCommand, issue, prepare, onProgress: progress,
+      www, redirect, domainCommand, issue, prepare, onProgress: progress, authorize,
     });
 
     progress('nginx config test', 'running');
-    if (sslResult.ok) reloaded = await reload();
+    if (sslResult.ok) {
+      authorize();
+      reloaded = await reload();
+    }
     const reloadDetail = reloaded?.ok ? undefined : 'nginx reload failed';
     progress('nginx config test', reloaded?.ok ? 'ok' : 'failed', reloadDetail);
     progress('nginx reload', 'running');
@@ -287,6 +308,7 @@ export async function linkDomain(appId, input = {}, deps = {}) {
     }
 
     progress('nginx config test', 'running');
+    authorize();
     reloaded = await reload();
     const reloadDetail = reloaded?.ok ? undefined : 'nginx reload failed';
     progress('nginx config test', reloaded?.ok ? 'ok' : 'failed', reloadDetail);
@@ -324,7 +346,9 @@ export async function linkDomain(appId, input = {}, deps = {}) {
 }
 
 /** Requests a certificate for a freshly linked domain and switches the domain to HTTPS. */
-async function requestCertificate(name, { www, redirect, domainCommand, issue, prepare, onProgress = null }) {
+async function requestCertificate(name, {
+  www, redirect, domainCommand, issue, prepare, onProgress = null, authorize = () => {},
+}) {
   const progress = typeof onProgress === 'function' ? onProgress : () => {};
   const config = loadConfig();
   if (!config.acmeEmail) {
@@ -337,6 +361,7 @@ async function requestCertificate(name, { www, redirect, domainCommand, issue, p
   let stage = 'challenge ready';
   try {
     const record = findDomain(name);
+    authorize();
     const prepared = await prepare(record);
     if (!prepared.ok) {
       progress('challenge ready', 'failed', `Could not prepare nginx for the challenge: ${prepared.error}`);
@@ -344,6 +369,7 @@ async function requestCertificate(name, { www, redirect, domainCommand, issue, p
       return { mode: 'issue', ok: false, detail: `Could not prepare nginx for the challenge: ${prepared.error}` };
     }
 
+    authorize();
     const issued = await issue(name, {
       validationMethod: 'http',
       email: config.acmeEmail,
@@ -365,6 +391,7 @@ async function requestCertificate(name, { www, redirect, domainCommand, issue, p
 
     stage = 'https';
     progress('https', 'running');
+    authorize();
     const updated = await domainCommand({
       action: 'update',
       name,
@@ -419,9 +446,12 @@ export function unlinkDomain(appId) {
  * @returns {Promise<{ ok: boolean, error: string|null }>}
  */
 export async function deleteLinkedDomain(app, deps = {}) {
-  const { domainCommand = handleHubDomainCommand } = deps;
+  const { domainCommand = handleHubDomainCommand, recheck = null } = deps;
   if (!app?.domain || !findDomain(app.domain)) return { ok: true, error: null };
-  const result = await domainCommand({ action: 'delete', name: app.domain });
+  if (typeof recheck === 'function') recheck();
+  const result = await domainCommand({ action: 'delete', name: app.domain }, {
+    recheck,
+  });
   return { ok: Boolean(result?.ok), error: result?.ok ? null : (result?.error ?? 'The domain could not be removed.') };
 }
 

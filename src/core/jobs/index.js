@@ -60,6 +60,7 @@ import { initHubAgent, stopHubAgent, reconcileHubAgent } from '../hub/agent.js';
 import { startMonitors } from './monitors.js';
 import { startDeployHookManager } from '../deploy/hookServer.js';
 import { startRevisionWatcher } from './revisionWatcher.js';
+import { retireLegacyDeployLogs } from '../deploy/logRetirement.js';
 
 /** How often a standby re-checks whether a daemon has appeared or gone. */
 export const OWNERSHIP_POLL_MS = 15_000;
@@ -177,6 +178,29 @@ export function startJobs({
       const swept = sweepAbandoned(lockOpts);
       if (swept > 0) console.log(`[jobs] cleared ${swept} abandoned notification claim(s)`);
     } catch { /* non-fatal */ }
+
+    // Pre-1.4.5 deployment logs cannot be re-redacted with values that have
+    // since been removed. Retire their bytes before any monitor or Hub agent
+    // can read deployment history. Active deployments are retried next start.
+    try {
+      const retired = retireLegacyDeployLogs(lockOpts);
+      if (retired.retiredRuns > 0 || retired.removedLogs > 0) {
+        console.log(
+          `[jobs] retired ${retired.retiredRuns} legacy deployment run(s) `
+          + `and ${retired.removedLogs} log file(s)`,
+        );
+      }
+      if (retired.activeApps.length > 0) {
+        console.log(
+          `[jobs] deferred legacy-log retirement for ${retired.activeApps.length} active deployment(s)`,
+        );
+      }
+      if (!retired.ok) {
+        console.error('[jobs] legacy deployment-log retirement reported an error');
+      }
+    } catch (err) {
+      console.error('[jobs] legacy deployment-log retirement failed:', err.message);
+    }
 
     handles.monitors = startMonitors({ intervals });
 

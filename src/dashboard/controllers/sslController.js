@@ -423,6 +423,13 @@ class SslController {
             'Disable SSL on those domains (or remove the lines) before deleting it.',
         });
       }
+      if (outcome.code === 'cert_not_managed') {
+        return res.status(409).json({
+          error: 'cert_not_managed',
+          detail: outcome.detail
+            ?? 'This certificate was not recorded as created by Easy DevOps, so it was not deleted.',
+        });
+      }
       if (outcome.code === 'delete_failed') {
         return res.status(500).json({ error: 'delete_failed', detail: outcome.detail });
       }

@@ -51,9 +51,14 @@
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
-import { randomUUID } from 'node:crypto';
 
-import { run as defaultRun, runFile as defaultRunFile, runCommandLine as defaultRunCommandLine } from '../shell.js';
+import {
+  commandEnvironment,
+  commandEnvironmentSecrets,
+  run as defaultRun,
+  runFile as defaultRunFile,
+  runCommandLine as defaultRunCommandLine,
+} from '../shell.js';
 import * as defaultRunner from '../runner.js';
 import { createDeployEvent } from '../events.js';
 import { sendNotification as defaultSendNotification } from '../notifier.js';
@@ -68,11 +73,20 @@ import {
 import { LAUNCHER_FILE, LAUNCHER_SOURCE, LAUNCHER_COMMAND_ENV } from './launcher.js';
 import { RUN_STAGES, plannedSkippedStages, stageForStep } from './stages.js';
 import {
-  acquireLock, appPaths, ensureAppDirs, isId, listReleases, logFile, newReleaseId, pathsIn, pruneReleases, pruneRuns,
-  readRun, readState, releaseDir, validateDeployDir, writeRun, writeState,
+  acquireLock, appPaths, engineReleaseDir, ensureAppDirs, ensureEngineReleaseDir, isId,
+  listReleases, logFile, newReleaseId, pathsIn, pruneReleases, pruneRuns,
+  readEngineJson, readRun, readState, releaseDir, removeEngineRelease,
+  validateDeployDir, writeRun, writeState,
 } from './store.js';
+import { openVerifiedChild, writeFileEventual } from '../safe-file.js';
+import {
+  LOG_SECURITY_REDACTED_V1,
+  createDeployLogRedactor,
+  sanitizeDeployText,
+  snapshotDeploySecrets,
+} from './logSecurity.js';
 
-/** The PM2 config written into every release. Its presence is what makes a release startable. */
+/** The PM2 config generated for every release. Its presence is what makes a release startable. */
 export const PM2_CONFIG_FILE = 'ez.pm2.json';
 
 const GIT_TIMEOUT_MS = 5 * 60 * 1000;
@@ -91,6 +105,8 @@ const ROLLBACK_HEALTH_TIMEOUT_S = 30;
 const BOOT_CONFIRM_MS = 5000;
 /** PM2 out+error lines kept in the run record when a release crashes at boot. */
 const BOOT_LOG_LINES = 40;
+/** Longest partial output line held by the logger before a safe fragment is written. */
+export const MAX_LOG_FRAGMENT_CHARS = 16 * 1024;
 
 const MIGRATE_HINT =
   'Migrations are forward-only: rolling the code back cannot undo a migration that already ran. ' +
@@ -166,13 +182,10 @@ export function isHealthyStatus(status, strict) {
  * @returns {string}
  */
 export function redactSecrets(text, env = {}, token = null) {
-  let out = String(text ?? '');
   const values = [...Object.values(env ?? {}), token]
     .filter((v) => typeof v === 'string' && v.length > 0)
     .sort((a, b) => b.length - a.length);
-
-  for (const value of values) out = out.split(value).join('***');
-  return out;
+  return sanitizeDeployText(text, values);
 }
 
 // ─── The engine ───────────────────────────────────────────────────────────────
@@ -188,39 +201,99 @@ function resolveDeps(deps = {}) {
     sendNotification: deps.sendNotification ?? defaultSendNotification,
     syncDomain: deps.syncDomain ?? syncLinkedDomain,
     deleteDomain: deps.deleteDomain ?? deleteLinkedDomain,
+    recheck: typeof deps.recheck === 'function' ? deps.recheck : null,
     now: deps.now ?? (() => Date.now()),
   };
 }
 
-/** Appends timestamped lines to a run's log. Never throws: a full disk must not mask the real error. */
-function makeLogger(appId, runId) {
+/**
+ * Appends timestamped lines to a run's log.
+ *
+ * The redactor is part of the writer, not a later reader. A secret is therefore
+ * absent from the persisted file even if it is removed from Settings before
+ * anyone opens the run. Neither this function nor its public accessors reveal
+ * the snapshot.
+ *
+ * Never throws: a full disk must not mask the real deployment error.
+ */
+export function makeLogger(appId, runId, secrets) {
   const file = logFile(appId, runId);
+  const redactor = createDeployLogRedactor(secrets);
   let partial = '';
+  let atLineStart = true;
+  let droppedPartial = 0;
 
   const write = (text) => {
     try { fs.appendFileSync(file, text); } catch { /* ignore */ }
   };
   const stamp = () => new Date().toISOString().slice(11, 19);
+  const writeSanitized = (text) => write(redactor.write(text));
+
+  const writeOutputLine = (line, { newline = true } = {}) => {
+    let prefix = '';
+    if (atLineStart) {
+      prefix = '          ';
+      atLineStart = false;
+    }
+    write(`${prefix}${line}${newline ? '\n' : ''}`);
+    if (newline) atLineStart = true;
+  };
+
+  const drainOutput = (force = false) => {
+    while (partial.length > 0) {
+      const newline = partial.indexOf('\n');
+      if (newline !== -1) {
+        const line = partial.slice(0, newline).replace(/\r$/, '');
+        partial = partial.slice(newline + 1);
+        writeOutputLine(line);
+        continue;
+      }
+
+      if (partial.length < MAX_LOG_FRAGMENT_CHARS && !force) return;
+
+      /*
+       * A newline-free producer must not grow this buffer without bound. The
+       * redactor has already removed complete secrets, so writing a fragment is
+       * safe. Keep the final character until flush because a carriage return
+       * pair can be split across chunks.
+       */
+      let cut = Math.min(MAX_LOG_FRAGMENT_CHARS, partial.length);
+      if (cut < partial.length) cut -= 1;
+      if (force) cut = partial.length;
+      const fragment = partial.slice(0, cut);
+      partial = partial.slice(cut);
+      writeOutputLine(fragment, { newline: false });
+      if (force) break;
+    }
+  };
 
   return {
     file,
     /** A line written by the engine itself. */
     line(text = '') {
-      write(`${stamp()}  ${text}\n`);
+      writeSanitized(`${stamp()}  ${text}\n`);
     },
     /** A heading for a step. */
     step(title) {
-      write(`\n${stamp()}  ── ${title}\n`);
+      writeSanitized(`\n${stamp()}  ── ${title}\n`);
     },
-    /** Raw output from a command, line-buffered so chunks do not interleave mid-line. */
+    /** Raw output from a command, redacted before it reaches disk. */
     output(chunk) {
-      partial += String(chunk).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-      const lines = partial.split('\n');
-      partial = lines.pop() ?? '';
-      if (lines.length > 0) write(lines.map((l) => `          ${l}`).join('\n') + '\n');
+      const safe = redactor.write(String(chunk ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
+      partial += safe;
+      drainOutput(false);
     },
     flush() {
-      if (partial) { write(`          ${partial}\n`); partial = ''; }
+      partial += redactor.flush();
+      if (droppedPartial > 0 && partial.length === 0) {
+        partial = `[incomplete log line truncated: ${droppedPartial} characters]\n`;
+        droppedPartial = 0;
+      }
+      drainOutput(true);
+      if (!atLineStart) {
+        write('\n');
+        atLineStart = true;
+      }
     },
   };
 }
@@ -570,7 +643,7 @@ function persistentLinks(appId) {
   const out = [];
   for (const id of listReleases(appId)) {
     const dir = releaseDir(appId, id);
-    for (const rel of releaseHealth(dir).persist) out.push({ dir, rel });
+    for (const rel of releaseHealth(appId, id, dir).persist) out.push({ dir, rel });
   }
   return out;
 }
@@ -648,27 +721,66 @@ function regularReleaseFile(file) {
   return Boolean(entry?.isFile() && entry.nlink === 1);
 }
 
-/** Publish a fresh inode. A repository-controlled link must never receive a write or chmod. */
-function writeReleaseFile(file, contents) {
-  if (!fs.lstatSync(path.dirname(file)).isDirectory()) throw new Error('Invalid release directory');
-  const existing = fs.lstatSync(file, { throwIfNoEntry: false });
-  if (existing && !existing.isFile()) throw new Error(`Invalid generated file: ${path.basename(file)}`);
-  const temporary = path.join(path.dirname(file), `.ez-write-${randomUUID()}`);
-  const fd = fs.openSync(temporary, 'wx', 0o600);
+function engineArtifactFile(appId, releaseId, fileName) {
+  if (typeof fileName !== 'string' || path.basename(fileName) !== fileName) {
+    throw new Error(`Invalid engine artifact name: ${JSON.stringify(fileName)}`);
+  }
+  return path.join(engineReleaseDir(appId, releaseId), fileName);
+}
+
+/** Publish an engine-owned artifact through exclusive create and atomic rename. */
+function writeEngineFile(appId, releaseId, fileName, contents) {
+  ensureEngineReleaseDir(appId, releaseId);
+  writeFileEventual(engineArtifactFile(appId, releaseId, fileName), contents, { mode: 0o600 });
+}
+
+/**
+ * Read a pre-1.4.5 artifact without following a final link, then publish the
+ * validated copy into the engine-owned directory. Legacy checkouts are only a
+ * migration source. No generated write ever targets them.
+ */
+function migrateLegacyArtifact(appId, releaseId, fileName, releaseDirectory) {
+  const legacy = path.join(releaseDirectory, fileName);
+  if (!regularReleaseFile(legacy)) return null;
+
+  let opened;
   try {
-    try {
-      fs.writeFileSync(fd, contents);
-    } finally {
-      fs.closeSync(fd);
-    }
-    fs.renameSync(temporary, file);
+    opened = openVerifiedChild(legacy, { expectedDirectory: releaseDirectory });
+    const contents = fs.readFileSync(opened.fd, 'utf8');
+    writeEngineFile(appId, releaseId, fileName, contents);
+    return contents;
+  } catch {
+    return null;
   } finally {
-    fs.rmSync(temporary, { force: true });
+    opened?.close();
   }
 }
 
-/** Writes the PM2 config (and the launcher, when needed) into a release directory. */
-function writePm2Config(dir, app, settings, env) {
+function readLegacyArtifact(appId, releaseId, fileName, releaseDirectory) {
+  const current = engineArtifactFile(appId, releaseId, fileName);
+  if (regularReleaseFile(current)) {
+    try {
+      return fs.readFileSync(current, 'utf8');
+    } catch {
+      return null;
+    }
+  }
+  return migrateLegacyArtifact(appId, releaseId, fileName, releaseDirectory);
+}
+
+function configFileForRelease(appId, releaseId, directory) {
+  const contents = readLegacyArtifact(appId, releaseId, PM2_CONFIG_FILE, directory);
+  if (contents === null) return null;
+  try {
+    const parsed = JSON.parse(contents);
+    return Array.isArray(parsed?.apps) ? engineArtifactFile(appId, releaseId, PM2_CONFIG_FILE) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Writes the PM2 config and launcher into the engine-owned artifact directory. */
+function writePm2Config(dir, app, releaseId, settings, env) {
   const start = parseStartCommand(settings.start);
   const entry = {
     name: pm2Name(app.id),
@@ -684,8 +796,9 @@ function writePm2Config(dir, app, settings, env) {
     entry.script = start.script;
     if (start.args.length > 0) entry.args = start.args;
   } else {
-    writeReleaseFile(path.join(dir, LAUNCHER_FILE), LAUNCHER_SOURCE);
-    entry.script = LAUNCHER_FILE;
+    const launcher = engineArtifactFile(app.id, releaseId, LAUNCHER_FILE);
+    writeEngineFile(app.id, releaseId, LAUNCHER_FILE, LAUNCHER_SOURCE);
+    entry.script = launcher;
     entry.env[LAUNCHER_COMMAND_ENV] = start.command;
   }
 
@@ -696,18 +809,21 @@ function writePm2Config(dir, app, settings, env) {
     entry.instances = settings.instances === 'max' ? 'max' : (settings.instances ?? 1);
   }
 
-  const file = path.join(dir, PM2_CONFIG_FILE);
+  const file = engineArtifactFile(app.id, releaseId, PM2_CONFIG_FILE);
   // Holds the app's environment, so owner-only like the deploy key.
-  writeReleaseFile(file, JSON.stringify({ apps: [entry] }, null, 2));
+  writeEngineFile(app.id, releaseId, PM2_CONFIG_FILE, JSON.stringify({ apps: [entry] }, null, 2));
   return file;
 }
 
 /** Reads back the health settings a release was started with, for a rollback. */
-function releaseHealth(dir) {
+function releaseHealth(appId, releaseId, dir = releaseDir(appId, releaseId)) {
   try {
-    const file = path.join(dir, 'ez.release.json');
-    if (!regularReleaseFile(file)) throw new Error('Missing or linked release metadata');
-    const meta = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const stored = readEngineJson(appId, releaseId, 'ez.release.json');
+    const migrated = stored === null
+      ? migrateLegacyArtifact(appId, releaseId, 'ez.release.json', dir)
+      : null;
+    if (stored === null && migrated === null) throw new Error('Missing or linked release metadata');
+    const meta = stored ?? JSON.parse(migrated);
     return {
       port: Number.isInteger(meta.port) ? meta.port : null,
       healthPath: typeof meta.healthPath === 'string' ? meta.healthPath : '/',
@@ -730,14 +846,14 @@ function releaseHealth(dir) {
 export function describeRelease(appId, releaseId) {
   let dir;
   try { dir = releaseDir(appId, releaseId); } catch { return null; }
-  const meta = releaseHealth(dir);
+  const meta = releaseHealth(appId, releaseId, dir);
   return {
     id: releaseId,
     sha: meta.sha,
     ref: meta.ref,
     execMode: meta.execMode,
     instances: meta.instances,
-    startable: regularReleaseFile(path.join(dir, PM2_CONFIG_FILE)),
+    startable: configFileForRelease(appId, releaseId, dir) !== null,
   };
 }
 
@@ -909,22 +1025,22 @@ async function waitHealthy({ name, port, healthPath, strict, timeoutS, pm2Path, 
 }
 
 /**
- * Reads the tail of a crashed release's PM2 out+error log, with the app's
- * secret values removed.
+ * Reads the tail of a crashed release's PM2 out+error log, with the deployment's
+ * immutable secret snapshot removed. Sanitizing the complete text matters:
+ * splitting first would let a PEM block body survive as individual lines.
  *
  * @returns {Promise<string[]>} At most BOOT_LOG_LINES lines
  */
-async function captureBootLog(name, app, pm2Path, d) {
+async function captureBootLog(name, secretSnapshot, pm2Path, d) {
   if (typeof d.runner.logs !== 'function') return [];
   try {
     const read = await d.runner.logs(name, { lines: BOOT_LOG_LINES, run: d.run, pm2Path });
     const text = Array.isArray(read?.lines) ? read.lines.join('\n') : String(read?.output ?? '');
-    return text
+    return sanitizeDeployText(text, secretSnapshot)
       .replace(/\r\n/g, '\n')
       .split('\n')
       .filter((line) => line.trim() !== '')
-      .slice(-BOOT_LOG_LINES)
-      .map((line) => redactSecrets(line, app.env ?? {}, app.auth?.token ?? null));
+      .slice(-BOOT_LOG_LINES);
   } catch {
     return [];
   }
@@ -943,9 +1059,11 @@ async function captureBootLog(name, app, pm2Path, d) {
  *
  * @param {{ execMode?: 'fork'|'cluster' }} [options]
  */
-async function switchTo(dir, name, pm2Path, d, log, { execMode = 'fork' } = {}) {
-  const config = path.join(dir, PM2_CONFIG_FILE);
-  if (!regularReleaseFile(config)) return { ok: false, output: `${PM2_CONFIG_FILE} is missing from ${dir}.` };
+async function switchTo(appId, releaseId, dir, name, pm2Path, d, log, { execMode = 'fork' } = {}) {
+  const config = configFileForRelease(appId, releaseId, dir);
+  if (!config || !regularReleaseFile(config)) {
+    return { ok: false, output: `${PM2_CONFIG_FILE} is missing for release ${releaseId}.` };
+  }
 
   if (execMode === 'cluster' && typeof d.runner.reloadConfig === 'function') {
     const current = await readPm2Status(name, pm2Path, d);
@@ -1004,6 +1122,11 @@ async function notify(app, run, d) {
 export function startDeployment(appId, { trigger = 'manual', ref = null, actor = null, deps = {} } = {}) {
   const app = getApp(appId);
   if (!app) return { ok: false, status: 404, error: `No app named "${appId}".` };
+  const userCommandEnv = commandEnvironment(app.env ?? {});
+  const secretSnapshot = [...new Set([
+    ...snapshotDeploySecrets(app),
+    ...commandEnvironmentSecrets(userCommandEnv),
+  ])].sort((a, b) => b.length - a.length || a.localeCompare(b));
 
   if (ref !== null && ref !== undefined && ref !== '') {
     const refError = validateRef(String(ref));
@@ -1041,14 +1164,16 @@ export function startDeployment(appId, { trigger = 'manual', ref = null, actor =
     logTail: [],
     /** true/false once an automatic rollback was attempted, null when none was. */
     rollbackSucceeded: null,
+    /** The writer that produced this run's file uses this exact policy. */
+    logSecurity: LOG_SECURITY_REDACTED_V1,
   };
   writeRun(run);
 
-  const done = executeDeployment(app, run, d)
+  const done = executeDeployment(app, run, d, secretSnapshot)
     .catch((err) => {
       // executeDeployment handles its own failures; this is the net under it.
       run.status = RUN_STATUS.FAILED;
-      run.error = err?.message ?? String(err);
+      run.error = sanitizeDeployText(err?.message ?? String(err), secretSnapshot);
       run.finishedAt = d.now();
       try { writeRun(run); } catch { /* ignore */ }
       return run;
@@ -1058,8 +1183,8 @@ export function startDeployment(appId, { trigger = 'manual', ref = null, actor =
   return { ok: true, runId, done };
 }
 
-async function executeDeployment(app, run, d) {
-  const log = makeLogger(app.id, run.id);
+async function executeDeployment(app, run, d, secretSnapshot) {
+  const log = makeLogger(app.id, run.id, secretSnapshot);
   const name = pm2Name(app.id);
   const dir = releaseDir(app.id, run.releaseId);
   const before = readState(app.id);
@@ -1097,7 +1222,10 @@ async function executeDeployment(app, run, d) {
       let tail = '';
       const r = await d.runCommandLine(command, {
         cwd: dir,
-        env,
+        env: commandEnvironment({
+          ...(env ?? {}),
+        }),
+        replaceEnv: true,
         timeout: STEP_TIMEOUT_MS,
         onData: (c) => {
           log.output(c);
@@ -1112,7 +1240,7 @@ async function executeDeployment(app, run, d) {
         const why = r.exitCode === null ? (r.stderr || 'it was stopped') : `exit code ${r.exitCode}`;
         const lines = includeOutput
           ? tail.replace(/\r\n/g, '\n').split('\n').map((l) => l.trim()).filter(Boolean).slice(-5)
-            .map((l) => redactSecrets(l, app.env ?? {}, app.auth?.token ?? null))
+            .map((l) => sanitizeDeployText(l, secretSnapshot))
           : [];
         const detail = `${title} failed: "${command}" — ${why}${lines.length ? `\n${lines.join('\n')}` : ''}${hint ? `\n${hint}` : ''}`;
         if (hint) log.line(`hint: ${hint}`);
@@ -1147,7 +1275,11 @@ async function executeDeployment(app, run, d) {
     // ── 2. settings ─────────────────────────────────────────────────────────
     setStep('settings', 'Reading project settings');
     const project = loadProjectSettings(dir, app.settings ?? {});
-    for (const w of project.warnings ?? []) { log.line(`warning: ${w}`); run.warnings.push(w); }
+    for (const w of project.warnings ?? []) {
+      const safeWarning = sanitizeDeployText(w, secretSnapshot);
+      log.line(`warning: ${safeWarning}`);
+      run.warnings.push(safeWarning);
+    }
     if (!project.ok) throw new StepError('settings', project.error);
 
     const { settings, sources } = project;
@@ -1215,8 +1347,8 @@ async function executeDeployment(app, run, d) {
     }
     pm2Path = pm2.path ?? 'pm2';
 
-    writePm2Config(dir, app, settings, env);
-    writeReleaseFile(path.join(dir, 'ez.release.json'), JSON.stringify({
+    writePm2Config(dir, app, run.releaseId, settings, env);
+    writeEngineFile(app.id, run.releaseId, 'ez.release.json', JSON.stringify({
       sha: run.sha, ref: run.ref, port: settings.port, healthPath: settings.healthPath, strict,
       persist: settings.persist,
       execMode: settings.execMode,
@@ -1226,7 +1358,9 @@ async function executeDeployment(app, run, d) {
 
     log.line(`$ pm2 delete ${name}; pm2 start ${PM2_CONFIG_FILE}${settings.execMode === 'cluster' ? ' (cluster mode; a running cluster app is reloaded instead)' : ''}`);
     switched = true;
-    const started = await switchTo(dir, name, pm2Path, d, log, { execMode: settings.execMode });
+    const started = await switchTo(
+      app.id, run.releaseId, dir, name, pm2Path, d, log, { execMode: settings.execMode },
+    );
     if (!started.ok) throw new StepError('start', 'PM2 could not start the new release.');
 
     // ── 5. health ───────────────────────────────────────────────────────────
@@ -1247,7 +1381,9 @@ async function executeDeployment(app, run, d) {
     const domainNote = await d.syncDomain(app, settings.port);
     if (domainNote) {
       log.line(domainNote);
-      if (domainNote.startsWith('warning:')) run.warnings.push(domainNote.replace(/^warning:\s*/, ''));
+      if (domainNote.startsWith('warning:')) {
+        run.warnings.push(sanitizeDeployText(domainNote.replace(/^warning:\s*/, ''), secretSnapshot));
+      }
     }
 
     try {
@@ -1255,7 +1391,10 @@ async function executeDeployment(app, run, d) {
     } catch (err) {
       // The new release is live and healthy. A failing post hook is worth
       // saying loudly, but undoing a good deployment for it is not.
-      const warning = `The post-deploy hook failed, but the release is live: ${err.message}`;
+      const warning = sanitizeDeployText(
+        `The post-deploy hook failed, but the release is live: ${err.message}`,
+        secretSnapshot,
+      );
       log.line(`warning: ${warning}`);
       run.warnings.push(warning);
     }
@@ -1274,19 +1413,19 @@ async function executeDeployment(app, run, d) {
   } catch (err) {
     log.flush();
     const bootCrash = err?.bootCrash === true;
-    run.error = err?.message ?? String(err);
+    run.error = sanitizeDeployText(err?.message ?? String(err), secretSnapshot);
     run.step = err?.step ?? run.step;
     // The stage stays where the failure happened. A custom step is "step N",
     // which has no stage of its own, so only a canonical step moves `stage`.
     if (RUN_STAGES.includes(run.step)) run.stage = run.step;
-    run.reason = err?.reason ?? null;
+    run.reason = err?.reason ? sanitizeDeployText(err.reason, secretSnapshot) : null;
     log.line(`ERROR: ${run.error}`);
     run.status = RUN_STATUS.FAILED;
 
     // Read the crashed release's own PM2 log BEFORE a rollback reuses the
     // same PM2 name — afterwards these lines belong to the restored release.
     if (bootCrash) {
-      run.logTail = await captureBootLog(name, app, pm2Path, d);
+      run.logTail = await captureBootLog(name, secretSnapshot, pm2Path, d);
       if (run.logTail.length > 0) {
         log.step(`PM2 log (last ${run.logTail.length} lines, secrets redacted)`);
         for (const line of run.logTail) log.line(line);
@@ -1307,8 +1446,10 @@ async function executeDeployment(app, run, d) {
       let restored = false;
       try {
         const previousDir = releaseDir(app.id, before.current);
-        const meta = releaseHealth(previousDir);
-        const back = await switchTo(previousDir, name, pm2Path, d, log, { execMode: meta.execMode });
+        const meta = releaseHealth(app.id, before.current, previousDir);
+        const back = await switchTo(
+          app.id, before.current, previousDir, name, pm2Path, d, log, { execMode: meta.execMode },
+        );
         if (back.ok) {
           const health = await waitHealthy({
             name, port: meta.port, healthPath: meta.healthPath, strict: meta.strict,
@@ -1370,6 +1511,11 @@ async function executeDeployment(app, run, d) {
 export function startRollback(appId, { releaseId = null, actor = null, deps = {} } = {}) {
   const app = getApp(appId);
   if (!app) return { ok: false, status: 404, error: `No app named "${appId}".` };
+  const userCommandEnv = commandEnvironment(app.env ?? {});
+  const secretSnapshot = [...new Set([
+    ...snapshotDeploySecrets(app),
+    ...commandEnvironmentSecrets(userCommandEnv),
+  ])].sort((a, b) => b.length - a.length || a.localeCompare(b));
 
   const before = readState(appId);
   const target = releaseId ?? before.previous;
@@ -1381,7 +1527,8 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
 
   let targetDir;
   try { targetDir = releaseDir(appId, target); } catch { return { ok: false, status: 400, error: 'Invalid release id.' }; }
-  if (!regularReleaseFile(path.join(targetDir, PM2_CONFIG_FILE))) {
+  const targetConfig = configFileForRelease(appId, target, targetDir);
+  if (!targetConfig || !regularReleaseFile(targetConfig)) {
     return { ok: false, status: 409, error: `Release ${target} was never started, so it cannot be rolled back to.` };
   }
 
@@ -1390,7 +1537,7 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
   const lock = acquireLock(appId, { runId });
   if (!lock.ok) return { ok: false, status: 409, error: lock.reason, runId: lock.runId };
 
-  const meta = releaseHealth(targetDir);
+  const meta = releaseHealth(appId, target, targetDir);
   const run = {
     id: runId,
     appId,
@@ -1412,11 +1559,12 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
     reason: null,
     logTail: [],
     rollbackSucceeded: null,
+    logSecurity: LOG_SECURITY_REDACTED_V1,
   };
   writeRun(run);
 
   const done = (async () => {
-    const log = makeLogger(appId, runId);
+    const log = makeLogger(appId, runId, secretSnapshot);
     const name = pm2Name(appId);
     let pm2Path = 'pm2';
 
@@ -1427,7 +1575,9 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
       pm2Path = pm2.path ?? 'pm2';
 
       log.step(`Starting release ${target}`);
-      const started = await switchTo(targetDir, name, pm2Path, d, log, { execMode: meta.execMode });
+      const started = await switchTo(
+        appId, target, targetDir, name, pm2Path, d, log, { execMode: meta.execMode },
+      );
       if (!started.ok) throw new StepError('start', 'PM2 could not start that release.');
 
       run.step = 'health';
@@ -1449,8 +1599,8 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
       log.line('Rollback succeeded.');
     } catch (err) {
       run.status = RUN_STATUS.FAILED;
-      run.error = err?.message ?? String(err);
-      run.reason = err?.reason ?? null;
+      run.error = sanitizeDeployText(err?.message ?? String(err), secretSnapshot);
+      run.reason = err?.reason ? sanitizeDeployText(err.reason, secretSnapshot) : null;
       run.step = err?.step ?? run.step;
       if (RUN_STAGES.includes(run.step)) run.stage = run.step;
       log.line(`ERROR: ${run.error}`);
@@ -1459,7 +1609,10 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
       if (before.current) {
         try {
           const restoreDir = releaseDir(appId, before.current);
-          const back = await switchTo(restoreDir, name, pm2Path, d, log, { execMode: releaseHealth(restoreDir).execMode });
+          const restoreMeta = releaseHealth(appId, before.current, restoreDir);
+          const back = await switchTo(
+            appId, before.current, restoreDir, name, pm2Path, d, log, { execMode: restoreMeta.execMode },
+          );
           log.line(back.ok
             ? `Release ${before.current} was started again.`
             : `Release ${before.current} could NOT be started again. The app may be down.`);
@@ -1477,7 +1630,7 @@ export function startRollback(appId, { releaseId = null, actor = null, deps = {}
   })()
     .catch((err) => {
       run.status = RUN_STATUS.FAILED;
-      run.error = err?.message ?? String(err);
+      run.error = sanitizeDeployText(err?.message ?? String(err), secretSnapshot);
       run.finishedAt = d.now();
       try { writeRun(run); } catch { /* ignore */ }
       return run;
@@ -1517,6 +1670,7 @@ export function removeRelease(appId, releaseId) {
       return { ok: false, status: 409, error: 'That release is the one an automatic rollback would return to. Delete it after the next deployment.' };
     }
     fs.rmSync(releaseDir(appId, releaseId), { recursive: true, force: true });
+    removeEngineRelease(appId, releaseId);
     return { ok: true, status: 200, error: null, deleted: releaseId };
   } catch (err) {
     return { ok: false, status: 500, error: `The release could not be deleted: ${err.message}` };
@@ -1544,8 +1698,13 @@ export async function removeApp(appId, { deleteDomain = false, purgeData = false
   if (!lock.ok) return { ok: false, status: 409, error: 'A deployment of this app is running. Wait for it to finish.' };
 
   try {
+    if (d.recheck) d.recheck();
     await stopProcess(appId, d, { save: true });
-  } catch { /* the registry entry is removed regardless */ } finally {
+  } catch (error) {
+    if (error?.code === 'HUB_PERMISSION_REVOKED') throw error;
+    // Other stop failures do not keep a registry entry the caller asked to
+    // remove, but a revocation must stop the larger operation immediately.
+  } finally {
     lock.release();
   }
 
@@ -1554,13 +1713,15 @@ export async function removeApp(appId, { deleteDomain = false, purgeData = false
   let domainDeleted = false;
   let warning = null;
   if (deleteDomain && app.domain) {
-    const removed = await d.deleteDomain(app);
+    if (d.recheck) d.recheck();
+    const removed = await d.deleteDomain(app, { recheck: d.recheck });
     domainDeleted = removed.ok;
     if (!removed.ok) warning = `The app was deleted, but the domain ${app.domain} was not: ${removed.error}`;
   }
 
   // Resolved before the record goes: afterwards nothing knows this app's folder.
   const sharedPath = appPaths(appId).shared;
+  if (d.recheck) d.recheck();
   const files = deleteApp(appId, { purgeData }) ?? { keptShared: false };
   return {
     ok: true, status: 200, error: null, domainDeleted, warning,
@@ -1588,7 +1749,9 @@ async function stopProcess(appId, d, { save = false } = {}) {
     wasRunning = Boolean(listed.ok && listed.apps.some((a) => a.name === name));
   } catch { /* treat as not running */ }
 
+  if (d.recheck) d.recheck();
   await d.runner.del(name, { run: d.run, pm2Path });
+  if (d.recheck) d.recheck();
   if (save) await d.runner.save({ run: d.run, pm2Path });
   return { pm2Path, wasRunning };
 }
@@ -1659,14 +1822,16 @@ export async function moveApp(appId, targetDir, { deps = {} } = {}) {
   /** Starts the live release from wherever the app now is. */
   const startCurrent = async () => {
     if (!state.current || !pm2Path) return false;
-    const config = path.join(releaseDir(appId, state.current), PM2_CONFIG_FILE);
-    if (!regularReleaseFile(config)) return false;
+    const currentDir = releaseDir(appId, state.current);
+    const config = configFileForRelease(appId, state.current, currentDir);
+    if (!config || !regularReleaseFile(config)) return false;
     const started = await d.runner.startConfig(config, { run: d.run, pm2Path });
     if (started.ok) await d.runner.save({ run: d.run, pm2Path });
     return started.ok;
   };
 
   try {
+    if (d.recheck) d.recheck();
     ({ pm2Path, wasRunning } = await stopProcess(appId, d));
 
     // An empty folder left by an earlier attempt would make the rename fail.
@@ -1674,9 +1839,11 @@ export async function moveApp(appId, targetDir, { deps = {} } = {}) {
 
     // Detached first: a junction holds an absolute path into the old folder,
     // and a cross-device copy must not read through the links.
+    if (d.recheck) d.recheck();
     detachPersistentLinks(appId);
 
     try {
+      if (d.recheck) d.recheck();
       if (fs.existsSync(from)) moveDirectory(from, to);
       else fs.mkdirSync(to, { recursive: true });
     } catch (err) {
@@ -1686,6 +1853,7 @@ export async function moveApp(appId, targetDir, { deps = {} } = {}) {
       return { ok: false, status: 500, error: `The folder could not be moved: ${err.message}` };
     }
 
+    if (d.recheck) d.recheck();
     setAppDir(appId, to);
     const relinkFailures = attachPersistentLinks(appId);
 
@@ -1696,18 +1864,19 @@ export async function moveApp(appId, targetDir, { deps = {} } = {}) {
     // Each release's PM2 config names its own absolute path.
     for (const id of listReleases(appId)) {
       const dir = releaseDir(appId, id);
-      const file = path.join(dir, PM2_CONFIG_FILE);
       try {
-        if (!regularReleaseFile(file)) continue;
+        const file = configFileForRelease(appId, id, dir);
+        if (!file || !regularReleaseFile(file)) continue;
         const config = JSON.parse(fs.readFileSync(file, 'utf8'));
         for (const entry of config.apps ?? []) entry.cwd = dir;
-        writeReleaseFile(file, JSON.stringify(config, null, 2));
+        writeEngineFile(appId, id, PM2_CONFIG_FILE, JSON.stringify(config, null, 2));
       } catch { /* a release that never started has no config */ }
     }
 
     let restarted = false;
     let warning = null;
     if (wasRunning) {
+      if (d.recheck) d.recheck();
       restarted = await startCurrent();
       if (!restarted) warning = 'The app was moved, but PM2 could not start it again. Deploy it, or start it from the Processes page.';
     }

@@ -27,6 +27,7 @@ import { TEST_DATA_DIR } from './lib/guard.mjs';
 
 import fs from 'fs';
 import path from 'path';
+import { spawn } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -41,6 +42,26 @@ function check(label, passed, detail = '') {
 }
 
 const srcUrl = (rel) => pathToFileURL(path.join(ROOT, 'src', rel)).href;
+
+function runNodeChild(source) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
+      env: {
+        ...process.env,
+        EZ_TEST: '1',
+        EASY_DEVOPS_DATA_DIR: TEST_DATA_DIR,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', (error) => resolve({ code: -1, stdout, stderr: String(error) }));
+    child.on('exit', (code) => resolve({ code, stdout, stderr }));
+  });
+}
 
 /** A minimal Express `res` that records what was answered. */
 function captureRes() {
@@ -147,8 +168,21 @@ async function testSetupRequiresCode() {
 
   await resetToFirstRun();
   resetAll();
-  const issued = await setupCode.issue();
   const controller = new AuthController();
+
+  // A missing or damaged record must not turn password setup into an open
+  // endpoint. Startup normally creates one, but this branch is the fail-closed
+  // boundary if that process did not complete.
+  const unavailable = captureRes();
+  await controller.setup(req({ password: 'correct-horse', setupCode: '123456' }), unavailable);
+  check('password setup without any stored issuance is refused',
+    unavailable.out.code === 400
+      && /No usable setup code is outstanding/.test(unavailable.out.body?.error ?? ''),
+    `${unavailable.out.code} ${JSON.stringify(unavailable.out.body)}`);
+  check('a damaged setup record stores no password',
+    loadConfig().dashboardPasswordHash === '');
+
+  const issued = await setupCode.issue();
 
   // GET /api/auth says a code is needed, without saying which.
   const authRes = captureRes();
@@ -335,7 +369,189 @@ async function testLimits() {
     loginRes.out.code !== 429, String(loginRes.out.code));
 }
 
-// ─── 5. It never leaves the machine ──────────────────────────────────────────
+// ─── 5. Concurrent guesses and rotations ────────────────────────────────────
+
+async function testConcurrentStateChanges() {
+  setGroup('5. overlapping guesses and rotations keep exact state');
+
+  const setupCode = await import(srcUrl('core/setupCode.js'));
+  const { default: AuthController } = await import(srcUrl('dashboard/controllers/authController.js'));
+  const { resetAll } = await import(srcUrl('dashboard/lib/loginRateLimit.js'));
+  const { dbGet } = await import(srcUrl('core/db.js'));
+
+  await resetToFirstRun();
+  resetAll();
+  await setupCode.issue();
+
+  const before = dbGet('setup-code');
+  check('every new issuance has an identifier',
+    typeof before.issuanceId === 'string' && before.issuanceId.length > 0);
+
+  const guesses = await Promise.all(
+    Array.from({ length: setupCode.MAX_GLOBAL_FAILURES }, () => setupCode.verify('000000')),
+  );
+  const after = dbGet('setup-code');
+  check('overlapping failures are all counted', after.failures === setupCode.MAX_GLOBAL_FAILURES,
+    `${after.failures}/${setupCode.MAX_GLOBAL_FAILURES}`);
+  check('the cap burns exactly at the documented count',
+    after.burned === true
+      && guesses.filter((guess) => guess.burned).length === 1
+      && Math.max(...guesses.map((guess) => guess.failures)) === setupCode.MAX_GLOBAL_FAILURES,
+    JSON.stringify(guesses.map((guess) => ({ failures: guess.failures, burned: guess.burned }))));
+  check('concurrent failures never overwrite the issuance id',
+    after.issuanceId === before.issuanceId);
+
+  // A boolean "we hold a file" flag is not re-entrancy: it also lets every
+  // overlapping call in this process run at once while the first awaits.
+  // Prove the async-context lock serializes independent calls while nested
+  // calls inside one critical section still work.
+  const lockOrder = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const firstLocked = setupCode.withSetupCodeLock(async () => {
+    lockOrder.push('first-enter');
+    await firstGate;
+    await setupCode.withSetupCodeLock(async () => {
+      lockOrder.push('nested');
+    });
+    lockOrder.push('first-exit');
+  });
+  const secondLocked = setupCode.withSetupCodeLock(async () => {
+    lockOrder.push('second-enter');
+  });
+  while (!lockOrder.includes('first-enter')) await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  check('a concurrent call waits while the first critical section is awaiting',
+    !lockOrder.includes('second-enter'), lockOrder.join(' → '));
+  releaseFirst();
+  await Promise.all([firstLocked, secondLocked]);
+  check('nested calls are re-entrant and the waiting call enters afterward',
+    lockOrder.join(' → ') === 'first-enter → nested → first-exit → second-enter',
+    lockOrder.join(' → '));
+
+  const replacementToken = 'replacement-owner-must-survive';
+  await setupCode.withSetupCodeLock(async () => {
+    const activeLock = path.join(TEST_DATA_DIR, 'setup-code.lock');
+    fs.unlinkSync(activeLock);
+    fs.writeFileSync(activeLock, `${JSON.stringify({
+      pid: process.pid,
+      token: replacementToken,
+      createdAt: Date.now(),
+    })}\n`, { mode: 0o600 });
+  });
+  let replacementRecord = null;
+  try {
+    replacementRecord = JSON.parse(fs.readFileSync(
+      path.join(TEST_DATA_DIR, 'setup-code.lock'),
+      'utf8',
+    ));
+  } catch { /* asserted below */ }
+  check('releasing an owner token never deletes a replacement owner lock',
+    replacementRecord?.token === replacementToken);
+  try { fs.unlinkSync(path.join(TEST_DATA_DIR, 'setup-code.lock')); } catch { /* absent */ }
+
+  // Rotate while a correct scrypt comparison is in flight. The lock makes the
+  // rotation wait, then the old proof is explicitly consumed with its issuance
+  // id so it cannot clear or authorize the new code.
+  const rotated = await setupCode.issue();
+  const oldIssuance = dbGet('setup-code').issuanceId;
+  const verified = setupCode.verify(rotated.code);
+  const rotation = setupCode.issue();
+  const [proof] = await Promise.all([verified, rotation]);
+  check('the proof identifies the issuance it checked',
+    proof.ok === true && typeof proof.issuanceId === 'string', JSON.stringify(proof));
+  check('a stale compare-and-clear cannot remove the newer code',
+    (await setupCode.clear(proof.issuanceId)) === false
+      && dbGet('setup-code')?.issuanceId !== oldIssuance
+      && setupCode.required() === true);
+  check('the old cleartext is rejected after rotation',
+    (await setupCode.verify(rotated.code)).ok === false);
+
+  // Two independent processes must not each apply a stale counter snapshot.
+  await resetToFirstRun();
+  await setupCode.issue();
+  const originalIssuance = dbGet('setup-code').issuanceId;
+  const childSource = `
+    const setupCode = await import(${JSON.stringify(srcUrl('core/setupCode.js'))});
+    const result = await setupCode.verify('000000');
+    process.stdout.write(JSON.stringify(result));
+  `;
+  const [childA, childB] = await Promise.all([runNodeChild(childSource), runNodeChild(childSource)]);
+  const persisted = dbGet('setup-code');
+  check('two processes can each complete a correctly serialized failed attempt',
+    childA.code === 0 && childB.code === 0
+      && persisted.failures === 2,
+    `A=${childA.code}:${childA.stderr} B=${childB.code}:${childB.stderr} failures=${persisted.failures}`);
+  check('the cross-process lock leaves the original issuance intact',
+    persisted.issuanceId === originalIssuance && persisted.burned === false);
+
+  // PID reuse must not keep an abandoned lock alive. The replacement process
+  // does not own the heartbeat, so the stale mtime is authoritative.
+  const reusedPidLock = path.join(TEST_DATA_DIR, 'setup-code.lock');
+  fs.writeFileSync(reusedPidLock, `${JSON.stringify({
+    pid: process.pid,
+    token: 'crashed-owner-with-a-reused-pid',
+    createdAt: Date.now() - 600_000,
+  })}\n`, { mode: 0o600 });
+  const oldLockTime = new Date(Date.now() - 600_000);
+  fs.utimesSync(reusedPidLock, oldLockTime, oldLockTime);
+  let recoveredReusedPid = false;
+  await setupCode.withSetupCodeLock(async () => {
+    recoveredReusedPid = true;
+  });
+  check('a stale lock is recovered even when its PID now belongs to a live process',
+    recoveredReusedPid && !fs.existsSync(reusedPidLock));
+
+  for (const [kind, body] of [
+    ['empty', ''],
+    ['truncated', '{"pid":'],
+  ]) {
+    fs.writeFileSync(reusedPidLock, body, { mode: 0o600 });
+    fs.utimesSync(reusedPidLock, oldLockTime, oldLockTime);
+    let recoveredDamaged = false;
+    await setupCode.withSetupCodeLock(async () => {
+      recoveredDamaged = true;
+    });
+    check(`a stale ${kind} lock left by an interrupted owner is recovered`,
+      recoveredDamaged && !fs.existsSync(reusedPidLock));
+  }
+
+  const cliSource = fs.readFileSync(path.join(ROOT, 'src/cli/menus/dashboard.js'), 'utf8');
+  const issueStart = cliSource.indexOf('async function issueSetupCode');
+  const issueEnd = cliSource.indexOf('\n/**', issueStart);
+  const issueBody = cliSource.slice(issueStart, issueEnd);
+  const lockAt = issueBody.indexOf('withSetupCodeLock');
+  const reloadAt = lockAt === -1 ? -1 : issueBody.indexOf('loadConfig()', lockAt);
+  const setupPendingAt = reloadAt === -1 ? -1 : issueBody.indexOf('setupPending', reloadAt);
+  const issueAt = setupPendingAt === -1 ? -1 : issueBody.indexOf('issue()', setupPendingAt);
+  check('the CLI rechecks setup state inside the issuance lock',
+    issueStart !== -1
+      && lockAt >= 0
+      && reloadAt > lockAt
+      && setupPendingAt > reloadAt
+      && issueAt > setupPendingAt,
+    JSON.stringify({ lockAt, reloadAt, setupPendingAt, issueAt }));
+
+  // Two correct HTTP submissions race from an unconfigured state. Exactly one
+  // may set the password; the other must observe the committed state.
+  await resetToFirstRun();
+  resetAll();
+  const final = await setupCode.issue();
+  const controller = new AuthController();
+  const first = captureRes();
+  const second = captureRes();
+  await Promise.all([
+    controller.setup(req({ password: 'correct-horse', setupCode: final.code }), first),
+    controller.setup(req({ password: 'different-horse', setupCode: final.code }), second),
+  ]);
+  const codes = [first.out.code, second.out.code].sort();
+  check('exactly one concurrent setup succeeds', codes[0] === 200 && codes[1] === 409,
+    codes.join(','));
+  check('the successful request leaves setup complete',
+    setupCode.required() === false && setupCode.publicState().state === 'none');
+}
+
+// ─── 6. It never leaves the machine ──────────────────────────────────────────
 
 /**
  * The property the user asked for, tested two ways.
@@ -349,7 +565,7 @@ async function testLimits() {
  * because it can only search the payloads that exist today.
  */
 async function testNeverLeaves() {
-  setGroup('5. the code never leaves the machine');
+  setGroup('6. the code never leaves the machine');
 
   const setupCode = await import(srcUrl('core/setupCode.js'));
   const { default: AuthController } = await import(srcUrl('dashboard/controllers/authController.js'));
@@ -480,6 +696,7 @@ async function main() {
   await testSetupRequiresCode();
   await testNoPasswordPath();
   await testLimits();
+  await testConcurrentStateChanges();
   await testNeverLeaves();
 
   const failed = results.filter((r) => !r.passed);

@@ -82,6 +82,43 @@ function realStartupSnapshot() {
 
 const REAL_STARTUP_BEFORE = realStartupSnapshot();
 
+/**
+ * Metadata-only snapshot of the real Server-mode directory.
+ *
+ * It may legitimately exist on a development machine with Easy DevOps
+ * installed. The suite must prove it did not add or replace an entry rather
+ * than assume the directory is absent.
+ */
+function realProgramDataSnapshot() {
+  const root = path.join(process.env.ProgramData || 'C:\\ProgramData', 'easy-devops');
+  try {
+    fs.lstatSync(root);
+  } catch (error) {
+    return error.code === 'ENOENT' ? 'absent' : `unreadable:${error.code ?? error.message}`;
+  }
+
+  const entries = [];
+  const walk = (dir, relative = '.') => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = path.join(dir, entry.name);
+      const shown = path.posix.join(relative, entry.name);
+      const stat = fs.lstatSync(full);
+      entries.push(`${shown}|${stat.isDirectory() ? 'd' : stat.isSymbolicLink() ? 'l' : 'f'}|${stat.size}|${stat.mtimeMs}`);
+      if (stat.isDirectory() && !stat.isSymbolicLink()) walk(full, shown);
+    }
+  };
+  try {
+    const rootStat = fs.lstatSync(root);
+    entries.push(`.|d|${rootStat.size}|${rootStat.mtimeMs}`);
+    walk(root);
+    return entries.join('\n');
+  } catch (error) {
+    return `unreadable:${error.code ?? error.message}`;
+  }
+}
+
+const REAL_PROGRAMDATA_BEFORE = realProgramDataSnapshot();
+
 function scratch(name) {
   const dir = path.join(TEST_DATA_DIR, 'scratch', name);
   assertInsideTestDataDir(dir, `create the scratch dir ${name}`);
@@ -112,6 +149,15 @@ function stubRun(rules = []) {
   run.calls = calls;
   run.matching = (re) => calls.filter((c) => re.test(c));
   return run;
+}
+
+/** A fetch response accepted by downloadWinsw; verification is injected. */
+function winswResponse(bytes = 'fresh wrapper bytes') {
+  return {
+    ok: true,
+    status: 200,
+    arrayBuffer: async () => Buffer.from(bytes),
+  };
 }
 
 /**
@@ -346,21 +392,23 @@ async function testSystemdInstall() {
     return { success: !failCopy, exitCode: Number(failCopy) };
   };
 
-  // install() requires a TTY, which a test child does not have. Faking it is
-  // the point of the check: the real guard is that a non-TTY is REFUSED, which
-  // is asserted first.
+  // Control terminal detection explicitly. e2e/run.mjs inherits stdio, so the
+  // suite must not change its verdict depending on whether it was started from
+  // an interactive shell.
   const refusedWithoutTty = await sd.install({
-    nodeExe: '/x/node', entry: '/x/entry.js', dataDir: dir, interactive, fileRunner, unitPath,
+    nodeExe: '/x/node',
+    entry: '/x/entry.js',
+    dataDir: dir,
+    interactive,
+    fileRunner,
+    unitPath,
+    stdin: { isTTY: false },
   });
   check('install refuses without a terminal, because sudo must ask',
     refusedWithoutTty.ok === false && /terminal/i.test(refusedWithoutTty.reason),
     refusedWithoutTty.reason?.slice(0, 60));
 
-  const realIsTty = process.stdin.isTTY;
-  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
-
-  try {
-    const installed = await sd.install({
+  const installed = await sd.install({
       nodeExe: '/x/node',
       entry: '/x/entry.js',
       dataDir: dir,
@@ -368,49 +416,59 @@ async function testSystemdInstall() {
       interactive,
       fileRunner,
       unitPath,
+      stdin: { isTTY: true },
       runner: stubRun([[/journalctl/, { stdout: '' }]]),
-    });
+  });
 
-    check('install succeeds with the stub', installed.ok === true, installed.reason ?? '');
+  check('install succeeds with the stub', installed.ok === true, installed.reason ?? '');
 
-    const joined = commands.join('\n');
-    check('it reloads systemd', joined.includes('sudo systemctl daemon-reload'));
-    check('it enables the unit for boot', /sudo systemctl enable easy-devops\.service/.test(joined));
-    check('it starts the unit', /sudo systemctl restart easy-devops\.service/.test(joined));
+  const joined = commands.join('\n');
+  check('it reloads systemd', joined.includes('sudo systemctl daemon-reload'));
+  check('it enables the unit for boot', /sudo systemctl enable easy-devops\.service/.test(joined));
+  check('it starts the unit', /sudo systemctl restart easy-devops\.service/.test(joined));
 
-    check('every privileged command goes through sudo, which does its own asking',
-      commands.filter((c) => /systemctl|cp |chmod/.test(c)).every((c) => c.startsWith('sudo ')),
-      commands.filter((c) => /systemctl|cp |chmod/.test(c)).find((c) => !c.startsWith('sudo ')) ?? '');
+  check('every privileged command goes through sudo, which does its own asking',
+    commands.filter((c) => /systemctl|cp |chmod/.test(c)).every((c) => c.startsWith('sudo ')),
+    commands.filter((c) => /systemctl|cp |chmod/.test(c)).find((c) => !c.startsWith('sudo ')) ?? '');
 
-    check('no command contains a password, a prompt flag or a stdin pipe',
-      !commands.some((c) => /-S\b|--stdin|password|echo .*\|/i.test(c)),
-      commands.find((c) => /-S\b|--stdin|password/i.test(c)) ?? '');
+  check('no command contains a password, a prompt flag or a stdin pipe',
+    !commands.some((c) => /-S\b|--stdin|password|echo .*\|/i.test(c)),
+    commands.find((c) => /-S\b|--stdin|password/i.test(c)) ?? '');
 
-    check('successful install cleans up the private staging directory', stages.length === 1 && !fs.existsSync(stages[0]));
-    failCopy = true;
-    const failed = await sd.install({
-      nodeExe: '/x/node', entry: '/x/entry.js', dataDir: dir, user: 'deploy', interactive, fileRunner, unitPath,
-    });
-    check('failed install uses and cleans up a fresh private directory',
-      !failed.ok && stages.length === 2 && stages[1] !== stages[0] && !fs.existsSync(stages[1]));
-    failCopy = false;
+  check('successful install cleans up the private staging directory', stages.length === 1 && !fs.existsSync(stages[0]));
+  failCopy = true;
+  const failed = await sd.install({
+      nodeExe: '/x/node',
+      entry: '/x/entry.js',
+      dataDir: dir,
+      user: 'deploy',
+      interactive,
+      fileRunner,
+      unitPath,
+    stdin: { isTTY: true },
+  });
+  check('failed install uses and cleans up a fresh private directory',
+    !failed.ok && stages.length === 2 && stages[1] !== stages[0] && !fs.existsSync(stages[1]));
+  failCopy = false;
 
-    // ── uninstall ───────────────────────────────────────────────────────────
-    commands.length = 0;
-    const removed = await sd.uninstall({ interactive, fileRunner, unitPath });
-    check('uninstall succeeds', removed.ok === true, removed.reason ?? '');
+  // ── uninstall ───────────────────────────────────────────────────────────
+  commands.length = 0;
+  const removed = await sd.uninstall({
+    interactive,
+    fileRunner,
+    unitPath,
+    stdin: { isTTY: true },
+  });
+  check('uninstall succeeds', removed.ok === true, removed.reason ?? '');
 
-    const removeJoined = commands.join('\n');
-    check('uninstall stops the unit', /sudo systemctl stop easy-devops\.service \|\| true/.test(removeJoined));
-    check('uninstall disables it', /sudo systemctl disable easy-devops\.service \|\| true/.test(removeJoined));
-    check('uninstall removes the unit file', /sudo rm -f/.test(removeJoined));
-    check('uninstall resets a failed state so a reinstall starts clean',
-      /reset-failed/.test(removeJoined));
-    check('steps that may legitimately fail are tolerant',
-      removeJoined.split('\n').filter((c) => /stop|disable|reset-failed/.test(c)).every((c) => c.endsWith('|| true')));
-  } finally {
-    Object.defineProperty(process.stdin, 'isTTY', { value: realIsTty, configurable: true });
-  }
+  const removeJoined = commands.join('\n');
+  check('uninstall stops the unit', /sudo systemctl stop easy-devops\.service \|\| true/.test(removeJoined));
+  check('uninstall disables it', /sudo systemctl disable easy-devops\.service \|\| true/.test(removeJoined));
+  check('uninstall removes the unit file', /sudo rm -f/.test(removeJoined));
+  check('uninstall resets a failed state so a reinstall starts clean',
+    /reset-failed/.test(removeJoined));
+  check('steps that may legitimately fail are tolerant',
+    removeJoined.split('\n').filter((c) => /stop|disable|reset-failed/.test(c)).every((c) => c.endsWith('|| true')));
 }
 
 // ─── 4. systemd status: crash loops ──────────────────────────────────────────
@@ -546,6 +604,8 @@ async function testWinswPin() {
 
   const missing = await winsw.verifyWinsw(path.join(dir, 'nope.exe'));
   check('a missing file is refused, not thrown', missing.ok === false && /cannot read/.test(missing.reason));
+  check('the read failure keeps its system error code for repair', missing.code === 'ENOENT',
+    missing.code ?? 'none');
 
   // The download path must not leave a bad file behind under the final name.
   const dest = path.join(dir, 'download-target.exe');
@@ -722,10 +782,10 @@ async function testGuardRefusesProgramData() {
 
   // Run in children, because the guard throws at getDataDir() and the refusal
   // depends on the environment being set before any import.
-  const programData = scratch('guard-machine');
   const roaming = scratch('guard-user');
   // The guard permits anything under os.tmpdir(). Give each child its own
-  // temp root, beside the simulated profile and machine directories.
+  // temp root. Machine data under ProgramData is therefore probed by its fixed
+  // lexical path: changing the environment must never move that boundary.
   const childTemp = scratch('guard-temp');
   const probe = (dataDir) => new Promise((resolve) => {
     const child = spawn(process.execPath, [
@@ -736,7 +796,8 @@ async function testGuardRefusesProgramData() {
       cwd: ROOT,
       env: {
         ...process.env, EZ_TEST: '1', EASY_DEVOPS_DATA_DIR: dataDir,
-        ProgramData: programData, APPDATA: roaming, TEMP: childTemp, TMP: childTemp,
+        ProgramData: path.join(TEST_DATA_DIR, 'guard-machine'), APPDATA: roaming,
+        TEMP: childTemp, TMP: childTemp,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -745,13 +806,12 @@ async function testGuardRefusesProgramData() {
     child.on('exit', () => resolve(out));
   });
 
-  const ezProgramData = path.join(programData, 'easy-devops');
-
-  fs.mkdirSync(path.join(ezProgramData, 'sub', 'dir'), { recursive: true });
+  const programData = 'C:\\ProgramData';
+  const ezProgramData = path.win32.join(programData, 'easy-devops');
   const exact = await probe(ezProgramData);
   check('C:\\ProgramData\\easy-devops is refused', exact.startsWith('REFUSED'), exact.slice(0, 80));
 
-  const inside = await probe(path.join(ezProgramData, 'sub', 'dir'));
+  const inside = await probe(path.win32.join(ezProgramData, 'sub', 'dir'));
   check('a directory inside it is refused', inside.startsWith('REFUSED'), inside.slice(0, 80));
 
   const parent = await probe(programData);
@@ -1018,8 +1078,48 @@ async function testRuntime() {
   check('an app directory with no dependencies is diagnosed', missing.ok === false);
   check('and the fix names npm install', /npm install/.test(missing.fix ?? missing.reason ?? ''));
 
+  // A merge into a stale runtime used to preserve this executable package.
+  const copySource = scratch('runtime-copy-source');
+  fs.mkdirSync(path.join(copySource, 'src', 'cli'), { recursive: true });
+  fs.writeFileSync(path.join(copySource, 'package.json'), '{"name":"runtime-copy-test","type":"module"}\n');
+  fs.writeFileSync(path.join(copySource, 'src', 'cli', 'index.js'), '// entry\n');
+
+  const platform = await import(srcUrl('core/platform.js'));
+  const { isWindows } = platform;
+  const previousProgramData = process.env.ProgramData;
+  process.env.ProgramData = scratch('runtime-copy-programdata');
+  platform.resetDataDirCache();
+  try {
+    const copyData = scratch('runtime-copy-target');
+    const staleStub = path.join(
+      rt.runtimeDir(copyData),
+      'app',
+      'node_modules',
+      'bufferutil',
+      'easy-devops-optional.cjs',
+    );
+    fs.mkdirSync(path.dirname(staleStub), { recursive: true });
+    fs.writeFileSync(staleStub, 'throw new Error("attacker-controlled package");\n');
+
+    const copied = rt.copyRuntime({
+      dataDir: copyData,
+      appRoot: copySource,
+      nodeExe: process.execPath,
+      log: () => {},
+    });
+    check('copying a runtime succeeds', copied.ok === true, copied.reason ?? '');
+    check('an optional package already present is replaced, not reused',
+      fs.readFileSync(staleStub, 'utf8').includes('Optional module bufferutil unavailable'),
+      fs.readFileSync(staleStub, 'utf8').slice(0, 100));
+    check('and no file from the attacker package survives the replacement',
+      !fs.readFileSync(staleStub, 'utf8').includes('attacker-controlled package'));
+  } finally {
+    if (previousProgramData === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previousProgramData;
+    platform.resetDataDirCache();
+  }
+
   // The Linux symlink. Skipped on Windows, where an unprivileged symlink fails.
-  const { isWindows } = await import(srcUrl('core/platform.js'));
   if (!isWindows) {
     const dir = scratch('runtime-link');
     const linked = rt.linkRuntime({ dataDir: dir });
@@ -1361,41 +1461,52 @@ async function testVersionProbe() {
   setGroup('20. the runtime version probe actually runs node');
 
   const rt = await import(srcUrl('core/service/runtime.js'));
+  const platform = await import(srcUrl('core/platform.js'));
+  const previousProgramData = process.env.ProgramData;
+  process.env.ProgramData = scratch('runtime-probe-programdata');
+  platform.resetDataDirCache();
 
-  // The bug: the probe built `"<path>" --version` by hand, and `run()` goes
-  // through PowerShell, where a quoted path needs the `&` call operator. The
-  // daemon was starting fine from the very path status called "not runnable".
-  const out = await rt.inspectRuntime({
-    dataDir: path.join(TEST_DATA_DIR, 'no-runtime-here'),
-    recordedNodeExe: process.execPath,
-  });
+  try {
+    // The bug: the probe built `"<path>" --version` by hand, and `run()` goes
+    // through PowerShell, where a quoted path needs the `&` call operator. The
+    // daemon was starting fine from the very path status called "not runnable".
+    const out = await rt.inspectRuntime({
+      dataDir: path.join(TEST_DATA_DIR, 'no-runtime-here'),
+      recordedNodeExe: process.execPath,
+    });
 
-  check('the recorded node is found', out.pinned.exists === true, process.execPath);
-  check('its version is read, not reported as unrunnable',
-    typeof out.pinned.version === 'string' && out.pinned.version.startsWith('v'),
-    String(out.pinned.version));
-  check('it matches the running node', out.pinned.version === process.version,
-    `${out.pinned.version} vs ${process.version}`);
-  check('it is not marked broken', out.pinned.broken === false);
-  check('no warning is produced for a working runtime', out.warnings.length === 0,
-    out.warnings.join(' | '));
+    check('the recorded node is found', out.pinned.exists === true, process.execPath);
+    check('its version is read, not reported as unrunnable',
+      typeof out.pinned.version === 'string' && out.pinned.version.startsWith('v'),
+      String(out.pinned.version));
+    check('it matches the running node', out.pinned.version === process.version,
+      `${out.pinned.version} vs ${process.version}`);
+    check('it is not marked broken', out.pinned.broken === false);
+    check('no warning is produced for a working runtime', out.warnings.length === 0,
+      out.warnings.join(' | '));
 
-  // The path this host runs from contains a space ("Program Files") often
-  // enough to be worth stating: that is the case plain quoting gets wrong.
-  if (process.execPath.includes(' ')) {
-    check('the probed path contains a space, which is the hard case', true, process.execPath);
-  } else {
-    check('the probed path contains a space, which is the hard case', true,
-      'skipped: this host\'s node path has no space');
+    // The path this host runs from contains a space ("Program Files") often
+    // enough to be worth stating: that is the case plain quoting gets wrong.
+    if (process.execPath.includes(' ')) {
+      check('the probed path contains a space, which is the hard case', true, process.execPath);
+    } else {
+      check('the probed path contains a space, which is the hard case', true,
+        'skipped: this host\'s node path has no space');
+    }
+
+    // A genuinely missing binary must still be reported.
+    const missing = await rt.inspectRuntime({
+      dataDir: path.join(TEST_DATA_DIR, 'no-runtime-here'),
+      recordedNodeExe: path.join(TEST_DATA_DIR, 'nope', 'node.exe'),
+    });
+    check('a missing runtime is still detected',
+      missing.pinned.exists === false && missing.pinned.broken === true);
+    check('and names `ezz service repair`', missing.warnings.some((w) => /ezz service repair/.test(w)));
+  } finally {
+    if (previousProgramData === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previousProgramData;
+    platform.resetDataDirCache();
   }
-
-  // A genuinely missing binary must still be reported.
-  const missing = await rt.inspectRuntime({
-    dataDir: path.join(TEST_DATA_DIR, 'no-runtime-here'),
-    recordedNodeExe: path.join(TEST_DATA_DIR, 'nope', 'node.exe'),
-  });
-  check('a missing runtime is still detected', missing.pinned.exists === false && missing.pinned.broken === true);
-  check('and names `ezz service repair`', missing.warnings.some((w) => /ezz service repair/.test(w)));
 }
 
 // ─── 21. Stop and start ─────────────────────────────────────────────────────
@@ -1810,7 +1921,7 @@ async function testWinswLeftoverUpgrade() {
       run,
       fetchImpl: async () => {
         fetched = true;
-        throw new Error('a verified leftover must not be downloaded again');
+        return winswResponse();
       },
       deps: {
         canWrite: () => true,
@@ -1836,7 +1947,7 @@ async function testWinswLeftoverUpgrade() {
     const register = run.calls.find((c) => / install$/.test(c));
     check('the register command is exactly the wrapper with install, no XML path',
       register === `& "${ws.winswPath()}" install`, register ?? '(none)');
-    check('no download happened', fetched === false);
+    check('the wrapper directory is rebuilt from a fresh verified download', fetched === true);
 
     const registerAt = run.calls.indexOf(register);
     // The folders the service runs code from are protected BEFORE the
@@ -1887,7 +1998,7 @@ async function testWinswReregisters() {
       appRoot: path.join(root, 'app'),
       config: {},
       run,
-      fetchImpl: async () => { throw new Error('the wrapper is already present'); },
+      fetchImpl: async () => winswResponse(),
       deps: {
         canWrite: () => true,
         isWindows: true,
@@ -1908,12 +2019,169 @@ async function testWinswReregisters() {
     const registerAt = run.calls.findIndex((c) => / install$/.test(c));
     const before = run.calls.slice(0, registerAt);
     check('a stop runs before the register',
-      before.some((c) => / stop$/.test(c)), before.join(' | '));
+      before.some((c) => /^sc\.exe stop /.test(c) || / stop$/.test(c)), before.join(' | '));
     check('a delete or a WinSW uninstall runs before the register',
       before.some((c) => /^sc\.exe delete /.test(c) || / uninstall$/.test(c)), before.join(' | '));
+    check('reinstall never executes the pre-existing wrapper',
+      !before.some((c) => /EasyDevOps\.exe"? (?:stop|uninstall)$/i.test(c)),
+      before.join(' | '));
     check('and the register follows the cleanup',
       registerAt > -1 && run.calls[run.calls.length - 1] === `& "${ws.winswPath()}" start`,
       run.calls[run.calls.length - 1]);
+  } finally {
+    if (previous === undefined) delete process.env.ProgramData;
+    else process.env.ProgramData = previous;
+    platform.resetDataDirCache();
+  }
+}
+
+// ─── 27a. SCM's marked-for-deletion state is not success yet ────────────────
+
+async function testMarkedForDeletion() {
+  setGroup('27a. SCM deletion waits for the service record to disappear');
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+
+  const calls = [];
+  let pendingQueries = 2;
+  const run = async (command) => {
+    calls.push(command);
+    if (/^sc\.exe query /.test(command)) {
+      if (pendingQueries-- > 0) {
+        return { success: true, stdout: 'STATE : 1 STOPPED' };
+      }
+      return {
+        success: false,
+        stdout: '',
+        stderr: 'The specified service does not exist as an installed service. (1060)',
+      };
+    }
+    if (/^sc\.exe stop /.test(command)) return { success: true, stdout: '' };
+    if (/^sc\.exe delete /.test(command)) {
+      return { success: false, stdout: '', stderr: 'The service is marked for deletion. (1072)' };
+    }
+    return { success: false, stdout: '', stderr: `unexpected: ${command}` };
+  };
+
+  const removed = await ws.unregister({ run, deleteWaitMs: 100, deletePollMs: 5 });
+  check('1072 is polled until SCM reports the service missing',
+    removed.ok === true && removed.removed === true,
+    JSON.stringify(removed));
+  check('the reinstall path does not proceed while SCM still owns the record',
+    calls.filter((command) => /^sc\.exe query /.test(command)).length >= 3,
+    calls.join(' | '));
+
+  let acceptedPendingQueries = 2;
+  const acceptedCalls = [];
+  const acceptedButPending = await ws.unregister({
+    deleteWaitMs: 100,
+    deletePollMs: 5,
+    run: async (command) => {
+      acceptedCalls.push(command);
+      if (/^sc\.exe query /.test(command)) {
+        if (acceptedPendingQueries-- > 0) {
+          return { success: true, stdout: 'STATE : 1 STOPPED' };
+        }
+        return {
+          success: false,
+          stdout: '',
+          stderr: 'The specified service does not exist as an installed service. (1060)',
+        };
+      }
+      if (/^sc\.exe stop /.test(command)) return { success: true, stdout: '' };
+      if (/^sc\.exe delete /.test(command)) return { success: true, stdout: '' };
+      return { success: false, stdout: '', stderr: `unexpected: ${command}` };
+    },
+  });
+  check('a successful delete command also waits for SCM to release the record',
+    acceptedButPending.ok === true && acceptedButPending.removed === true
+      && acceptedCalls.filter((command) => /^sc\.exe query /.test(command)).length >= 3,
+    JSON.stringify({ acceptedButPending, acceptedCalls }));
+
+  let stillPending = 0;
+  const stuck = await ws.unregister({
+    deleteWaitMs: 20,
+    deletePollMs: 5,
+    run: async (command) => {
+      if (/^sc\.exe query /.test(command)) {
+        stillPending++;
+        return { success: true, stdout: 'STATE : 1 STOPPED' };
+      }
+      if (/^sc\.exe stop /.test(command)) return { success: true, stdout: '' };
+      if (/^sc\.exe delete /.test(command)) {
+        return { success: false, stdout: '', stderr: 'The service is marked for deletion. (1072)' };
+      }
+      return { success: false, stdout: '', stderr: `unexpected: ${command}` };
+    },
+  });
+  check('a record that never disappears fails closed',
+    stuck.ok === false && /still owns it/.test(stuck.reason ?? ''),
+    JSON.stringify(stuck));
+  check('and the wait was bounded', stillPending >= 2, String(stillPending));
+
+  const unknownCalls = [];
+  const unknown = await ws.unregister({
+    run: async (command) => {
+      unknownCalls.push(command);
+      if (/^sc\.exe query /.test(command)) {
+        return { success: true, stdout: 'Access is denied.' };
+      }
+      return { success: true, stdout: '' };
+    },
+  });
+  check('an unknown initial SCM state prevents every delete attempt',
+    unknown.ok === false
+      && unknownCalls.every((command) => !/^sc\.exe (?:stop|delete) /.test(command)),
+    JSON.stringify({ unknown, unknownCalls }));
+}
+
+// ─── 27b. An unknown service-manager state fails closed ──────────────────────
+
+async function testWinswUnknownRegistration() {
+  setGroup('27b. an unknown service-manager state cannot overwrite an install');
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const platform = await import(srcUrl('core/platform.js'));
+  const previous = process.env.ProgramData;
+  const root = scratch('winsw-unknown-registration');
+  process.env.ProgramData = root;
+  platform.resetDataDirCache();
+
+  try {
+    let copied = false;
+    let fetched = false;
+    const installed = await ws.install({
+      dataDir: platform.programDataDir(),
+      appRoot: path.join(root, 'app'),
+      config: {},
+      run: async (command) => {
+        if (/^sc\.exe query /.test(command)) {
+          return { success: false, stdout: '', stderr: 'Access is denied.' };
+        }
+        throw new Error(`unexpected command: ${command}`);
+      },
+      fetchImpl: async () => {
+        fetched = true;
+        return winswResponse();
+      },
+      deps: {
+        isWindows: true,
+        isElevated: () => true,
+        canWrite: () => true,
+        copyRuntime: () => {
+          copied = true;
+          return { ok: false, reason: 'must not run' };
+        },
+      },
+    });
+
+    check('install refuses when the Service Control Manager query is inconclusive',
+      installed.ok === false
+        && installed.registrationFailed === true
+        && /could not determine/i.test(installed.reason ?? ''),
+      installed.reason ?? '');
+    check('no runtime, wrapper download, or wrapper command runs after an unknown SCM state',
+      copied === false && fetched === false);
   } finally {
     if (previous === undefined) delete process.env.ProgramData;
     else process.env.ProgramData = previous;
@@ -1952,7 +2220,7 @@ async function testWinswRegistrationFailure() {
       appRoot: path.join(root, 'app'),
       config: {},
       run,
-      fetchImpl: async () => { throw new Error('the wrapper download must not be reached'); },
+      fetchImpl: async () => winswResponse(),
       deps: {
         canWrite: () => true,
         isWindows: true,
@@ -1977,7 +2245,7 @@ async function testWinswRegistrationFailure() {
     const registerAt = run.calls.findIndex((c) => / install$/.test(c));
     const cleanup = run.calls.slice(registerAt + 1);
     check('the failed registration was cleaned up afterwards',
-      cleanup.some((c) => / (stop|uninstall)$/.test(c) || /^sc delete /.test(c)),
+      cleanup.some((c) => /^sc\.exe delete EasyDevOps$/.test(c)),
       cleanup.join(' | '));
   } finally {
     if (previous === undefined) delete process.env.ProgramData;
@@ -2128,6 +2396,55 @@ async function testDataDirOriginal() {
     });
     check('nothing to move reports no original, not a false path',
       direct.ok === true && direct.originalAt === null);
+
+    const outside = path.join(root, 'outside');
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'keep.txt'), 'OUTSIDE');
+
+    const linkedParent = path.join(root, 'linked-parent');
+    fs.symlinkSync(outside, linkedParent, 'junction');
+    const linkedSource = path.join(root, 'linked-source');
+    fs.mkdirSync(linkedSource, { recursive: true });
+    fs.writeFileSync(path.join(linkedSource, 'easy-devops.sqlite'), 'LINKED');
+    const linkedDestination = path.join(linkedParent, 'easy-devops');
+    const linkedRefused = moveDataDir({ from: linkedSource, to: linkedDestination });
+    check('a linked destination component is refused before the copy',
+      linkedRefused.ok === false
+        && /link|reparse/i.test(linkedRefused.reason ?? '')
+        && !fs.existsSync(path.join(outside, 'easy-devops'))
+        && fs.existsSync(path.join(linkedSource, 'easy-devops.sqlite')),
+      linkedRefused.reason ?? '');
+
+    const linkedTreeSource = path.join(root, 'linked-tree-source');
+    fs.mkdirSync(linkedTreeSource, { recursive: true });
+    fs.writeFileSync(path.join(linkedTreeSource, 'easy-devops.sqlite'), 'TREE');
+    fs.symlinkSync(outside, path.join(linkedTreeSource, 'escape'), 'junction');
+    const linkedTreeTarget = path.join(root, 'linked-tree-target');
+    const linkedTreeRefused = moveDataDir({ from: linkedTreeSource, to: linkedTreeTarget });
+    check('a reparse point inside the source tree is refused before the copy',
+      linkedTreeRefused.ok === false
+        && /link|reparse/i.test(linkedTreeRefused.reason ?? '')
+        && !fs.existsSync(linkedTreeTarget),
+      linkedTreeRefused.reason ?? '');
+
+    process.env.ProgramData = path.join(root, 'programdata-marker');
+    process.env.APPDATA = path.join(root, 'appdata-marker');
+    platform.resetDataDirCache();
+    const markerTarget = platform.programDataDir();
+    fs.mkdirSync(markerTarget, { recursive: true });
+    const foreignMarker = path.join(root, 'foreign-marker');
+    fs.mkdirSync(foreignMarker, { recursive: true });
+    fs.symlinkSync(foreignMarker, platform.serverModeMarkerPath(), 'junction');
+    const markerSource = path.join(root, 'appdata-marker', 'easy-devops');
+    fs.mkdirSync(markerSource, { recursive: true });
+    fs.writeFileSync(path.join(markerSource, 'easy-devops.sqlite'), 'MARKER-SOURCE');
+    const markerRefused = enableServerMode({});
+    check('a linked Server-mode marker is refused before data is copied into it',
+      markerRefused.ok === false
+        && /marker|link|reparse/i.test(markerRefused.reason ?? '')
+        && !fs.existsSync(path.join(markerTarget, 'easy-devops.sqlite'))
+        && fs.readFileSync(path.join(markerSource, 'easy-devops.sqlite'), 'utf8') === 'MARKER-SOURCE',
+      markerRefused.reason ?? '');
   } finally {
     if (previousProgramData === undefined) delete process.env.ProgramData;
     else process.env.ProgramData = previousProgramData;
@@ -2298,7 +2615,7 @@ async function testScExeEverywhere() {
       config: {},
       run,
       log,
-      fetchImpl: async () => { throw new Error('the wrapper is already present'); },
+      fetchImpl: async () => winswResponse(),
       deps,
     }));
     await ws.uninstall(withFileStub({ dataDir, config: {}, run, log }));
@@ -2337,10 +2654,34 @@ async function testScExeEverywhere() {
   }
 }
 
-// ─── 35. Real elevation, before anything is copied or migrated ──────────────
+// ─── 35. Shell launch failures stay structured ──────────────────────────────
+
+async function testShellLaunchSafety() {
+  setGroup('35. Windows system shell and spawn failures stay bounded');
+
+  const shell = await import(srcUrl('core/shell.js'));
+  const configured = shell.getShell();
+  const expected = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+  check('Windows PowerShell is pinned under System32', configured.shell === expected, configured.shell);
+
+  let threw = false;
+  let failed;
+  try {
+    failed = await shell.runFile('\0', []);
+  } catch (error) {
+    threw = true;
+    failed = { stderr: error.message };
+  }
+  check('a synchronous spawn rejection becomes a command result', threw === false
+    && failed.success === false && failed.exitCode === null, JSON.stringify(failed));
+  check('and the result explains the launch failure',
+    /ERR_INVALID_ARG_VALUE|null bytes|spawn/i.test(failed.stderr ?? ''), failed.stderr ?? '');
+}
+
+// ─── 36. Real elevation, before anything is copied or migrated ──────────────
 
 async function testElevation() {
-  setGroup('35. elevation is checked for real before anything');
+  setGroup('36. elevation is checked for real before anything');
 
   const ws = await import(srcUrl('core/service/windowsService.js'));
   const svc = await import(srcUrl('core/service/index.js'));
@@ -2417,6 +2758,7 @@ async function testElevation() {
       config: {},
       run,
       log: (line) => logs.push(line),
+      fetchImpl: async () => winswResponse(),
       deps: {
         isWindows: true,
         isElevated: () => null,
@@ -2442,10 +2784,10 @@ async function testElevation() {
   }
 }
 
-// ─── 36. Status agrees with Windows, not only with the files ────────────────
+// ─── 37. Status agrees with Windows, not only with the files ────────────────
 
 async function testStatusAgainstWindows() {
-  setGroup('36. status asks Windows whether the service exists');
+  setGroup('37. status asks Windows whether the service exists');
 
   const ws = await import(srcUrl('core/service/windowsService.js'));
   const svc = await import(srcUrl('core/service/index.js'));
@@ -2475,6 +2817,90 @@ async function testStatusAgainstWindows() {
     const running = await ws.status({ dataDir, config: {}, run: runningRun, granted: [] });
     check('a RUNNING state is reported', running.running === true && running.state === 'running');
     check('Start on boot is read from sc.exe qc', running.enabledOnBoot === true);
+
+    const directCalls = [];
+    const directStatus = await ws.status({
+      dataDir,
+      config: {},
+      runFile: async (file, args) => {
+        directCalls.push({ file, args });
+        if (args[0] === 'query') {
+          return { success: true, stdout: 'STATE : 4 RUNNING' };
+        }
+        if (args[0] === 'qc') {
+          return { success: true, stdout: 'START_TYPE : 2 AUTO_START' };
+        }
+        return { success: false, stdout: '', stderr: `unmatched ${args.join(' ')}` };
+      },
+      granted: [],
+    });
+    check('production status calls Service Control Manager through direct sc.exe argv',
+      directStatus.running === true
+        && directCalls.every((entry) => /sc\.exe$/i.test(entry.file))
+        && directCalls.some((entry) => JSON.stringify(entry.args) === JSON.stringify(['query', 'EasyDevOps']))
+        && directCalls.some((entry) => JSON.stringify(entry.args) === JSON.stringify(['qc', 'EasyDevOps'])),
+      JSON.stringify(directCalls));
+
+    const throwingStatus = await ws.status({
+      dataDir,
+      config: {},
+      run: async () => { throw new Error('spawn EPERM'); },
+      granted: [],
+    });
+    check('a spawn failure during status becomes an unknown state instead of throwing',
+      throwingStatus.state === 'unknown' && throwingStatus.filesPresent === true,
+      JSON.stringify(throwingStatus));
+    check('the detailed status carries the service-manager failure as a warning',
+      throwingStatus.warnings.some((warning) => /spawn EPERM/.test(warning)),
+      throwingStatus.warnings.join(' | '));
+
+    const deniedStatus = await ws.status({
+      dataDir,
+      config: {},
+      run: runningRun,
+      granted: [],
+      deps: {
+        fs: {
+          existsSync: () => {
+            const error = new Error('EPERM: operation not permitted, open EasyDevOps.exe');
+            error.code = 'EPERM';
+            throw error;
+          },
+        },
+      },
+    });
+    check('a filesystem EPERM during status stays reportable',
+      deniedStatus.state === 'running'
+      && /EPERM: operation not permitted/.test(deniedStatus.fileInspectionError ?? '')
+      && /Could not inspect the service files/.test(deniedStatus.mismatch ?? ''),
+      deniedStatus.fileInspectionError ?? '');
+
+    const hiddenStatus = await ws.status({
+      dataDir,
+      config: {},
+      run: runningRun,
+      granted: [],
+      deps: {
+        fs: {
+          existsSync: () => false,
+          lstatSync: () => {
+            const error = new Error('EPERM: operation not permitted, stat EasyDevOps.exe');
+            error.code = 'EPERM';
+            throw error;
+          },
+        },
+      },
+    });
+    check('existsSync returning false for an ACL denial is reported as unreadable, not missing',
+      hiddenStatus.state === 'running'
+      && hiddenStatus.filesPresent === false
+      && /EPERM: operation not permitted/.test(hiddenStatus.fileInspectionError ?? '')
+      && /Could not inspect the service files/.test(hiddenStatus.mismatch ?? ''),
+      JSON.stringify({
+        filesPresent: hiddenStatus.filesPresent,
+        error: hiddenStatus.fileInspectionError,
+        mismatch: hiddenStatus.mismatch,
+      }));
 
     const missingRun = async (cmd) => {
       if (/^sc\.exe query /.test(cmd)) {
@@ -2514,6 +2940,44 @@ async function testStatusAgainstWindows() {
     check('and tells the user to run ezz service install',
       warned.warnings.some((w) => /ezz service install/.test(w)),
       warned.warnings.join(' | '));
+
+    const degraded = await svc.status({
+      deps: {
+        windowsService: {
+          status: async () => { throw new Error('spawn EPERM'); },
+        },
+        inspectRuntime: async () => { throw new Error('spawn EPERM'); },
+        detectLegacy: async () => { throw new Error('spawn EPERM'); },
+        isStopRequested: () => false,
+      },
+    });
+    check('a failed service-manager probe does not make status throw',
+      degraded.service.installed === null && degraded.service.state === null,
+      JSON.stringify(degraded.service));
+    check('the service-manager spawn failure is shown as a warning',
+      degraded.warnings.some((w) => /Could not read the service state: spawn EPERM/.test(w)),
+      degraded.warnings.join(' | '));
+    check('runtime and legacy probe failures are also isolated',
+      degraded.warnings.some((w) => /pinned Node runtime: spawn EPERM/.test(w))
+      && degraded.warnings.some((w) => /legacy service leftovers: spawn EPERM/.test(w)),
+      degraded.warnings.join(' | '));
+
+    const hiddenInstall = svc.backgroundServiceState({
+      dataDir,
+      deps: {
+        mechanism: { mechanism: 'winsw', mode: 'server' },
+        fs: {
+          lstatSync() {
+            const error = new Error('EPERM: operation not permitted, open EasyDevOps.exe');
+            error.code = 'EPERM';
+            throw error;
+          },
+        },
+      },
+    });
+    check('the cheap service state reports an ACL-denied install as unknown, not absent',
+      hiddenInstall.installed === null && /EPERM/.test(hiddenInstall.detail ?? ''),
+      JSON.stringify(hiddenInstall));
   } finally {
     if (savedState === undefined) db.dbDelete('service-state');
     else db.dbSet('service-state', savedState);
@@ -2526,7 +2990,7 @@ async function testStatusAgainstWindows() {
 // ─── 37. Only real process starts count as restarts ─────────────────────────
 
 async function testRestartCounting() {
-  setGroup('37. only real process starts count as restarts');
+  setGroup('38. only real process starts count as restarts');
 
   const ws = await import(srcUrl('core/service/windowsService.js'));
 
@@ -2585,7 +3049,7 @@ async function testRestartCounting() {
 // ─── 38. Install waits for the daemon, and says when it is still starting ───
 
 async function testInstallWait() {
-  setGroup('38. install waits, and distinguishes still starting from failed');
+  setGroup('39. install waits, and distinguishes still starting from failed');
 
   const svc = await import(srcUrl('core/service/index.js'));
   const db = await import(srcUrl('core/db.js'));
@@ -2655,7 +3119,7 @@ async function testInstallWait() {
 // ─── 39. Repair while the service is running ────────────────────────────────
 
 async function testRepairWhileRunning() {
-  setGroup('39. repair stops, replaces and restores the runtime');
+  setGroup('40. repair stops, replaces and restores the runtime');
 
   const ws = await import(srcUrl('core/service/windowsService.js'));
   const rt = await import(srcUrl('core/service/runtime.js'));
@@ -2701,7 +3165,10 @@ async function testRepairWhileRunning() {
     isWindows: true,
     isElevated: () => true,
     canWrite: () => true,
-    verifyWinsw: async () => ({ ok: true }),
+    verifyWinsw: async () => {
+      events.push(`VERIFY_WINSW_STATE:${run.state.sc}`);
+      return { ok: true };
+    },
     copyRuntime: () => {
       events.push('COPY');
       events.push(`COPY_STATE:${run.state.sc}`);
@@ -2747,9 +3214,45 @@ async function testRepairWhileRunning() {
     const stopAt = successEvents.indexOf('SC_STOP');
     check('the stop came before the copy', stopAt >= 0 && copyAt > stopAt,
       `stop ${stopAt}, copy ${copyAt}`);
+    const verifyAt = successEvents.findIndex((event) => event.startsWith('VERIFY_WINSW_STATE:'));
+    check('the running wrapper is verified after the service stops',
+      verifyAt > stopAt && successEvents[verifyAt] === 'VERIFY_WINSW_STATE:STOPPED',
+      successEvents.join(' | '));
     check('the new runtime is in place',
       fs.readFileSync(path.join(dir, 'marker'), 'utf8') === 'NEW');
     check('the previous copy is gone', !fs.existsSync(`${dir}.prev`));
+
+    // A stopped wrapper that still cannot be read is a permissions problem.
+    // Repair must put the service back and must not try to download over it.
+    fs.writeFileSync(path.join(dir, 'marker'), 'OLD');
+    const unreadableEvents = [];
+    const unreadableRun = makeRun(unreadableEvents);
+    const unreadable = await ws.repair(withFileStub({
+      dataDir,
+      appRoot,
+      config: {},
+      run: unreadableRun,
+      waitForStart: async () => ({ alive: true }),
+      deps: {
+        ...makeDeps(unreadableEvents, unreadableRun),
+        verifyWinsw: async () => ({
+          ok: false,
+          code: 'EPERM',
+          reason: `cannot read ${ws.winswPath()}: operation not permitted`,
+        }),
+      },
+    }));
+    check('an unreadable stopped wrapper is reported without replacing it',
+      unreadable.ok === false && /was not replaced/.test(unreadable.reason ?? ''),
+      unreadable.reason ?? '');
+    check('the service is started again after the wrapper read failure',
+      unreadable.restarted === true
+      && unreadableEvents.filter((event) => event === 'SC_START').length >= 1,
+      unreadableEvents.join(' | '));
+    check('the runtime was not copied or changed after that failure',
+      !unreadableEvents.includes('COPY')
+      && fs.readFileSync(path.join(dir, 'marker'), 'utf8') === 'OLD',
+      unreadableEvents.join(' | '));
 
     // Rollback: the new copy starts but the daemon never reports in.
     fs.writeFileSync(path.join(dir, 'marker'), 'OLD');
@@ -2801,6 +3304,79 @@ async function testRepairWhileRunning() {
     check('and issued no stop',
       !noElevationEvents.some((c) => /^sc\.exe stop /.test(c)), noElevationEvents.join(' | '));
 
+    const unknownElevationEvents = [];
+    const unknownElevationRun = makeRun(unknownElevationEvents);
+    const unknown = await ws.repair(withFileStub({
+      dataDir,
+      appRoot,
+      config: {},
+      run: unknownElevationRun,
+      deps: { isWindows: true, isElevated: () => null, canWrite: () => true },
+    }));
+    check('repair refuses when administrator rights cannot be verified',
+      unknown.ok === false && unknown.needsElevation === true, unknown.reason ?? '');
+    check('and issues no stop when elevation is unknown',
+      !unknownElevationEvents.some((c) => /^sc\.exe stop /.test(c)), unknownElevationEvents.join(' | '));
+
+    const aclHiddenEvents = [];
+    const aclHiddenRun = makeRun(aclHiddenEvents);
+    const aclHidden = await ws.repair(withFileStub({
+      dataDir,
+      appRoot,
+      config: {},
+      run: aclHiddenRun,
+      waitForStart: async () => ({ alive: true }),
+      deps: {
+        ...makeDeps(aclHiddenEvents, aclHiddenRun),
+        fs: {
+          existsSync: () => false,
+          lstatSync: () => {
+            const error = new Error('EPERM: operation not permitted, open EasyDevOps.exe');
+            error.code = 'EPERM';
+            throw error;
+          },
+        },
+      },
+    }));
+    check('a registered service with an ACL-hidden wrapper reaches repair',
+      aclHidden.ok === true, aclHidden.reason ?? '');
+    check('repair stops before trying to read or replace the hidden wrapper',
+      aclHiddenEvents.indexOf('SC_STOP') >= 0
+      && aclHiddenEvents.findIndex((event) => event.startsWith('VERIFY_WINSW_STATE:'))
+        > aclHiddenEvents.indexOf('SC_STOP'),
+      aclHiddenEvents.join(' | '));
+
+    const unknownProbeEvents = [];
+    const unknownProbe = await ws.repair(withFileStub({
+      dataDir,
+      appRoot,
+      config: {},
+      run: async (command) => {
+        unknownProbeEvents.push(command);
+        throw new Error('spawn EPERM');
+      },
+      deps: {
+        isWindows: true,
+        isElevated: () => true,
+        canWrite: () => true,
+        fs: {
+          existsSync: () => false,
+          lstatSync: () => {
+            const error = new Error('EPERM: operation not permitted, open EasyDevOps.exe');
+            error.code = 'EPERM';
+            throw error;
+          },
+        },
+      },
+    }));
+    check('repair refuses when neither the SCM nor the protected files can be inspected',
+      unknownProbe.ok === false
+      && /Could not determine whether the service is installed/.test(unknownProbe.reason ?? '')
+      && unknownProbeEvents.length === 1
+      && /^sc\.exe query EasyDevOps\b/.test(unknownProbeEvents[0])
+      && !unknownProbeEvents.some((command) => /^sc\.exe (stop|start|delete)\b/.test(command)),
+      unknownProbe.reason ?? '');
+
     fs.writeFileSync(path.join(dir, 'node.exe'), 'dummy node');
     const logs = [];
     const selfCopy = rt.copyRuntime({
@@ -2824,7 +3400,7 @@ async function testRepairWhileRunning() {
 // ─── 40. The daemon state file, for a pipe the CLI cannot open ──────────────
 
 async function testAgentStateFile() {
-  setGroup('40. the daemon state file is a trusted second window');
+  setGroup('41. the daemon state file is a trusted second window');
 
   const stateFile = await import(srcUrl('core/daemon/stateFile.js'));
   const lock = await import(srcUrl('core/daemon/lock.js'));
@@ -2896,9 +3472,9 @@ async function testAgentStateFile() {
 function assertNoRealArtifacts() {
   setGroup('17. nothing real was created');
 
-  const programData = process.env.ProgramData || 'C:\\ProgramData';
-  const ourProgramData = path.join(programData, 'easy-devops');
-  check('no C:\\ProgramData\\easy-devops was created', !fs.existsSync(ourProgramData), ourProgramData);
+  check('the real Server-mode directory is exactly as this run found it',
+    realProgramDataSnapshot() === REAL_PROGRAMDATA_BEFORE,
+    path.join(process.env.ProgramData || 'C:\\ProgramData', 'easy-devops'));
 
   // Compared against the snapshot taken before any test ran, not against
   // absence: a machine with Easy DevOps legitimately installed in Personal
@@ -2948,6 +3524,8 @@ async function main() {
   await testServiceFileNames();
   await testWinswLeftoverUpgrade();
   await testWinswReregisters();
+  await testMarkedForDeletion();
+  await testWinswUnknownRegistration();
   await testWinswRegistrationFailure();
   if (isWindows) await testServerInstallResume();
   if (isWindows) await testDataDirOriginal();
@@ -2955,6 +3533,7 @@ async function main() {
   if (isWindows) await testDashboardRunningBlocksMigration();
   await testReopenDb();
   if (isWindows) await testScExeEverywhere();
+  if (isWindows) await testShellLaunchSafety();
   if (isWindows) await testElevation();
   if (isWindows) await testStatusAgainstWindows();
   await testRestartCounting();

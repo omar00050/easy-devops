@@ -26,12 +26,15 @@ import { TEST_DATA_DIR, assertInsideTestDataDir } from './lib/guard.mjs';
 
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { spawn } from 'child_process';
 import { once } from 'events';
+import { createRequire } from 'module';
 import { fileURLToPath, pathToFileURL } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
+const require = createRequire(import.meta.url);
 
 const results = [];
 let group = '';
@@ -154,6 +157,124 @@ async function testPermissionsEndpoint() {
     refusal?.reason ?? 'not refused');
   check('and it is not in ownDirs', !unsafe.ownDirs.includes('/etc/ssl'));
 
+  // Editable settings cannot nominate an unrelated descendant just because it
+  // ends in conf.d. The nginx leaf must belong to a directory named nginx.
+  const unrelated = perms.deriveOwnDirs({
+    nginxDir: '/etc/ssl/private',
+    sslDir: '/home/someuser/.config/easy-devops/ssl',
+  });
+  check('an unrelated conf.d target is refused',
+    unrelated.refused.some((r) => r.dir === '/etc/ssl/private/conf.d')
+      && !unrelated.ownDirs.includes('/etc/ssl/private/conf.d'),
+    JSON.stringify(unrelated.refused));
+
+  const lookalike = perms.deriveOwnDirs({
+    nginxDir: '/opt/nginx',
+    sslDir: '/srv/easy-devops/ssl',
+  });
+  check('settings cannot substitute lookalike managed roots',
+    lookalike.ownDirs.length === 0
+      && lookalike.refused.some((r) => r.dir === '/srv/easy-devops/ssl')
+      && lookalike.refused.some((r) => r.dir === '/opt/nginx/conf.d'),
+    JSON.stringify(lookalike));
+
+  const dirStat = (pile, uid = 0, mode = 0o040755) => ({
+    uid,
+    mode,
+    isDirectory: () => pile === 'directory',
+    isSymbolicLink: () => pile === 'link',
+  });
+  const fakeTree = (entries) => ({
+    validateFilesystem: true,
+    uid: 1000,
+    lstatSync(target) {
+      if (!(target in entries)) {
+        const error = new Error('missing');
+        error.code = 'ENOENT';
+        throw error;
+      }
+      return entries[target];
+    },
+    realpathSync(target) {
+      if (!(target in entries)) {
+        const error = new Error('missing');
+        error.code = 'ENOENT';
+        throw error;
+      }
+      return target;
+    },
+  });
+
+  const linkedDeps = fakeTree({
+    '/etc': dirStat('directory'),
+    '/etc/easy-devops': dirStat('link'),
+  });
+  check('a linked existing ancestor is refused',
+    /link/.test(perms.validateManagedPath('/etc/easy-devops/ssl', 'ssl', linkedDeps) ?? ''),
+    perms.validateManagedPath('/etc/easy-devops/ssl', 'ssl', linkedDeps));
+
+  const ownedDeps = fakeTree({
+    '/etc': dirStat('directory'),
+    '/etc/easy-devops': dirStat('directory', 1001),
+    '/etc/easy-devops/ssl': dirStat('directory', 1001),
+  });
+  check('an ancestor owned by another account is refused',
+    /owned by uid 1001/.test(perms.validateManagedPath('/etc/easy-devops/ssl', 'ssl', ownedDeps) ?? ''),
+    perms.validateManagedPath('/etc/easy-devops/ssl', 'ssl', ownedDeps));
+
+  const writableDeps = fakeTree({
+    '/etc': dirStat('directory', 0, 0o041777),
+    '/etc/easy-devops': dirStat('directory'),
+    '/etc/easy-devops/ssl': dirStat('directory'),
+  });
+  check('a group- or world-writable ancestor is refused',
+    /writable/.test(perms.validateManagedPath('/etc/easy-devops/ssl', 'ssl', writableDeps) ?? ''),
+    perms.validateManagedPath('/etc/easy-devops/ssl', 'ssl', writableDeps));
+
+  const finalLinkDeps = fakeTree({
+    '/etc': dirStat('directory'),
+    '/etc/nginx': dirStat('directory'),
+    '/etc/nginx/conf.d': dirStat('link'),
+  });
+  check('a linked final target is refused',
+    /link/.test(perms.validateManagedPath('/etc/nginx/conf.d', 'nginx', finalLinkDeps) ?? ''),
+    perms.validateManagedPath('/etc/nginx/conf.d', 'nginx', finalLinkDeps));
+
+  const fileStat = (uid = 0, mode = 0o100644) => ({
+    uid,
+    mode,
+    isDirectory: () => false,
+    isSymbolicLink: () => false,
+    isFile: () => true,
+  });
+  const userOwnedAnchor = fakeTree({
+    '/etc': dirStat('directory'),
+    '/etc/nginx': dirStat('directory'),
+    '/etc/nginx/conf.d': dirStat('directory'),
+    '/etc/nginx/nginx.conf': fileStat(1000),
+  });
+  const anchorResult = perms.deriveOwnDirs(
+    { nginxDir: '/etc/nginx', sslDir: '' },
+    userOwnedAnchor,
+  );
+  check('nginx.conf owned by the installing account is refused',
+    anchorResult.ownDirs.length === 0
+      && anchorResult.refused.some((entry) => /nginx\.conf is owned by uid 1000, not root/.test(entry.reason)),
+    JSON.stringify(anchorResult));
+
+  check('the privileged setup uses a fixed trusted PATH',
+    /^PATH=\/usr\/sbin:\/usr\/bin:\/sbin:\/bin$/m.test(perms.MANAGED_DIR_SETUP_SCRIPT));
+  const managedSetupCode = codeOnly(perms.MANAGED_DIR_SETUP_SCRIPT)
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*#.*$/, ''))
+    .join('\n');
+  check('the privileged setup never resolves chown through PATH',
+    !/(^|[\s;])chown\s/.test(managedSetupCode)
+      && /\/bin\/chown -h -- "\$owner" "\$target"/.test(perms.MANAGED_DIR_SETUP_SCRIPT));
+  check('the privileged setup rechecks that the final target is not a link',
+    /chown -h[\s\S]{0,240}\[ -L "\$target" \][\s\S]{0,120}\[ ! -d "\$target" \]/
+      .test(perms.MANAGED_DIR_SETUP_SCRIPT));
+
   // The CLI must use the same derivation and the same function, or the two
   // can show different commands for the same machine.
   const cliSource = fs.readFileSync(path.join(ROOT, 'src/cli/menus/settings.js'), 'utf8');
@@ -195,18 +316,30 @@ async function testSetupScript() {
 
   const text = (script.lines ?? []).join('\n');
   check('it contains no password', !/password/i.test(text));
-  check('it contains no wildcard', !text.includes('*'));
+  check('its sudoers rule contains no wildcard',
+    !perms.buildSudoersLine('someuser').includes('*'));
   check('it grants through the fixed sudoers path',
     text.includes('/etc/sudoers.d/easy-devops') && text.includes('(root)'));
   check('it validates with visudo -cf BEFORE installing',
     text.indexOf('visudo -cf') !== -1 && text.indexOf('visudo -cf') < text.indexOf('sudo install'));
-  check('it creates each own directory and hands it over',
-    text.includes('sudo mkdir -p /etc/easy-devops/ssl')
-    && text.includes('sudo chown someuser:someuser /etc/easy-devops/ssl'));
+  check('it prepares each reviewed directory through a separate-argv root script',
+    text.includes("sudo /bin/sh -c 'set -eu")
+      && text.includes('easy-devops-managed-dir /etc/easy-devops/ssl someuser'));
+  check('the root script rejects links and creates without following one',
+    text.includes('[ -L "$current" ]')
+      && text.includes('mkdir -m 0755 -- "$current"')
+      && !text.includes('mkdir -p /etc/easy-devops/ssl'));
 
   // An unsafe own directory is refused outright, not silently dropped.
   const bad = perms.buildSetupScript({ user: 'someuser', ownDirs: ['/etc/ssl'] });
   check('an unsafe own directory makes the script refuse', bad.ok === false, bad.reason ?? '');
+
+  const badLookalike = perms.buildSetupScript({
+    user: 'someuser',
+    ownDirs: ['/srv/easy-devops/ssl'],
+  });
+  check('a caller cannot bypass the reviewed managed-root allowlist',
+    badLookalike.ok === false, badLookalike.reason ?? '');
 
   const badUser = perms.buildSetupScript({ user: 'root; rm -rf /' });
   check('an unsafe account name is refused', badUser.ok === false, badUser.reason ?? '');
@@ -540,6 +673,220 @@ async function testDashboardUiAgreement() {
     `${unset.get} / ${unset.post}`);
 }
 
+function certificatePair(domain) {
+  const forge = require('node-forge');
+  const keys = forge.pki.rsa.generateKeyPair(1024);
+  const cert = forge.pki.createCertificate();
+  cert.publicKey = keys.publicKey;
+  cert.serialNumber = crypto.randomBytes(8).toString('hex');
+  cert.validity.notBefore = new Date(Date.now() - 60_000);
+  cert.validity.notAfter = new Date(Date.now() + 86_400_000);
+  const subject = [{ name: 'commonName', value: domain }];
+  cert.setSubject(subject);
+  cert.setIssuer(subject);
+  cert.setExtensions([{ name: 'subjectAltName', altNames: [{ type: 2, value: domain }] }]);
+  cert.sign(keys.privateKey, forge.md.sha256.create());
+  return {
+    key: forge.pki.privateKeyToPem(keys.privateKey),
+    cert: forge.pki.certificateToPem(cert),
+  };
+}
+
+// ─── 6. Recoverable certificate publication ─────────────────────────────────
+
+async function testCertificateTransactions() {
+  setGroup('6. certificate publication is paired, locked and crash-recoverable');
+  const managed = await import(srcUrl('core/ssl/managed-artifacts.js'));
+  const transactions = await import(srcUrl('core/ssl/certificate-transaction.js'));
+  const cryptoModule = await import('node:crypto');
+
+  const dataDir = scratch('certificate-transaction-data');
+  const sslDir = scratch('certificate-transaction-ssl');
+  if (process.platform !== 'win32') fs.chmodSync(sslDir, 0o700);
+  const domain = 'transaction.example';
+  const certDir = path.join(sslDir, domain);
+  fs.mkdirSync(certDir, { recursive: true, mode: 0o700 });
+  if (process.platform !== 'win32') fs.chmodSync(certDir, 0o700);
+
+  const first = certificatePair(domain);
+  const firstKey = seed(path.join(certDir, 'privkey.pem'), first.key);
+  const firstCert = seed(path.join(certDir, 'fullchain.pem'), first.cert);
+  if (process.platform !== 'win32') {
+    fs.chmodSync(firstKey, 0o600);
+    fs.chmodSync(firstCert, 0o600);
+  }
+  await managed.recordManagedArtifacts({
+    dataDir,
+    sslDir,
+    files: [`${domain}/privkey.pem`, `${domain}/fullchain.pem`],
+  });
+  const originalKey = fs.readFileSync(firstKey, 'utf8');
+  const originalCert = fs.readFileSync(firstCert, 'utf8');
+
+  const second = certificatePair(domain);
+  let betweenRenames = false;
+  try {
+    await transactions.publishCertificateFiles({
+      dataDir,
+      sslDir,
+      domain,
+      files: {
+        'privkey.pem': second.key,
+        'fullchain.pem': second.cert,
+        'ez-cert.json': JSON.stringify({ domain, validationMethod: 'http' }),
+      },
+      onPublished: () => managed.recordManagedArtifacts({
+        dataDir,
+        sslDir,
+        files: [
+          `${domain}/privkey.pem`,
+          `${domain}/fullchain.pem`,
+          `${domain}/ez-cert.json`,
+        ],
+      }),
+      deps: {
+        renameSync(from, to, name, index) {
+          fs.renameSync(from, to);
+          if (index === 1) throw new Error('injected failure between key and certificate');
+          return true;
+        },
+      },
+    });
+  } catch (error) {
+    betweenRenames = /injected failure/.test(error.message);
+  }
+  check('a failure between the key and certificate renames is rolled back',
+    betweenRenames
+      && fs.readFileSync(firstKey, 'utf8') === originalKey
+      && fs.readFileSync(firstCert, 'utf8') === originalCert,
+    betweenRenames ? '' : 'publication did not fail at the intended boundary');
+  check('a failed pair never leaves a transaction journal or staging files',
+    !fs.readdirSync(dataDir).some((name) => name.includes('ssl-certificate'))
+      && !fs.readdirSync(certDir).some((name) => name.endsWith('.next') || name.endsWith('.bak')));
+
+  const concurrentPairs = [
+    certificatePair(domain),
+    certificatePair(domain),
+  ];
+  await Promise.all(concurrentPairs.map((pair) => transactions.publishCertificateFiles({
+    dataDir,
+    sslDir,
+    domain,
+    files: {
+      'privkey.pem': pair.key,
+      'fullchain.pem': pair.cert,
+      'ez-cert.json': JSON.stringify({ domain, validationMethod: 'http' }),
+    },
+    onPublished: () => managed.recordManagedArtifacts({
+      dataDir,
+      sslDir,
+      files: [
+        `${domain}/privkey.pem`,
+        `${domain}/fullchain.pem`,
+        `${domain}/ez-cert.json`,
+      ],
+    }),
+  })));
+  const finalKey = fs.readFileSync(path.join(certDir, 'privkey.pem'), 'utf8');
+  const finalCert = fs.readFileSync(path.join(certDir, 'fullchain.pem'), 'utf8');
+  const finalPair = concurrentPairs.find((pair) => pair.key === finalKey && pair.cert === finalCert);
+  check('concurrent same-domain publication serialises to one complete pair',
+    Boolean(finalPair)
+      && new cryptoModule.X509Certificate(finalCert).checkPrivateKey(
+        cryptoModule.createPrivateKey(finalKey),
+      ),
+    finalPair ? '' : 'the final key and certificate came from different attempts');
+  if (process.platform !== 'win32') {
+    check('published private keys and certificate metadata are mode 0600',
+      ['privkey.pem', 'fullchain.pem', 'ez-cert.json'].every((name) =>
+        (fs.statSync(path.join(certDir, name)).mode & 0o777) === 0o600));
+  } else {
+    check('published private files were created with the private publication path', true);
+  }
+
+  // Put back the original pair, then crash a child after its key rename. The
+  // journal remains on disk so the next renewal or repair must recover it.
+  fs.writeFileSync(firstKey, originalKey, { mode: 0o600 });
+  fs.writeFileSync(firstCert, originalCert, { mode: 0o600 });
+  fs.rmSync(path.join(certDir, 'ez-cert.json'), { force: true });
+  await managed.recordManagedArtifacts({
+    dataDir,
+    sslDir,
+    files: [`${domain}/privkey.pem`, `${domain}/fullchain.pem`],
+  });
+  const crashPair = certificatePair(domain);
+  const crashKey = seed(path.join(TEST_DATA_DIR, 'scratch', 'crash-next-key.pem'), crashPair.key);
+  const crashCert = seed(path.join(TEST_DATA_DIR, 'scratch', 'crash-next-cert.pem'), crashPair.cert);
+  const childSource = `
+    import fs from 'node:fs';
+    const [dataDir, sslDir, domain, keyFile, certFile] = process.argv.slice(1);
+    const managed = await import(${JSON.stringify(srcUrl('core/ssl/managed-artifacts.js'))});
+    const transactions = await import(${JSON.stringify(srcUrl('core/ssl/certificate-transaction.js'))});
+    await transactions.publishCertificateFiles({
+      dataDir, sslDir, domain,
+      files: {
+        'privkey.pem': fs.readFileSync(keyFile, 'utf8'),
+        'fullchain.pem': fs.readFileSync(certFile, 'utf8'),
+        'ez-cert.json': JSON.stringify({ domain, validationMethod: 'http' }),
+      },
+      onPublished: () => managed.recordManagedArtifacts({
+        dataDir, sslDir,
+        files: [domain + '/privkey.pem', domain + '/fullchain.pem', domain + '/ez-cert.json'],
+      }),
+      deps: {
+        renameSync(from, to, name, index) {
+          fs.renameSync(from, to);
+          if (index === 0) process.exit(91);
+          return true;
+        },
+      },
+    });
+  `;
+  const child = spawn(process.execPath, [
+    '--input-type=module',
+    '-e',
+    childSource,
+    dataDir,
+    sslDir,
+    domain,
+    crashKey,
+    crashCert,
+  ], { cwd: ROOT, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let childErr = '';
+  child.stderr.on('data', (chunk) => { childErr += chunk; });
+  const [code] = await once(child, 'close');
+  const journalPath = transactions.certificateJournalPath(dataDir, domain);
+  check('a process crash leaves the durable journal and a partial pair',
+    code === 91 && fs.existsSync(journalPath)
+      && fs.readFileSync(firstKey, 'utf8') === crashPair.key
+      && fs.readFileSync(firstCert, 'utf8') === originalCert,
+    childErr.trim() || `exit=${code}`);
+  const recovered = await transactions.recoverCertificateFiles({ dataDir, sslDir, domain });
+  check('the next certificate operation restores both files from the journal',
+    recovered === true
+      && fs.readFileSync(firstKey, 'utf8') === originalKey
+      && fs.readFileSync(firstCert, 'utf8') === originalCert
+      && !fs.existsSync(journalPath),
+    `recovered=${recovered}`);
+
+  const mismatched = certificatePair('other.example');
+  let mismatchRefused = false;
+  try {
+    await transactions.publishCertificateFiles({
+      dataDir,
+      sslDir,
+      domain,
+      files: {
+        'privkey.pem': mismatched.key,
+        'fullchain.pem': first.cert,
+      },
+    });
+  } catch (error) {
+    mismatchRefused = /invalid certificate\/key pair/i.test(error.message);
+  }
+  check('publication refuses a mismatched key/certificate pair', mismatchRefused);
+}
+
 // ─── main ────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -552,6 +899,7 @@ async function main() {
   await testStopDashboard();
   await testCleanupApply();
   await testDashboardUiAgreement();
+  await testCertificateTransactions();
 
   const failed = results.filter((r) => !r.passed);
   process.stdout.write(`\n${'-'.repeat(62)}\n`);

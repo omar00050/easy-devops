@@ -318,15 +318,53 @@ async function main() {
         'ez.release.json': file => fs.linkSync(target, file),
       } }));
       const result = await deploy('generated-files');
-      check('generated files replace existing inodes without modifying linked data',
-        result.status === 'success' && fs.readFileSync(target, 'utf8') === 'keep', result.error ?? '');
+      const repoDir = result.releaseId ? store.releaseDir('generated-files', result.releaseId) : '';
+      const engineDir = result.releaseId
+        ? store.engineReleaseDir('generated-files', result.releaseId)
+        : '';
+      check('repository hard links are ignored by the engine-owned artifact writer',
+        result.status === 'success'
+        && fs.readFileSync(target, 'utf8') === 'keep'
+        && fs.existsSync(path.join(engineDir, engine.PM2_CONFIG_FILE))
+        && fs.existsSync(path.join(engineDir, 'ez.release.json')),
+        result.error ?? '');
+
       // A junction is available to ordinary Windows users and lstat reports it as a link.
       git.setFiles(files('v2', { files: {
         'ez.pm2.json': file => fs.symlinkSync(TEST_DATA_DIR, file, 'junction'),
+        'ez.release.json': file => fs.symlinkSync(TEST_DATA_DIR, file, 'junction'),
       } }));
-      const refused = await deploy('generated-files');
-      check('a linked generated filename is refused before PM2 starts',
-        refused.status === 'failed' && /Invalid generated file/.test(refused.error ?? ''));
+      const linked = await deploy('generated-files');
+      const linkedRelease = linked.releaseId
+        ? store.releaseDir('generated-files', linked.releaseId)
+        : '';
+      const linkedEngine = linked.releaseId
+        ? store.engineReleaseDir('generated-files', linked.releaseId)
+        : '';
+      const latestStart = pm2.calls.filter((call) => call.type === 'start').at(-1);
+      check('repository links cannot redirect generated config or metadata',
+        linked.status === 'success'
+        && fs.lstatSync(path.join(linkedRelease, engine.PM2_CONFIG_FILE)).isSymbolicLink()
+        && fs.lstatSync(path.join(linkedRelease, 'ez.release.json')).isSymbolicLink()
+        && latestStart?.file === path.join(linkedEngine, engine.PM2_CONFIG_FILE)
+        && !latestStart.file.startsWith(`${linkedRelease}${path.sep}`),
+        linked.error ?? '');
+
+      fs.rmSync(store.engineAppDir('generated-files'), { recursive: true, force: true });
+      fs.symlinkSync(
+        TEST_DATA_DIR,
+        store.engineAppDir('generated-files'),
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+      const tamperedEngine = await deploy('generated-files');
+      check('a linked engine artifact directory is refused before PM2 starts',
+        tamperedEngine.status === 'failed'
+        && /linked or non-directory engine artifact path/i.test(tamperedEngine.error ?? '')
+        && pm2.calls.filter((call) => call.type === 'start').at(-1)?.file
+          === latestStart?.file,
+        tamperedEngine.error ?? '');
+      if (process.platform === 'win32') fs.rmdirSync(store.engineAppDir('generated-files'));
+      else fs.unlinkSync(store.engineAppDir('generated-files'));
       commands.calls.length = 0;
       pm2.calls.length = 0;
     }
@@ -467,14 +505,24 @@ async function main() {
 
       const { token } = apps.rotateHookToken('crasher');
       const hubDeploy = await import(srcUrl('core/deploy/hubCommands.js'));
-      const hubStatus = await hubDeploy.handleHubDeployHook({
+      const hubStatusWithoutLogs = await hubDeploy.handleHubDeployHook({
         action: 'status', appId: 'crasher', token, runId: crashed.id,
-      });
-      check('the Hub run-status result carries reason, redacted log tail and rollback result',
-        hubStatus.found === true && hubStatus.run.reason === crashed.reason
-        && hubStatus.run.rollbackSucceeded === true
-        && Array.isArray(hubStatus.run.logTail) && hubStatus.run.logTail.length > 0
-        && !JSON.stringify(hubStatus).includes(env.API_TOKEN));
+      }, { permissions: { 'deploy.logs': false } });
+      check('Hub run status keeps rollback state but no diagnostics without deploy.logs',
+        hubStatusWithoutLogs.found === true
+        && hubStatusWithoutLogs.run.reason === null
+        && hubStatusWithoutLogs.run.rollbackSucceeded === true
+        && Array.isArray(hubStatusWithoutLogs.run.logTail)
+        && hubStatusWithoutLogs.run.logTail.length === 0
+        && !JSON.stringify(hubStatusWithoutLogs).includes(env.API_TOKEN));
+      const hubStatusWithLogs = await hubDeploy.handleHubDeployHook({
+        action: 'status', appId: 'crasher', token, runId: crashed.id,
+      }, { permissions: { 'deploy.logs': true } });
+      check('deploy.logs restores the reason, redacted log tail and rollback result',
+        hubStatusWithLogs.found === true && hubStatusWithLogs.run.reason === crashed.reason
+        && hubStatusWithLogs.run.rollbackSucceeded === true
+        && Array.isArray(hubStatusWithLogs.run.logTail) && hubStatusWithLogs.run.logTail.length > 0
+        && !JSON.stringify(hubStatusWithLogs).includes(env.API_TOKEN));
     }
 
     // ── 5. First release crashing: nothing to return to ─────────────────────
@@ -521,8 +569,137 @@ async function main() {
       check('no crash log is attached to a plain health failure', Array.isArray(sick.logTail) && sick.logTail.length === 0);
     }
 
-    // ── 7. The runner status helper never starts a daemon ───────────────────
-    setGroup('7. core/runner.js status reads');
+    // ── 7. EZ-20: Hub run projections are an explicit allowlist ─────────────
+    setGroup('7. Hub deployment diagnostics require deploy.logs');
+    {
+      const id = 'telemetry-run';
+      register(id);
+      const runId = '20261124-130000-abcdef';
+      const sentinel = 'HUB_RUN_SENTINEL_91bc7';
+      const run = {
+        id: runId,
+        appId: id,
+        trigger: 'manual',
+        actor: 'local-user@example.com',
+        ref: 'main',
+        sha: 'b'.repeat(40),
+        releaseId: runId,
+        status: 'failed',
+        step: 'health',
+        stage: 'health',
+        skippedStages: ['install'],
+        startedAt: 1_800_000_000_000,
+        finishedAt: 1_800_000_030_000,
+        error: `stderr: ${sentinel}`,
+        warnings: [`warning: ${sentinel}_WARN`],
+        reason: `reason: ${sentinel}_REASON`,
+        logTail: [`tail: ${sentinel}_TAIL`],
+        rolledBackTo: null,
+        rollbackSucceeded: true,
+        logSecurity: 'redacted-v1',
+        debugOutput: `unknown: ${sentinel}_UNKNOWN`,
+      };
+      store.writeRun(run);
+      fs.writeFileSync(store.logFile(id, runId), `log: ${sentinel}_LOG\n`, 'utf8');
+
+      const statusModule = await import(srcUrl('core/deploy/status.js'));
+      const { projectRunForHub } = await import(srcUrl('core/hub/telemetry.js'));
+      const hubDeploy = await import(srcUrl('core/deploy/hubCommands.js'));
+      const inertRunner = { isDaemonRunning: () => false };
+      const noLogsView = (entry) => projectRunForHub(entry, { 'deploy.logs': false });
+      const logsView = (entry) => projectRunForHub(entry, { 'deploy.logs': true });
+
+      const local = statusModule.describeApp(apps.getApp(id), new Map());
+      const hubApp = statusModule.describeApp(apps.getApp(id), new Map(), apps.publicApp, noLogsView);
+      check('the local dashboard still receives every run diagnostic',
+        local.lastRun?.error === run.error
+        && local.lastRun?.reason === run.reason
+        && local.lastRun?.warnings?.[0] === run.warnings[0]
+        && local.lastRun?.logTail?.[0] === run.logTail[0]
+        && local.lastRun?.debugOutput === run.debugOutput);
+      check('Hub list telemetry keeps status metadata and removes every output field',
+        hubApp.lastRun?.id === runId
+        && hubApp.lastRun?.status === 'failed'
+        && hubApp.lastRun?.step === 'health'
+        && hubApp.lastRun?.stage === 'health'
+        && hubApp.lastRun?.rollbackSucceeded === true
+        && hubApp.lastRun?.error === null
+        && hubApp.lastRun?.reason === null
+        && hubApp.lastRun?.warnings?.length === 0
+        && hubApp.lastRun?.logTail?.length === 0
+        && !Object.prototype.hasOwnProperty.call(hubApp.lastRun ?? {}, 'debugOutput')
+        && !Object.prototype.hasOwnProperty.call(hubApp.lastRun ?? {}, 'actor')
+        && !JSON.stringify(hubApp).includes(sentinel));
+
+      const hubDetail = await statusModule.describeAppDetail(id, {
+        view: apps.publicApp,
+        runView: noLogsView,
+        runner: inertRunner,
+      });
+      check('Hub detail projects lastRun and every historical run',
+        hubDetail.runs.length === 1
+        && hubDetail.runs[0].error === null
+        && hubDetail.lastRun.error === null
+        && !JSON.stringify(hubDetail).includes(sentinel));
+
+      const privileged = statusModule.describeApp(apps.getApp(id), new Map(), apps.publicApp, logsView);
+      check('deploy.logs restores only the approved diagnostics and nothing future-added',
+        privileged.lastRun?.error === run.error
+        && privileged.lastRun?.reason === run.reason
+        && privileged.lastRun?.warnings?.[0] === run.warnings[0]
+        && privileged.lastRun?.logTail?.[0] === run.logTail[0]
+        && !Object.prototype.hasOwnProperty.call(privileged.lastRun ?? {}, 'debugOutput'));
+
+      let refusedRunFetch = null;
+      try {
+        await hubDeploy.handleHubDeployCommand(
+          { action: 'run', id, runId },
+          { permissions: { 'deploy.logs': false } },
+        );
+      } catch (err) {
+        refusedRunFetch = err;
+      }
+      check('the explicit run action is defense-in-depth refused without deploy.logs',
+        refusedRunFetch?.expected === true && /deploy\.logs/.test(refusedRunFetch.message));
+
+      const fetched = await hubDeploy.handleHubDeployCommand(
+        { action: 'run', id, runId },
+        { permissions: { 'deploy.logs': true } },
+      );
+      check('the explicit run returns the projected record plus the gated log',
+        fetched.error === run.error
+        && fetched.log.includes(`${sentinel}_LOG`)
+        && fetched.logTruncated === false
+        && !Object.prototype.hasOwnProperty.call(fetched, 'debugOutput')
+        && !Object.prototype.hasOwnProperty.call(fetched, 'actor'));
+
+      const { token } = apps.rotateHookToken(id);
+      const hookOff = await hubDeploy.handleHubDeployHook(
+        { action: 'status', appId: id, token, runId },
+        { permissions: { 'deploy.logs': false } },
+      );
+      const hookOn = await hubDeploy.handleHubDeployHook(
+        { action: 'status', appId: id, token, runId },
+        { permissions: { 'deploy.logs': true } },
+      );
+      check('CI hook status uses the same null/empty projection without deploy.logs',
+        hookOff.found === true
+        && hookOff.run.runId === runId
+        && hookOff.run.error === null
+        && hookOff.run.reason === null
+        && hookOff.run.warnings.length === 0
+        && hookOff.run.logTail.length === 0
+        && !JSON.stringify(hookOff).includes(sentinel));
+      check('CI hook status reveals diagnostics only with deploy.logs',
+        hookOn.run.error === run.error
+        && hookOn.run.reason === run.reason
+        && hookOn.run.warnings[0] === run.warnings[0]
+        && hookOn.run.logTail[0] === run.logTail[0]
+        && !JSON.stringify(hookOn).includes(`${sentinel}_UNKNOWN`));
+    }
+
+    // ── 8. The runner status helper never starts a daemon ───────────────────
+    setGroup('8. core/runner.js status reads');
     {
       const calls = [];
       const off = await runner.status('ez-x', {

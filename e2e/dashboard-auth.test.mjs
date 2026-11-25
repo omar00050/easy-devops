@@ -40,7 +40,6 @@ import { fileURLToPath, pathToFileURL } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
-const REAL_LEGACY_DB = path.join(ROOT, 'data', 'easy-devops.sqlite');
 
 /** Throwaway, for a throwaway install in a temp directory. */
 const PASSWORD = 'correct-horse-battery';
@@ -67,6 +66,9 @@ fs.mkdirSync(dataDir, { recursive: true });
 // A pre-created 0-byte file so db.js's legacy migration — which RENAMES
 // data/easy-devops.sqlite — can never run against the real installation.
 fs.writeFileSync(path.join(dataDir, 'easy-devops.sqlite'), '');
+const migratedSentinel = 'pre-existing migrated database bytes\n';
+const migratedCopy = path.join(dataDir, 'easy-devops.sqlite.migrated');
+fs.writeFileSync(migratedCopy, migratedSentinel);
 
 process.env.EASY_DEVOPS_DATA_DIR = dataDir;
 
@@ -172,6 +174,7 @@ async function req(method, pathname, { body, cookie, noHeader, headers } = {}) {
     status: res.status,
     body: json,
     cookie: setCookie ? setCookie.split(';')[0] : null,
+    setCookie,
   };
 }
 
@@ -193,11 +196,11 @@ async function req(method, pathname, { body, cookie, noHeader, headers } = {}) {
  * @param {Object} [opts.body]
  */
 function rawReq(method, pathname, {
-  targetPort, host, origin, cookie, header = true, body,
+  targetPort, host, origin, cookie, header = true, body, extraHeaders = {},
 } = {}) {
   return new Promise((resolve) => {
     const payload = body === undefined ? null : JSON.stringify(body);
-    const headers = { 'Content-Type': 'application/json' };
+    const headers = { 'Content-Type': 'application/json', ...extraHeaders };
     if (host !== undefined) headers.Host = host;
     if (origin !== undefined) headers.Origin = origin;
     if (cookie) headers.Cookie = cookie;
@@ -213,7 +216,13 @@ function rawReq(method, pathname, {
         res.on('end', () => {
           let json = null;
           try { json = JSON.parse(text); } catch { /* not json */ }
-          resolve({ status: res.statusCode, body: json });
+          const setCookie = res.headers['set-cookie']?.[0] ?? null;
+          resolve({
+            status: res.statusCode,
+            body: json,
+            setCookie,
+            cookie: setCookie ? setCookie.split(';')[0] : null,
+          });
         });
       }
     );
@@ -262,14 +271,23 @@ async function main() {
   const port = await freePort();
   DASH = `http://localhost:${port}`;
 
-  const legacyBefore = fs.existsSync(REAL_LEGACY_DB) ? fs.statSync(REAL_LEGACY_DB).mtimeMs : null;
 
-  const env = { ...process.env, EASY_DEVOPS_DATA_DIR: dataDir, DASHBOARD_PORT: String(port) };
+  const env = {
+    ...process.env,
+    EASY_DEVOPS_DATA_DIR: dataDir,
+    DASHBOARD_PORT: String(port),
+    // A stale service environment from 1.4.4 and earlier must not widen the
+    // listener. The server still starts on loopback and says that it ignored it.
+    DASHBOARD_BIND_ADDRESS: '0.0.0.0',
+  };
 
   process.stdout.write(`\nport ${port}\ndata ${dataDir}\n`);
 
   const server = start('dashboard', [path.join('src', 'dashboard', 'server.js')], env);
   await waitFor(DASH, 'dashboard');
+  check('a stale public DASHBOARD_BIND_ADDRESS is ignored',
+    /Ignoring non-loopback dashboard bind 0\.0\.0\.0; listening on 127\.0\.0\.1/.test(server.output ?? ''),
+    (server.output ?? '').slice(-240));
 
   // ── (1) First run ─────────────────────────────────────────────────────────
   setGroup('(1) first run, with no password set');
@@ -403,6 +421,28 @@ async function main() {
   check('settings report the bind address',
     typeof settings.body?.dashboardBindAddress === 'string',
     String(settings.body?.dashboardBindAddress));
+
+  const nestedSsl = await req('POST', '/api/settings', {
+    cookie: sessionCookie,
+    body: { sslDir: path.join(dataDir, 'certificates') },
+  });
+  check('sslDir cannot be nested under the Easy DevOps data directory',
+    nestedSsl.status === 400 && nestedSsl.body?.reason === 'ssl_dir_overlaps_data_dir',
+    JSON.stringify({ status: nestedSsl.status, reason: nestedSsl.body?.reason }));
+
+  const sslLink = path.join(tmpRoot, 'ssl-overlap-link');
+  fs.symlinkSync(dataDir, sslLink, process.platform === 'win32' ? 'junction' : 'dir');
+  const canonicalSsl = await req('POST', '/api/settings', {
+    cookie: sessionCookie,
+    body: { sslDir: sslLink },
+  });
+  check('sslDir cannot canonically resolve into the data directory',
+    canonicalSsl.status === 400 && canonicalSsl.body?.reason === 'ssl_dir_overlaps_data_dir',
+    JSON.stringify({ status: canonicalSsl.status, reason: canonicalSsl.body?.reason }));
+  try {
+    if (process.platform === 'win32') fs.rmdirSync(sslLink);
+    else fs.unlinkSync(sslLink);
+  } catch { /* the scratch root cleanup is the final fallback */ }
 
   const hubStatus = await req('GET', '/api/hub/status', { cookie: sessionCookie });
   check('the hub router still works when signed in', hubStatus.status === 200);
@@ -599,7 +639,8 @@ async function main() {
     `${process.platform}: ${after.dashboardBindAddress}`);
 
   // An EXISTING install predates the setting and was listening everywhere.
-  // Upgrading must not silently move it to loopback.
+  // Upgrading must move an old public listener to loopback without losing the
+  // authentication choice that becomes safe there.
   const upgradeDir = path.join(tmpRoot, 'upgrade');
   fs.mkdirSync(upgradeDir, { recursive: true });
   fs.writeFileSync(path.join(upgradeDir, 'easy-devops.sqlite'), '');
@@ -630,8 +671,8 @@ async function main() {
   const bindAfterUpgrade = probeOut.includes('__BIND__')
     ? probeOut.slice(probeOut.indexOf('__BIND__') + 8).trim()
     : null;
-  check('an existing install keeps listening on all interfaces after upgrade',
-    bindAfterUpgrade === '0.0.0.0', String(bindAfterUpgrade));
+  check('an existing public listener is migrated to loopback after upgrade',
+    bindAfterUpgrade === '127.0.0.1', String(bindAfterUpgrade));
 
 
   // ── (12) Host / Origin / X-EZ-Request, in BOTH auth modes ────────────────
@@ -664,9 +705,7 @@ async function main() {
   check('a password was set for the cross-site tests', xsiteSetup.status === 200,
     'status ' + xsiteSetup.status);
 
-  // The guard reads the bind address from the CONFIG, not from the listener,
-  // so a loopback-only rule needs the config to say loopback. A fresh config
-  // on Windows defaults to 0.0.0.0, where the rule is same-origin instead.
+  // The listener and config both default to loopback on every platform.
   const xsiteLoopback = await req('POST', '/api/settings', {
     cookie: xsiteSetup.cookie, body: { dashboardBindAddress: '127.0.0.1' },
   });
@@ -680,6 +719,141 @@ async function main() {
   const signedIn = await req('POST', '/api/login', { body: { password: PASSWORD } });
   const sess = signedIn.cookie;
   check('signed in for the cross-site tests', signedIn.status === 200, 'status ' + signedIn.status);
+
+  // A loopback HTTPS terminator preserves the public origin. Express must trust
+  // that one proxy hop, but only because the TCP peer is loopback, and the
+  // session cookie must then carry every browser isolation flag.
+  const proxiedLogin = await rawReq('POST', '/api/login', {
+    targetPort: port3,
+    host: '127.0.0.1:' + port3,
+    origin: 'https://dashboard.example.com',
+    extraHeaders: {
+      'X-Forwarded-Proto': 'https',
+      'X-Forwarded-Host': 'dashboard.example.com',
+      'X-Forwarded-For': '203.0.113.25',
+    },
+    body: { password: PASSWORD },
+  });
+  check('a loopback HTTPS proxy may preserve a public dashboard origin',
+    proxiedLogin.status === 200, 'status ' + proxiedLogin.status);
+  check('the proxied session cookie is Secure, HttpOnly and SameSite=Lax',
+    /;\s*Secure/i.test(proxiedLogin.setCookie ?? '')
+      && /;\s*HttpOnly/i.test(proxiedLogin.setCookie ?? '')
+      && /;\s*SameSite=Lax/i.test(proxiedLogin.setCookie ?? ''),
+    proxiedLogin.setCookie ?? '(no cookie)');
+
+  assertTempDataDir('import the local-request verifier');
+  const localRequest = await import(
+    pathToFileURL(path.join(ROOT, 'src/dashboard/lib/localRequest.js')).href
+      + `?proxy=${Date.now()}`
+  );
+  const spoofed = localRequest.checkLocalRequest({
+    method: 'GET',
+    headers: {
+      host: '127.0.0.1:' + port3,
+    origin: 'http://attacker.example.com:' + port3,
+      'x-forwarded-proto': 'https',
+      'x-forwarded-host': 'attacker.example.com',
+    },
+    socket: { remoteAddress: '203.0.113.50' },
+  }, { port: port3, bindAddress: '127.0.0.1' });
+  check('forwarded headers from a non-loopback peer do not create a remote path',
+    spoofed.ok === false && spoofed.reason === 'origin_not_local',
+    JSON.stringify(spoofed));
+
+  const localRequestCase = ({
+    host = '127.0.0.1:' + port3,
+    headers = {},
+    rawHeaders = [],
+    method = 'GET',
+  } = {}) => localRequest.checkLocalRequest({
+    method,
+    headers: { host, ...headers },
+    rawHeaders: ['Host', host, ...rawHeaders],
+    socket: { remoteAddress: '127.0.0.1' },
+  }, { port: port3, bindAddress: '127.0.0.1' });
+
+  const omittedHost = localRequestCase({ host: '' });
+  check('a missing Host header is refused',
+    omittedHost.ok === false && omittedHost.reason === 'host_missing',
+    JSON.stringify(omittedHost));
+
+  for (const host of ['127.evil:' + port3, '[::1]evil:' + port3]) {
+    const lookalike = localRequestCase({ host });
+    check('lookalike Host ' + host + ' is refused',
+      lookalike.ok === false,
+      JSON.stringify(lookalike));
+  }
+
+  const duplicateHost = localRequest.checkLocalRequest({
+    method: 'GET',
+    headers: { host: '127.0.0.1:' + port3 },
+    rawHeaders: [
+      'Host', '127.0.0.1:' + port3,
+      'Host', 'evil.example.com:' + port3,
+    ],
+    socket: { remoteAddress: '127.0.0.1' },
+  }, { port: port3, bindAddress: '127.0.0.1' });
+  check('a duplicate Host header is refused',
+    duplicateHost.ok === false && duplicateHost.reason === 'duplicate_forwarding_header',
+    JSON.stringify(duplicateHost));
+
+  for (const name of ['X-Forwarded-Proto', 'X-Forwarded-Host']) {
+    const duplicate = localRequest.checkLocalRequest({
+      method: 'GET',
+      headers: {
+        host: '127.0.0.1:' + port3,
+        'x-forwarded-proto': 'https',
+        'x-forwarded-host': 'dashboard.example.com',
+      },
+      rawHeaders: ['Host', '127.0.0.1:' + port3, name, 'one', name, 'two'],
+      socket: { remoteAddress: '127.0.0.1' },
+    }, { port: port3, bindAddress: '127.0.0.1' });
+    check('a duplicate ' + name + ' header is refused',
+      duplicate.ok === false && duplicate.reason === 'duplicate_forwarding_header',
+      JSON.stringify(duplicate));
+  }
+
+  const commaListHost = localRequestCase({
+    headers: {
+      'x-forwarded-proto': 'https',
+      'x-forwarded-host': 'dashboard.example.com, attacker.example.com',
+    },
+  });
+  check('a forwarded-host list is not accepted',
+    commaListHost.ok === true,
+    JSON.stringify(commaListHost));
+  check('the forwarding metadata still prevents passwordless access',
+    localRequest.isDirectLoopbackRequest({
+      headers: {
+        host: '127.0.0.1:' + port3,
+        'x-forwarded-host': 'dashboard.example.com, attacker.example.com',
+        'x-forwarded-proto': 'https',
+      },
+      rawHeaders: [],
+      socket: { remoteAddress: '127.0.0.1' },
+    }) === false);
+  check('a malformed X-Forwarded-For string prevents direct-loopback access',
+    localRequest.isDirectLoopbackRequest({
+      headers: { host: '127.0.0.1:' + port3, 'x-forwarded-for': 'not, an, ip' },
+      rawHeaders: ['Host', '127.0.0.1:' + port3, 'X-Forwarded-For', 'not, an, ip'],
+      socket: { remoteAddress: '127.0.0.1' },
+    }) === false);
+
+  const wrongProtocol = await rawReq('POST', '/api/settings', {
+    targetPort: port3,
+    cookie: sess,
+    host: '127.0.0.1:' + port3,
+    origin: 'http://dashboard.example.com',
+    extraHeaders: {
+      'X-Forwarded-Proto': 'https',
+      'X-Forwarded-Host': 'dashboard.example.com',
+    },
+    body: { acmeEmail: 'proxy@example.com' },
+  });
+  check('a trusted HTTPS proxy cannot be paired with an HTTP Origin',
+    wrongProtocol.status === 403 && wrongProtocol.body?.reason === 'origin_protocol_mismatch',
+    JSON.stringify({ status: wrongProtocol.status, reason: wrongProtocol.body?.reason }));
 
   // A state-changing request without the custom header: the shape a
   // cross-site form POST has, since a form cannot set one.
@@ -860,90 +1034,76 @@ async function main() {
   check('a socket with the header connects without a session',
     anonSocketOkOutcome === 'connected', anonSocketOkOutcome);
 
-  // ── (15) The bind address is locked while there is no password ──────────
-  setGroup('(15) the bind address cannot be opened up while auth is none');
+  const proxiedAnonHttp = await rawReq('POST', '/api/settings', {
+    targetPort: port3,
+    host: '127.0.0.1:' + port3,
+    origin: 'https://dashboard.example.com',
+    extraHeaders: {
+      'X-Forwarded-Proto': 'https',
+      'X-Forwarded-Host': 'dashboard.example.com',
+      'X-Forwarded-For': '203.0.113.25',
+    },
+    body: { acmeEmail: 'remote@example.com' },
+  });
+  check('auth none through a local HTTPS proxy still requires a session',
+    proxiedAnonHttp.status === 401,
+    'status ' + proxiedAnonHttp.status);
+
+  const proxiedAnonSocket = io(DASH, {
+    transports: ['websocket'],
+    reconnection: false,
+    extraHeaders: {
+      'X-EZ-Request': '1',
+      'X-Forwarded-Proto': 'https',
+      'X-Forwarded-Host': 'dashboard.example.com',
+      'X-Forwarded-For': '203.0.113.25',
+    },
+  });
+  const proxiedAnonSocketOutcome = await new Promise((resolve) => {
+    const t = setTimeout(() => resolve('timeout'), 10000);
+    proxiedAnonSocket.on('connect', () => { clearTimeout(t); resolve('connected'); });
+    proxiedAnonSocket.on('connect_error', (e) => { clearTimeout(t); resolve('refused: ' + e.message); });
+  });
+  proxiedAnonSocket.disconnect();
+  check('auth none through a local HTTPS proxy refuses the socket handshake',
+    proxiedAnonSocketOutcome === 'refused: UNAUTHORIZED', proxiedAnonSocketOutcome);
+
+  // ── (15) The dashboard listener is always loopback-only ──────────────────
+  setGroup('(15) the dashboard listener cannot be opened to the network');
 
   const openUp = await req('POST', '/api/settings', {
     body: { dashboardBindAddress: '0.0.0.0' },
   });
-  check('changing the bind away from loopback is refused', openUp.status === 400,
+  check('changing the bind away from loopback is refused even with auth none', openUp.status === 400,
     'status ' + openUp.status);
-  check('the reason names the interlock',
-    openUp.body?.reason === 'bind_requires_password', String(openUp.body?.reason));
-  check('the error tells the user to set a password first',
-    /set a password first/i.test(openUp.body?.error ?? ''), openUp.body?.error ?? '');
+  check('the refusal names the loopback requirement',
+    openUp.body?.reason === 'dashboard_requires_loopback', String(openUp.body?.reason));
+  check('the error gives the supported remote-access path',
+    /HTTPS reverse proxy or secure tunnel/i.test(openUp.body?.error ?? ''), openUp.body?.error ?? '');
 
-  // Both in one request must not slip through by checking each against the
-  // OLD value.
+  // Supplying a password in the same request must not unlock a public listener.
   const bothAtOnce = await req('POST', '/api/settings', {
-    body: { dashboardAuth: 'none', dashboardBindAddress: '0.0.0.0' },
+    body: { dashboardAuth: 'password', dashboardPassword: PASSWORD, dashboardBindAddress: '0.0.0.0' },
   });
-  check('setting none and a public bind together is refused',
+  check('setting a password and a public bind together is still refused',
     bothAtOnce.status === 400, 'status ' + bothAtOnce.status);
 
   const stillLoopback = await req('GET', '/api/settings');
   check('the bind address did not change', stillLoopback.body?.dashboardBindAddress === '127.0.0.1',
     String(stillLoopback.body?.dashboardBindAddress));
 
-  // Setting a password and opening the bind together IS allowed.
-  const withPassword = await req('POST', '/api/settings', {
-    body: { dashboardAuth: 'password', dashboardPassword: PASSWORD, dashboardBindAddress: '0.0.0.0' },
-  });
-  check('setting a password and opening the bind together is allowed',
-    withPassword.status === 200, 'status ' + withPassword.status);
-
-  // ── (16) With a public bind, none is refused ────────────────────────────
-  setGroup('(16) none is refused while the bind is public');
-
-  const relogin = await req('POST', '/api/login', { body: { password: PASSWORD } });
-  check('a password is required again', relogin.status === 200, 'status ' + relogin.status);
-  const sess2 = relogin.cookie;
-
-  const noneOnPublic = await req('POST', '/api/settings', {
-    cookie: sess2, body: { dashboardAuth: 'none' },
-  });
-  check('switching to none on a public bind is refused', noneOnPublic.status === 400,
-    'status ' + noneOnPublic.status);
-  check('the reason names the loopback requirement',
-    noneOnPublic.body?.reason === 'no_auth_requires_loopback', String(noneOnPublic.body?.reason));
-
-  const publicSettings = await req('GET', '/api/settings', { cookie: sess2 });
-  check('settings say no-password is unavailable on a public bind',
-    publicSettings.body?.canUseNoPassword === false,
-    String(publicSettings.body?.canUseNoPassword));
-
-  // With a non-loopback bind the Host rule relaxes to same-origin, so remote
-  // access keeps working — but cross-site requests still do not.
+  // A public Host remains forbidden because the listener configuration stays
+  // loopback. Remote access goes through the trusted local HTTPS terminator
+  // tested above.
   const remoteHost = await rawReq('GET', '/api/domains', {
-    targetPort: port3, cookie: sess2, host: '192.168.1.50:' + port3,
+    targetPort: port3, cookie: sess, host: '192.168.1.50:' + port3,
   });
-  check('a LAN Host is accepted once the bind is public', remoteHost.status === 200,
-    'status ' + remoteHost.status);
-
-  const remoteCrossSite = await rawReq('POST', '/api/settings', {
-    targetPort: port3,
-    cookie: sess2,
-    host: '192.168.1.50:' + port3,
-    origin: 'http://evil.example.com:' + port3,
-    body: { acmeEmail: 'ok@example.com' },
-  });
-  check('a cross-site Origin is still refused on a public bind',
-    remoteCrossSite.status === 403, 'status ' + remoteCrossSite.status);
-
-  // Same-origin from that LAN address must keep working, or binding to all
-  // interfaces would be pointless.
-  const remoteSameOrigin = await rawReq('POST', '/api/settings', {
-    targetPort: port3,
-    cookie: sess2,
-    host: '192.168.1.50:' + port3,
-    origin: 'http://192.168.1.50:' + port3,
-    body: { acmeEmail: 'ok@example.com' },
-  });
-  check('same-origin from a LAN address is accepted', remoteSameOrigin.status === 200,
-    'status ' + remoteSameOrigin.status);
+  check('a LAN Host is refused because the listener remains loopback',
+    remoteHost.status === 403 && remoteHost.body?.reason === 'host_not_local',
+    JSON.stringify({ status: remoteHost.status, reason: remoteHost.body?.reason }));
 
 
-  // ── (17) Upgrading an existing install ──────────────────────────────────
+  // ── (16) Upgrading an existing install ──────────────────────────────────
   setGroup('(17) existing installs keep working, safely');
 
   // An empty password used to MEAN "no login". On a loopback-bound install
@@ -991,22 +1151,25 @@ async function main() {
   check('and none is actually in force there',
     upgLoopback.effective === 'none', upgLoopback.effective);
 
-  // Empty password, no bind recorded -> the bind migrates to 0.0.0.0, so a
-  // password is required.
+  // Empty password, no bind recorded -> the legacy default was every
+  // interface, so it migrates to loopback AND requires a password. Moving an
+  // exposed installation to loopback must not silently enable passwordless
+  // mode for a config that never explicitly chose it.
   const upgLegacy = await probeUpgrade("legacy", {
     dashboardPort: 6443, dashboardPassword: "",
   });
   check('empty password + no recorded bind requires a password',
     upgLegacy.auth === 'password', JSON.stringify(upgLegacy));
-  check('because that install was listening on every interface',
-    upgLegacy.bind === '0.0.0.0', upgLegacy.bind);
+  check('and the old public default is migrated to loopback without passwordless mode',
+    upgLegacy.bind === '127.0.0.1' && upgLegacy.effective === 'password', JSON.stringify(upgLegacy));
 
-  // Empty password, explicitly bound to all interfaces -> password.
+  // Empty password, explicitly bound to all interfaces -> loopback + password.
   const upgPublic = await probeUpgrade("public", {
     dashboardPort: 6443, dashboardPassword: "", dashboardBindAddress: "0.0.0.0",
   });
-  check('empty password + public bind requires a password',
-    upgPublic.auth === 'password', JSON.stringify(upgPublic));
+  check('empty password + public bind migrates safely to loopback with a password',
+    upgPublic.auth === 'password' && upgPublic.bind === '127.0.0.1' && upgPublic.effective === 'password',
+    JSON.stringify(upgPublic));
 
   // A password already set -> password mode, whatever the bind.
   const upgWithPw = await probeUpgrade("withpw", {
@@ -1015,25 +1178,26 @@ async function main() {
   check('an existing password keeps password mode', upgWithPw.auth === 'password',
     JSON.stringify(upgWithPw));
 
-  // Defence in depth: a hand-edited or restored config claiming none with a
-  // public bind must not be honoured.
+  // Defence in depth: a hand-edited or restored config claiming a public bind
+  // is normalised to loopback before the auth mode is decided.
   const upgInconsistent = await probeUpgrade("inconsistent", {
     dashboardPort: 6443, dashboardAuth: "none", dashboardBindAddress: "0.0.0.0",
   });
-  check('a stored none with a public bind is not honoured',
-    upgInconsistent.effective === 'password', upgInconsistent.effective);
+  check('a stored none with a public bind is moved to loopback and requires a password',
+    upgInconsistent.bind === '127.0.0.1' && upgInconsistent.auth === 'password'
+      && upgInconsistent.effective === 'password',
+    JSON.stringify(upgInconsistent));
 
-  return finish(legacyBefore);
+  return finish();
 }
 
-async function finish(legacyBefore) {
+async function finish() {
   setGroup('teardown and isolation');
 
   await stopAll();
 
-  const legacyAfter = fs.existsSync(REAL_LEGACY_DB) ? fs.statSync(REAL_LEGACY_DB).mtimeMs : null;
-  check('real data/easy-devops.sqlite untouched', legacyAfter === legacyBefore);
-  check('no .migrated file created', !fs.existsSync(`${REAL_LEGACY_DB}.migrated`));
+  check('a pre-existing migrated database copy is preserved byte-for-byte',
+    fs.readFileSync(migratedCopy, 'utf8') === migratedSentinel);
 
   try {
     const dbMod = await import(pathToFileURL(path.join(ROOT, 'src/core/db.js')).href);

@@ -61,7 +61,7 @@ const TABS: { id: Tab; label: string }[] = [
 
 const BIND_CHOICES: { value: string; label: string }[] = [
   { value: '127.0.0.1', label: 'This machine only (127.0.0.1)' },
-  { value: '0.0.0.0', label: 'All interfaces (0.0.0.0)' },
+  { value: '::1', label: 'This machine only (IPv6 ::1)' },
 ];
 
 function bindLabel(value: string): string {
@@ -299,8 +299,8 @@ export function SettingsPage() {
     setAccessError(null);
     setPasswordError(null);
 
-    if (access.auth === 'none' && access.bind === '0.0.0.0') {
-      setAccessError('Running without a password requires the dashboard to listen here only.');
+    if (!['127.0.0.1', '::1'].includes(access.bind)) {
+      setAccessError('The dashboard must listen on this machine. Use a local HTTPS proxy or secure tunnel for remote access.');
       return;
     }
 
@@ -795,9 +795,9 @@ export function SettingsPage() {
       );
     }
 
-    const loopbackDraft = access.bind !== '0.0.0.0';
-    const canUseNoPassword =
-      settings.data.canUseNoPassword || loopbackDraft;
+    // The server decides whether this request is a direct local request.
+    // A loopback draft alone does not make a proxied browser local.
+    const canUseNoPassword = settings.data.canUseNoPassword;
     const livePasswordProblem = access.password
       ? validatePassword(access.password, minPasswordLength) ??
         (access.confirm && access.password !== access.confirm
@@ -832,20 +832,18 @@ export function SettingsPage() {
                   setAccess({
                     ...access,
                     bind,
-                    auth: bind === '0.0.0.0' ? 'password' : access.auth,
                   });
                 }}
                 hint={
                   access.auth === 'none'
                     ? 'Locked to this machine while there is no password.'
-                    : 'Changing this needs a dashboard restart.'
+                    : 'Remote access goes through an HTTPS proxy or secure tunnel on this machine.'
                 }
               >
                 {BIND_CHOICES.map((choice) => (
                   <option
                     key={choice.value}
                     value={choice.value}
-                    disabled={choice.value === '0.0.0.0' && access.auth === 'none'}
                   >
                     {choice.label}
                   </option>

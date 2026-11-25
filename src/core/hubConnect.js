@@ -18,14 +18,13 @@
  */
 
 import { parseConnectionString } from './hubLink.js';
+import { isLoopbackHubHostname } from './validators.js';
 
 export const CONNECT_TIMEOUT_MS = 15_000;
 /** A real answer is ~200 bytes; anything far larger is not the Hub. */
 const MAX_BODY_BYTES = 16 * 1024;
 
 const LINK_PATH = /^\/api\/v1\/connect\/cli\/([A-Za-z0-9_-]{43})$/;
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
-
 /** Failure reasons the CLI turns into a sentence; stable for tests. */
 export const CONNECT_ERRORS = Object.freeze({
   INVALID_INPUT: 'invalid_input',
@@ -93,7 +92,7 @@ export function parseConnectTarget(input) {
   if (!LINK_PATH.test(url.pathname.replace(/\/+$/, ''))) return fail(CONNECT_ERRORS.INVALID_INPUT);
 
   if (url.protocol === 'http:') {
-    if (!LOOPBACK_HOSTS.has(url.hostname)) return fail(CONNECT_ERRORS.INSECURE);
+    if (!isLoopbackHubHostname(url.hostname)) return fail(CONNECT_ERRORS.INSECURE);
   } else if (url.protocol !== 'https:') {
     return fail(CONNECT_ERRORS.INVALID_INPUT);
   }
@@ -149,7 +148,10 @@ export async function fetchConnectionString(linkUrl, deps = {}) {
     try {
       const text = await readLimited(res, MAX_BODY_BYTES);
       body = JSON.parse(text);
-    } catch {
+    } catch (err) {
+      if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+        return fail(CONNECT_ERRORS.TIMEOUT);
+      }
       return fail(CONNECT_ERRORS.REJECTED);
     }
     const connectionString = typeof body?.connectionString === 'string' ? body.connectionString.trim() : '';
@@ -182,11 +184,57 @@ export async function fetchConnectionString(linkUrl, deps = {}) {
 }
 
 async function readLimited(res, limit) {
-  const declared = Number(res.headers?.get?.('content-length'));
-  if (Number.isFinite(declared) && declared > limit) throw new Error('response too large');
-  const text = await res.text();
-  if (text.length > limit) throw new Error('response too large');
-  return text;
+  const declaredHeader = res.headers?.get?.('content-length');
+  if (typeof declaredHeader === 'string' && declaredHeader.includes(',')) {
+    await cancelResponseBody(res, 'conflicting content-length headers');
+    throw new Error('conflicting content-length headers');
+  }
+  const declared = declaredHeader == null || declaredHeader === '' ? NaN : Number(declaredHeader);
+  if (declaredHeader != null && declaredHeader !== ''
+      && (!/^\d+$/.test(declaredHeader) || !Number.isSafeInteger(declared))) {
+    await cancelResponseBody(res, 'invalid content-length header');
+    throw new Error('invalid content-length header');
+  }
+  if (Number.isFinite(declared) && declared > limit) {
+    await cancelResponseBody(res, 'response too large');
+    throw new Error('response too large');
+  }
+
+  if (!res.body || typeof res.body.getReader !== 'function') {
+    throw new Error('response body unavailable');
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let received = 0;
+  let text = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return text + decoder.decode();
+      if (!(value instanceof Uint8Array)) throw new Error('response body is not bytes');
+
+      received += value.byteLength;
+      if (received > limit) throw new Error('response too large');
+      text += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    try {
+      await reader.cancel('response body no longer needed');
+    } catch {
+      /* preserve the size, decoding or stream error */
+    }
+    reader.releaseLock();
+  }
+}
+
+async function cancelResponseBody(res, reason) {
+  try {
+    await res.body?.cancel?.(reason);
+  } catch {
+    /* the framing or size check remains authoritative */
+  }
 }
 
 /**

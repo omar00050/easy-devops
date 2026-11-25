@@ -81,6 +81,7 @@ function makeRun(appId, runId, { status = 'running', step = 'build', stage = nul
     reason: null,
     logTail: [],
     rollbackSucceeded: null,
+    logSecurity: 'redacted-v1',
   };
   // Left absent by default: that is the record an older agent still writes.
   if (stage !== null) run.stage = stage;
@@ -389,6 +390,57 @@ async function testRecordWithoutStageFields() {
   }
 }
 
+async function testSeenRunLimit() {
+  setGroup('7. completed-run memory stays bounded');
+
+  const totalRuns = progress.MAX_SEEN_RUNS + 25;
+  const emitted = [];
+  let cursor = 0;
+  let currentRunId = null;
+
+  const poller = progress.createDeployProgress({
+    dataDir: TEST_DATA_DIR,
+    detectMs: 1,
+    pollMs: 60_000,
+    emitMs: 0,
+    emit: (_event, payload) => emitted.push(payload.runId),
+    deps: {
+      listApps: () => {
+        if (cursor >= totalRuns) return [];
+        currentRunId = `churn-${String(cursor).padStart(4, '0')}`;
+        cursor += 1;
+        return [{ id: 'churn-app' }];
+      },
+      lockHolder: () => currentRunId ? { runId: currentRunId } : null,
+      listRuns: () => [],
+      readRun: () => ({
+        id: currentRunId,
+        status: 'success',
+        step: 'done',
+        stage: 'done',
+        skippedStages: [],
+      }),
+      logFile: () => path.join(TEST_DATA_DIR, 'missing-churn.log'),
+      getPermissions: () => ({ 'deploy.logs': false }),
+    },
+  });
+
+  poller.start();
+  try {
+    const finished = await waitFor(() => emitted.length === totalRuns, 15_000);
+    const seen = poller.seenRunIds();
+    check('every short deployment is processed', Boolean(finished), `${emitted.length}/${totalRuns}`);
+    check('the completed-run ledger is capped',
+      seen.length === progress.MAX_SEEN_RUNS,
+      `${seen.length}/${progress.MAX_SEEN_RUNS}`);
+    check('only the oldest completed runs were evicted',
+      seen[0] === 'churn-0025' && seen[seen.length - 1] === `churn-${String(totalRuns - 1).padStart(4, '0')}`,
+      `${seen[0]} → ${seen[seen.length - 1]}`);
+  } finally {
+    poller.stop();
+  }
+}
+
 async function main() {
   process.stdout.write('\nDeployment progress: files → agent → Hub\n');
   process.stdout.write(`data dir: ${TEST_DATA_DIR}\n`);
@@ -405,6 +457,7 @@ async function main() {
     await testPartialAndTruncatedLog();
     await testStageBar();
     await testRecordWithoutStageFields();
+    await testSeenRunLimit();
   } finally {
     progress.stopDeployProgress();
     try { db.closeDb(); } catch { /* already closed */ }

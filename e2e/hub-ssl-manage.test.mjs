@@ -37,6 +37,7 @@ import { TEST_DATA_DIR, assertInsideTestDataDir } from './lib/guard.mjs';
 
 import fs from 'fs';
 import net from 'net';
+import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
 import { once } from 'events';
@@ -47,6 +48,7 @@ import { issueSetupCode } from './lib/firstRun.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const REAL_LEGACY_DB = path.join(ROOT, 'data', 'easy-devops.sqlite');
+const REAL_LEGACY_MARKER = `${REAL_LEGACY_DB}.migrated`;
 
 const srcUrl = (rel) => pathToFileURL(path.join(ROOT, 'src', rel)).href;
 const forward = (p) => String(p).replace(/\\/g, '/');
@@ -56,6 +58,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const PASSWORD = 'ssl-manage-e2e-password';
 const SERVER_ID = 'test-server-id';
 const SECRET = 'test-secret';
+const HUB_COMMAND_TIMEOUT_MS = 90_000;
 
 const results = [];
 let group = '';
@@ -76,9 +79,29 @@ async function waitUntil(fn, { timeoutMs = 8_000, everyMs = 100 } = {}) {
 
 // ─── Scratch layout ─────────────────────────────────────────────────────────
 
-const scratchRoot = path.join(TEST_DATA_DIR, 'scratch');
+const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ez-hub-ssl-manage-'));
 const sslDir = path.join(scratchRoot, 'ssl');
 const nginxDir = path.join(scratchRoot, 'nginx');
+
+function assertInsideScratch(file, what) {
+  const candidate = path.resolve(file);
+  const root = path.resolve(scratchRoot);
+  const normalize = (value) => process.platform === 'win32' ? value.toLowerCase() : value;
+  const relative = normalize(candidate).startsWith(`${normalize(root)}${path.sep}`)
+    || normalize(candidate) === normalize(root);
+  if (!relative) throw new Error(`Refusing to ${what}: ${file} is outside ${scratchRoot}`);
+}
+
+function cleanupScratch() {
+  const resolved = path.resolve(scratchRoot);
+  const parent = path.resolve(os.tmpdir());
+  const normalize = (value) => process.platform === 'win32' ? value.toLowerCase() : value;
+  if (normalize(path.dirname(resolved)) !== normalize(parent)
+      || !path.basename(resolved).startsWith('ez-hub-ssl-manage-')) {
+    throw new Error(`Refusing to remove unexpected scratch directory: ${resolved}`);
+  }
+  fs.rmSync(resolved, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+}
 
 // Fake certificate FILES only. No real certificate is created or needed:
 // deletion only asks whether the directory is referenced, and
@@ -87,17 +110,33 @@ const nginxDir = path.join(scratchRoot, 'nginx');
 const FAKE_CERT = '-----BEGIN CERTIFICATE-----\nnot-a-real-certificate\n-----END CERTIFICATE-----\n';
 const FAKE_KEY = '-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n';
 
-function makeCert(name) {
+async function makeCert(name) {
+  const rootCreated = !fs.existsSync(sslDir);
   const dir = path.join(sslDir, name);
-  assertInsideTestDataDir(dir, `write a fake certificate for ${name}`);
+  assertInsideScratch(dir, `write a fake certificate for ${name}`);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'fullchain.pem'), FAKE_CERT);
   fs.writeFileSync(path.join(dir, 'privkey.pem'), FAKE_KEY);
+  const managed = await import(srcUrl('core/ssl/managed-artifacts.js'));
+  await managed.recordManagedArtifacts({
+    dataDir: TEST_DATA_DIR,
+    sslDir,
+    rootCreated,
+    files: [`${name}/fullchain.pem`, `${name}/privkey.pem`],
+    directories: [name],
+  });
   return dir;
 }
 
 function certPath(name) { return forward(path.join(sslDir, name, 'fullchain.pem')); }
 function keyPath(name) { return forward(path.join(sslDir, name, 'privkey.pem')); }
+
+function seed(file, contents) {
+  assertInsideScratch(file, `write ${file}`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, contents);
+  return file;
+}
 
 // ─── Dashboard helpers ──────────────────────────────────────────────────────
 
@@ -219,6 +258,9 @@ async function startTestHub() {
 
 async function main() {
   const legacyBefore = fs.existsSync(REAL_LEGACY_DB) ? fs.statSync(REAL_LEGACY_DB).mtimeMs : null;
+  const markerBefore = fs.existsSync(REAL_LEGACY_MARKER)
+    ? fs.statSync(REAL_LEGACY_MARKER).mtimeMs
+    : null;
 
   fs.mkdirSync(sslDir, { recursive: true });
   fs.mkdirSync(nginxDir, { recursive: true });
@@ -239,6 +281,7 @@ async function main() {
   // ── Config and stored domains, before any core module reads them ──────────
   assertInsideTestDataDir(TEST_DATA_DIR, 'seed the config');
   const cfg = await import(srcUrl('core/config.js'));
+  const { saveHubLink, clearHubLink, saveHubPermissions } = await import(srcUrl('core/hubLink.js'));
   cfg.saveConfig({
     ...cfg.loadConfig(),
     nginxDir,
@@ -249,9 +292,16 @@ async function main() {
     os: process.platform,
   });
 
-  makeCert('used.example.com');
-  makeCert('ref.example.com');
-  makeCert('disabled.example.com');
+  await makeCert('used.example.com');
+  await makeCert('ref.example.com');
+  await makeCert('disabled.example.com');
+  await makeCert('alias-config.example');
+  await makeCert('alias-reference.example');
+
+  const sslAlias = path.join(scratchRoot, 'ssl-alias');
+  fs.symlinkSync(sslDir, sslAlias, process.platform === 'win32' ? 'junction' : 'dir');
+  const aliasCert = (name) => forward(path.join(sslAlias, name, 'fullchain.pem'));
+  const aliasKey = (name) => forward(path.join(sslAlias, name, 'privkey.pem'));
 
   // A disabled domain's `.conf.disabled` copy referencing a certificate. This
   // is the "config line only" case: no enabled domain uses it.
@@ -267,6 +317,57 @@ async function main() {
       '',
     ].join('\n'),
   );
+  const relativeRefConf = path.join(nginxDir, 'alias-config.example.conf.disabled');
+  fs.writeFileSync(
+    relativeRefConf,
+    [
+      'server {',
+      '    listen 443 ssl;',
+      '    ssl_certificate ../ssl/alias-config.example/fullchain.pem;',
+      '    ssl_certificate_key ../ssl/alias-config.example/privkey.pem;',
+      '}',
+      '',
+    ].join('\n'),
+  );
+
+  // A hard link keeps the inode but changes the basename. The scan must not
+  // decide what to resolve from `fullchain.pem` / `privkey.pem` alone.
+  const aliasDir = path.join(scratchRoot, 'renamed-certificate-files');
+  fs.mkdirSync(aliasDir, { recursive: true });
+  const renamedChain = forward(path.join(aliasDir, 'currently-served.pem'));
+  const renamedKey = forward(path.join(aliasDir, 'currently-served.key'));
+  fs.linkSync(path.join(sslDir, 'alias-reference.example', 'fullchain.pem'), renamedChain);
+  fs.linkSync(path.join(sslDir, 'alias-reference.example', 'privkey.pem'), renamedKey);
+  fs.writeFileSync(
+    path.join(nginxDir, 'renamed-alias.conf.disabled'),
+    [
+      'server {',
+      '    listen 443 ssl;',
+      `    ssl_certificate ${renamedChain};`,
+      `    ssl_certificate_key ${renamedKey};`,
+      '}',
+      '',
+    ].join('\n'),
+  );
+
+  // Config includes may be linked directories. They are part of nginx's real
+  // search surface, including a cycle that must not make the walk recurse.
+  const linkedConfigTarget = path.join(scratchRoot, 'linked-nginx-configs');
+  fs.mkdirSync(linkedConfigTarget, { recursive: true });
+  fs.writeFileSync(
+    path.join(linkedConfigTarget, 'linked-reference.conf.disabled'),
+    [
+      'server {',
+      '    listen 443 ssl;',
+      `    ssl_certificate ${certPath('alias-reference.example')};`,
+      `    ssl_certificate_key ${keyPath('alias-reference.example')};`,
+      '}',
+      '',
+    ].join('\n'),
+  );
+  const directoryLinkType = process.platform === 'win32' ? 'junction' : 'dir';
+  fs.symlinkSync(linkedConfigTarget, path.join(nginxDir, 'linked-configs'), directoryLinkType);
+  fs.symlinkSync(linkedConfigTarget, path.join(linkedConfigTarget, 'cycle'), directoryLinkType);
 
   assertInsideTestDataDir(TEST_DATA_DIR, 'seed the domains');
   const domainsDb = await import(srcUrl('core/domains-db.js'));
@@ -274,6 +375,22 @@ async function main() {
     domainsDb.createDomain({
       name: 'used.example.com', port: 3000, enabled: true,
       ssl: { enabled: true, certPath: certPath('used.example.com'), keyPath: keyPath('used.example.com') },
+    }),
+    domainsDb.createDomain({
+      name: 'relative.example.com', port: 3003, enabled: true,
+      ssl: {
+        enabled: true,
+        certPath: '../ssl/used.example.com/fullchain.pem',
+        keyPath: '../ssl/used.example.com/privkey.pem',
+      },
+    }),
+    domainsDb.createDomain({
+      name: 'junction.example.com', port: 3004, enabled: true,
+      ssl: {
+        enabled: true,
+        certPath: aliasCert('used.example.com'),
+        keyPath: aliasKey('used.example.com'),
+      },
     }),
     // SSL is ON but the domain is disabled: on its own this must not protect
     // the certificate, because nothing serves it.
@@ -310,6 +427,10 @@ async function main() {
   const byDomain = await usage.domainsUsingCert('used.example.com');
   check('an enabled SSL domain counts as a user', byDomain.includes('used.example.com'),
     JSON.stringify(byDomain));
+  check('relative certificate paths are resolved from the nginx directory',
+    byDomain.includes('relative.example.com'), JSON.stringify(byDomain));
+  check('a junction or symlink alias to the same certificate counts as a user',
+    byDomain.includes('junction.example.com'), JSON.stringify(byDomain));
   check('a disabled SSL domain does NOT count as a user',
     !(await usage.domainsUsingCert('disabled.example.com')).includes('disabled.example.com'));
 
@@ -337,13 +458,40 @@ async function main() {
     byConfig.references.some((r) => path.basename(r.file) === 'ref.example.com.conf.disabled' && r.line === 4),
     JSON.stringify(byConfig.references.map((r) => ({ f: path.basename(r.file), l: r.line }))));
 
+  const relativeRefs = await usage.findCertReferences('alias-config.example');
+  check('a relative nginx certificate path resolves to the managed certificate',
+    relativeRefs.length === 2
+      && relativeRefs.every((entry) => path.basename(entry.file) === 'alias-config.example.conf.disabled'),
+    relativeRefs.map((entry) => `${path.basename(entry.file)}:${entry.line}`).join(', '));
+  const byRelativeConfig = await usage.deleteCertificate('alias-config.example');
+  check('the relative nginx reference prevents certificate deletion',
+    byRelativeConfig.ok === false && byRelativeConfig.code === 'cert_in_use',
+    JSON.stringify(byRelativeConfig.code));
+
+  const aliasRefs = await usage.findCertReferences('alias-reference.example');
+  check('renamed hard-link aliases are resolved and found',
+    aliasRefs.some((entry) => path.basename(entry.file) === 'renamed-alias.conf.disabled' && entry.line === 3)
+      && aliasRefs.some((entry) => path.basename(entry.file) === 'renamed-alias.conf.disabled' && entry.line === 4),
+    aliasRefs.map((entry) => `${path.basename(entry.file)}:${entry.line}`).join(', '));
+  check('linked nginx config directories are traversed with cycle protection',
+    aliasRefs.filter((entry) => path.basename(entry.file) === 'linked-reference.conf.disabled').length === 2,
+    aliasRefs.map((entry) => `${path.basename(entry.file)}:${entry.line}`).join(', '));
+  const byAliasConfig = await usage.deleteCertificate('alias-reference.example');
+  check('renamed and linked-directory references both prevent deletion',
+    byAliasConfig.ok === false && byAliasConfig.code === 'cert_in_use'
+      && byAliasConfig.references.length === 4,
+    JSON.stringify(byAliasConfig.references?.map((entry) => ({
+      file: path.basename(entry.file),
+      line: entry.line,
+    }))));
+
   const disabled = await usage.deleteCertificate('disabled.example.com');
   check('a disabled domain with no config reference does not protect the certificate',
     disabled.ok === true && disabled.domain === 'disabled.example.com', JSON.stringify(disabled));
   check('  ...and the directory is gone',
     !fs.existsSync(path.join(sslDir, 'disabled.example.com')));
 
-  makeCert('free.example.com');
+  await makeCert('free.example.com');
   const unused = await usage.deleteCertificate('free.example.com');
   check('an unused certificate is deleted',
     unused.ok === true && unused.domain === 'free.example.com', JSON.stringify(unused));
@@ -351,6 +499,53 @@ async function main() {
     !fs.existsSync(path.join(sslDir, 'free.example.com')));
   check('the result reports the directory it removed',
     unused.directory === path.join(sslDir, 'free.example.com'), unused.directory);
+
+  await makeCert('mixed.example.com');
+  const unrelatedCertFile = seed(
+    path.join(sslDir, 'mixed.example.com', 'UNRELATED.txt'),
+    'must remain',
+  );
+  const mixed = await usage.deleteCertificate('mixed.example.com');
+  check('managed certificate deletion is not recursive',
+    mixed.ok === true
+      && !fs.existsSync(path.join(sslDir, 'mixed.example.com', 'fullchain.pem'))
+      && !fs.existsSync(path.join(sslDir, 'mixed.example.com', 'privkey.pem'))
+      && fs.existsSync(path.join(sslDir, 'mixed.example.com'))
+      && fs.readFileSync(unrelatedCertFile, 'utf8') === 'must remain',
+    JSON.stringify(mixed));
+
+  const unmanagedDir = path.join(sslDir, 'unmanaged.example.com');
+  assertInsideScratch(unmanagedDir, 'write an unmanaged certificate');
+  fs.mkdirSync(unmanagedDir, { recursive: true });
+  fs.writeFileSync(path.join(unmanagedDir, 'fullchain.pem'), FAKE_CERT);
+  fs.writeFileSync(path.join(unmanagedDir, 'privkey.pem'), FAKE_KEY);
+  const unmanaged = await usage.deleteCertificate('unmanaged.example.com');
+  check('a certificate absent from the ownership manifest is refused',
+    unmanaged.ok === false
+      && unmanaged.code === 'cert_not_managed'
+      && fs.existsSync(path.join(sslDir, 'unmanaged.example.com', 'privkey.pem')),
+    JSON.stringify(unmanaged));
+
+  await makeCert('race.example.com');
+  const raceSentinel = seed(path.join(scratchRoot, 'race-sentinel.txt'), 'link target must survive');
+  const managed = await import(srcUrl('core/ssl/managed-artifacts.js'));
+  const raced = managed.removeManagedCertificateDomain({
+    dataDir: TEST_DATA_DIR,
+    sslDir,
+    domain: 'race.example.com',
+    deps: {
+      afterValidation(file) {
+        if (path.basename(file) !== 'fullchain.pem') return;
+        fs.rmSync(file, { force: true });
+        fs.linkSync(raceSentinel, file);
+      },
+    },
+  });
+  check('a file replaced by a link after validation is never followed',
+    raced.ok === false
+      && raced.errors.some((entry) => /changed|replaced|linked|regular/i.test(entry.reason))
+      && fs.readFileSync(raceSentinel, 'utf8') === 'link target must survive',
+    JSON.stringify(raced.errors));
 
   // ── (2) handleHubSslCommand: delete ──────────────────────────────────────
   setGroup('(2) handleHubSslCommand delete: structured refusals, no paths');
@@ -392,7 +587,7 @@ async function main() {
   check('a delete without a domain is refused',
     hubNoName.ok === false && /domain is required/.test(hubNoName.error ?? ''), hubNoName.error);
 
-  makeCert('hub-free.example.com');
+  await makeCert('hub-free.example.com');
   const hubDeleted = await ops.handleHubSslCommand({ action: 'delete', domain: 'hub-free.example.com' });
   check('an unused certificate is deleted through the Hub action',
     hubDeleted.ok === true && hubDeleted.deleted === true && hubDeleted.domain === 'hub-free.example.com',
@@ -431,8 +626,81 @@ async function main() {
     fs.readdirSync(sslDir).sort().join(',') === sslBefore.join(','),
     fs.readdirSync(sslDir).sort().join(', '));
 
+  // Path disclosure has its own permission. Exercise successful projections
+  // with an injected issuer so this suite never contacts an ACME server.
+  cfg.saveConfig({ ...cfg.loadConfig(), acmeEmail: 'ops@example.com' });
+  const issuePaths = {
+    certPath: certPath('viewless.example.com'),
+    keyPath: keyPath('viewless.example.com'),
+  };
+  const fakeIssue = async () => ({
+    success: true,
+    mode: 'proxy',
+    ...issuePaths,
+    preflight: { ok: true, detail: 'ok', results: [], proxied: false },
+  });
+
+  saveHubPermissions({ 'nginx.config.view': false });
+  const issueWithoutView = await ops.handleHubSslCommand(
+    { action: 'issue', domain: 'viewless.example.com' },
+    { issueFn: fakeIssue },
+  );
+  check('a successful SSL issue omits certificate paths without nginx.config.view',
+    issueWithoutView.ok === true
+      && !Object.prototype.hasOwnProperty.call(issueWithoutView, 'certPath')
+      && !Object.prototype.hasOwnProperty.call(issueWithoutView, 'keyPath')
+      && !JSON.stringify(issueWithoutView).includes(forward(sslDir)),
+    JSON.stringify(issueWithoutView));
+
+  saveHubPermissions({ 'nginx.config.view': true });
+  const issueWithView = await ops.handleHubSslCommand(
+    { action: 'issue', domain: 'viewless.example.com' },
+    { issueFn: fakeIssue },
+  );
+  check('a successful SSL issue includes certificate paths with nginx.config.view',
+    issueWithView.ok === true
+      && forward(issueWithView.certPath) === issuePaths.certPath
+      && forward(issueWithView.keyPath) === issuePaths.keyPath,
+    JSON.stringify(issueWithView));
+
+  const fakeSuggest = async () => ({
+    found: true,
+    match: 'exact',
+    certificate: {
+      domain: 'viewless.example.com',
+      names: ['viewless.example.com'],
+      ...issuePaths,
+      status: 'valid',
+    },
+  });
+  saveHubPermissions({ 'nginx.config.view': false });
+  const suggestWithoutView = await ops.handleHubSslCommand(
+    { action: 'suggest', domain: 'viewless.example.com' },
+    { suggestFn: fakeSuggest },
+  );
+  check('SSL suggest omits top-level and nested certificate paths without nginx.config.view',
+    suggestWithoutView.ok === true
+      && !Object.prototype.hasOwnProperty.call(suggestWithoutView, 'certPath')
+      && !Object.prototype.hasOwnProperty.call(suggestWithoutView.certificate ?? {}, 'certPath')
+      && !Object.prototype.hasOwnProperty.call(suggestWithoutView.certificate ?? {}, 'keyPath')
+      && !JSON.stringify(suggestWithoutView).includes(forward(sslDir)),
+    JSON.stringify(suggestWithoutView));
+
+  saveHubPermissions({ 'nginx.config.view': true });
+  const suggestWithView = await ops.handleHubSslCommand(
+    { action: 'suggest', domain: 'viewless.example.com' },
+    { suggestFn: fakeSuggest },
+  );
+  check('SSL suggest includes certificate paths with nginx.config.view',
+    suggestWithView.ok === true
+      && forward(suggestWithView.certificate?.certPath) === issuePaths.certPath
+      && forward(suggestWithView.certificate?.keyPath) === issuePaths.keyPath,
+    JSON.stringify(suggestWithView));
+
   // ── (4) handleHubDomainCommand: input checks and cert files ──────────────
   setGroup('(4) handleHubDomainCommand: validation and cert_missing');
+
+  saveHubPermissions({ 'nginx.config.view': true });
 
   const nginxBefore = fs.readdirSync(nginxDir).sort();
   const evilCreate = await domainsDb.handleHubDomainCommand({
@@ -464,7 +732,7 @@ async function main() {
       && missingCreate.error === missingCreate.hint, missingCreate.hint);
   check('the domain was not stored', !domainsDb.findDomain('nocert.example.com'));
 
-  makeCert('ready.example.com');
+  await makeCert('ready.example.com');
   const readyCreate = await domainsDb.handleHubDomainCommand({
     action: 'create',
     domain: { name: 'ready.example.com', port: 3202, ssl: { enabled: true } },
@@ -536,12 +804,87 @@ async function main() {
       createdAt: afterUsed.createdAt,
     }));
 
+  saveHubPermissions({ 'nginx.config.view': false });
+  const privateMissingCreate = await domainsDb.handleHubDomainCommand({
+    action: 'create',
+    domain: { name: 'private-nocert.example.com', port: 3203, ssl: { enabled: true } },
+  });
+  check('cert_missing create omits certificate paths without nginx.config.view',
+    privateMissingCreate.code === 'cert_missing'
+      && !Object.prototype.hasOwnProperty.call(privateMissingCreate, 'certPath')
+      && !Object.prototype.hasOwnProperty.call(privateMissingCreate, 'keyPath')
+      && !JSON.stringify(privateMissingCreate).includes(forward(sslDir)),
+    JSON.stringify(privateMissingCreate));
+
+  const privateMissingUpdate = await domainsDb.handleHubDomainCommand({
+    action: 'update',
+    name: 'nofile.example.com',
+    domain: { ssl: { enabled: true } },
+  });
+  check('cert_missing update omits certificate paths without nginx.config.view',
+    privateMissingUpdate.code === 'cert_missing'
+      && !Object.prototype.hasOwnProperty.call(privateMissingUpdate, 'certPath')
+      && !Object.prototype.hasOwnProperty.call(privateMissingUpdate, 'keyPath')
+      && !JSON.stringify(privateMissingUpdate).includes(forward(sslDir)),
+    JSON.stringify(privateMissingUpdate));
+
+  const deployApps = await import(srcUrl('core/deploy/apps.js'));
+  const deployCommands = await import(srcUrl('core/deploy/hubCommands.js'));
+  const linkedApp = deployApps.createApp({
+    id: 'ssl-view-app',
+    repoUrl: 'https://github.com/example/ssl-view-app.git',
+  });
+  if (!linkedApp.ok) throw new Error(linkedApp.errors.join(', '));
+  const fakeLink = async () => ({
+    ok: true,
+    domain: 'linked.example.com',
+    created: true,
+    port: 3000,
+    www: false,
+    behindCloudflare: false,
+    ssl: { mode: 'existing', ok: true, ...issuePaths },
+    redirect: true,
+    nginxReloaded: true,
+  });
+  const linkedWithoutView = await deployCommands.handleHubDeployCommand(
+    {
+      action: 'linkDomain',
+      id: linkedApp.app.id,
+      domain: 'linked.example.com',
+      ssl: { mode: 'existing', certName: 'viewless.example.com' },
+    },
+    { linkDomainFn: fakeLink },
+  );
+  check('a linked-domain result omits certificate paths without nginx.config.view',
+    linkedWithoutView.domain === 'linked.example.com'
+      && linkedWithoutView.created === true
+      && !Object.prototype.hasOwnProperty.call(linkedWithoutView.ssl ?? {}, 'certPath')
+      && !Object.prototype.hasOwnProperty.call(linkedWithoutView.ssl ?? {}, 'keyPath')
+      && !JSON.stringify(linkedWithoutView).includes(forward(sslDir)),
+    JSON.stringify(linkedWithoutView));
+
+  saveHubPermissions({ 'nginx.config.view': true });
+  const linkedWithView = await deployCommands.handleHubDeployCommand(
+    {
+      action: 'linkDomain',
+      id: linkedApp.app.id,
+      domain: 'linked.example.com',
+      ssl: { mode: 'existing', certName: 'viewless.example.com' },
+    },
+    { linkDomainFn: fakeLink },
+  );
+  check('a linked-domain result includes certificate paths with nginx.config.view',
+    linkedWithView.domain === 'linked.example.com'
+      && linkedWithView.created === true
+      && forward(linkedWithView.ssl?.certPath) === issuePaths.certPath
+      && forward(linkedWithView.ssl?.keyPath) === issuePaths.keyPath,
+    JSON.stringify(linkedWithView));
+
   // ── (5) The agent refuses over the socket, and forwards the reason ────────
   setGroup('(5) hub:manageSSL delete over the fake Hub socket');
 
   const hub = await startTestHub();
   const agent = await import(srcUrl('core/hub/agent.js'));
-  const { saveHubLink, clearHubLink, saveHubPermissions } = await import(srcUrl('core/hubLink.js'));
   saveHubLink({ hubUrl: hub.url, serverId: SERVER_ID, secret: SECRET });
 
   /** Emits a command and waits for BOTH the ack and command:result. */
@@ -551,7 +894,7 @@ async function main() {
     let acked = null;
     if (hub.state.socket) {
       await new Promise((resolve) => {
-        const timer = setTimeout(resolve, 15_000);
+        const timer = setTimeout(resolve, HUB_COMMAND_TIMEOUT_MS);
         hub.state.socket.emit('hub:manageSSL', { ...payload, requestId }, (ack) => {
           acked = ack;
           clearTimeout(timer);
@@ -559,7 +902,10 @@ async function main() {
         });
       });
     }
-    await waitUntil(() => hub.state.results.length > before, { timeoutMs: 15_000 });
+    await waitUntil(
+      () => hub.state.results.length > before,
+      { timeoutMs: HUB_COMMAND_TIMEOUT_MS },
+    );
     return {
       acked,
       event: hub.state.results.find((r) => r.requestId === requestId) ?? null,
@@ -570,7 +916,11 @@ async function main() {
   try {
     saveHubPermissions({ 'ssl.delete': true });
     agent.initHubAgent();
-    check('the agent connects to the fake Hub', await waitUntil(() => hub.live() === 1), `live: ${hub.live()}`);
+    check(
+      'the agent connects to the fake Hub',
+      await waitUntil(() => hub.live() === 1 && agent.getHubAgentStatus().connected),
+      `live: ${hub.live()}, status: ${agent.getHubAgentStatus().status}`,
+    );
 
     const refused = await dispatch({ action: 'delete', domain: 'used.example.com' });
     check('a refusal is emitted as command:result with ok:false',
@@ -609,7 +959,7 @@ async function main() {
   // ── (6) DELETE /api/ssl/:domain on the real dashboard ────────────────────
   setGroup('(6) dashboard DELETE /api/ssl/:domain');
 
-  makeCert('dash-free.example.com');
+  await makeCert('dash-free.example.com');
 
   // The dashboard is a separate process opening the same SQLite file, so this
   // process must let go of it first.
@@ -657,13 +1007,21 @@ async function main() {
   // ── (7) Isolation ────────────────────────────────────────────────────────
   setGroup('(7) isolation');
   const legacyAfter = fs.existsSync(REAL_LEGACY_DB) ? fs.statSync(REAL_LEGACY_DB).mtimeMs : null;
+  const markerAfter = fs.existsSync(REAL_LEGACY_MARKER)
+    ? fs.statSync(REAL_LEGACY_MARKER).mtimeMs
+    : null;
   check('data/easy-devops.sqlite untouched', legacyAfter === legacyBefore);
-  check('no .migrated file created', !fs.existsSync(`${REAL_LEGACY_DB}.migrated`));
+  check('the legacy .migrated marker was neither created nor modified',
+    markerAfter === markerBefore);
   check('the sentinel in sslDir\'s parent is still intact',
     fs.existsSync(parentSentinel) && fs.existsSync(outsideFile));
   check('the protected certificate is still on disk at the end',
     fs.existsSync(path.join(sslDir, 'used.example.com', 'privkey.pem')));
   check('no child process is left running', procs.length === 0);
+
+  cleanupScratch();
+  check('the external certificate and nginx scratch directory was removed',
+    !fs.existsSync(scratchRoot));
 
   const failed = results.filter((r) => !r.passed);
   process.stdout.write(`\n${'─'.repeat(62)}\n`);
@@ -678,5 +1036,6 @@ async function main() {
 main().catch(async (err) => {
   process.stderr.write(`\nHarness error: ${err.stack}\n`);
   await stopAll();
+  cleanupScratch();
   process.exit(1);
 });

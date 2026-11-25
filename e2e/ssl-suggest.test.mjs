@@ -189,6 +189,9 @@ function forward(p) {
 
 async function main() {
   const legacyBefore = fs.existsSync(REAL_LEGACY_DB) ? fs.statSync(REAL_LEGACY_DB).mtimeMs : null;
+  const legacyMarkerBefore = fs.existsSync(`${REAL_LEGACY_DB}.migrated`)
+    ? fs.statSync(`${REAL_LEGACY_DB}.migrated`).mtimeMs
+    : null;
 
   // ── (1) The resolver ──────────────────────────────────────────────────────
   setGroup('(1) resolver: matching and ranking');
@@ -331,6 +334,9 @@ async function main() {
   await stopAll();
   coreDb.initDb();
 
+  const hubLink = await import(pathToFileURL(path.join(ROOT, 'src/core/hubLink.js')).href);
+  hubLink.saveHubPermissions({ 'nginx.config.view': true });
+
   assertTempDataDir('import core/cert-operations.js');
   const ops = await import(pathToFileURL(path.join(ROOT, 'src/core/cert-operations.js')).href);
 
@@ -356,8 +362,12 @@ async function main() {
   // ── Isolation ─────────────────────────────────────────────────────────────
   setGroup('Isolation');
   const legacyAfter = fs.existsSync(REAL_LEGACY_DB) ? fs.statSync(REAL_LEGACY_DB).mtimeMs : null;
+  const legacyMarkerAfter = fs.existsSync(`${REAL_LEGACY_DB}.migrated`)
+    ? fs.statSync(`${REAL_LEGACY_DB}.migrated`).mtimeMs
+    : null;
   check('data/easy-devops.sqlite untouched', legacyAfter === legacyBefore);
-  check('no .migrated file created', !fs.existsSync(`${REAL_LEGACY_DB}.migrated`));
+  check('the legacy .migrated marker was neither created nor modified',
+    legacyMarkerAfter === legacyMarkerBefore);
 
   coreDb.closeDb();
   check('temporary directory removed', rmWithRetry(tmpRoot), tmpRoot);

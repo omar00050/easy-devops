@@ -1,6 +1,6 @@
 # Easy DevOps — Dashboard API Contract
 
-**Contract version: 2.17.0** · Last updated: 2026-11-19 · Derived from the code in
+**Contract version: 2.18.0** · Last updated: 2026-11-24 · Derived from the code in
 `src/dashboard/`, not from any earlier plan.
 
 > ## The rule
@@ -34,13 +34,24 @@ password never protected against.
 
 | Check | Rule | Failure |
 |---|---|---|
-| `Host` | Port must match the dashboard's. On a **loopback** bind the hostname must be `localhost`, `127.0.0.1` or `[::1]`. On a **public** bind any hostname is accepted. | `403` |
-| `Origin` | When present: port must match. On a loopback bind the hostname must be a loopback name; on a public bind it must equal the `Host` hostname (same-origin). | `403` |
+| `Host` | Port must match the dashboard's. A direct request must use `localhost`, `127.0.0.1` or `[::1]`. | `403` |
+| `Origin` | When present: protocol and port must match the direct HTTP request, and its hostname must be a loopback name. | `403` |
 | `X-EZ-Request: 1` | Required on every `POST`, `PUT`, `PATCH`, `DELETE`, and on the Socket.io handshake. Not required on `GET`. | `403` |
+
+The dashboard always listens on a loopback address because its listener uses
+plain HTTP. For remote access, an HTTPS reverse proxy or authenticated tunnel on
+the same machine connects to that listener. A request is treated as a trusted
+proxy request only when its TCP peer is loopback, `X-Forwarded-Proto` is exactly
+`https`, and one `X-Forwarded-Host` value is present. The public forwarded host
+then replaces the direct `Host` and the `Origin` must use `https` and the
+effective HTTPS port. Duplicate `Host`, `X-Forwarded-Host` or
+`X-Forwarded-Proto` headers are refused. Sessions on this path use a `Secure`
+cookie.
 
 A `403` from these checks carries `{ error, reason, detail }`, where `reason` is
 one of `host_missing`, `host_port_mismatch`, `host_not_local`,
-`origin_malformed`, `origin_port_mismatch`, `origin_not_local`,
+`host_invalid`, `duplicate_forwarding_header`, `origin_malformed`,
+`origin_protocol_mismatch`, `origin_port_mismatch`, `origin_not_local`,
 `origin_cross_site`, `missing_request_header`.
 
 **403 is deliberately not 401.** A login cannot fix "this request may not be
@@ -53,9 +64,11 @@ screen.
 
 - **`password`** — every endpoint marked *session* requires a logged-in session
   cookie. Without one: `401 { error: "Unauthorized" }`.
-- **`none`** — no session is required. Honoured **only** while
-  `dashboardBindAddress` is `127.0.0.1` or `::1`; if the stored config ever says
-  `none` with a public bind, a password is required anyway
+- **`none`** — no session is required only for a direct request whose TCP peer
+  is loopback and which carries no forwarding headers. A request through a
+  local HTTPS proxy or tunnel therefore requires a session even when the stored
+  setting is `none`. If the stored config ever says `none` with a non-loopback
+  bind, the bind is repaired to loopback and a password is required anyway
   (`effectiveAuthMode()` in `src/core/config.js`).
 
 The transport checks above are **not** relaxed in `none` mode. In that mode they
@@ -99,8 +112,8 @@ Response `200`:
 }
 ```
 `canUseNoPassword` is true only when the bind is loopback **and** this request
-came from a loopback address. It drives whether the first-run screen offers the
-"No password" option at all.
+is a direct loopback request with no proxy headers. It drives whether the
+first-run screen offers the "No password" option at all.
 
 `setupCodeRequired` is true while first-run setup is pending and a one-time
 setup code is outstanding; the first-run screen must then collect it alongside
@@ -208,12 +221,42 @@ Cloudflare IPv4/IPv6 range and `real_ip_header CF-Connecting-IP`. Absent means
 non-boolean value is `400 Invalid behindCloudflare: must be true or false`.
 
 Responses: `201` (create) or `200` (update) with the stored domain object plus
-its current `notifications` map;
-`{ "deleted": name, "certDeleted": boolean }` for delete, where
-`?deleteCert=true` also removes the certificate directory and `certDeleted`
-reports whether it did; and `{ "enabled": boolean }` for toggle. `PUT
-/api/domains/:name/toggle` takes **no body**: it flips the domain's current
-state, so two clients cannot disagree about the target.
+its current `notifications` map; `{ "enabled": boolean }` for toggle; and the
+delete response below. `PUT /api/domains/:name/toggle` takes **no body**: it
+flips the domain's current state, so two clients cannot disagree about the
+target.
+
+`DELETE /api/domains/:name` always removes the domain record and its nginx
+config. Without `?deleteCert=true`, or for a domain without SSL enabled, it
+answers:
+
+```json
+{ "deleted": "example.com", "certDeleted": false }
+```
+
+With `?deleteCert=true`, it also asks the shared certificate lifecycle service
+to remove the certificate. A successful certificate removal answers
+`{ "deleted": name, "certDeleted": true }`. The domain deletion still succeeds
+when the certificate cannot safely be removed. In that case the response keeps
+the certificate and reports why:
+
+```json
+{
+  "deleted": "example.com",
+  "certDeleted": false,
+  "certRetained": true,
+  "certReason": "cert_in_use",
+  "certMessage": "The domain was deleted, but its certificate is still used by another domain or nginx configuration and was retained.",
+  "usedBy": ["another.example.com"],
+  "references": [{ "file": "another.example.com.conf", "line": 8 }]
+}
+```
+
+`certReason` is `cert_in_use`, `cert_not_managed`, or `delete_failed`.
+`usedBy` is empty unless another stored domain uses the certificate.
+`references` contains configuration file basenames and one-based line numbers,
+never full paths or configuration text. An unmanaged certificate is retained
+because it is not recorded as Easy DevOps-owned.
 
 Errors: `400` validation (including a toggle of a domain whose config file path
 was never recorded) · `404` `{ "error": "Domain not found: …" }` ·
@@ -378,11 +421,14 @@ The whole issue or renewal is bounded at **five minutes**; a run that runs out
 of time fails with `step` naming the stage it was in rather than leaving the
 request open. Each stage is reported as it happens — see §3.1 and §3.5.
 
-**`DELETE /api/ssl/:domain`** removes the certificate's directory
-(`${sslDir}/${domain}`, containing `fullchain.pem` and `privkey.pem`). Before
-deleting anything it scans the nginx configuration tree (`nginxDir`,
-recursively, over `*.conf` and `*.conf.disabled` files including the main
-`nginx.conf`) for lines that point into that directory.
+**`DELETE /api/ssl/:domain`** removes only files recorded for that certificate
+in the Easy DevOps managed-artifact manifest, then removes the now-empty
+directory. It never recursively removes `${sslDir}/${domain}`. Files that
+Easy DevOps did not record, later replacements whose identity no longer
+matches the manifest, and unrelated files are kept. Before deleting anything
+it scans the nginx configuration tree (`nginxDir`, recursively, over `*.conf`
+and `*.conf.disabled` files including the main `nginx.conf`) for lines that
+point into that directory.
 
 - `200` `{ "deleted": "broken.example.com", "directory": "/etc/easy-devops/ssl/broken.example.com" }`.
 - `404` `{ "error": "Certificate '<domain>' not found" }` when the certificate
@@ -410,6 +456,12 @@ recursively, over `*.conf` and `*.conf.disabled` files including the main
   (1.4.2) lists the enabled domains with SSL on whose certificate lives in that
   directory; either a non-empty `usedBy` or any reference refuses the delete.
   The Hub agent deletes through the same check (`core/cert-usage.js`).
+- `409` `{ "error": "cert_not_managed", "detail": "…" }` when the certificate
+  has no matching managed-artifact ownership record, or has no files recorded
+  for it. Nothing is deleted.
+- `500` `{ "error": "delete_failed", "detail": "…" }` when a recorded file no
+  longer matches its ownership identity, a path is linked or unsafe, or the
+  filesystem refuses the operation. Remaining unrelated content is kept.
 
 **Renewal behaviour (2.3.0).** `renew/:domain`, `renew-all`, the CLI, the Hub
 command and the background job all go through `renewCertificate()` in
@@ -546,14 +598,11 @@ down through no choice of its own, so a stored `classic` is migrated to `new`
 after that is never overridden.
 
 The **auth/bind interlock** is validated against the state the request would
-produce, not the current state, so a single request cannot set both and slip
-through:
+produce, not the current state:
 
-- `dashboardAuth: "none"` with a non-loopback bind → `400`
-  `{ reason: "no_auth_requires_loopback" }`.
-- Moving the bind off loopback while auth is `none` → `400`
-  `{ reason: "bind_requires_password" }`, with an error telling the user to set
-  a password first.
+- Any bind other than `127.0.0.1` or `::1` → `400`
+  `{ reason: "dashboard_requires_loopback" }`. Remote use is provided by a
+  local HTTPS reverse proxy or secure tunnel.
 - Turning auth off from a non-loopback request → `403`
   `{ reason: "no_auth_requires_local_request" }`.
 - Setting a password implies `dashboardAuth: "password"`.
@@ -900,7 +949,7 @@ parallel, which took it from about 7.5 s to about 2 s.
 |---|---|
 | `running` | A daemon holds the lock, so monitoring survives closing the dashboard |
 | `connected` | **This** dashboard has a live IPC event channel to it. Narrower than `running`: a daemon whose IPC failed to bind is still working |
-| `installed` | A native install exists. **Not derivable from `running`** — a daemon started by hand runs without being installed, and a stopped service is installed without running |
+| `installed` | A native install exists. **Not derivable from `running`** — a daemon started by hand runs without being installed, and a stopped service is installed without running. This is `null` when the service files exist but Windows denied inspection; `detail` explains the permission error |
 | `mechanism` | `systemd` \| `winsw` \| `startup-supervisor` |
 | `mode` | `personal` \| `server` \| `null` (Linux) |
 | `startsAt` | `logon` (Windows Personal) or `boot` |
@@ -1651,8 +1700,18 @@ carries it as `data`, and the stored result keeps it:
   `{ ok, detail, results: [{ id, status, message, fix? }], proxied }` or `null`.
 - `hub:manageSSL { action: "delete", domain }` — success `{ ok: true, domain,
   deleted: true }`; refusals `{ code: "cert_in_use", domain, usedBy: [names],
-  references: [{ file: <basename>, line }] }`, `{ code: "cert_not_found" }` and
+  references: [{ file: <basename>, line }] }`, `{ code: "cert_not_found" }`,
+  `{ code: "cert_not_managed" }` when no ownership-manifest entry exists, and
   `{ code: "delete_failed" }`. Same rules as `DELETE /api/ssl/:domain`.
+- `hub:manageDomain { action: "delete", name, deleteCert? }` — removes the
+  domain record and nginx config. When `deleteCert` is `true` and SSL was
+  enabled, a successful certificate removal is included as `certDeleted:
+  true`. If the certificate is still referenced, is not managed by Easy DevOps,
+  or cannot be removed safely, the domain deletion still succeeds and the
+  result carries `certDeleted: false`, `certRetained: true`, `certReason`
+  (`cert_in_use` | `cert_not_managed` | `delete_failed`), `certMessage`,
+  `usedBy`, and `references: [{ file: <basename>, line }]`. The full successful
+  result is `{ ok: true, action: "delete", domain, certDeleted, ...retention }`.
 - `hub:manageDomain { action: "create" | "update" }` — the dashboard's field
   checks, then `{ code: "cert_missing", certPath, keyPath, hint }` when SSL is
   on and either file is missing (blank paths resolve to `<sslDir>/<name>/`),
@@ -1660,13 +1719,16 @@ carries it as `data`, and the stored result keeps it:
   `configFile`, `enabled` and `createdAt` from the payload.
   Creating a domain with custom locations, changing the stored text or clearing
   it requires the additional local grant `nginx.config.edit`. An update can
-  omit the text or send its current value with only `domains.edit`.
+  omit the text or send its current value with only `domains.edit`. Hub updates
+  are partial. When `nginx.config.view` did not expose `ssl.certPath`,
+  `ssl.keyPath`, `configFile`, or `advanced.customLocations`, the Hub UI must
+  omit those fields rather than submit local defaults such as an empty string.
 
 | Command | Payload | Permission |
 |---|---|---|
 | `hub:reloadNginx` | — | `nginx.reload` |
 | `hub:nginxAction` | `{ action: start \| stop \| restart \| reload \| test }` | `nginx.<action>` |
-| `hub:manageDomain` | `{ action: create \| update \| toggle \| delete \| reload, … }` | `domains.create`, `domains.edit`, `domains.toggle`, `domains.delete` or `nginx.reload` respectively. Raw custom-location changes also require `nginx.config.edit`. |
+| `hub:manageDomain` | `{ action: create \| update \| toggle \| delete \| reload, … }`; delete also accepts `deleteCert?: boolean` | `domains.create`, `domains.edit`, `domains.toggle`, `domains.delete` or `nginx.reload` respectively. Raw custom-location changes also require `nginx.config.edit`. |
 | `hub:manageSSL` | `{ action: renew \| renewAll \| issue \| delete, … }` | `ssl.<action>` |
 | `hub:manageSSL` | `{ action: suggest, domain }` | none (read-only) |
 | `hub:manageProcess` | `{ action: start \| stop \| restart, name }` | `process.<action>` |
@@ -1725,16 +1787,16 @@ the push is skipped and the next reconnect re-sends the full state.
 
 | Event | Payload | Sent |
 |---|---|---|
-| `server:info` | `{ platform, sslDir }` | Once, immediately after a successful handshake — it lets the Hub tailor the domain form to this server's paths |
+| `server:info` | `{ platform, sslDir }` — `sslDir` is populated only when `nginx.config.view` is granted and is otherwise `""` | Immediately after a successful handshake and whenever the permission revision changes. Re-sending the empty value replaces a path retained by the Hub after access is revoked |
 | `nginx:status` | `{ running, version }` (`version` may be `null`) | Every 5 s, and on connect |
 | `server:resources` | `{ cpu, ram, disk }` — whole percentages | Every 30 s, and on connect |
 | `domain:health` | `[{ name, enabled, up }]` — `up` is `true`/`false`, or `null` for a disabled domain and for an external backend | Every 60 s, and on connect; reuses the monitors' fresh sweep and probes directly only when there is none |
-| `domain:configs` | The complete stored domain-object array. Each object may carry `certStatus` (`valid` \| `expiring` \| `expired` \| `not_issued` \| `unreadable`) and `certLabel` (for example `"Not issued yet"`). It carries no certificate path or contents | On connect, every 5 min, after a pairing/permission revision moves, and after any Hub domain command |
+| `domain:configs` | An explicit Hub projection of every stored domain. It always carries monitoring and ordinary editable fields such as `name`, `enabled`, `port`, `backendHost`, `upstreamType`, `www`, `wildcard`, `behindCloudflare`, safe nested SSL/performance/security values, `advanced.accessLog`, and notification routing. `backendHost` is `null` when a legacy stored value contains URL credentials. `certStatus` (`valid` \| `expiring` \| `expired` \| `not_issued` \| `unreadable`) and `certLabel` may also be present. With `nginx.config.view`, it additionally carries `ssl.certPath`, `ssl.keyPath`, `configFile`, and `advanced.customLocations`. It never carries certificate contents, credentials, or unknown stored fields | On connect, every 5 min, after a pairing/permission revision moves, and after any Hub domain command |
 | `channels:list` | `[{ id, name, type }]` — no webhook URL or bot token | On connect and every 5 min |
 | `cert:expiry` | `[{ domain, expiresAt, daysLeft, status?, label? }]` — `expiresAt` is an ISO string or `null`, `daysLeft` may be negative, and `status`/`label` use the same values as `domain:configs` | On connect and every 12 h, and after any Hub SSL command |
-| `service:state` | `{ installed, running, status, mechanism, mode, startsAt, stoppedByUser, jobsRunningHere, enabledOnBoot, dev, pm2Installed, pm2Version, uptimeMs }` | On connect, every 5 min, and whenever the shared revision moves. It describes the **native** service; `pm2*` is the user's own PM2, a different thing |
+| `service:state` | `{ installed, running, status, mechanism, mode, startsAt, stoppedByUser, jobsRunningHere, enabledOnBoot, dev, pm2Installed, pm2Version, uptimeMs }`; `installed` is `boolean \| null`, where `null` means protected service files could not be inspected | On connect, every 5 min, and whenever the shared revision moves. It describes the **native** service; `pm2*` is the user's own PM2, a different thing |
 | `processes:list` | `{ daemonRunning, apps }` — the same app objects as `GET /api/processes`, and `daemonRunning: false` with `apps: []` when PM2 is absent or its daemon is down | On connect and every 60 s. It never starts a PM2 daemon just to report |
-| `deploy:apps` | The **public** app array: `envKeys` (sorted names, never values) instead of `env`, and no credentials. See §6 | On connect, every 20 s, and when any deployment begins or ends — whatever started it |
+| `deploy:apps` | The **public** app array: `envKeys` (sorted names, never values) instead of `env`, and no credentials. Every `lastRun` is an explicit operational projection. `error`, `reason`, `warnings`, and `logTail` are null/empty unless `deploy.logs` is granted. See §6 | On connect, every 20 s, when any deployment begins or ends, and when a permission revision changes so a revocation takes effect promptly |
 | `deploy:progress` | `{ appId, runId, status, steps: [{ name, status }], stage, skippedStages: string[], lines: string[], skipped?, done, at }`. `steps` comes from the run record's `step` field; `stage` (2.17.0) is the canonical stage the run is in, or `null` when the record has none; `skippedStages` (2.17.0) is the record's own `skippedStages`, or `[]` when it has none. `at` is an ISO string. `lines` is empty unless `deploy.logs` is granted. See §6 | Every second while a run is active, and once with `done: true` when it ends (status no longer running or its lock is released) |
 | `permissions:state` | `{ tree, permissions, comingSoon }` — the catalog plus this server's grant map | On connect and whenever permissions change |
 | `nginx:configs` | `[{ name, content }]` | After a `hub:getConfigs` command, in addition to its `command:result` |
@@ -1897,12 +1959,18 @@ deployments. The local permission check in `core/hubPermissions.js` is the
 gate for every command; the Hub's own copy is a UI hint.
 
 **Telemetry the agent sends** — `deploy:apps`: the array `GET /api/deployments`
-returns in `apps`, with one difference that matters. Each app is the *public*
+returns in `apps`, with two differences that matter. Each app is the *public*
 view: `envKeys` (sorted variable names) instead of `env`, and no credentials.
 Its `settings` is the same one the dashboard sees, including `steps` and
-`runtime` (2.15.0). Sent on connect, every 20 seconds, and when any deployment
-begins or ends — whether it was started from the Hub, the local dashboard, the
-CLI or CI. Not gated: a paired server is a monitored server.
+`runtime` (2.15.0). Each `lastRun` is also rebuilt from an explicit operational
+allowlist (`id`, app/release identifiers, trigger, ref, SHA, status, step,
+stage, skipped stages, timestamps, and rollback outcome). `error`, `reason`,
+`warnings`, and `logTail` remain null/empty unless `deploy.logs` is granted;
+unknown future fields are not forwarded. Sent on connect, every 20 seconds,
+when any deployment begins or ends, and when a permission revision changes —
+whether the deployment was started from the Hub, the local dashboard, the CLI
+or CI. Operational monitoring is not gated: a paired server remains a monitored
+server.
 
 **Live progress** — `deploy:progress`: sent at most once per second for a run
 that is under way, and once with `done: true` when it ends (its status is no
@@ -1930,15 +1998,23 @@ with `command:result` like every other command.
 
 - `list` → `{ apps }` · `detail` (`id`) → the app with `runs` and `releases` ·
   `github` (`id`) → the setup of §2.8, with the public app view. No permission.
+  Every `lastRun` and run in `runs` uses the same explicit projection as
+  `deploy:apps`. Operational status metadata is always present. `error`,
+  `reason`, `warnings`, and `logTail` are null/empty unless `deploy.logs` is
+  granted.
 - `deploy` (`id`, `ref?`) → `{ runId, status: "running" }`. Needs `deploy.run`.
 - `rollback` (`id`, `releaseId?`) → `{ runId, status }`. Needs `deploy.rollback`.
 - `deleteRelease` (`id`, `releaseId`) → `{ deleted }` (2.8.0). Needs
   `deploy.manage`. Refused for the live release, the one an automatic rollback
   would return to, and while a deployment of the app is running.
-- `run` (`id`, `runId`) → the run with `log` (last 32 kB) and `logTruncated`.
-  Needs `deploy.logs`. The log goes through the same treatment as live
-  progress: environment values and the app's token are redacted, and PEM
-  private-key blocks are dropped, before it leaves the server.
+- `run` (`id`, `runId`) → the projected run with `log` (last 32 KiB),
+  `logTruncated`, and `logUnavailable: "legacy-format"` when the record predates
+  per-run redaction (2.18.0). Needs `deploy.logs`, which the agent checks before
+  the core handler receives the command. New-format logs go through the same
+  treatment as live progress: environment values and the app's token are
+  redacted, and PEM private-key blocks are dropped, before they leave the
+  server. Legacy-format logs are withheld because a secret rotated since they
+  were written cannot be redacted from them safely.
 - `linkDomain` (`id`, `domain`, `www?`, `ssl?`, `redirect?`,
   `behindCloudflare?`) · `unlinkDomain` (`id`) · `move` (`id`, `path`)
   (2.6.0, extended 2.12.0). Need `deploy.manage`; `linkDomain` additionally
@@ -1986,10 +2062,13 @@ the Hub stores no token and cannot mint one.
 - `trigger` → `{ started: true, runId }`, or
   `{ started: false, status: 409, error, runId }` when the app is already
   deploying.
-- `status` → `{ found: true, run: { runId, status, step, sha, error,
-  rolledBackTo, reason, logTail, rollbackSucceeded, startedAt, finishedAt } }`,
-  or `{ found: false }`. `reason`, `logTail` (redacted) and
-  `rollbackSucceeded` are the boot-crash report of §2.8 (2.11.0).
+- `status` → `{ found: true, run: { runId, appId, trigger, ref, sha,
+  releaseId, status, step, stage, skippedStages, startedAt, finishedAt, error,
+  warnings, rolledBackTo, reason, logTail, rollbackSucceeded } }`, or
+  `{ found: false }`. The run uses the same explicit Hub projection as every
+  other deployment surface. `error`, `warnings`, `reason`, and `logTail`
+  remain null/empty unless `deploy.logs` is granted. A trigger refusal's
+  `error` is likewise null without that grant.
 
 The Hub's CI endpoint answers these with the same non-5xx failures as a command:
 an offline agent is `409 AGENT_OFFLINE`, an agent that does not answer is

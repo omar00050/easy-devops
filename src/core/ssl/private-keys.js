@@ -3,10 +3,11 @@ import { constants } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { isWindows, isServerMode } from '../platform.js';
+import { getDataDir, isWindows, isServerMode, WINDOWS_SYSTEM_ROOT } from '../platform.js';
 import { approvedGrantDirs, canonicalAclDirectory } from '../service/acl.js';
 import { runFile } from '../shell.js';
 import { validateDomainName } from '../validators.js';
+import { recoverCertificateFiles } from './certificate-transaction.js';
 
 const aclScript = fileURLToPath(new URL('./key-permissions.ps1', import.meta.url));
 
@@ -44,7 +45,13 @@ export async function protectKeyDirectory(sslDir, name, { create = true, server 
     throw new Error(`Replace the linked or non-regular private key at ${key} before continuing.`);
   }
   if (isWindows) {
-    const powershell = path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const powershell = path.win32.join(
+      WINDOWS_SYSTEM_ROOT,
+      'System32',
+      'WindowsPowerShell',
+      'v1.0',
+      'powershell.exe',
+    );
     const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', aclScript, dir];
     if (server) args.push('-ServerMode');
     const result = await runFile(powershell, args);
@@ -108,10 +115,14 @@ export async function repairPrivateKeys(sslDir, options = {}) {
   if (!await statIfPresent(sslDir)) return;
   if (isWindows && options.server) canonicalAclDirectory(sslDir);
   await assertCanonical(sslDir);
+  const dataDir = options.dataDir ?? getDataDir();
   for (const entry of await fs.readdir(sslDir, { withFileTypes: true })) {
     if (entry.name !== '.account' && validateDomainName(entry.name)) continue;
     if (entry.isSymbolicLink()) throw new Error(`Remove the link at ${path.join(sslDir, entry.name)} before repair.`);
     if (!entry.isDirectory()) continue;
+    if (entry.name !== '.account') {
+      await recoverCertificateFiles({ dataDir, sslDir, domain: entry.name });
+    }
     const key = entry.name === '.account' ? 'account.key' : 'privkey.pem';
     if (await statIfPresent(path.join(sslDir, entry.name, key))) {
       await protectKeyDirectory(sslDir, entry.name, { ...options, create: false });

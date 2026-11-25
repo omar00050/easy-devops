@@ -36,6 +36,9 @@ let ioServer = null;
 let unsubscribeBus = null;
 let unsubscribeSslProgress = null;
 
+/** A socket client never receives an unbounded newline-free log fragment. */
+export const MAX_SOCKET_LOG_LINE_BYTES = 16 * 1024;
+
 /**
  * The most recent payload for each replayable event.
  *
@@ -166,18 +169,36 @@ function startTail(socket, logFile) {
     windowsHide: true,
   });
 
-  let buf = '';
+  let buf = Buffer.alloc(0);
+  let droppedBytes = 0;
+  const emitBufferedLine = (lineBuffer) => {
+    let line = lineBuffer.toString('utf8').trim();
+    if (droppedBytes > 0) {
+      line = `[line truncated: ${droppedBytes} bytes] ${line}`;
+      droppedBytes = 0;
+    }
+    if (line) socket.emit('logs:line', { line, logFile });
+  };
+
   child.stdout.on('data', (chunk) => {
-    buf += chunk.toString();
-    const lines = buf.split('\n');
-    buf = lines.pop(); // keep the incomplete line in the buffer
-    for (const line of lines) {
-      if (line.trim()) socket.emit('logs:line', { line: line.trim(), logFile });
+    buf = Buffer.concat([buf, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+    let newline;
+    while ((newline = buf.indexOf(0x0a)) !== -1) {
+      emitBufferedLine(buf.subarray(0, newline));
+      buf = buf.subarray(newline + 1);
+    }
+
+    if (buf.length > MAX_SOCKET_LOG_LINE_BYTES) {
+      const drop = buf.length - MAX_SOCKET_LOG_LINE_BYTES;
+      buf = buf.subarray(drop);
+      droppedBytes += drop;
     }
   });
 
   child.on('error', () => {});
   child.on('close', () => {
+    if (buf.length > 0) emitBufferedLine(buf);
+    buf = Buffer.alloc(0);
     activeTails.delete(socket.id);
   });
 

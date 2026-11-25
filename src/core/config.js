@@ -101,10 +101,10 @@ const DEFAULTS = {
     dashboardPassword: '',
     dashboardPasswordHash: '',
     dashboardAuth: AUTH_MODES.PASSWORD,
-    // Windows installs are typically a workstation behind a firewall, and
-    // binding to loopback there would break the common "reach it from my
-    // laptop" setup without warning.
-    dashboardBindAddress: BIND_ALL,
+    // The dashboard itself is HTTP. A Windows install therefore listens on
+    // loopback and reaches other machines only through a local HTTPS reverse
+    // proxy or authenticated tunnel.
+    dashboardBindAddress: BIND_LOOPBACK,
     dashboardUi: UI_MODES.NEW,
     dashboardUiMigrated: true,
     acmeEmail: '',
@@ -135,29 +135,38 @@ export function loadConfig() {
   if (stored) {
     const merged = { ...defaultConfig, ...stored };
     let migrated = false;
+    const storedBindWasMissing = stored.dashboardBindAddress === undefined;
+    const storedBindWasPublic = storedBindWasMissing || !isLoopbackBind(stored.dashboardBindAddress);
+    let authMigration = null;
 
-    // An EXISTING install predates the bind setting, and was therefore
-    // listening on every interface. Merging the new default would silently
-    // move it to loopback on upgrade and cut off anyone reaching the
-    // dashboard over the network — so the old behaviour is preserved and
-    // written down explicitly, leaving the choice to the user.
-    if (stored.dashboardBindAddress === undefined) {
-      merged.dashboardBindAddress = BIND_ALL;
+    // Earlier releases allowed the plain-HTTP dashboard on every interface.
+    // That sent session cookies and API traffic in cleartext. Keep the setting
+    // field for API/backup compatibility, but fail closed to loopback. Remote
+    // use is supported through a local HTTPS reverse proxy or secure tunnel.
+    if (!isLoopbackBind(merged.dashboardBindAddress)) {
+      merged.dashboardBindAddress = BIND_LOOPBACK;
       migrated = true;
     }
 
-    // An EXISTING install predates the auth setting too. An empty password
-    // used to mean "no login", and for a loopback-bound dashboard that is a
-    // legitimate choice, so it is preserved as an explicit 'none'. With a
-    // bind that is reachable from the network it is not: those installs get
-    // 'password' and are asked to set one, because the old behaviour there
-    // was an exposed dashboard anyone could open.
+    // An existing install predates the auth setting too. The absence of a bind
+    // meant the old public default, so normalising it to loopback must not turn
+    // an empty password into a safe-looking passwordless installation. Only an
+    // install explicitly bound to loopback may keep the legacy no-login choice.
     if (stored.dashboardAuth === undefined) {
       merged.dashboardAuth =
-        !hasStoredPassword(stored) && isLoopbackBind(merged.dashboardBindAddress)
+        !hasStoredPassword(stored) && !storedBindWasPublic
           ? AUTH_MODES.NONE
           : AUTH_MODES.PASSWORD;
       migrated = true;
+      authMigration = storedBindWasPublic ? 'legacy-public-bind-requires-password' : null;
+    } else if (stored.dashboardAuth === AUTH_MODES.NONE && storedBindWasPublic) {
+      // A stored hand-edited/restored mismatch is the other route by which an
+      // old public dashboard could become loopback plus no-password after an
+      // upgrade. Normalising the address is necessary, and requiring a
+      // password prevents that normalisation from weakening authentication.
+      merged.dashboardAuth = AUTH_MODES.PASSWORD;
+      migrated = true;
+      authMigration = 'public-bind-requires-password';
     }
 
     // The React dashboard became the default. An existing install has
@@ -177,6 +186,13 @@ export function loadConfig() {
     }
 
     if (migrated) saveConfig(merged);
+    if (authMigration) {
+      Object.defineProperty(merged, 'dashboardAuthMigration', {
+        value: authMigration,
+        enumerable: false,
+        configurable: true,
+      });
+    }
     return merged;
   }
 
@@ -187,7 +203,12 @@ export function loadConfig() {
 }
 
 export function saveConfig(config) {
-  dbSet('config', config);
+  dbSet('config', {
+    ...config,
+    dashboardBindAddress: isLoopbackBind(config?.dashboardBindAddress)
+      ? config.dashboardBindAddress
+      : BIND_LOOPBACK,
+  });
 }
 
 /**

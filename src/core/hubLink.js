@@ -22,7 +22,7 @@
  */
 
 import { dbGet, dbSet, dbDelete } from './db.js';
-import { validateConnectionString } from './validators.js';
+import { validateConnectionString, validateHubUrl } from './validators.js';
 import {
   defaultPermissions,
   normalizePermissions,
@@ -146,6 +146,9 @@ export function getHubLink() {
   const link = dbGet(HUB_LINK_KEY);
   if (!link || typeof link !== 'object') return null;
   if (!link.hubUrl || !link.serverId || !link.secret) return null;
+  // Fail closed for links stored by an older build. In particular, a remote
+  // plain-HTTP Hub would receive the long-lived agent secret in cleartext.
+  if (validateHubUrl(link.hubUrl)) return null;
   return { hubUrl: link.hubUrl, serverId: link.serverId, secret: link.secret };
 }
 
@@ -173,6 +176,8 @@ export function saveHubLink(link) {
   if (!hubUrl || !serverId || !secret) {
     return { ok: false, error: 'Hub link requires hubUrl, serverId and secret' };
   }
+  const urlError = validateHubUrl(hubUrl);
+  if (urlError) return { ok: false, error: urlError };
 
   dbSet(HUB_LINK_KEY, { hubUrl, serverId, secret });
 

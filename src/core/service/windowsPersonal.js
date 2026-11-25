@@ -50,6 +50,10 @@ import { getStartupFolder, isWindows, isDefaultDataDir } from '../platform.js';
 import { dbGet, dbSet } from '../db.js';
 import { run as shellRun } from '../shell.js';
 import { stopRequestPath } from '../daemon/stopRequest.js';
+import {
+  completeLogLines,
+  readBoundedTailSync,
+} from './logTail.js';
 
 /** The Startup entry. Distinct from the old PM2 one (`easy-devops-pm2.cmd`). */
 export const LAUNCHER_FILE = 'easy-devops-daemon.cmd';
@@ -476,7 +480,7 @@ export function status({ dataDir = null, startupDir = getStartupFolder() } = {})
   // in a visible window for the whole session. Detected by its size: the
   // bootstrap is small, while the old all-in-one script was not.
   try {
-    const script = fs.readFileSync(launcher, 'utf8');
+    const script = readBoundedTailSync(launcher, { maxBytes: 64 * 1024 }).text;
     if (!script.includes('EZ_SUPERVISOR')) {
       out.warnings.push(
         'Your Startup launcher is from an older version that ran in a visible '
@@ -496,12 +500,17 @@ export function status({ dataDir = null, startupDir = getStartupFolder() } = {})
 }
 
 /** Recent supervisor log lines. */
-export function readLogs({ dataDir, lines = 50 } = {}) {
-  const file = logFilePath(dataDir);
+export function readLogs({
+  dataDir,
+  lines = 50,
+  file: requestedFile = null,
+  fsApi = fs,
+} = {}) {
+  const file = requestedFile ?? logFilePath(dataDir);
 
-  let text;
+  let tail;
   try {
-    text = fs.readFileSync(file, 'utf8');
+    tail = readBoundedTailSync(file, { fsApi });
   } catch (err) {
     return {
       ok: false,
@@ -512,8 +521,7 @@ export function readLogs({ dataDir, lines = 50 } = {}) {
     };
   }
 
-  const all = text.split(/\r?\n/).filter(Boolean);
-  return { ok: true, file, output: all.slice(-Math.max(1, Math.min(5000, Number(lines) || 50))).join('\n') };
+  return { ok: true, file, output: completeLogLines(tail, lines).join('\n') };
 }
 
 /** Rewrites both scripts against the Node running now. */

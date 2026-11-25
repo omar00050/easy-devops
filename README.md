@@ -30,8 +30,8 @@ No external ACME binaries required — SSL certificates are issued via [`acme-cl
 
 - **Node.js 18+** (with npm)
 - **Linux** (Debian/Ubuntu/etc.) or **Windows**
-- ⚠️ **Windows users: PowerShell must be run as Administrator** (required for managing services and SSL certificates)
-- Optional: Nginx, nvm (installed separately or via the tool)
+- Windows Server mode needs one Administrator/UAC approval when the service is installed or repaired.
+- Optional: nginx, nvm (the bootstrap installer fails closed when nvm is missing)
 
 ## Installation
 
@@ -44,36 +44,39 @@ npm install -g easy-devops && easy-devops
 # Short alias also available: ezz
 ```
 
-If you **don't have Node.js** yet, use the bootstrap installer:
+The bootstrap installers verify the reviewed helper files that ship beside
+them. They do not download mutable helper scripts or unverified runtimes.
 
-#### Linux / macOS
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/install.sh -o install.sh && bash install.sh
-```
-
-Or with wget:
+#### Linux
 
 ```bash
-wget -qO install.sh https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/install.sh && bash install.sh
+git clone --branch v1.4.5 --depth 1 https://github.com/omar00050/Easy-DevOps.git
+cd Easy-DevOps
+bash install.sh
 ```
+
+The tagged checkout includes the helper bundle. If Node.js 18+ is already
+installed, use `bash install.sh --keep-node`. If nvm is required but missing,
+the installer stops with reviewed release instructions instead of fetching
+code from a mutable branch.
 
 #### Windows (PowerShell)
 
-> ⚠️ **Important:** Run PowerShell **as Administrator**. Right-click PowerShell → "Run as Administrator".
-
 ```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/install.ps1" -OutFile "install.ps1"; ./install.ps1
+git clone --branch v1.4.5 --depth 1 https://github.com/omar00050/Easy-DevOps.git
+Set-Location Easy-DevOps
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Or from Command Prompt:
-
-```cmd
-powershell -ExecutionPolicy Bypass -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/omar00050/Easy-DevOps/main/install.ps1' -OutFile 'install.ps1'; ./install.ps1"
-```
+The tagged checkout includes the reviewed installer. Automatic nvm-windows
+installation is disabled in this release because no reviewed executable digest
+is bundled. With Node.js 18+ already installed, add `-KeepNode`.
+If Node.js is missing, install a reviewed Node.js or nvm-windows release first,
+then rerun the installer. Windows Server mode requests UAC approval at the
+service step.
 
 > **What the installer does:**
-> 1. Checks for Node.js 18+ (installs via nvm if missing)
+> 1. Checks for Node.js 18+ and an existing reviewed nvm installation when a runtime change is needed
 > 2. Installs Easy DevOps globally via npm
 > 3. Launches the interactive CLI
 
@@ -111,7 +114,7 @@ npx easy-devops
 ### CLI Overview
 
 ```
-  ███████╗███████╗     Easy DevOps  v2.0.0
+  ███████╗███████╗     Easy DevOps  v1.4.5
   ██╔════╝╚════██╗     ─────────────────────
   █████╗      ██╔╝     CLI & Web Dashboard
   ██╔══╝     ██╔╝      Nginx · SSL · Domains · Node.js
@@ -425,7 +428,7 @@ easy-devops/
 │       └── installer/        # Bash helper modules for install.sh
 ├── data/
 │   └── easy-devops.sqlite
-├── install.sh            # Linux/macOS bootstrap installer
+├── install.sh            # Linux bootstrap installer
 └── install.ps1           # Windows PowerShell installer
 ```
 
@@ -441,7 +444,7 @@ easy-devops/
 | SSL — HTTP-01 (acme-client) | ✅ | ✅ |
 | SSL — DNS-01 (acme-client) | ✅ | ✅ |
 | Wildcard Certificates | ✅ | ✅ |
-| Node.js (nvm) | ✅ | ✅ (nvm-windows) |
+| Node.js (nvm) | ✅ with an already-installed nvm | ✅ with an already-installed nvm-windows |
 | Nginx service control | systemctl | nginx.exe direct |
 
 ---

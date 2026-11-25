@@ -41,7 +41,7 @@ import path from 'path';
 
 import { run as shellRun, runFile as shellRunFile } from '../shell.js';
 import { WINDOWS_SC, programDataDir, windowsCurrentUserCmd } from '../platform.js';
-import { checkedAclDirectory, systemTool } from './acl.js';
+import { checkedAclDirectory, systemTool, walkAclTree } from './acl.js';
 import { SERVICE_ID, SERVICE_ACCOUNT } from './winsw.js';
 
 /** Set by the relaunch, so the elevated copy grants the user who asked — see cli/elevation.js. */
@@ -157,9 +157,14 @@ export function operatorAceState(sddl, sid) {
   };
 }
 
-/** `sc.exe sdshow`, the DACL line only. */
-export async function readServiceSddl({ run = shellRun } = {}) {
-  const result = await run(`${WINDOWS_SC} sdshow ${SERVICE_ID}`, { timeout: 20_000 });
+/** `sc.exe sdshow`, the DACL line only. Production always uses direct argv. */
+export async function readServiceSddl({
+  run = shellRun,
+  runFile = shellRunFile,
+} = {}) {
+  const result = run !== shellRun
+    ? await run(`${WINDOWS_SC} sdshow ${SERVICE_ID}`, { timeout: 20_000 })
+    : await runFile(systemTool(WINDOWS_SC), ['sdshow', SERVICE_ID], { timeout: 20_000 });
   const line = `${result?.stdout ?? ''}`.split(/\r?\n/).map((l) => l.trim()).find((l) => l.startsWith('D:'));
   return line ?? null;
 }
@@ -172,7 +177,7 @@ export async function readServiceSddl({ run = shellRun } = {}) {
 export async function grantServiceControl({ sid, run = shellRun, runFile = shellRunFile } = {}) {
   if (!isAccountSid(sid)) return { ok: false, reason: 'no user account to grant it to' };
 
-  const current = await readServiceSddl({ run });
+  const current = await readServiceSddl({ run, runFile });
   if (!current) return { ok: false, reason: `could not read the ${SERVICE_ID} service permissions` };
 
   let next;
@@ -192,7 +197,7 @@ export async function grantServiceControl({ sid, run = shellRun, runFile = shell
     return { ok: false, reason: `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300) || 'sc.exe sdset failed' };
   }
 
-  const after = operatorAceState(await readServiceSddl({ run }), sid);
+  const after = operatorAceState(await readServiceSddl({ run, runFile }), sid);
   return after.granted && !after.excessive
     ? { ok: true }
     : { ok: false, reason: 'the permission was written but does not read back as expected' };
@@ -216,19 +221,17 @@ export function buildDataDirGrantCommand(dataDir, sid) {
   return [safePath(dataDir), '/grant', `*${accountSid(sid)}:(OI)(CI)M`, '/L', '/Q'];
 }
 
-/** Removes every allow entry for the SID under the data directory. */
-export function buildDataDirRevokeCommand(dataDir, sid) {
-  return [safePath(dataDir), '/remove:g', `*${accountSid(sid)}`, '/T', '/L', '/Q'];
-}
-
 /**
- * A path that can sit inside double quotes in a shell command. Windows paths
- * cannot contain `"`, so one that does was not a path; refused rather than
- * escaped. The data directory can come from EASY_DEVOPS_DATA_DIR.
+ * A value that can be passed as one direct argv entry. Native ACL calls never
+ * involve a shell, so shell metacharacters such as `$` and backticks are
+ * ordinary path characters. Windows cannot represent control characters in a
+ * path, so those are refused before the filesystem check.
  */
 function safePath(dir) {
   const value = String(dir ?? '');
-  if (!value || /["\r\n`$]/.test(value)) throw new Error(`refusing an unusual path: ${JSON.stringify(value)}`);
+  if (!value || /["\x00-\x1f]/.test(value)) {
+    throw new Error(`refusing an unusual path: ${JSON.stringify(value)}`);
+  }
   return value;
 }
 
@@ -241,22 +244,59 @@ function accountSid(sid) {
 /**
  * The commands that make one folder administrator-only to change.
  *
- * Inheritance off, then an explicit list replacing whatever was there, then
- * any leftover entry for the operator removed (a grant from before this
- * protection existed was applied with `/T`).
+ * A recursive reset first discards explicit ACEs as well as inherited ones.
+ * Inheritance is then removed and the approved list replaces the old DACL.
+ * Finally, any leftover entry for the operator is removed (a grant from before
+ * this protection existed was applied with `/T`).
+ *
+ * The caller runs this on one exact directory or file, never with `/T`.
+ * `replaceInheritance` is true for the root of a tree. Descendants are reset
+ * against their already-safe parent and keep inheritance so the later,
+ * narrowly scoped data-root grant can still reach ordinary data files while
+ * the protected runtime and wrapper roots opt out.
  */
-export function buildProtectCommands(dir, sid = null, { serviceAccount = true } = {}) {
+export function buildProtectCommands(
+  dir,
+  sid = null,
+  {
+    serviceAccount = true,
+    serviceAccess = 'RX',
+    usersRead = true,
+    objectType = 'directory',
+    replaceInheritance = objectType === 'directory',
+  } = {},
+) {
   const target = safePath(dir);
+  if (!['RX', 'M', 'F'].includes(serviceAccess)) {
+    throw new Error(`refusing an unusual service access mask: ${String(serviceAccess)}`);
+  }
+  if (typeof usersRead !== 'boolean') {
+    throw new Error('refusing an unusual usersRead value');
+  }
+  if (!['directory', 'file'].includes(objectType)) {
+    throw new Error('refusing an unusual ACL object type');
+  }
+  if (typeof replaceInheritance !== 'boolean' || (objectType === 'file' && replaceInheritance)) {
+    throw new Error('refusing an unusual inheritance setting');
+  }
   // Before the service is registered its account does not exist yet, and
   // icacls refuses an unknown name; install protects again once it does.
-  const recursive = ['/T', '/L', '/Q'];
-  const trustees = [`${SID_SYSTEM}:(OI)(CI)F`, `${SID_ADMINISTRATORS}:(OI)(CI)F`, `${SID_USERS}:(OI)(CI)RX`];
-  if (serviceAccount) trustees.push(`${SERVICE_ACCOUNT}:(OI)(CI)RX`);
+  const scope = ['/L', '/Q'];
+  const propagate = objectType === 'directory' ? '(OI)(CI)' : '';
+  const trustees = [`${SID_SYSTEM}:${propagate}F`, `${SID_ADMINISTRATORS}:${propagate}F`];
+  if (usersRead) trustees.push(`${SID_USERS}:${propagate}RX`);
+  if (serviceAccount) trustees.push(`${SERVICE_ACCOUNT}:${propagate}${serviceAccess}`);
   const commands = [
-    [target, '/setowner', SID_ADMINISTRATORS, ...recursive],
-    [target, '/inheritance:r', '/grant:r', ...trustees, ...recursive],
+    [target, '/setowner', SID_ADMINISTRATORS, ...scope],
+    // `/grant:r` replaces ACEs only for the trustees it names. Without this
+    // reset, an explicit ACE created before installation for Everyone or an
+    // arbitrary SID would survive both the inheritance change and the grant.
+    [target, '/reset', ...scope],
+    replaceInheritance
+      ? [target, '/inheritance:r', '/grant:r', ...trustees, ...scope]
+      : [target, '/grant:r', ...trustees, ...scope],
   ];
-  if (isAccountSid(sid)) commands.push([target, '/remove:g', `*${sid}`, ...recursive]);
+  if (isAccountSid(sid)) commands.push([target, '/remove:g', `*${sid}`, ...scope]);
   return commands;
 }
 
@@ -271,7 +311,15 @@ export function buildProtectCommands(dir, sid = null, { serviceAccount = true } 
  * @param {string|null} [opts.sid]
  * @returns {Promise<{ ok: boolean, protected: string[], failed: Array<{ path: string, reason: string }> }>}
  */
-export async function protectServiceFiles({ dirs, sid = null, serviceAccount = true, runFile = shellRunFile, log = () => {} } = {}) {
+export async function protectServiceFiles({
+  dirs,
+  sid = null,
+  serviceAccount = true,
+  serviceAccess = 'RX',
+  usersRead = true,
+  runFile = shellRunFile,
+  log = () => {},
+} = {}) {
   const done = [];
   const failed = [];
   for (const dir of dirs) {
@@ -279,25 +327,34 @@ export async function protectServiceFiles({ dirs, sid = null, serviceAccount = t
     let error = null;
     let commands = [];
     try {
-      commands = buildProtectCommands(dir, sid, { serviceAccount });
-      await checkedAclDirectory(dir, runFile, true);
+      await walkAclTree(dir, async (target, objectType) => {
+        const isRoot = path.resolve(target) === path.resolve(dir);
+        commands = buildProtectCommands(target, sid, {
+          serviceAccount,
+          serviceAccess,
+          usersRead,
+          objectType,
+          replaceInheritance: isRoot && objectType === 'directory',
+        });
+        for (const command of commands) {
+          const result = await runFile(systemTool('icacls.exe'), command, { timeout: 120_000 });
+          if (!result.success) {
+            const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300);
+            throw new Error(output || 'icacls failed');
+          }
+        }
+      }, { runFile });
     } catch (err) {
       error = err.message;
-      commands = [];
-    }
-    for (const command of commands) {
-      const result = await runFile(systemTool('icacls.exe'), command, { timeout: 120_000 });
-      if (!result.success) {
-        error = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300) || 'icacls failed';
-        break;
-      }
     }
     if (error) {
       failed.push({ path: dir, reason: error });
       log(`  ${dir}: could not be protected`);
     } else {
       done.push(dir);
-      log(`  ${dir}: administrators only (read & execute for the service and users)`);
+      log(`  ${dir}: administrators only (${usersRead ? 'read & execute for the service and users' : `${
+        serviceAccess === 'M' ? 'modify' : 'read & execute'
+      } for the service`})`);
     }
   }
   return { ok: failed.length === 0, protected: done, failed };
@@ -314,7 +371,32 @@ export async function protectServiceFiles({ dirs, sid = null, serviceAccount = t
  * @returns {Promise<Object>} the record to keep under `service-state.operator`
  */
 export async function grantOperator({ operator, dataDir, approvedDataDir = programDataDir(), protectedDirs, run = shellRun, runFile = shellRunFile, log = () => {} } = {}) {
-  const protection = await protectServiceFiles({ dirs: protectedDirs, sid: operator?.sid ?? null, runFile, log });
+  // Normalize the ProgramData root first. A standard user can create this
+  // directory before installing the service, so inheriting its owner or DACL
+  // would leave the database writable by that user. This recursive pass is
+  // then followed by the narrower runtime/bin protections below, which restore
+  // execute-only access for the service account on executable files.
+  const dataProtection = await protectServiceFiles({
+    dirs: [dataDir],
+    sid: operator?.sid ?? null,
+    serviceAccess: 'M',
+    usersRead: false,
+    runFile,
+    log,
+  });
+  const fileProtection = await protectServiceFiles({
+    dirs: protectedDirs,
+    sid: operator?.sid ?? null,
+    serviceAccess: 'RX',
+    usersRead: true,
+    runFile,
+    log,
+  });
+  const protection = {
+    ok: dataProtection.ok && fileProtection.ok,
+    protected: [...dataProtection.protected, ...fileProtection.protected],
+    failed: [...dataProtection.failed, ...fileProtection.failed],
+  };
 
   if (!operator || !isAccountSid(operator.sid)) {
     return {
@@ -341,7 +423,13 @@ export async function grantOperator({ operator, dataDir, approvedDataDir = progr
   } else {
     // Fail closed. A grant from an earlier install or repair would otherwise
     // still be inherited by a runtime folder that could not be protected.
-    await runSafely(() => buildDataDirRevokeCommand(dataDir, operator.sid), approvedDataDir, runFile, 120_000);
+    await removeOperatorDataAce({
+      operator,
+      dataDir,
+      approvedDataDir,
+      runFile,
+      log,
+    });
     notes.push('the runtime folder could not be protected, so the data directory is not shared with your account; '
       + 'run `ezz service repair` as administrator again');
   }
@@ -364,12 +452,60 @@ export async function grantOperator({ operator, dataDir, approvedDataDir = progr
  * removal: it belongs to the service and is deleted with it.
  */
 export async function revokeOperator({ operator, dataDir, approvedDataDir = programDataDir(), runFile = shellRunFile, log = () => {} } = {}) {
-  if (!operator || !isAccountSid(operator.sid) || !dataDir || !fs.existsSync(dataDir)) return { ok: true };
-  const result = await runSafely(() => buildDataDirRevokeCommand(dataDir, operator.sid), approvedDataDir, runFile, 120_000);
-  if (result.success) log(`  ${operator.name ?? operator.sid}: data directory access removed`);
-  return result.success
-    ? { ok: true }
-    : { ok: false, reason: `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300) };
+  if (!operator || !isAccountSid(operator.sid) || !dataDir) return { ok: true };
+  return removeOperatorDataAce({
+    operator,
+    dataDir,
+    approvedDataDir,
+    runFile,
+    log,
+  });
+}
+
+/**
+ * Removes one account's ACE from every entry below the approved data root.
+ * Each directory's ACL is rewritten before it is enumerated, and links,
+ * reparse points, and hard-linked files are refused by walkAclTree. No
+ * recursive `icacls /T` ever follows a path chosen by the filesystem.
+ */
+async function removeOperatorDataAce({
+  operator,
+  dataDir,
+  approvedDataDir,
+  runFile,
+  log,
+}) {
+  if (!operator || !isAccountSid(operator.sid) || !dataDir) return { ok: true };
+  const relative = path.relative(path.resolve(approvedDataDir), path.resolve(dataDir));
+  if (relative !== '') {
+    return { ok: false, reason: 'Only the approved service data directory may be changed' };
+  }
+  let directory;
+  try {
+    directory = fs.lstatSync(dataDir, { throwIfNoEntry: false }) ?? null;
+  } catch (error) {
+    return { ok: false, reason: `${dataDir} could not be inspected: ${error.code ?? error.message}` };
+  }
+  if (!directory) return { ok: true };
+  if (directory.isSymbolicLink() || !directory.isDirectory()) {
+    return { ok: false, reason: `${dataDir} is a link, reparse point, or non-directory; no permissions were changed` };
+  }
+
+  try {
+    await walkAclTree(dataDir, async (target) => {
+      const result = await runFile(systemTool('icacls.exe'), [
+        target, '/remove:g', `*${operator.sid}`, '/L', '/Q',
+      ], { timeout: 120_000 });
+      if (!result.success) {
+        throw new Error(`${result.stdout ?? ''}${result.stderr ?? ''}`.trim().slice(0, 300)
+          || 'icacls failed');
+      }
+    }, { runFile });
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+  log(`  ${operator.name ?? operator.sid}: data directory access removed`);
+  return { ok: true };
 }
 
 /** Builds a command and runs it; a refused build is a failed result, never a throw. */
@@ -378,7 +514,7 @@ async function runSafely(build, approvedDataDir, runFile, timeout) {
   try {
     command = build();
     if (path.relative(approvedDataDir, command[0]) !== '') throw new Error('Only the approved service data directory may be shared');
-    await checkedAclDirectory(command[0], runFile, command.includes('/T'));
+    await checkedAclDirectory(command[0], runFile, false);
   } catch (err) {
     return { success: false, stdout: '', stderr: err.message };
   }
@@ -387,7 +523,9 @@ async function runSafely(build, approvedDataDir, runFile, timeout) {
 
 /**
  * Creates a folder the service will run code from and protects it while it is
- * still empty.
+ * still empty. With `fresh`, an existing tree is verified and replaced before
+ * it is protected. Install uses that for runtime and bin so executable content
+ * left by another account can never be merged into the service's runtime.
  *
  * A fresh folder inside the data directory inherits the installing user's
  * Modify grant, so copying first and protecting afterwards would leave a window
@@ -395,14 +533,60 @@ async function runSafely(build, approvedDataDir, runFile, timeout) {
  *
  * @returns {Promise<{ ok: boolean, reason?: string }>}
  */
-export async function prepareProtectedDir({ dir, sid = null, serviceAccount = true, runFile = shellRunFile, log = () => {} } = {}) {
+export async function prepareProtectedDir({
+  dir,
+  sid = null,
+  serviceAccount = true,
+  fresh = false,
+  runFile = shellRunFile,
+  fsApi = fs,
+  log = () => {},
+} = {}) {
   try {
-    if (!fs.existsSync(dir)) {
+    let before;
+    try {
+      before = fsApi.lstatSync(dir, { throwIfNoEntry: false }) ?? null;
+    } catch (error) {
+      if (error?.code === 'ENOENT') before = null;
+      else return {
+        ok: false,
+        reason: `could not ${fresh ? 'replace' : 'create'} ${dir}: ${error.code ?? error.message}`,
+      };
+    }
+
+    if (before) {
+      if (before.isSymbolicLink() || !before.isDirectory()) {
+        return {
+          ok: false,
+          reason: `could not ${fresh ? 'replace' : 'create'} ${dir}: it is a link, reparse point, or non-directory`,
+        };
+      }
+      if (fresh) {
+        // Verify the whole tree first, including native reparse attributes.
+        // Recursive deletion then cannot be redirected through a link.
+        await checkedAclDirectory(dir, runFile, true);
+        fsApi.rmSync(dir, { recursive: true, force: true });
+      }
+    } else {
       await checkedAclDirectory(path.dirname(dir), runFile);
-      fs.mkdirSync(dir);
+    }
+
+    let afterRemove;
+    try {
+      afterRemove = fsApi.lstatSync(dir, { throwIfNoEntry: false }) ?? null;
+    } catch (error) {
+      if (error?.code === 'ENOENT') afterRemove = null;
+      else throw error;
+    }
+    if (!afterRemove) {
+      fsApi.mkdirSync(dir, { mode: 0o700 });
+    }
+    const created = fsApi.lstatSync(dir, { throwIfNoEntry: false });
+    if (!created || created.isSymbolicLink() || !created.isDirectory()) {
+      throw new Error('the path became a link, reparse point, or non-directory after creation');
     }
   } catch (err) {
-    return { ok: false, reason: `could not create ${dir}: ${err.message}` };
+    return { ok: false, reason: `could not ${fresh ? 'replace' : 'create'} ${dir}: ${err.message}` };
   }
   const result = await protectServiceFiles({ dirs: [dir], sid, serviceAccount, runFile, log });
   return result.ok ? { ok: true } : { ok: false, reason: result.failed[0]?.reason ?? `could not protect ${dir}` };

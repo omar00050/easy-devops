@@ -3,7 +3,16 @@ import path from 'path';
 import { run } from './shell.js';
 import { loadConfig } from './config.js';
 import { ensureNginxInclude, getConfDDir } from './nginx-conf-generator.js';
-import { isWindows, getNginxExe, nginxTestCmd, combineOutput, isNginxTestOk, nginxLogPath } from './platform.js';
+import {
+  isWindows,
+  getNginxExe,
+  nginxTestCmd,
+  combineOutput,
+  isNginxTestOk,
+  nginxLogPath,
+  powerShellLiteral,
+} from './platform.js';
+import { completeLogLines, readBoundedTailSync } from './service/logTail.js';
 
 // ─── Error Types ──────────────────────────────────────────────────────────────
 
@@ -18,7 +27,84 @@ export class NginxConfigError extends Error {
 
 export class InvalidFilenameError extends Error { }
 
+/** Each stream capture and nginx log read has a hard, exported byte budget. */
+export const NGINX_LOG_TAIL_MAX_BYTES = 1024 * 1024;
+export const NGINX_LOG_TAIL_CHUNK_BYTES = 64 * 1024;
+export const NGINX_LOG_MAX_LINES = 5000;
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function clampLogLines(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 100;
+  return Math.max(1, Math.min(NGINX_LOG_MAX_LINES, Math.trunc(parsed)));
+}
+
+function tailHasEnoughLines(text, requested, startsMidFile) {
+  const parts = text.split('\n');
+
+  // The first entry can be the tail of a line that began before the bounded
+  // read. Exclude it so every count represents a complete line.
+  if (startsMidFile && parts.length > 0) parts.shift();
+  return parts.filter(Boolean).length >= requested;
+}
+
+function readErrorTail(file, lines) {
+  try {
+    return completeLogLines(readBoundedTailSync(file), lines).join('\n');
+  } catch {
+    return '';
+  }
+}
+
+async function readBoundedLogTail(handle, size, requested) {
+  const truncated = size > NGINX_LOG_TAIL_MAX_BYTES;
+  const contentBudget = truncated
+    ? NGINX_LOG_TAIL_MAX_BYTES - 1
+    : NGINX_LOG_TAIL_MAX_BYTES;
+  const floor = Math.max(0, size - contentBudget);
+  let end = size;
+  let bytes = 0;
+  const chunks = [];
+
+  while (end > floor) {
+    const start = Math.max(floor, end - NGINX_LOG_TAIL_CHUNK_BYTES);
+    const buffer = Buffer.allocUnsafe(end - start);
+    let offset = 0;
+
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        offset,
+        buffer.length - offset,
+        start + offset,
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+
+    if (offset === 0) break;
+    chunks.unshift(buffer.subarray(0, offset));
+    bytes += offset;
+    end = start;
+
+    const text = Buffer.concat(chunks, bytes).toString('utf8');
+    if (end === 0 || tailHasEnoughLines(text, requested, end > 0)) break;
+  }
+
+  const text = Buffer.concat(chunks, bytes).toString('utf8');
+  const parts = text.split('\n');
+
+  if (end > 0) {
+    // The byte immediately before the bounded window tells us whether the
+    // first entry is a complete line or the tail of an older one.
+    const boundary = Buffer.allocUnsafe(1);
+    const { bytesRead } = await handle.read(boundary, 0, 1, end - 1);
+    if (bytesRead !== 1 || boundary[0] !== 0x0a) parts.shift();
+  }
+
+  return parts.filter(Boolean).slice(-requested);
+}
 
 function getNginxDir() {
   const { nginxDir } = loadConfig();
@@ -171,7 +257,7 @@ export async function start() {
   // Start nginx
   if (isWindows) {
     const confPath = path.join(nginxDir, 'conf', 'nginx.conf');
-    const startCmd = `Start-Process -FilePath "${path.join(nginxDir, 'nginx.exe')}" -ArgumentList '-c','"${confPath}"' -WorkingDirectory "${nginxDir}" -WindowStyle Hidden`;
+    const startCmd = `Start-Process -FilePath ${powerShellLiteral(path.join(nginxDir, 'nginx.exe'))} -ArgumentList @('-c', ${powerShellLiteral(confPath)}) -WorkingDirectory ${powerShellLiteral(nginxDir)} -WindowStyle Hidden`;
     await run(startCmd, { cwd: nginxDir, timeout: 10000 });
   } else {
     const result = await run('sudo -n /usr/bin/systemctl start nginx');
@@ -198,14 +284,11 @@ export async function start() {
 
   // Didn't start — surface error log
   const logPath = nginxLogPath(nginxDir, 'error');
-  const logCmd = isWindows
-    ? `Get-Content -Tail 20 "${logPath}" -ErrorAction SilentlyContinue`
-    : `tail -n 20 "${logPath}" 2>/dev/null`;
-  const logResult = await run(logCmd);
+  const logTail = readErrorTail(logPath, 20);
 
   return {
     success: false,
-    output: 'nginx did not start\n\n' + (logResult.success ? logResult.stdout : '(no error log)'),
+    output: 'nginx did not start\n\n' + (logTail || '(no error log)'),
   };
 }
 
@@ -311,20 +394,32 @@ export async function saveConfig(filename, content) {
  * always read the error log, so every existing caller keeps working. The
  * access log was unreachable before, which is what the UI needed.
  *
+ * The line count is clamped internally. File I/O walks backwards from EOF in
+ * fixed chunks and stops at a line or byte budget, so this never loads a large
+ * log into memory.
+ *
  * @param {number} [lines]
  * @param {'error'|'access'} [which]
  * @returns {Promise<{ lines: string[] }>}
  */
 export async function getLogs(lines = 100, which = 'error') {
+  const requested = clampLogLines(lines);
   const nginxDir = getNginxDir();
   const logPath = nginxLogPath(nginxDir, which === 'access' ? 'access' : 'error');
-  let content;
+
+  let handle;
   try {
-    content = await fs.readFile(logPath, 'utf8');
+    handle = await fs.open(logPath, 'r');
   } catch (err) {
     if (err.code === 'ENOENT') return { lines: [] };
     throw err;
   }
-  const allLines = content.split('\n').filter(Boolean);
-  return { lines: allLines.slice(-lines) };
+
+  try {
+    const stats = await handle.stat();
+    if (stats.size === 0) return { lines: [] };
+    return { lines: await readBoundedLogTail(handle, stats.size, requested) };
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }

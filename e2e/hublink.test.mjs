@@ -192,6 +192,9 @@ async function main() {
   const legacyBefore = fs.existsSync(REAL_LEGACY_DB)
     ? fs.statSync(REAL_LEGACY_DB).mtimeMs
     : null;
+  const legacyMarkerBefore = fs.existsSync(`${REAL_LEGACY_DB}.migrated`)
+    ? fs.statSync(`${REAL_LEGACY_DB}.migrated`).mtimeMs
+    : null;
 
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ezdevops-hublink-'));
   const cfgDir = path.join(tmpRoot, 'easy-devops');
@@ -247,12 +250,15 @@ async function main() {
   const legacyAfter = fs.existsSync(REAL_LEGACY_DB)
     ? fs.statSync(REAL_LEGACY_DB).mtimeMs
     : null;
+  const legacyMarkerAfter = fs.existsSync(`${REAL_LEGACY_DB}.migrated`)
+    ? fs.statSync(`${REAL_LEGACY_DB}.migrated`).mtimeMs
+    : null;
   process.stdout.write(`\nIsolation checks:\n`);
   process.stdout.write(`   ${legacyAfter === legacyBefore ? 'PASS' : 'FAIL'}  data/easy-devops.sqlite untouched (not migrated/renamed)\n`);
-  process.stdout.write(`   ${!fs.existsSync(REAL_LEGACY_DB + '.migrated') ? 'PASS' : 'FAIL'}  no .migrated file was created\n`);
+  process.stdout.write(`   ${legacyMarkerAfter === legacyMarkerBefore ? 'PASS' : 'FAIL'}  the legacy .migrated marker was neither created nor modified\n`);
   const tempDbUsed = fs.existsSync(path.join(cfgDir, 'easy-devops.sqlite'));
   process.stdout.write(`   ${tempDbUsed ? 'PASS' : 'FAIL'}  temp config dir was used\n`);
-  if (legacyAfter !== legacyBefore || fs.existsSync(REAL_LEGACY_DB + '.migrated')) process.exitCode = 1;
+  if (legacyAfter !== legacyBefore || legacyMarkerAfter !== legacyMarkerBefore) process.exitCode = 1;
 
   fs.rmSync(tmpRoot, { recursive: true, force: true });
   fs.rmSync(childFile, { force: true });

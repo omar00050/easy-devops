@@ -13,7 +13,7 @@ import path from 'path';
 import { loadConfig } from './config.js';
 import { describeIssuance, issueCertificate, prepareDomainForHttpChallenge } from './ssl-issuer.js';
 import { renewCertificate, describeRenewal, failureReason } from './cert-renewal.js';
-import { bumpHubRevision } from './hubLink.js';
+import { bumpHubRevision, getHubPermissions } from './hubLink.js';
 import { listAllCerts } from './cert-reader.js';
 import { findCertificateForDomain } from './cert-suggest.js';
 import { findDomain } from './domains-db.js';
@@ -67,8 +67,10 @@ function newCertificateResult(domain, result) {
     }
     : null;
   if (out.ok) {
-    out.certPath = result.certPath ?? null;
-    out.keyPath = result.keyPath ?? null;
+    if (getHubPermissions()['nginx.config.view'] === true) {
+      out.certPath = result.certPath ?? null;
+      out.keyPath = result.keyPath ?? null;
+    }
   } else {
     out.error = failureDetail(result) ?? { stage: null, cause: out.error, fix: null, consequence: null };
   }
@@ -114,8 +116,16 @@ async function prepare(domainName) {
  */
 export async function handleHubSslCommand(payload, options = {}) {
   const { action, domain } = payload ?? {};
-  const { onProgress = null } = options ?? {};
+  const {
+    onProgress = null,
+    recheck = null,
+    issueFn = issueCertificate,
+    suggestFn = findCertificateForDomain,
+  } = options ?? {};
   const config = loadConfig();
+  const authorize = () => {
+    if (typeof recheck === 'function') recheck();
+  };
 
   // Every SSL stage belongs to a name; the Hub needs that to show renewAll
   // per domain. The agent's onProgress accepts it as its fourth argument.
@@ -132,6 +142,7 @@ export async function handleHubSslCommand(payload, options = {}) {
       // renewCertificate() keeps the names the certificate already covers
       // (a `www` certificate stays a `www` certificate), prepares the nginx
       // config, and reloads nginx afterwards.
+      authorize();
       const result = await renewCertificate(domain, {
         email: config.acmeEmail,
         opId: payload?.opId,
@@ -154,6 +165,7 @@ export async function handleHubSslCommand(payload, options = {}) {
       const renewed = [];
 
       for (const cert of expiring) {
+        authorize();
         const result = await renewCertificate(cert.domain, {
           email: config.acmeEmail,
           opId: payload?.opId,
@@ -193,10 +205,12 @@ export async function handleHubSslCommand(payload, options = {}) {
         return { ok: false, error: 'No acmeEmail configured on this server. Set it in the server’s dashboard: Settings → General.' };
       }
 
+      authorize();
       const prep = await prepare(domain);
       if (!prep.ok) return { ok: false, error: `Challenge setup failed: ${prep.error}` };
 
-      const result = await issueCertificate(domain, {
+      authorize();
+      const result = await issueFn(domain, {
         www: Boolean(payload?.www),
         validationMethod: 'http',
         email: config.acmeEmail,
@@ -216,7 +230,22 @@ export async function handleHubSslCommand(payload, options = {}) {
     // fills them into the form and the operator still has to save.
     case 'suggest': {
       if (!domain) return { ok: false, error: 'domain is required' };
-      return { ok: true, ...(await findCertificateForDomain(domain)) };
+      const found = await suggestFn(domain);
+      const safe = {
+        ...found,
+        ...(found?.certificate && typeof found.certificate === 'object'
+          ? { certificate: { ...found.certificate } }
+          : {}),
+      };
+      if (getHubPermissions()['nginx.config.view'] !== true) {
+        delete safe.certPath;
+        delete safe.keyPath;
+        if (safe.certificate) {
+          delete safe.certificate.certPath;
+          delete safe.certificate.keyPath;
+        }
+      }
+      return { ok: true, ...safe };
     }
 
     // ── Delete a certificate ──────────────────────────────────────────────
@@ -226,6 +255,7 @@ export async function handleHubSslCommand(payload, options = {}) {
     case 'delete': {
       if (!domain) return { ok: false, error: 'domain is required' };
 
+      authorize();
       const outcome = await deleteCertificate(domain);
       if (outcome.code === 'cert_not_found') {
         return { ok: false, code: 'cert_not_found', domain: outcome.domain, error: `No certificate named ${outcome.domain} on this server.` };
@@ -243,6 +273,15 @@ export async function handleHubSslCommand(payload, options = {}) {
           error:
             `Certificate for ${outcome.domain} is still used by ${names}. ` +
             'Disable SSL on those domains (or disable the domains) before deleting it.',
+        };
+      }
+      if (outcome.code === 'cert_not_managed') {
+        return {
+          ok: false,
+          code: 'cert_not_managed',
+          domain: outcome.domain,
+          error: outcome.detail
+            ?? 'This certificate was not recorded as created by Easy DevOps, so it was not deleted.',
         };
       }
       if (outcome.code === 'delete_failed') {

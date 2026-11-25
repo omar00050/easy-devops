@@ -120,6 +120,43 @@ async function testStatusFile() {
   fs.writeFileSync(status.statusPath(dir), JSON.stringify({ hello: 'world' }));
   check('a record without an id/phase is not data', status.readStatus(dir) === null);
 
+  for (const [label, record] of [
+    ['an unknown phase', { id: 'bad-phase', phase: 'running-forever' }],
+    ['an empty run id', { id: '', phase: 'starting' }],
+    ['an overlong run id', { id: 'x'.repeat(201), phase: 'starting' }],
+    ['an invalid dashboard PID', { id: 'bad-pid', phase: 'starting', dashboard: { pid: -1, port: 6443 } }],
+    ['an invalid dashboard port', { id: 'bad-port', phase: 'starting', dashboard: { pid: 1, port: 70_000 } }],
+    ['an invalid worker PID', { id: 'bad-worker-pid', phase: 'updating', workerPid: 0 }],
+    ['an incomplete update version', { id: 'bad-version', phase: 'starting', from: '1.3.4 extra', to: '1.3.5' }],
+  ]) {
+    fs.writeFileSync(status.statusPath(dir), JSON.stringify(record));
+    check(`${label} is not a process-control record`, status.readStatus(dir) === null);
+  }
+
+  fs.writeFileSync(status.statusPath(dir), JSON.stringify({
+    id: 'oversized',
+    phase: 'starting',
+    padding: 'x'.repeat(300 * 1024),
+  }));
+  check('an oversized status record fails closed', status.readStatus(dir) === null);
+
+  fs.writeFileSync(status.statusPath(dir), JSON.stringify({
+    id: 'growth-race',
+    phase: 'starting',
+    padding: 'x'.repeat(300 * 1024),
+  }));
+  const actualFstat = fs.fstatSync;
+  try {
+    fs.fstatSync = (fd) => {
+      const stat = actualFstat(fd);
+      return { size: 1, nlink: stat.nlink, isFile: () => stat.isFile() };
+    };
+    check('a file that grows beyond the limit after fstat is rejected',
+      status.readStatus(dir) === null);
+  } finally {
+    fs.fstatSync = actualFstat;
+  }
+
   const live = { phase: 'updating', updatedAt: Date.now(), workerPid: process.pid };
   check('a live worker pid makes a run active', status.runIsActive(live) === true);
   check('a fresh heartbeat alone makes a run active',
@@ -218,7 +255,7 @@ async function testStartRefusals() {
     const code = await runPendingUpdate({ dataDir: badDir, runId, apply: () => { applied = true; } });
     const record = status.readStatus(badDir);
     check('worker refuses an invalid saved version before stopping the dashboard',
-      code === 1 && !applied && record.phase === 'failed' && record.step === 'version');
+      code === 1 && !applied && record === null);
   }
 
   const uptodateDir = scratch('refuse-uptodate');
@@ -292,6 +329,79 @@ async function testStartAccepted() {
   check('a stale active run does not block a new one', staleRes.statusCode === 202,
     String(staleRes.statusCode));
   check('and the record is replaced, not merged', staleRes.body.run?.id !== 'dead');
+
+  // Omitted-version starts wait for the registry. The reservation must happen
+  // before that await, or two requests can both finish the lookup and spawn.
+  const raceDir = scratch('accept-concurrent-start');
+  let registryEntered;
+  const entered = new Promise((resolve) => { registryEntered = resolve; });
+  let releaseRegistry;
+  const registryGate = new Promise((resolve) => { releaseRegistry = resolve; });
+  const race = await makeController(raceDir, {
+    checkForUpdate: async () => {
+      race.calls.checks += 1;
+      registryEntered();
+      await registryGate;
+      return { reachable: true, current: '1.3.4', latest: '1.3.5', updateAvailable: true };
+    },
+  });
+  const firstRaceRes = makeRes();
+  const firstRace = race.controller.start(makeReq({}), firstRaceRes);
+  await entered;
+  const secondRaceRes = makeRes();
+  await race.controller.start(makeReq({}), secondRaceRes);
+  check('a second registry-backed start is refused while the first is looking up',
+    secondRaceRes.statusCode === 409 && race.calls.spawns.length === 0,
+    `${secondRaceRes.statusCode} spawns=${race.calls.spawns.length}`);
+  releaseRegistry();
+  await firstRace;
+  check('only the reserved request can launch the worker',
+    firstRaceRes.statusCode === 202
+      && secondRaceRes.statusCode === 409
+      && race.calls.checks === 1
+      && race.calls.spawns.length === 1,
+    `first=${firstRaceRes.statusCode} second=${secondRaceRes.statusCode} checks=${race.calls.checks} spawns=${race.calls.spawns.length}`);
+
+  // Even if two worker processes are started for one run, the per-run claim
+  // admits one apply() and the loser exits before touching npm or the dashboard.
+  const { runPendingUpdate } = await import(srcUrl('dashboard/updateWorker.js'));
+  const workerDir = scratch('worker-concurrent-claim');
+  status.writeStatus({
+    id: 'claimed-run',
+    phase: 'starting',
+    from: '1.3.4',
+    to: '1.3.5',
+    dashboard: { pid: 1, port: 6443 },
+  }, { dataDir: workerDir, replace: true });
+  let applyEntered;
+  const applying = new Promise((resolve) => { applyEntered = resolve; });
+  let releaseApply;
+  const applyGate = new Promise((resolve) => { releaseApply = resolve; });
+  let applies = 0;
+  const firstWorker = runPendingUpdate({
+    dataDir: workerDir,
+    runId: 'claimed-run',
+    apply: async () => {
+      applies += 1;
+      applyEntered();
+      await applyGate;
+      return 0;
+    },
+  });
+  await applying;
+  const secondWorker = await runPendingUpdate({
+    dataDir: workerDir,
+    runId: 'claimed-run',
+    apply: async () => {
+      applies += 1;
+      return 0;
+    },
+  });
+  releaseApply();
+  const firstWorkerCode = await firstWorker;
+  check('one worker owns a starting run and a duplicate exits before apply',
+    firstWorkerCode === 0 && secondWorker === 1 && applies === 1,
+    `first=${firstWorkerCode} second=${secondWorker} applies=${applies}`);
 }
 
 // ─── 5. The status endpoint ──────────────────────────────────────────────────

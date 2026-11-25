@@ -30,11 +30,21 @@ import crypto from 'crypto';
 import { getDataDir } from '../platform.js';
 import { dbGet } from '../db.js';
 import { loadConfig } from '../config.js';
+import {
+  openVerifiedChild, unlinkVerifiedChild, writeFileEventual,
+} from '../safe-file.js';
 
 /** Name of the folder new apps are created in, under the data directory by default. */
 export const DEPLOY_FOLDER = 'ez_deploys';
 /** Where apps lived before the folder was configurable. Apps without a recorded `dir` are still there. */
 const LEGACY_FOLDER = 'deploy';
+/**
+ * Engine-owned deployment artifacts. These are deliberately outside the
+ * deploy root: an app's install/build hooks can change every file in a
+ * checkout, but they must never be able to redirect a generated PM2 config,
+ * launcher, or release record through a link.
+ */
+export const ENGINE_ARTIFACT_FOLDER = 'engine-deploy';
 
 /** How many run records are kept per app. Older ones are deleted with their logs. */
 export const MAX_RUNS_KEPT = 30;
@@ -135,6 +145,71 @@ export function pathsIn(root) {
   };
 }
 
+/**
+ * The private artifact directory for one release. It always lives below the
+ * data directory, even when the app checkout is in a custom deploy folder.
+ */
+export function engineAppDir(appId, dataDir = getDataDir()) {
+  if (typeof appId !== 'string' || !/^[a-z0-9][a-z0-9-]{0,39}$/.test(appId)) {
+    throw new Error(`Invalid app id: ${JSON.stringify(appId)}`);
+  }
+  return path.join(dataDir, ENGINE_ARTIFACT_FOLDER, appId);
+}
+
+export function engineReleaseDir(appId, releaseId, dataDir = getDataDir()) {
+  if (!isId(releaseId)) throw new Error(`Invalid release id: ${JSON.stringify(releaseId)}`);
+  return path.join(engineAppDir(appId, dataDir), releaseId);
+}
+
+function ensurePrivateDirectory(directory, mode) {
+  const existing = fs.lstatSync(directory, { throwIfNoEntry: false });
+  if (existing) {
+    if (!existing.isDirectory() || existing.isSymbolicLink()) {
+      throw new Error(`Refusing a linked or non-directory engine artifact path: ${directory}`);
+    }
+    fs.chmodSync(directory, mode);
+    return existing;
+  }
+
+  fs.mkdirSync(directory, { mode });
+  const created = fs.lstatSync(directory);
+  if (!created.isDirectory() || created.isSymbolicLink()) {
+    throw new Error(`Refusing a linked or non-directory engine artifact path: ${directory}`);
+  }
+  fs.chmodSync(directory, mode);
+  return created;
+}
+
+/**
+ * Create and return one release's private artifact directory.
+ *
+ * Each newly introduced path component is checked independently so a link
+ * cannot make a later component resolve outside the engine-owned tree.
+ */
+export function ensureEngineReleaseDir(appId, releaseId, dataDir = getDataDir()) {
+  const root = path.resolve(dataDir);
+  const rootStat = fs.lstatSync(root, { throwIfNoEntry: false });
+  if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error(`The Easy DevOps data directory is not a regular directory: ${root}`);
+  }
+
+  ensurePrivateDirectory(path.join(root, ENGINE_ARTIFACT_FOLDER), 0o700);
+  ensurePrivateDirectory(path.join(root, ENGINE_ARTIFACT_FOLDER, appId), 0o700);
+  return ensurePrivateDirectory(engineReleaseDir(appId, releaseId, root), 0o700);
+}
+
+/** Read a JSON artifact only from the engine-owned location. */
+export function readEngineJson(appId, releaseId, fileName, dataDir = getDataDir()) {
+  if (typeof fileName !== 'string' || path.basename(fileName) !== fileName || !fileName.endsWith('.json')) {
+    throw new Error(`Invalid engine artifact name: ${JSON.stringify(fileName)}`);
+  }
+  return readJson(path.join(engineReleaseDir(appId, releaseId, dataDir), fileName));
+}
+
+export function removeEngineRelease(appId, releaseId, dataDir = getDataDir()) {
+  fs.rmSync(engineReleaseDir(appId, releaseId, dataDir), { recursive: true, force: true });
+}
+
 export function ensureAppDirs(appId, dataDir) {
   const p = appPaths(appId, dataDir);
   for (const dir of [p.root, p.releases, p.runs, p.logs]) fs.mkdirSync(dir, { recursive: true });
@@ -144,16 +219,18 @@ export function ensureAppDirs(appId, dataDir) {
 // ─── Small atomic JSON files ──────────────────────────────────────────────────
 
 function writeJsonAtomic(file, value) {
-  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
-  fs.renameSync(tmp, file);
+  writeFileEventual(file, JSON.stringify(value, null, 2), { mode: 0o600 });
 }
 
 function readJson(file) {
+  let opened;
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    opened = openVerifiedChild(file);
+    return JSON.parse(fs.readFileSync(opened.fd, 'utf8'));
   } catch {
     return null;
+  } finally {
+    opened?.close();
   }
 }
 
@@ -207,7 +284,51 @@ export function logFile(appId, runId, dataDir) {
 
 export function writeRun(run, dataDir) {
   ensureAppDirs(run.appId, dataDir);
-  writeJsonAtomic(runFile(run.appId, run.id, dataDir), run);
+  writeRunAt(appPaths(run.appId, dataDir), run);
+}
+
+/**
+ * Reads runs from one explicit app folder.
+ *
+ * Unlike the ordinary dashboard accessor, this migration-facing reader refuses
+ * a linked runs directory or a linked/hard-linked run file. A legacy record
+ * that cannot be trusted must not be copied into a backup as though it had
+ * been inspected and scrubbed.
+ */
+export function listRunsAt(paths, { limit = MAX_RUNS_KEPT } = {}) {
+  const directory = fs.lstatSync(paths.runs, { throwIfNoEntry: false });
+  if (!directory) return [];
+  if (!directory.isDirectory() || directory.isSymbolicLink()) {
+    throw new Error(`Refusing a linked or non-directory deployment runs folder: ${paths.runs}`);
+  }
+
+  const names = fs.readdirSync(paths.runs)
+    .filter((name) => name.endsWith('.json') && isId(name.slice(0, -5)))
+    .sort()
+    .reverse()
+    .slice(0, limit);
+
+  return names.map((name) => {
+    const id = name.slice(0, -5);
+    const file = path.join(paths.runs, name);
+    let handle;
+    try {
+      handle = openVerifiedChild(file, { expectedDirectory: paths.runs });
+      const run = JSON.parse(fs.readFileSync(handle.fd, 'utf8'));
+      if (!run || typeof run !== 'object' || run.id !== id) {
+        throw new Error(`Invalid deployment run record: ${file}`);
+      }
+      return run;
+    } finally {
+      handle?.close();
+    }
+  });
+}
+
+/** Writes a run to one explicit app folder by exclusive-create and rename. */
+export function writeRunAt(paths, run) {
+  if (!isId(run?.id)) throw new Error(`Invalid run id: ${JSON.stringify(run?.id)}`);
+  writeJsonAtomic(path.join(paths.runs, `${run.id}.json`), run);
 }
 
 /** @returns {Object|null} */
@@ -259,16 +380,26 @@ export function pruneRuns(appId, dataDir) {
  * @returns {{ text: string, truncated: boolean }}
  */
 export function readLogTail(appId, runId, { maxBytes = 64 * 1024, dataDir } = {}) {
+  let paths;
   let file;
-  try { file = logFile(appId, runId, dataDir); } catch { return { text: '', truncated: false }; }
-
-  let fd;
   try {
-    fd = fs.openSync(file, 'r');
-    const size = fs.fstatSync(fd).size;
-    const start = Math.max(0, size - maxBytes);
+    paths = appPaths(appId, dataDir);
+    file = path.join(paths.logs, `${runId}.log`);
+    if (!isId(runId)) throw new Error('invalid run id');
+  } catch {
+    return { text: '', truncated: false };
+  }
+
+  const budget = Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0
+    ? Math.min(64 * 1024, Math.trunc(Number(maxBytes)))
+    : 64 * 1024;
+  let opened;
+  try {
+    opened = openVerifiedChild(file, { expectedDirectory: paths.logs });
+    const size = opened.opened.size;
+    const start = Math.max(0, size - budget);
     const buf = Buffer.alloc(size - start);
-    fs.readSync(fd, buf, 0, buf.length, start);
+    fs.readSync(opened.fd, buf, 0, buf.length, start);
     let text = buf.toString('utf8');
     // Starting mid-file usually lands inside a line; drop the partial one.
     if (start > 0) text = text.slice(text.indexOf('\n') + 1);
@@ -276,7 +407,7 @@ export function readLogTail(appId, runId, { maxBytes = 64 * 1024, dataDir } = {}
   } catch {
     return { text: '', truncated: false };
   } finally {
-    if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+    opened?.close();
   }
 }
 
@@ -316,6 +447,7 @@ export function pruneReleases(appId, { keep = 5, protect = [], dataDir } = {}) {
     if (guarded.has(id)) continue;
     try {
       fs.rmSync(releaseDir(appId, id, dataDir), { recursive: true, force: true });
+      removeEngineRelease(appId, id, dataDir);
       removed.push(id);
     } catch { /* a file in use (Windows): try again on the next deployment */ }
   }
@@ -344,12 +476,24 @@ function pidAlive(pid) {
  *
  * @returns {{ ok: true, release: () => void } | { ok: false, reason: string, runId: string|null }}
  */
-export function acquireLock(appId, { runId = null, dataDir, now = Date.now() } = {}) {
-  const p = ensureAppDirs(appId, dataDir);
-  const body = JSON.stringify({ pid: process.pid, runId, at: now });
+export function acquireLockAt(paths, { runId = null, now = Date.now() } = {}) {
+  const p = paths;
+  const token = crypto.randomBytes(16).toString('hex');
+  const body = JSON.stringify({ pid: process.pid, runId, at: now, token });
 
   const take = () => {
-    fs.writeFileSync(p.lock, body, { flag: 'wx' });
+    let opened;
+    try {
+      opened = openVerifiedChild(p.lock, {
+        expectedDirectory: p.root,
+        flags: fs.constants.O_WRONLY | fs.constants.O_CREAT,
+        mode: 0o600,
+        exclusive: true,
+      });
+      fs.writeFileSync(opened.fd, body, 'utf8');
+    } finally {
+      opened?.close();
+    }
     let released = false;
     return {
       ok: true,
@@ -359,8 +503,10 @@ export function acquireLock(appId, { runId = null, dataDir, now = Date.now() } =
         // Only remove a lock that is still ours: after a stale takeover it is
         // somebody else's, and removing it would let a third deployment in.
         const held = readJson(p.lock);
-        if (held?.pid === process.pid && held?.runId === runId) {
-          try { fs.rmSync(p.lock, { force: true }); } catch { /* ignore */ }
+        if (held?.pid === process.pid && held?.runId === runId && held?.token === token) {
+          try {
+            unlinkVerifiedChild(p.lock, { expectedDirectory: p.root });
+          } catch { /* a replacement lock is not ours to remove */ }
         }
       },
     };
@@ -378,13 +524,25 @@ export function acquireLock(appId, { runId = null, dataDir, now = Date.now() } =
     return { ok: false, reason: 'A deployment of this app is already running.', runId: held.runId ?? null };
   }
 
-  try { fs.rmSync(p.lock, { force: true }); } catch { /* raced with another taker */ }
+  try {
+    const listed = fs.lstatSync(p.lock, { throwIfNoEntry: false });
+    if (listed) {
+      unlinkVerifiedChild(p.lock, {
+        expectedDirectory: p.root,
+        expected: listed,
+      });
+    }
+  } catch { /* raced with another taker or was replaced */ }
   try {
     return take();
   } catch (err) {
     if (err.code !== 'EEXIST') throw err;
     return { ok: false, reason: 'A deployment of this app is already running.', runId: null };
   }
+}
+
+export function acquireLock(appId, { runId = null, dataDir, now = Date.now() } = {}) {
+  return acquireLockAt(ensureAppDirs(appId, dataDir), { runId, now });
 }
 
 /** The run currently holding the lock, or null. */
@@ -406,6 +564,7 @@ export function lockHolder(appId, dataDir) {
  */
 export function removeAppFiles(appId, { keepShared = false, dataDir } = {}) {
   const p = appPaths(appId, dataDir);
+  const artifacts = engineAppDir(appId, dataDir);
 
   let hasShared = false;
   if (keepShared) {
@@ -413,6 +572,7 @@ export function removeAppFiles(appId, { keepShared = false, dataDir } = {}) {
   }
   if (!hasShared) {
     fs.rmSync(p.root, { recursive: true, force: true });
+    fs.rmSync(artifacts, { recursive: true, force: true });
     return { keptShared: false, sharedPath: p.shared };
   }
 
@@ -420,5 +580,6 @@ export function removeAppFiles(appId, { keepShared = false, dataDir } = {}) {
     if (entry === 'shared') continue;
     fs.rmSync(path.join(p.root, entry), { recursive: true, force: true });
   }
+  fs.rmSync(artifacts, { recursive: true, force: true });
   return { keptShared: true, sharedPath: p.shared };
 }

@@ -1,7 +1,7 @@
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import {
-  loadConfig, saveConfig, AUTH_MODES, BIND_ALL, BIND_LOOPBACK,
+  loadConfig, saveConfig, AUTH_MODES, BIND_LOOPBACK, BIND_LOOPBACK_V6,
   isLoopbackBind, effectiveAuthMode,
 } from '../../core/config.js';
 import {
@@ -217,25 +217,17 @@ export default async function settingsMenu() {
         default: config.dashboardBindAddress,
         choices: [
           { name: `This machine only (${BIND_LOOPBACK})`, value: BIND_LOOPBACK },
-          { name: `All interfaces (${BIND_ALL})`, value: BIND_ALL },
+          { name: `This machine only (IPv6 ${BIND_LOOPBACK_V6})`, value: BIND_LOOPBACK_V6 },
           { name: '← Cancel', value: 'cancel' },
         ],
       }]);
 
       if (value === 'cancel') continue;
 
-      // Opening the listener up while there is no password would publish an
-      // unauthenticated dashboard to the network.
-      if (!isLoopbackBind(value) && authMode === AUTH_MODES.NONE) {
-        console.log(chalk.yellow('\n  This dashboard has no password, so it can only listen on this machine.'));
-        console.log(chalk.gray('  Set a password first (Dashboard Auth), then change this.\n'));
-        await pause();
-        continue;
-      }
-
       config.dashboardBindAddress = value;
       saveConfig(config);
-      console.log(chalk.green('\n  ✓ Saved. Restart the dashboard for it to take effect.\n'));
+      console.log(chalk.green('\n  ✓ Saved. Restart the dashboard for it to take effect.'));
+      console.log(chalk.gray('  Remote access uses a local HTTPS reverse proxy or secure tunnel.\n'));
 
     } else if (field === 'acmeEmail') {
       const { value } = await inquirer.prompt([{

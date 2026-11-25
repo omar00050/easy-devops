@@ -200,6 +200,7 @@ async function main() {
   const events = await import(srcUrl('core/events.js'));
   const { dbGet, dbSet } = await import(srcUrl('core/db.js'));
   const { loadConfig, saveConfig } = await import(srcUrl('core/config.js'));
+  const { runFile } = await import(srcUrl('core/shell.js'));
 
   // ── 1. ez.json ──────────────────────────────────────────────────────────────
   setGroup('1. ez.json and defaults');
@@ -504,6 +505,15 @@ async function main() {
 
   const port = await freePort();
   const repo = makeRepo('site');
+  const originRepo = makeRepo('origin-switch');
+  commit(originRepo, {
+    'package.json': JSON.stringify({
+      name: 'origin-switch',
+      scripts: { start: 'node server.js' },
+    }),
+    'server.js': SERVER_JS,
+    VERSION: 'origin-baseline',
+  }, 'origin baseline');
 
   /** Registers an app whose "repository" is the local one — the engine trusts the record. */
   const register = (id, overrides = {}) => {
@@ -526,6 +536,90 @@ async function main() {
   const logOf = (id, runId) => fs.readFileSync(store.logFile(id, runId), 'utf8');
 
   try {
+    const ORIGIN_TOKEN_A = 'ghp_OriginTokenAAAAAAAAAAAA';
+    const ORIGIN_TOKEN_B = 'ghp_ReplacementTokenBBBBBBBB';
+    const originPort = await freePort();
+    const originCreated = apps.createApp({
+      id: 'origin-switch',
+      repoUrl: 'https://github.com/original/project.git',
+      authType: 'token',
+      token: ORIGIN_TOKEN_A,
+      settings: { port: originPort },
+    });
+    const originCleared = apps.updateApp('origin-switch', {
+      repoUrl: 'https://github.com/replacement/project.git',
+      authType: 'none',
+    });
+    check('changing the repository through updateApp drops the old token',
+      originCreated.ok
+        && originCleared.ok
+        && originCleared.app.auth.token === null
+        && originCleared.app.auth.type === 'none',
+      JSON.stringify(originCleared));
+
+    // The test repository is local, but the auth record is exactly the one
+    // updateApp produced for the replacement origin. Prove the child fetch
+    // boundary cannot receive the credential that belonged to identity A.
+    register('origin-switch', {
+      repoUrl: originRepo,
+      auth: originCleared.app.auth,
+      settings: { port: originPort },
+    });
+    const clearedFetchCalls = [];
+    const originClearedDeploy = await deploy('origin-switch', {
+      deps: {
+        ...deps,
+        runFile(file, args, options) {
+          if (file === 'git' && args.includes('fetch')) {
+            clearedFetchCalls.push({ command: [file, ...args].join(' '), env: options?.env });
+          }
+          return runFile(file, args, options);
+        },
+      },
+    });
+    const oldBasic = Buffer.from(`x-access-token:${ORIGIN_TOKEN_A}`).toString('base64');
+    check('a deployment after an origin change passes no old token to Git',
+      originClearedDeploy.run.status === 'success'
+        && clearedFetchCalls.length === 1
+        && !clearedFetchCalls[0].env?.GIT_CONFIG_VALUE_0
+        && !JSON.stringify(clearedFetchCalls[0]).includes(ORIGIN_TOKEN_A)
+        && !JSON.stringify(clearedFetchCalls[0]).includes(oldBasic),
+      JSON.stringify({ run: originClearedDeploy.run, clearedFetchCalls }));
+
+    const originRebound = apps.updateApp('origin-switch', {
+      repoUrl: 'https://github.com/replacement/project.git',
+      authType: 'token',
+      token: ORIGIN_TOKEN_B,
+    });
+    check('the replacement origin accepts a new token',
+      originRebound.ok && originRebound.app.auth.token === ORIGIN_TOKEN_B,
+      JSON.stringify(originRebound));
+    register('origin-switch', {
+      repoUrl: originRepo,
+      auth: originRebound.app.auth,
+      settings: { port: originPort },
+    });
+    const replacementFetchCalls = [];
+    const originReboundDeploy = await deploy('origin-switch', {
+      deps: {
+        ...deps,
+        runFile(file, args, options) {
+          if (file === 'git' && args.includes('fetch')) {
+            replacementFetchCalls.push({ command: [file, ...args].join(' '), env: options?.env });
+          }
+          return runFile(file, args, options);
+        },
+      },
+    });
+    const newBasic = Buffer.from(`x-access-token:${ORIGIN_TOKEN_B}`).toString('base64');
+    check('Git receives only the replacement origin\'s new credential',
+      originReboundDeploy.run.status === 'success'
+        && replacementFetchCalls.length === 1
+        && replacementFetchCalls[0].env?.GIT_CONFIG_VALUE_0 === `Authorization: Basic ${newBasic}`
+        && !JSON.stringify(replacementFetchCalls[0]).includes(ORIGIN_TOKEN_A)
+        && !JSON.stringify(replacementFetchCalls[0]).includes(oldBasic),
+      JSON.stringify({ run: originReboundDeploy.run, replacementFetchCalls }));
+
     register('site');
 
     // v1: plain package.json, no ez.json.
@@ -544,16 +638,19 @@ async function main() {
     check('the state names the live release', store.readState('site').current === run1.releaseId && store.readState('site').previous === null);
 
     const dir1 = store.releaseDir('site', run1.releaseId);
+    const engineDir1 = store.engineReleaseDir('site', run1.releaseId);
     check('the build ran in the release directory', fs.existsSync(path.join(dir1, 'BUILT')));
     check('node_modules-free project still installed without error (npm install ran)', /npm install/.test(logOf('site', run1.id)));
     check('the app\'s environment reaches the process, with PORT and the release id',
       JSON.parse(await body(port, '/env')).greeting === 'hello' && JSON.parse(await body(port, '/env')).release === run1.releaseId);
     check('the log shows where each setting came from', /\[package\.json\]/.test(logOf('site', run1.id)) && /\[override\]/.test(logOf('site', run1.id)));
     check('"npm start" went through the launcher',
-      fs.existsSync(path.join(dir1, 'ez-launch.cjs')) && JSON.parse(fs.readFileSync(path.join(dir1, engine.PM2_CONFIG_FILE))).apps[0].script === 'ez-launch.cjs');
+      fs.existsSync(path.join(engineDir1, 'ez-launch.cjs'))
+      && JSON.parse(fs.readFileSync(path.join(engineDir1, engine.PM2_CONFIG_FILE))).apps[0].script
+        === path.join(engineDir1, 'ez-launch.cjs'));
     if (process.platform !== 'win32') {
       check('the PM2 config (it holds the environment) is owner-only',
-        (fs.statSync(path.join(dir1, engine.PM2_CONFIG_FILE)).mode & 0o077) === 0);
+        (fs.statSync(path.join(engineDir1, engine.PM2_CONFIG_FILE)).mode & 0o077) === 0);
     }
     check('PM2 was asked to save the process list', pm2.calls.some((c) => c[0] === 'save'));
     check('a success notification went to the app\'s channels',
@@ -574,6 +671,7 @@ async function main() {
     const d2 = await deploy('site');
     const run2 = d2.run;
     const dir2 = run2 ? store.releaseDir('site', run2.releaseId) : '';
+    const engineDir2 = run2 ? store.engineReleaseDir('site', run2.releaseId) : '';
     check('a second deployment succeeds and the new version answers', run2?.status === 'success' && await body() === 'v2', run2?.error ?? '');
     check('the previous release is remembered for a rollback',
       store.readState('site').current === run2.releaseId && store.readState('site').previous === run1.releaseId);
@@ -581,7 +679,8 @@ async function main() {
     check('install: false skipped the install step', !/── Install/.test(logOf('site', run2.id)));
     check('the pre and post hooks ran', fs.existsSync(path.join(dir2, 'PRE')) && fs.existsSync(path.join(dir2, 'POST')));
     check('"node server.js" is run by PM2 directly, with no launcher',
-      !fs.existsSync(path.join(dir2, 'ez-launch.cjs')) && JSON.parse(fs.readFileSync(path.join(dir2, engine.PM2_CONFIG_FILE))).apps[0].script === 'server.js');
+      !fs.existsSync(path.join(engineDir2, 'ez-launch.cjs'))
+      && JSON.parse(fs.readFileSync(path.join(engineDir2, engine.PM2_CONFIG_FILE))).apps[0].script === 'server.js');
     check('the old release is still on disk', fs.existsSync(dir1));
 
     // Two at once.
@@ -717,7 +816,6 @@ async function main() {
     // A token must never reach the log.
     const TOKEN = 'ghp_SuperSecretToken1234567890';
     register('tokened', { auth: { type: 'token', token: TOKEN, publicKey: null }, settings: { port: await freePort() } });
-    const { runFile } = await import(srcUrl('core/shell.js'));
     const fetchCalls = [];
     const d13 = await deploy('tokened', { deps: { ...deps, runFile(file, args, options) {
       fetchCalls.push({ command: [file, ...args].join(' '), env: options?.env });

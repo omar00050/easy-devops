@@ -1370,12 +1370,14 @@ function handle(
     }
     if (data.dashboardBindAddress !== undefined) {
       const bind = String(data.dashboardBindAddress);
-      if (!['127.0.0.1', '0.0.0.0', '::1'].includes(bind)) {
-        fail(400, 'Bind address must be 127.0.0.1 (this machine only) or 0.0.0.0 (all interfaces)');
+      if (!['127.0.0.1', '::1'].includes(bind)) {
+        fail(400, 'The dashboard must listen on this machine. Use a local HTTPS proxy or secure tunnel for remote access.', {
+          reason: 'dashboard_requires_loopback',
+        });
       }
       if (bind !== s.settings.dashboardBindAddress) needsRestart = true;
       next.dashboardBindAddress = bind;
-      next.bindsToLoopbackOnly = bind !== '0.0.0.0';
+      next.bindsToLoopbackOnly = true;
     }
     if (data.dashboardAuth !== undefined) {
       if (!['password', 'none'].includes(String(data.dashboardAuth))) {
@@ -1426,14 +1428,6 @@ function handle(
     }
 
     const nextAuth = next.dashboardAuth;
-    const nextBind = next.dashboardBindAddress;
-    if (nextAuth === 'none' && nextBind === '0.0.0.0') {
-      fail(
-        400,
-        'Running without a password requires the dashboard to listen on this machine only.',
-        { reason: 'no_auth_requires_loopback' }
-      );
-    }
 
     s.settings = next;
     s.authMode = nextAuth;

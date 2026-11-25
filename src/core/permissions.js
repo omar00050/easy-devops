@@ -36,6 +36,7 @@
 
 import os from 'os';
 import path from 'path';
+import fs from 'fs';
 
 import { run, runInteractiveFile } from './shell.js';
 import { isWindows } from './platform.js';
@@ -43,6 +44,83 @@ import { loadConfig } from './config.js';
 
 /** Where the rule file is installed. */
 export const SUDOERS_PATH = '/etc/sudoers.d/easy-devops';
+
+/**
+ * The only two Linux directories the generated setup may hand to the operator.
+ * They are constants, not values derived from settings: a stored-path writer
+ * must not be able to turn the operator's one privileged setup step into a
+ * chown of an arbitrary directory.
+ */
+export const LINUX_NGINX_DIR = '/etc/nginx';
+export const LINUX_NGINX_CONF_DIR = '/etc/nginx/conf.d';
+export const LINUX_SSL_DIR = '/etc/easy-devops/ssl';
+export const MANAGED_LINUX_DIRS = Object.freeze([
+  LINUX_SSL_DIR,
+  LINUX_NGINX_CONF_DIR,
+]);
+
+/**
+ * Root-side directory preparation, passed to a fixed `/bin/sh` with the target
+ * and owner as separate positional arguments.
+ *
+ * It check-then-creates every existing component, rejects links, and requires
+ * every non-final component to be root-owned. The user therefore cannot swap a
+ * component for a link between the generated setup text and the privileged
+ * command. Missing components are created one at a time with plain `mkdir`
+ * after proving their parent is root-owned.
+ */
+export const MANAGED_DIR_SETUP_SCRIPT = String.raw`set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+target=$1
+owner=$2
+if [ "$target" != /etc/easy-devops/ssl ] && [ "$target" != /etc/nginx/conf.d ]; then
+  echo "Refusing an unmanaged directory: $target" >&2
+  exit 64
+fi
+owner_uid=$(/usr/bin/id -u "$owner")
+parent=__EASY_DEVOPS_TARGET_PARENT__
+top=__EASY_DEVOPS_TOP__
+for current in "$top" "$parent" "$target"; do
+  if [ -L "$current" ]; then
+    echo "Refusing linked directory component: $current" >&2
+    exit 65
+  fi
+  if [ -e "$current" ]; then
+    if [ ! -d "$current" ]; then
+      echo "Refusing non-directory component: $current" >&2
+      exit 66
+    fi
+    uid=$(/usr/bin/stat -c %u -- "$current")
+    if [ "$current" = "$target" ]; then
+      if [ "$uid" -ne 0 ] && [ "$uid" -ne "$owner_uid" ]; then
+        echo "Refusing foreign target ownership: $current" >&2
+        exit 67
+      fi
+    elif [ "$uid" -ne 0 ]; then
+      echo "Refusing user-owned ancestor: $current" >&2
+      exit 68
+    fi
+  else
+    ancestor=__EASY_DEVOPS_CURRENT_PARENT__
+    if [ "$(/usr/bin/stat -c %u -- "$ancestor")" -ne 0 ]; then
+      echo "Refusing to create under a non-root directory: $ancestor" >&2
+      exit 69
+    fi
+    /bin/mkdir -m 0755 -- "$current"
+  fi
+done
+# -h is essential: if the final path is replaced between the checks above and
+# this call, GNU chown must never follow a resulting symlink. The second check
+# then reports failure instead of treating that race as a successful handover.
+/bin/chown -h -- "$owner" "$target"
+if [ -L "$target" ] || [ ! -d "$target" ]; then
+  echo "Refusing a target that stopped being an unlinked directory: $target" >&2
+  exit 70
+fi`
+  .replace('__EASY_DEVOPS_TARGET_PARENT__', '${target%/*}')
+  .replace('__EASY_DEVOPS_TOP__', '${parent%/*}')
+  .replace('__EASY_DEVOPS_CURRENT_PARENT__', '${current%/*}');
 
 /**
  * Every command Easy DevOps runs non-interactively with `sudo -n`.
@@ -121,7 +199,98 @@ export function isSafeSetupDir(dir) {
     '/usr/bin', '/usr/sbin', '/usr/lib', '/usr/local', '/usr/local/bin', '/usr/share',
     '/var/lib', '/var/log', '/var/spool', '/var/www',
   ]);
-  return !forbidden.has(dir);
+  if (forbidden.has(dir)) return false;
+
+  // A path that merely looks harmless is not enough: settings are editable, so
+  // accepting an arbitrary descendant would let a stored-path writer ask the
+  // operator to chown `/etc/ssl/private/anything` or an unrelated existing
+  // `/opt/nginx/conf.d`. Only the reviewed Easy DevOps roots are authorized.
+  return MANAGED_LINUX_DIRS.includes(dir);
+}
+
+function managedDirKind(dir) {
+  if (dir === LINUX_SSL_DIR) return 'ssl';
+  if (dir === LINUX_NGINX_CONF_DIR) return 'nginx';
+  return null;
+}
+
+/**
+ * Check every existing component without following links.
+ *
+ * This is exported for the regression suite: the suite runs on Windows too,
+ * where POSIX `/etc` paths cannot be created, so the stat/realpath functions
+ * and uid are injectable. Production always uses the host filesystem.
+ */
+export function validateManagedPath(dir, kind, deps = {}) {
+  if (!isSafeSetupDir(dir) || managedDirKind(dir) !== kind) {
+    return 'not a dedicated Easy DevOps or nginx configuration directory';
+  }
+
+  if (!deps.validateFilesystem) return null;
+
+  const uid = deps.uid ?? (typeof process.getuid === 'function' ? process.getuid() : null);
+  if (!Number.isInteger(uid)) return 'could not determine the account that will receive the directory';
+
+  const lstat = deps.lstatSync ?? fs.lstatSync;
+  const realpath = deps.realpathSync ?? fs.realpathSync;
+  const pieces = dir.split('/').filter(Boolean);
+  let current = '';
+  let missing = false;
+
+  for (const piece of pieces) {
+    current += `/${piece}`;
+    if (missing) continue;
+
+    let stat;
+    try {
+      stat = lstat(current);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        missing = true;
+        continue;
+      }
+      return `could not inspect ${current}: ${error.message}`;
+    }
+
+    if (stat.isSymbolicLink?.()) return `${current} is a link`;
+    const isFinal = current === dir;
+    if (!isFinal && !stat.isDirectory?.()) return `${current} is not a directory`;
+    if (isFinal && !stat.isDirectory?.()) return `${current} is not a directory`;
+    if (stat.uid !== 0 && stat.uid !== uid) {
+      return `${current} is owned by uid ${stat.uid}, not root or the installing account`;
+    }
+    if ((Number(stat.mode) & 0o022) !== 0) {
+      return `${current} is writable by a group or other users`;
+    }
+    try {
+      const resolved = realpath(current);
+      if (path.posix.normalize(resolved) !== current) {
+        return `${current} resolves to ${resolved}`;
+      }
+    } catch (error) {
+      return `could not resolve ${current}: ${error.message}`;
+    }
+  }
+
+  return null;
+}
+
+function validateNginxAnchor(nginxDir, deps) {
+  const lstat = deps.lstatSync ?? fs.lstatSync;
+  const conf = path.posix.join(nginxDir, 'nginx.conf');
+  let stat;
+  try {
+    stat = lstat(conf);
+  } catch (error) {
+    return `could not find the nginx configuration at ${conf}`;
+  }
+  if (stat.isSymbolicLink?.() || !stat.isFile?.()) return `${conf} must be an unlinked regular file`;
+  // The installing account may write conf.d. It must never write nginx.conf:
+  // the main context can load modules and choose the worker account, so that
+  // file plus the granted reload command would itself be a root escalation.
+  if (stat.uid !== 0) return `${conf} is owned by uid ${stat.uid}, not root`;
+  if ((Number(stat.mode) & 0o022) !== 0) return `${conf} is writable by a group or other users`;
+  return null;
 }
 
 /**
@@ -148,28 +317,45 @@ export function isSafeSetupDir(dir) {
  * @param {Object} [config] Defaults to loadConfig()
  * @returns {{ ownDirs: string[], refused: Array<{ dir: string, reason: string }> }}
  */
-export function deriveOwnDirs(config = loadConfig()) {
+export function deriveOwnDirs(config = loadConfig(), deps = {}) {
   const nginxDir = typeof config?.nginxDir === 'string' ? config.nginxDir : '';
-
-  const candidates = [
-    typeof config?.sslDir === 'string' ? config.sslDir : '',
-    // POSIX join throughout: this derivation only ever describes a Linux
-    // machine, so the host platform must not influence it. nginx's Linux
-    // layout has no extra `conf/` level (that is the Windows layout in
-    // nginx-conf-generator's getConfDDir()).
-    nginxDir ? path.posix.join(nginxDir, 'conf.d') : '',
-  ];
 
   const ownDirs = [];
   const refused = [];
+  const managed = [
+    {
+      dir: typeof config?.sslDir === 'string' ? config.sslDir : '',
+      reviewed: LINUX_SSL_DIR,
+      kind: 'ssl',
+    },
+    {
+      dir: nginxDir ? path.posix.join(nginxDir, 'conf.d') : '',
+      reviewed: LINUX_NGINX_CONF_DIR,
+      kind: 'nginx',
+    },
+  ];
 
-  for (const dir of candidates) {
+  for (const { dir, reviewed, kind } of managed) {
     if (!dir) continue;
-
-    if (!isSafeSetupDir(dir)) {
+    if (dir !== reviewed) {
       refused.push({
         dir,
-        reason: 'not an absolute, plain Linux path below a system directory, or it is a system directory itself',
+        reason: `not the reviewed managed directory ${reviewed}`,
+      });
+      continue;
+    }
+
+    const validateFilesystem = deps.validateFilesystem ?? (process.platform === 'linux');
+    const reason = validateManagedPath(dir, kind, {
+      validateFilesystem,
+      lstatSync: deps.lstatSync,
+      realpathSync: deps.realpathSync,
+      uid: deps.uid,
+    }) || (validateFilesystem && kind === 'nginx' ? validateNginxAnchor(LINUX_NGINX_DIR, deps) : null);
+    if (reason) {
+      refused.push({
+        dir,
+        reason,
       });
       continue;
     }
@@ -221,10 +407,10 @@ export function buildSetupScript({ user = os.userInfo().username, ownDirs = [] }
   }
 
   for (const dir of ownDirs) {
-    if (!isSafeSetupDir(dir)) {
+    if (!isSafeSetupDir(dir) || !managedDirKind(dir)) {
       return {
         ok: false,
-        reason: `refusing to hand ${JSON.stringify(dir)} to ${user}: it must be an absolute, plain path below a system directory, not a system directory itself`,
+        reason: `refusing to hand ${JSON.stringify(dir)} to ${user}: it is not a dedicated Easy DevOps or nginx configuration directory`,
       };
     }
   }
@@ -242,10 +428,9 @@ export function buildSetupScript({ user = os.userInfo().username, ownDirs = [] }
   ];
 
   for (const dir of ownDirs) {
-    lines.push(`sudo mkdir -p ${dir}`);
-    // Not recursive: only the directory itself changes hands, never anything
-    // that already sits inside it.
-    lines.push(`sudo chown ${user}:${user} ${dir}`);
+    lines.push(
+      `sudo /bin/sh -c '${MANAGED_DIR_SETUP_SCRIPT}' easy-devops-managed-dir ${dir} ${user}`,
+    );
   }
 
   return { ok: true, lines };
@@ -286,7 +471,10 @@ export async function setupLinuxPermissions({ ownDirs = [] } = {}) {
   const stage = `set -e; t=$(mktemp); trap 'rm -f "$t"' EXIT; printf '%s\\n' "$1" > "$t"; sudo visudo -cf "$t"; sudo install -o root -g root -m 0440 "$t" "$2"`;
   const commands = [['bash', ['-c', stage, 'easy-devops', buildSudoersLine(user), SUDOERS_PATH]]];
   for (const dir of ownDirs) {
-    commands.push(['sudo', ['mkdir', '-p', '--', dir]], ['sudo', ['chown', '--', `${user}:${user}`, dir]]);
+    commands.push([
+      'sudo',
+      ['/bin/sh', '-c', MANAGED_DIR_SETUP_SCRIPT, 'easy-devops-managed-dir', dir, user],
+    ]);
   }
   for (const [index, [file, args]] of commands.entries()) {
     if (!(await runInteractiveFile(file, args)).success) {

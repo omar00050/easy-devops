@@ -37,15 +37,15 @@
             <div>
               <p class="text-[10px] uppercase tracking-widest text-muted font-bold">Installed</p>
               <p class="text-sm font-semibold mt-1"
-                :class="svc.status.installed ? 'text-green-500' : 'text-yellow-500'">
-                {{ svc.status.installed ? 'Yes' : 'No' }}
+                :class="svc.status.installed === true ? 'text-green-500' : 'text-yellow-500'">
+                {{ svc.status.installed === null ? 'Unknown' : (svc.status.installed ? 'Yes' : 'No') }}
               </p>
             </div>
             <div>
               <p class="text-[10px] uppercase tracking-widest text-muted font-bold">Running</p>
               <p class="text-sm font-semibold mt-1"
                 :class="svc.status.running ? 'text-green-500' : 'text-yellow-500'">
-                {{ svc.status.running ? 'Yes' : (svc.status.status || 'No') }}
+                {{ svc.status.running === null ? 'Unknown' : (svc.status.running ? 'Yes' : (svc.status.status || 'No')) }}
               </p>
             </div>
             <div>
@@ -61,6 +61,12 @@
                 {{ svc.status.pm2.version || 'installed' }}
               </p>
             </div>
+          </div>
+
+          <div v-if="svc.status.installed === null"
+            class="px-4 py-3 rounded-[10px] text-[13px] border bg-yellow-500/10 border-yellow-500/20 text-yellow-700 dark:text-yellow-400">
+            Windows could not inspect the protected service files. Run
+            <code class="font-mono">ezz service status</code> from an Administrator PowerShell.
           </div>
 
           <!-- App name and data directory, so a dev instance is obvious -->

@@ -187,6 +187,9 @@ Using random ports — hub ${HUB_PORT}, dashboard ${DASH_PORT}
 
   const hubDbBefore = fs.existsSync(REAL_HUB_DB) ? fs.statSync(REAL_HUB_DB).mtimeMs : null;
   const legacyBefore = fs.existsSync(REAL_LEGACY_DB) ? fs.statSync(REAL_LEGACY_DB).mtimeMs : null;
+  const legacyMarkerBefore = fs.existsSync(`${REAL_LEGACY_DB}.migrated`)
+    ? fs.statSync(`${REAL_LEGACY_DB}.migrated`).mtimeMs
+    : null;
 
   // Temporary easy-devops config dir, with a pre-created 0-byte DB so that
   // db.js's legacy migration (which renames data/easy-devops.sqlite) never runs.
@@ -361,6 +364,9 @@ Using random ports — hub ${HUB_PORT}, dashboard ${DASH_PORT}
   process.stdout.write('\n── Isolation checks\n');
   const hubDbAfter = fs.existsSync(REAL_HUB_DB) ? fs.statSync(REAL_HUB_DB).mtimeMs : null;
   const legacyAfter = fs.existsSync(REAL_LEGACY_DB) ? fs.statSync(REAL_LEGACY_DB).mtimeMs : null;
+  const legacyMarkerAfter = fs.existsSync(`${REAL_LEGACY_DB}.migrated`)
+    ? fs.statSync(`${REAL_LEGACY_DB}.migrated`).mtimeMs
+    : null;
 
   // A developer's own hub_backend may be running against the real hub.db, and
   // its agent writes lastSeenAt every few seconds. That moves the mtime for a
@@ -391,7 +397,8 @@ Using random ports — hub ${HUB_PORT}, dashboard ${DASH_PORT}
         : `mtime changed with no other hub_backend running (${hubDbBefore} -> ${hubDbAfter})`);
   }
   check('real data/easy-devops.sqlite untouched', legacyAfter === legacyBefore);
-  check('no .migrated file created', !fs.existsSync(REAL_LEGACY_DB + '.migrated'));
+  check('the legacy .migrated marker was neither created nor modified',
+    legacyMarkerAfter === legacyMarkerBefore);
 
   fs.rmSync(tmpRoot, { recursive: true, force: true });
   process.stdout.write('   removed temp easy-devops config dir\n');

@@ -15,12 +15,18 @@
       "regenerateKey": "deploy.manage",
       "testKey": "deploy.manage",
       "addKeyToGithub": "deploy.manage",
-      "linkDomain": ["deploy.manage", "domains.create"],
+      "linkDomain": ["deploy.manage", "domains.create", "domains.edit", "nginx.reload"],
       "unlinkDomain": "deploy.manage",
       "move": "deploy.manage",
       "getEnv": "deploy.env",
       "setEnv": "deploy.env"
     },
-    "linkDomainIssue": ["deploy.manage", "domains.create", "ssl.issue"]
+    "linkDomainIssue": [
+      "deploy.manage",
+      "domains.create",
+      "domains.edit",
+      "nginx.reload",
+      "ssl.issue"
+    ]
   }
 }

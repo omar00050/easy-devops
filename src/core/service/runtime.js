@@ -248,28 +248,39 @@ export function installRuntimeStubs(appDir) {
     }
 
     const target = path.join(parent, parts.at(-1));
-    try {
-      assertRuntimeDirectory(target, root);
-      continue;
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
-
     const stub = `throw Object.assign(new Error('Optional module ${name} unavailable'), { code: 'MODULE_NOT_FOUND' });\n`;
     const manifest = JSON.stringify({ name, type: 'commonjs', main: 'easy-devops-optional.cjs' });
     const temporary = fs.mkdtempSync(path.join(parent, `.easy-devops-${randomUUID()}-`));
+    let displaced = null;
     try {
       fs.chmodSync(temporary, 0o755);
       writeExclusive(path.join(temporary, 'easy-devops-optional.cjs'), stub, 0o644);
       writeExclusive(path.join(temporary, 'package.json'), manifest, 0o644);
-      try {
-        // Publish the complete package atomically and only if its name is free.
-        fs.renameSync(temporary, target);
-      } catch (error) {
-        if (!['EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error;
-        assertRuntimeDirectory(target, root);
+
+      const existing = fs.lstatSync(target, { throwIfNoEntry: false });
+      if (existing) {
+        if (existing.isSymbolicLink()) {
+          // Remove the link itself. Never traverse where it points.
+          fs.unlinkSync(target);
+        } else {
+          if (!existing.isDirectory()) {
+            throw new Error(`Optional module path is not a directory: ${target}`);
+          }
+          assertRuntimeDirectory(target, root);
+          displaced = path.join(parent, `.easy-devops-old-${randomUUID()}`);
+          fs.renameSync(target, displaced);
+        }
       }
+
+      // Always replace the package. A directory with the expected name may be
+      // executable content left by an earlier or less trustworthy install.
+      fs.renameSync(temporary, target);
+      if (displaced) fs.rmSync(displaced, { recursive: true, force: true });
+      displaced = null;
     } finally {
+      if (displaced) {
+        try { fs.rmSync(displaced, { recursive: true, force: true }); } catch { /* surfaced above */ }
+      }
       fs.rmSync(temporary, { recursive: true, force: true });
     }
   }

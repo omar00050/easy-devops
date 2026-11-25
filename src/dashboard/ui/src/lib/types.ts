@@ -102,6 +102,11 @@ export type DomainInput = Omit<
 export interface DomainDeleteResult {
   deleted: string;
   certDeleted: boolean;
+  certRetained?: boolean;
+  certReason?: 'cert_in_use' | 'cert_not_managed' | 'delete_failed';
+  certMessage?: string;
+  usedBy?: string[];
+  references?: CertConfigReference[];
 }
 
 // ─── SSL ─────────────────────────────────────────────────────────────────────
@@ -403,7 +408,7 @@ export interface BackgroundServiceLiveStatus {
   jobsOwnerRole: 'daemon' | 'dashboard' | string | null;
   mechanism: ServiceMechanismWire;
   mode: 'personal' | 'server' | null;
-  installed: boolean;
+  installed: boolean | null;
   startsAt: ServiceStartsAt;
   stoppedByUser: boolean;
   stoppedAt: string | null;

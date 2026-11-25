@@ -13,7 +13,12 @@ import { loadConfig } from './config.js';
 import { listAllCerts } from './cert-reader.js';
 import { getDomains } from './domains-db.js';
 import { getDefaultCertPaths } from './nginx-conf-generator.js';
-import { isWindows } from './platform.js';
+import { getDataDir, isWindows } from './platform.js';
+import {
+  acquireArtifactLock,
+  SSL_ARTIFACT_LIFECYCLE_LOCK,
+} from './ssl/artifact-lock.js';
+import { removeManagedCertificateDomain } from './ssl/managed-artifacts.js';
 
 // nginx writes its logs and scratch files here; those can grow large and never
 // contain certificate paths.
@@ -30,32 +35,92 @@ function comparablePath(value) {
   return isWindows ? slashed.toLowerCase() : slashed;
 }
 
+function resolveAgainst(value, base) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  return path.resolve(base, value);
+}
+
+async function canonicalPath(value) {
+  const resolved = path.resolve(value);
+  try {
+    return await fs.realpath(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+async function pointsAtPath(candidate, target) {
+  if (!candidate || !target) return false;
+  const [left, right] = await Promise.all([canonicalPath(candidate), canonicalPath(target)]);
+  if (comparablePath(left) === comparablePath(right)) return true;
+  try {
+    const [a, b] = await Promise.all([fs.stat(left), fs.stat(right)]);
+    return a.isFile() && b.isFile() && a.dev === b.dev && a.ino === b.ino;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Collects every nginx configuration file under `dir` — the main nginx.conf,
  * domain configs, and the `.conf.disabled` copies a disabled domain leaves.
  */
-async function collectConfigFiles(dir, found = []) {
+async function collectConfigFiles(dir, state = null) {
+  const current = state ?? {
+    found: [],
+    directories: new Set(),
+    files: new Set(),
+  };
+
+  let canonicalDir;
+  try {
+    canonicalDir = await fs.realpath(dir);
+  } catch {
+    return current.found;
+  }
+  const dirKey = comparablePath(canonicalDir);
+  if (current.directories.has(dirKey)) return current.found;
+  current.directories.add(dirKey);
+
   let entries;
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
   } catch {
-    return found;
+    return current.found;
   }
 
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (!NGINX_SKIP_DIRS.has(entry.name.toLowerCase())) {
-        await collectConfigFiles(full, found);
+    if (NGINX_SKIP_DIRS.has(entry.name.toLowerCase())) continue;
+
+    let kind = entry;
+    if (entry.isSymbolicLink()) {
+      try {
+        kind = await fs.stat(full);
+      } catch {
+        continue;
       }
+    }
+    if (kind.isDirectory()) {
+      await collectConfigFiles(full, current);
       continue;
     }
-    if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+    if (!kind.isFile()) continue;
     const name = entry.name.toLowerCase();
-    if (name.endsWith('.conf') || name.endsWith('.conf.disabled')) found.push(full);
+    if (!name.endsWith('.conf') && !name.endsWith('.conf.disabled')) continue;
+    let canonicalFile;
+    try {
+      canonicalFile = await fs.realpath(full);
+    } catch {
+      continue;
+    }
+    const fileKey = comparablePath(canonicalFile);
+    if (current.files.has(fileKey)) continue;
+    current.files.add(fileKey);
+    current.found.push(full);
   }
 
-  return found;
+  return current.found;
 }
 
 /**
@@ -65,7 +130,12 @@ async function collectConfigFiles(dir, found = []) {
  * @returns {Promise<Array<{ file: string, line: number, text: string }>>}
  */
 export async function findCertReferences(domain, config = loadConfig()) {
-  const target = `${comparablePath(path.join(config.sslDir, domain)).replace(/\/+$/, '')}/`;
+  const directory = path.join(config.sslDir, domain);
+  const target = `${comparablePath(directory).replace(/\/+$/, '')}/`;
+  const targetFiles = [
+    path.join(directory, 'fullchain.pem'),
+    path.join(directory, 'privkey.pem'),
+  ];
   const files = await collectConfigFiles(config.nginxDir);
   const references = [];
 
@@ -77,11 +147,34 @@ export async function findCertReferences(domain, config = loadConfig()) {
       continue;
     }
 
-    content.split(/\r?\n/).forEach((text, index) => {
-      if (comparablePath(text).includes(target)) {
+    for (const [index, text] of content.split(/\r?\n/).entries()) {
+      let matched = comparablePath(text).includes(target);
+      if (!matched) {
+        const candidates = new Set();
+        for (const match of text.matchAll(/(["'])(.*?)\1|(?:^|\s)([^\s;{}]+)/g)) {
+          const value = (match[2] ?? match[3] ?? '').trim().replace(/[;,]+$/, '');
+          if (value.includes('/') || value.includes('\\')) candidates.add(value);
+        }
+        for (const candidate of candidates) {
+          if (candidate.includes('$') || candidate.includes('%')) {
+            matched = comparablePath(candidate).includes(comparablePath(domain));
+            if (matched) break;
+            continue;
+          }
+          const resolved = resolveAgainst(candidate.replace(/['"]/g, ''), config.nginxDir);
+          for (const certificateFile of targetFiles) {
+            if (await pointsAtPath(resolved, certificateFile)) {
+              matched = true;
+              break;
+            }
+          }
+          if (matched) break;
+        }
+      }
+      if (matched) {
         references.push({ file, line: index + 1, text: text.trim() });
       }
-    });
+    }
   }
 
   return references;
@@ -93,17 +186,42 @@ export async function findCertReferences(domain, config = loadConfig()) {
  *
  * @returns {string[]} domain names
  */
-export function domainsUsingCert(certDomain, config = loadConfig()) {
+export async function domainsUsingCert(certDomain, config = loadConfig()) {
   const dir = comparablePath(path.join(config.sslDir, certDomain)).replace(/\/+$/, '');
+  const targetFiles = [
+    path.join(config.sslDir, certDomain, 'fullchain.pem'),
+    path.join(config.sslDir, certDomain, 'privkey.pem'),
+  ];
   const inside = (p) => {
-    const value = comparablePath(p);
+    if (typeof p !== 'string' || !p.trim()) return false;
+    const value = comparablePath(path.resolve(config.nginxDir, p));
     return value === dir || value.startsWith(`${dir}/`);
   };
 
-  return getDomains()
-    .filter((d) => d.enabled !== false && d.ssl?.enabled)
-    .filter((d) => d.name === certDomain || inside(d.ssl?.certPath) || inside(d.ssl?.keyPath))
-    .map((d) => d.name);
+  const usedBy = [];
+  for (const domain of getDomains().filter((entry) => entry.enabled !== false && entry.ssl?.enabled)) {
+    if (domain.name === certDomain || inside(domain.ssl?.certPath) || inside(domain.ssl?.keyPath)) {
+      usedBy.push(domain.name);
+      continue;
+    }
+
+    const candidates = [
+      resolveAgainst(domain.ssl?.certPath, config.nginxDir),
+      resolveAgainst(domain.ssl?.keyPath, config.nginxDir),
+    ].filter(Boolean);
+    let matches = false;
+    for (const candidate of candidates) {
+      for (const targetFile of targetFiles) {
+        if (await pointsAtPath(candidate, targetFile)) {
+          matches = true;
+          break;
+        }
+      }
+      if (matches) break;
+    }
+    if (matches) usedBy.push(domain.name);
+  }
+  return usedBy;
 }
 
 /**
@@ -135,7 +253,28 @@ export const CERT_MISSING_HINT =
   'The SSL certificate files do not exist at the configured paths. Create the certificate first, or disable SSL.';
 
 /**
- * Deletes one certificate directory under sslDir.
+ * Runs a certificate-reference mutation while holding the same cross-process
+ * lock used by issuance, deletion and purge.
+ */
+export async function withCertificateLifecycleLock(fn, {
+  dataDir = getDataDir(),
+  timeoutMs = 60_000,
+} = {}) {
+  const lifecycle = await acquireArtifactLock({
+    dataDir,
+    key: SSL_ARTIFACT_LIFECYCLE_LOCK,
+    timeoutMs,
+  });
+  try {
+    return await fn(lifecycle);
+  } finally {
+    lifecycle.release();
+  }
+}
+
+/**
+ * Deletes one certificate directory under sslDir while the caller holds the
+ * lifecycle lock.
  *
  * The directory name is taken from listAllCerts(), never from the caller:
  * listAllCerts() only returns direct children of sslDir, so a name such as
@@ -154,28 +293,55 @@ export const CERT_MISSING_HINT =
  *   { ok: false, code: 'delete_failed', domain: string, directory: string, detail: string }
  * >}
  */
-export async function deleteCertificate(domain) {
-  const config = loadConfig();
-  const certs = await listAllCerts({ includeUnusable: true });
+export async function deleteCertificateUnderLock(domain, lifecycle, {
+  dataDir = getDataDir(),
+  config = loadConfig(),
+} = {}) {
+  if (!lifecycle?.isOwner?.()) {
+    return {
+      ok: false,
+      code: 'delete_failed',
+      domain: String(domain ?? ''),
+      detail: 'The certificate lifecycle lock is not held by this operation.',
+    };
+  }
+
+  const certs = await listAllCerts({ sslDir: config.sslDir, includeUnusable: true });
   const cert = typeof domain === 'string' ? certs.find((entry) => entry.domain === domain) : null;
   if (!cert) return { ok: false, code: 'cert_not_found', domain: String(domain ?? '') };
 
   const directory = path.join(config.sslDir, cert.domain);
-  const usedBy = domainsUsingCert(cert.domain, config);
+  const usedBy = await domainsUsingCert(cert.domain, config);
   const references = await findCertReferences(cert.domain, config);
 
   if (usedBy.length > 0 || references.length > 0) {
     return { ok: false, code: 'cert_in_use', domain: cert.domain, directory, usedBy, references };
   }
 
-  try {
-    await fs.rm(directory, { recursive: true, force: true });
-  } catch (error) {
+  const removed = removeManagedCertificateDomain({
+    dataDir,
+    sslDir: config.sslDir,
+    domain: cert.domain,
+  });
+  if (!removed.ok) {
     return {
-      ok: false, code: 'delete_failed', domain: cert.domain, directory,
-      detail: `Could not delete ${directory}: ${error.message}`,
+      ...removed,
+      domain: cert.domain,
+      directory,
+      detail: removed.detail ?? 'The certificate could not be deleted safely.',
     };
   }
+  return {
+    ok: true,
+    domain: cert.domain,
+    directory,
+    removedFiles: removed.removedFiles,
+  };
+}
 
-  return { ok: true, domain: cert.domain, directory };
+/** Deletes one managed certificate directory under the lifecycle lock. */
+export async function deleteCertificate(domain) {
+  return withCertificateLifecycleLock(
+    (lifecycle) => deleteCertificateUnderLock(domain, lifecycle),
+  );
 }

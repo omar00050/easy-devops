@@ -30,11 +30,16 @@
  */
 
 import { loadConfig, AUTH_MODES, effectiveAuthMode } from '../../core/config.js';
+import { isDirectLoopbackRequest } from './localRequest.js';
 
 /** Whether a password is required right now. */
-function passwordRequired() {
+function passwordRequired(req) {
   try {
-    return effectiveAuthMode(loadConfig()) !== AUTH_MODES.NONE;
+    if (effectiveAuthMode(loadConfig()) !== AUTH_MODES.NONE) return true;
+    // Passwordless mode describes a person at this machine, not merely a
+    // loopback TCP connection. A local HTTPS reverse proxy connects from
+    // loopback too, so forwarded requests must still authenticate.
+    return !isDirectLoopbackRequest(req);
   } catch {
     // An unreadable config must not become an open dashboard.
     return true;
@@ -53,7 +58,7 @@ function passwordRequired() {
  * allowlist that could drift.
  */
 export function requireAuth(req, res, next) {
-  if (!passwordRequired()) return next();
+  if (!passwordRequired(req)) return next();
   if (req.session?.authenticated === true) return next();
   return res.status(401).json({ error: 'Unauthorized' });
 }
@@ -70,7 +75,7 @@ export function requireAuth(req, res, next) {
  * @param {(err?: Error) => void} next
  */
 export function socketRequireAuth(socket, next) {
-  if (!passwordRequired()) return next();
+  if (!passwordRequired(socket.request)) return next();
   if (socket.request?.session?.authenticated === true) return next();
 
   const err = new Error('UNAUTHORIZED');

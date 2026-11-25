@@ -68,15 +68,15 @@
 						<div>
 							<p class="text-[10px] uppercase tracking-widest text-muted font-bold">Installed</p>
 							<p class="text-sm font-semibold mt-1"
-								:class="svc.status.installed ? 'text-green-500' : 'text-yellow-500'">
-								{{ svc.status.installed ? 'Yes' : 'No' }}
+								:class="svc.status.installed === true ? 'text-green-500' : 'text-yellow-500'">
+								{{ svc.status.installed === null ? 'Unknown' : (svc.status.installed ? 'Yes' : 'No') }}
 							</p>
 						</div>
 						<div>
 							<p class="text-[10px] uppercase tracking-widest text-muted font-bold">Running</p>
 							<p class="text-sm font-semibold mt-1"
 								:class="svc.status.running ? 'text-green-500' : 'text-yellow-500'">
-								{{ svc.status.running ? 'Yes' : (svc.status.status || 'No') }}
+								{{ svc.status.running === null ? 'Unknown' : (svc.status.running ? 'Yes' : (svc.status.status || 'No')) }}
 							</p>
 						</div>
 						<div>
@@ -158,28 +158,18 @@
 						</p>
 					</div>
 
-					<!--
-						Who can reach the dashboard. Loopback-only is the safer default
-						and the one new Linux installs get; an existing install keeps
-						listening everywhere until it is changed here.
-					-->
+					<!-- The dashboard speaks HTTP only, so its listener is loopback-only. -->
 					<div class="w-full">
 						<label class="form-label">Listen On</label>
 						<select v-model="settings.dashboardBindAddress" class="form-input">
 							<option value="127.0.0.1">This machine only (127.0.0.1)</option>
-							<option value="0.0.0.0">All interfaces (0.0.0.0)</option>
+							<option value="::1">This machine only (IPv6 ::1)</option>
 						</select>
-						<p class="text-[11px] mt-2 font-bold tracking-wide uppercase opacity-70"
-							:class="settings.bindsToLoopbackOnly ? 'text-muted' : 'text-yellow-600 dark:text-yellow-500'">
-							<span v-if="settings.bindsToLoopbackOnly">
-								Currently {{ settings.dashboardBindAddress }} — reachable only from this machine
-							</span>
-							<span v-else>
-								Currently {{ settings.dashboardBindAddress }} — reachable from the network
-							</span>
+						<p class="text-[11px] mt-2 font-bold tracking-wide uppercase opacity-70">
+							Currently {{ settings.dashboardBindAddress }} — this machine only
 						</p>
 						<p class="text-[11px] text-muted mt-1 font-bold tracking-wide uppercase opacity-70">
-							Restart dashboard after changing
+							Remote access requires a local HTTPS proxy or secure tunnel
 						</p>
 						<p v-if="settings.dashboardAuth === 'none'"
 							class="text-[11px] mt-1 font-bold tracking-wide uppercase opacity-70 text-yellow-600 dark:text-yellow-500">

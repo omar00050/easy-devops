@@ -105,7 +105,12 @@ export async function verifyWinsw(file) {
   try {
     bytes = fs.statSync(file).size;
   } catch (err) {
-    return { ok: false, reason: `cannot read ${file}: ${err.message}` };
+    return {
+      ok: false,
+      bytes: null,
+      code: err.code ?? null,
+      reason: `cannot read ${file}: ${err.message}`,
+    };
   }
 
   // Size first: it is free, and a truncated download is the common failure.
@@ -118,7 +123,17 @@ export async function verifyWinsw(file) {
     };
   }
 
-  const sha256 = await hashFile(file);
+  let sha256;
+  try {
+    sha256 = await hashFile(file);
+  } catch (err) {
+    return {
+      ok: false,
+      bytes,
+      code: err.code ?? null,
+      reason: `cannot read ${file}: ${err.message}`,
+    };
+  }
   if (sha256 !== WINSW_SHA256) {
     return {
       ok: false,

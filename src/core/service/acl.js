@@ -28,9 +28,9 @@
  * ── Why inheritance flags matter ───────────────────────────────────────────
  *
  * `(OI)(CI)` makes the grant apply to files and subdirectories created later.
- * Without them, a certificate renewed next month lands in a directory the
- * service can enter but whose new file it cannot read. `/T` applies the change
- * to what is already there.
+ * Existing entries are visited depth-first. Each directory is locked before it
+ * is enumerated, so a same-account process cannot swap in a reparse point or
+ * hard link after validation and before the ACL mutation.
  *
  * Nothing in this module runs without an elevated terminal; `icacls` fails with
  * "Access is denied" otherwise, which is reported as such rather than retried.
@@ -40,7 +40,14 @@ import fs from 'fs';
 import path from 'path';
 
 import { runFile as shellRunFile } from '../shell.js';
-import { isWindows, programDataDir } from '../platform.js';
+import {
+  isWindows,
+  programDataDir,
+  WINDOWS_PROGRAM_DATA_ROOT,
+  WINDOWS_PROGRAM_FILES_ROOT,
+  WINDOWS_PROGRAM_FILES_X86_ROOT,
+  WINDOWS_SYSTEM_ROOT,
+} from '../platform.js';
 import { SERVICE_ACCOUNT } from './winsw.js';
 
 /** Access levels, in icacls's own notation. */
@@ -93,7 +100,7 @@ export function requiredGrants({ dataDir, nginxDir = null, sslDir = null } = {})
 
 /** Pin native tools to the Windows installation, bypassing the current directory and PATH. */
 export function systemTool(name) {
-  return path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', name);
+  return path.win32.join(WINDOWS_SYSTEM_ROOT, 'System32', name);
 }
 
 export const WINDOWS_POWERSHELL = systemTool('WindowsPowerShell\\v1.0\\powershell.exe');
@@ -101,6 +108,15 @@ export const WINDOWS_POWERSHELL = systemTool('WindowsPowerShell\\v1.0\\powershel
 function inside(dir, base) {
   const rel = path.relative(base, dir);
   return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel));
+}
+
+function sameDirectory(left, right) {
+  if (!left || !right) return false;
+  const normalize = (value) => (
+    isWindows ? path.win32.normalize(path.resolve(value)).toLowerCase()
+      : path.posix.normalize(path.resolve(value))
+  );
+  return normalize(left) === normalize(right);
 }
 
 /** Validate before examining a settings-controlled location or passing it to an OS utility. */
@@ -112,12 +128,24 @@ export function canonicalAclDirectory(dir) {
   }
   const target = path.resolve(dir);
   const root = path.parse(target).root;
-  const windows = process.env.SystemRoot || 'C:\\Windows';
-  const blocked = [windows, process.env.ProgramFiles, process.env['ProgramFiles(x86)'],
-    process.env.ProgramW6432, path.join(root, 'System Volume Information'), path.join(root, '$Recycle.Bin')];
-  if (target === root || (isWindows && (blocked.filter(Boolean).some(base => inside(target, base))
-      || [process.env.ProgramData, process.env.USERPROFILE, path.join(root, 'Users')]
-        .filter(Boolean).some(base => inside(base, target))))) {
+  const windows = WINDOWS_SYSTEM_ROOT;
+  const protectedTrees = [
+    windows,
+    WINDOWS_PROGRAM_FILES_ROOT,
+    WINDOWS_PROGRAM_FILES_X86_ROOT,
+    path.join(root, 'System Volume Information'),
+    path.join(root, '$Recycle.Bin'),
+  ];
+  // Dedicated Easy DevOps directories live below these OS container roots.
+  // Deny the containers themselves, not every legitimate child. Callers that
+  // accept a configured path also require it to equal a machine-level approval.
+  const protectedContainers = [
+    WINDOWS_PROGRAM_DATA_ROOT,
+    path.join(root, 'Users'),
+  ];
+  if (target === root || (isWindows && (protectedTrees.some(base => inside(target, base))
+      || protectedTrees.some(base => inside(base, target))
+      || protectedContainers.some(base => sameDirectory(base, target))))) {
     throw new Error('refusing a system directory');
   }
   // Check every component before descending. realpath additionally catches aliases such as 8.3 names.
@@ -149,11 +177,81 @@ const CHECK_ATTRIBUTES = [
 
 export async function checkedAclDirectory(dir, runFile, recursive = false) {
   const target = canonicalAclDirectory(dir);
+  // The native walk checks reparse attributes before this process traverses
+  // anything below the root. Hard-linked files are checked in walkAclTree only
+  // after their parent DACL has been locked, which avoids a JavaScript tree
+  // walk following a reparse tag that lstat did not classify as a symlink.
   const result = await runFile(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', CHECK_ATTRIBUTES], {
     env: { EZ_ACL_TARGET: target, EZ_ACL_TREE: recursive ? '1' : '0' }, timeout: 120_000,
   });
   if (!result.success) throw new Error('could not verify directory attributes or found a reparse point');
   return target;
+}
+
+/**
+ * Applies a caller-supplied ACL operation without recursive icacls.
+ *
+ * The root is preflighted first. The walk then rewrites each directory's ACL
+ * before reading its children. Once that operation removes ordinary-user write
+ * access, the entries it enumerates cannot be replaced by the account whose
+ * race this protects against. Files are checked for hard links immediately
+ * after their now-protected parent is locked and before their own ACL changes.
+ *
+ * @param {string} root
+ * @param {(target: string, kind: 'directory'|'file', stat: fs.Stats) => Promise<void>} visit
+ * @param {{ runFile?: Function, fsApi?: typeof fs }} [opts]
+ */
+export async function walkAclTree(root, visit, {
+  runFile = shellRunFile,
+  fsApi = fs,
+} = {}) {
+  const canonical = await checkedAclDirectory(root, runFile, true);
+  const pending = [canonical];
+
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    // The parent is locked before this check, so it cannot have been swapped
+    // for another native reparse tag by the account this operation removes.
+    await checkedAclDirectory(directory, runFile, false);
+    const directoryStat = fsApi.lstatSync(directory);
+    if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
+      throw new Error(`refusing a reparse point or non-directory at ${directory}`);
+    }
+    await visit(directory, 'directory', directoryStat);
+
+    let entries;
+    try {
+      entries = fsApi.readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      throw new Error(`could not inspect ${directory}: ${error.message}`);
+    }
+
+    for (const entry of entries) {
+      const target = path.join(directory, entry.name);
+      let stat;
+      try {
+        stat = fsApi.lstatSync(target);
+      } catch (error) {
+        throw new Error(`could not inspect ${target}: ${error.message}`);
+      }
+      if (stat.isSymbolicLink()) {
+        throw new Error(`refusing a reparse point at ${target}`);
+      }
+      if (stat.isDirectory()) {
+        pending.push(target);
+        continue;
+      }
+      if (!stat.isFile()) {
+        throw new Error(`refusing a non-file entry at ${target}`);
+      }
+      if (stat.nlink > 1) {
+        throw new Error(`refusing a hard-linked file in the approved directory: ${target}`);
+      }
+      await visit(target, 'file', stat);
+    }
+  }
+
+  return canonical;
 }
 
 /** Read independent approvals from the machine environment (HKLM), never the operator database. */
@@ -180,22 +278,26 @@ async function changeGrants({ grants, approvedDirs, runFile, revoke, log }) {
         throw new Error('directory lacks administrator approval; set the matching machine-level '
           + 'EASY_DEVOPS_APPROVED_NGINX_DIR or EASY_DEVOPS_APPROVED_SSL_DIR and run ezz service repair');
       }
-      const target = await checkedAclDirectory(dir, runFile, revoke);
       const machine = programDataDir();
-      if (['runtime', 'runtime.prev', 'bin'].some(name => inside(target, path.join(machine, name)))) {
+      const canonical = await checkedAclDirectory(dir, runFile, false);
+      if (['runtime', 'runtime.prev', 'bin'].some(name => inside(canonical, path.join(machine, name)))) {
         throw new Error('Service code directories cannot receive a data grant');
       }
-      // Inherit Modify into ordinary children. Protected bin/runtime DACLs must remain read-only.
-      const args = revoke ? [target, '/remove:g', SERVICE_ACCOUNT, '/T']
-        : [target, '/grant', `${SERVICE_ACCOUNT}:(OI)(CI)M`];
-      const result = await runFile(systemTool('icacls.exe'), [...args, '/L', '/Q'], { timeout: 120_000 });
-      if (!result.success) {
-        const output = `${result.stdout ?? ''} ${result.stderr ?? ''}`.trim();
-        if (/access is denied/i.test(output)) needsElevation = true;
-        throw new Error(output.slice(0, 300) || 'icacls failed');
-      }
+      await walkAclTree(canonical, async (target, kind) => {
+        // Inherit Modify into ordinary children. Protected bin/runtime DACLs
+        // remain read-only and are rejected before the walk begins.
+        const args = revoke
+          ? [target, '/remove:g', SERVICE_ACCOUNT]
+          : [target, '/grant', `${SERVICE_ACCOUNT}:${kind === 'directory' ? '(OI)(CI)' : ''}M`];
+        const result = await runFile(systemTool('icacls.exe'), [...args, '/L', '/Q'], { timeout: 120_000 });
+        if (!result.success) {
+          const output = `${result.stdout ?? ''} ${result.stderr ?? ''}`.trim();
+          if (/access is denied/i.test(output)) needsElevation = true;
+          throw new Error(output.slice(0, 300) || 'icacls failed');
+        }
+      }, { runFile });
       applied.push(grant);
-      log(`  ${target}: ${revoke ? 'removed service grant' : 'granted Modify'}`);
+      log(`  ${canonical}: ${revoke ? 'removed service grant' : 'granted Modify'}`);
     } catch (err) {
       failed.push({ ...grant, reason: err.message });
       log(`  ${grant.path}: ${err.message}`);

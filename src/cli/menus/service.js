@@ -148,12 +148,18 @@ export async function showStatus() {
 
   const modeLabel = s.mode ? ` (${s.mode})` : '';
   console.log(`  Mechanism      ${MECHANISM_LABELS[s.mechanism] ?? s.mechanism}${chalk.gray(modeLabel)}`);
-  console.log(`  Installed      ${dot(s.service.installed)} ${s.service.installed ? 'yes' : 'no'}`);
+  const installedText = s.service.installed === null || s.service.installed === undefined
+    ? 'unknown'
+    : (s.service.installed ? 'yes' : 'no');
+  console.log(`  Installed      ${maybeDot(s.service.installed)} ${installedText}`);
 
   if (s.mode === service.MODES.PERSONAL) {
     console.log(`  Starts         ${chalk.gray('at logon (nothing runs before you sign in)')}`);
   } else {
-    console.log(`  Running        ${dot(s.service.running)} ${s.service.running ? 'yes' : `no${s.service.state ? ` (${s.service.state})` : ''}`}`);
+    const runningText = s.service.running === null || s.service.running === undefined
+      ? 'unknown'
+      : (s.service.running ? 'yes' : `no${s.service.state ? ` (${s.service.state})` : ''}`);
+    console.log(`  Running        ${maybeDot(s.service.running)} ${runningText}`);
     console.log(`  Start on boot  ${maybeDot(s.service.enabledOnBoot)} ${describeBoot(s.service.enabledOnBoot)}`);
   }
 
@@ -222,7 +228,11 @@ export async function showStatus() {
 
   printWarnings(s.warnings);
 
-  if (!s.service.installed) {
+  if (s.service.installed === null || s.service.installed === undefined) {
+    console.log();
+    console.log('  ' + chalk.gray('The service manager gave no usable answer. Check with: ')
+      + chalk.white('ezz service status'));
+  } else if (s.service.installed === false) {
     console.log();
     console.log('  ' + chalk.gray('Install it with: ') + chalk.white('ezz service install'));
   }

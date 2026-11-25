@@ -1,5 +1,4 @@
 import fs from 'fs/promises';
-import path from 'node:path';
 import { dbGet, dbSet } from './db.js';
 import { DOMAIN_DEFAULTS, migrateDomain } from './nginx-conf-generator.js';
 import { writeConfWithTest } from './nginx-apply.js';
@@ -9,7 +8,10 @@ import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk } from './platfo
 import { saveDomainNotifConfig } from './domainNotifier.js';
 import { bumpHubRevision, getHubPermissions } from './hubLink.js';
 import { nginxDomainError } from './nginx-fields.js';
-import { missingCertFiles, CERT_MISSING_HINT } from './cert-usage.js';
+import {
+  missingCertFiles, CERT_MISSING_HINT,
+  withCertificateLifecycleLock, deleteCertificateUnderLock,
+} from './cert-usage.js';
 import {
   validateDomainName, validatePort, validateUpstreamType,
   validateMaxBodySize, validateBehindCloudflare,
@@ -123,12 +125,41 @@ function hubDomainInputError(input, { creating, existing = null }) {
  * and the hint travel to the Hub as the command's data.
  */
 function certMissingResult({ certPath, keyPath }) {
-  return { ok: false, code: 'cert_missing', certPath, keyPath, hint: CERT_MISSING_HINT, error: CERT_MISSING_HINT };
+  const out = { ok: false, code: 'cert_missing', hint: CERT_MISSING_HINT, error: CERT_MISSING_HINT };
+  if (getHubPermissions()['nginx.config.view'] === true) {
+    out.certPath = certPath;
+    out.keyPath = keyPath;
+  }
+  return out;
 }
 
-export async function handleHubDomainCommand(payload) {
+function certificateRetention(result) {
+  if (result.ok) return { certDeleted: true, certificate: result.domain };
+  return {
+    certDeleted: false,
+    certRetained: true,
+    certReason: result.code ?? 'delete_failed',
+    certMessage: result.code === 'cert_in_use'
+      ? 'The domain was deleted, but its certificate is still used by another domain or nginx configuration and was retained.'
+      : result.code === 'cert_not_managed'
+        ? 'The domain was deleted, but Easy DevOps did not create that certificate, so it was retained.'
+        : 'The domain was deleted, but its certificate could not be removed safely and was retained.',
+    usedBy: Array.isArray(result.usedBy) ? result.usedBy : [],
+    references: Array.isArray(result.references)
+      ? result.references.map((reference) => ({
+        file: String(reference.file ?? '').split(/[\\/]/).pop(),
+        line: Number(reference.line) || null,
+      }))
+      : [],
+  };
+}
+
+export async function handleHubDomainCommand(payload, { runFn = run, recheck = null } = {}) {
   const { action, name, domain, deleteCert } = payload ?? {};
   const { nginxDir } = loadConfig();
+  const authorize = () => {
+    if (typeof recheck === 'function') recheck();
+  };
 
   switch (action) {
 
@@ -138,120 +169,154 @@ export async function handleHubDomainCommand(payload) {
       // name, so it must be a plain hostname before anything is written.
       const invalid = hubDomainInputError(domain, { creating: true });
       if (invalid) return { ok: false, error: invalid };
-      if (findDomain(domain.name)) return { ok: false, error: `Domain ${domain.name} already exists` };
+      return withCertificateLifecycleLock(async () => {
+        if (findDomain(domain.name)) return { ok: false, error: `Domain ${domain.name} already exists` };
 
-      const newDomain = createDomain({
-        name: domain.name,
-        port: Number(domain.port) || 3000,
-        backendHost: domain.backendHost ?? DOMAIN_DEFAULTS.backendHost,
-        upstreamType: domain.upstreamType ?? DOMAIN_DEFAULTS.upstreamType,
-        www: domain.www ?? false,
-        wildcard: domain.wildcard ?? false,
-        behindCloudflare: domain.behindCloudflare ?? false,
-        enabled: true,
-        ssl: { ...DOMAIN_DEFAULTS.ssl, ...domain.ssl },
-        performance: { ...DOMAIN_DEFAULTS.performance, ...domain.performance },
-        security: { ...DOMAIN_DEFAULTS.security, ...domain.security },
-        advanced: { ...DOMAIN_DEFAULTS.advanced, ...domain.advanced },
+        const newDomain = createDomain({
+          name: domain.name,
+          port: Number(domain.port) || 3000,
+          backendHost: domain.backendHost ?? DOMAIN_DEFAULTS.backendHost,
+          upstreamType: domain.upstreamType ?? DOMAIN_DEFAULTS.upstreamType,
+          www: domain.www ?? false,
+          wildcard: domain.wildcard ?? false,
+          behindCloudflare: domain.behindCloudflare ?? false,
+          enabled: true,
+          ssl: { ...DOMAIN_DEFAULTS.ssl, ...domain.ssl },
+          performance: { ...DOMAIN_DEFAULTS.performance, ...domain.performance },
+          security: { ...DOMAIN_DEFAULTS.security, ...domain.security },
+          advanced: { ...DOMAIN_DEFAULTS.advanced, ...domain.advanced },
+        });
+
+        // Same refusal as the dashboard: never point nginx at certificate files
+        // that are not on disk. The Hub offers Create certificate on this code.
+        const missingNew = await missingCertFiles(newDomain);
+        if (missingNew) return certMissingResult(missingNew);
+
+        // Shared core apply (same path as the CLI and the dashboard API).
+        authorize();
+        const created = await writeConfWithTest(newDomain);
+        if (!created.ok) {
+          return { ok: false, error: created.error ?? 'nginx rejected the new config' };
+        }
+
+        const domains = getDomains();
+        authorize();
+        domains.push(newDomain);
+        saveDomains(domains);
+
+        if (domain.notifications && typeof domain.notifications === 'object') {
+          try {
+            authorize();
+            saveDomainNotifConfig(domain.name, domain.notifications);
+          } catch (error) {
+            if (error?.code === 'HUB_PERMISSION_REVOKED') throw error;
+          }
+        }
+
+        bumpHubRevision();
+        console.log('[hubAgent] domain created:', domain.name);
+        return { ok: true, action: 'create', domain: domain.name };
       });
-
-      // Same refusal as the dashboard: never point nginx at certificate files
-      // that are not on disk. The Hub offers Create certificate on this code.
-      const missingNew = await missingCertFiles(newDomain);
-      if (missingNew) return certMissingResult(missingNew);
-
-      // Shared core apply (same path as the CLI and the dashboard API).
-      const created = await writeConfWithTest(newDomain);
-      if (!created.ok) {
-        return { ok: false, error: created.error ?? 'nginx rejected the new config' };
-      }
-
-      const domains = getDomains();
-      domains.push(newDomain);
-      saveDomains(domains);
-
-      if (domain.notifications && typeof domain.notifications === 'object') {
-        try { saveDomainNotifConfig(domain.name, domain.notifications); } catch { /* non-fatal */ }
-      }
-
-      bumpHubRevision();
-      console.log('[hubAgent] domain created:', domain.name);
-      return { ok: true, action: 'create', domain: domain.name };
     }
 
     case 'update': {
       const targetName = name ?? domain?.name;
-      const existing = targetName ? findDomain(targetName) : null;
-      if (!existing) return { ok: false, error: `Domain ${targetName} not found` };
+      return withCertificateLifecycleLock(async () => {
+        const existing = targetName ? findDomain(targetName) : null;
+        if (!existing) return { ok: false, error: `Domain ${targetName} not found` };
 
-      // Fields the agent owns are never taken from the Hub: the config path is
-      // derived from the name, and enabling is hub:manageDomain toggle, which
-      // has its own permission.
-      const { configFile: _cf, enabled: _en, createdAt: _ca, ...updates } = domain ?? {};
-      const invalid = hubDomainInputError(updates, { creating: false, existing });
-      if (invalid) return { ok: false, error: invalid };
-      const updatedDomain = {
-        ...existing,
-        ...updates,
-        name: existing.name, // name is immutable
-        ssl: { ...existing.ssl, ...updates.ssl },
-        performance: { ...existing.performance, ...updates.performance },
-        security: { ...existing.security, ...updates.security },
-        advanced: { ...existing.advanced, ...updates.advanced },
-        updatedAt: new Date().toISOString(),
-      };
+        // Fields the agent owns are never taken from the Hub: the config path is
+        // derived from the name, and enabling is hub:manageDomain toggle, which
+        // has its own permission.
+        const { configFile: _cf, enabled: _en, createdAt: _ca, ...updates } = domain ?? {};
+        const invalid = hubDomainInputError(updates, { creating: false, existing });
+        if (invalid) return { ok: false, error: invalid };
+        const updatedDomain = {
+          ...existing,
+          ...updates,
+          name: existing.name, // name is immutable
+          ssl: { ...existing.ssl, ...updates.ssl },
+          performance: { ...existing.performance, ...updates.performance },
+          security: { ...existing.security, ...updates.security },
+          advanced: { ...existing.advanced, ...updates.advanced },
+          updatedAt: new Date().toISOString(),
+        };
 
-      // Same refusal as the dashboard: never point nginx at certificate files
-      // that are not on disk. The Hub offers Create certificate on this code.
-      const missingUpdated = await missingCertFiles(updatedDomain);
-      if (missingUpdated) return certMissingResult(missingUpdated);
+        // Same refusal as the dashboard: never point nginx at certificate files
+        // that are not on disk. The Hub offers Create certificate on this code.
+        const missingUpdated = await missingCertFiles(updatedDomain);
+        if (missingUpdated) return certMissingResult(missingUpdated);
 
-      // Shared core apply — restores the previous config exactly if it fails,
-      // so the .bak dance is no longer needed here.
-      const updatedResult = await writeConfWithTest(updatedDomain);
-      if (!updatedResult.ok) {
-        return { ok: false, error: updatedResult.error ?? 'nginx rejected the updated config' };
-      }
+        // Shared core apply — restores the previous config exactly if it fails,
+        // so the .bak dance is no longer needed here.
+        authorize();
+        const updatedResult = await writeConfWithTest(updatedDomain);
+        if (!updatedResult.ok) {
+          return { ok: false, error: updatedResult.error ?? 'nginx rejected the updated config' };
+        }
 
-      const domains = getDomains();
-      const idx = domains.findIndex((d) => d.name === existing.name);
-      domains[idx] = updatedDomain;
-      saveDomains(domains);
+        const domains = getDomains();
+        const idx = domains.findIndex((d) => d.name === existing.name);
+        authorize();
+        domains[idx] = updatedDomain;
+        saveDomains(domains);
 
-      if (updates.notifications && typeof updates.notifications === 'object') {
-        try { saveDomainNotifConfig(existing.name, updates.notifications); } catch { /* non-fatal */ }
-      }
+        if (updates.notifications && typeof updates.notifications === 'object') {
+          try {
+            authorize();
+            saveDomainNotifConfig(existing.name, updates.notifications);
+          } catch (error) {
+            if (error?.code === 'HUB_PERMISSION_REVOKED') throw error;
+          }
+        }
 
-      bumpHubRevision();
-      console.log('[hubAgent] domain updated:', existing.name);
-      return { ok: true, action: 'update', domain: existing.name };
+        bumpHubRevision();
+        console.log('[hubAgent] domain updated:', existing.name);
+        return { ok: true, action: 'update', domain: existing.name };
+      });
     }
 
     case 'delete': {
-      const domain = findDomain(name);
-      if (!domain) return { ok: false, error: `Domain ${name} not found` };
+      const result = await withCertificateLifecycleLock(async (lifecycle) => {
+        const domain = findDomain(name);
+        if (!domain) return { ok: false, error: `Domain ${name} not found` };
 
-      if (domain.configFile) {
-        try { await fs.unlink(domain.configFile); } catch (err) {
-          if (err.code !== 'ENOENT') return { ok: false, error: `Could not remove config: ${err.message}` };
+        if (domain.configFile) {
+          authorize();
+          try { await fs.unlink(domain.configFile); } catch (err) {
+            if (err.code !== 'ENOENT') return { ok: false, error: `Could not remove config: ${err.message}` };
+          }
         }
-      }
 
-      saveDomains(getDomains().filter((d) => d.name !== name));
+        // Remove the domain record before the shared deletion path scans for
+        // users. Other domains and every nginx reference are still considered.
+        authorize();
+        saveDomains(getDomains().filter((d) => d.name !== name));
 
-      // Optionally delete SSL certificate directory
-      if (deleteCert && domain.ssl?.enabled) {
-        const { sslDir } = loadConfig();
-        const certDir = path.join(sslDir, name);
-        try { await fs.rm(certDir, { recursive: true, force: true }); } catch { /* ignore */ }
-      }
+        let certificate = null;
+        if (deleteCert && domain.ssl?.enabled) {
+          authorize();
+          certificate = certificateRetention(
+            await deleteCertificateUnderLock(name, lifecycle),
+          );
+        }
+        return {
+          ok: true,
+          action: 'delete',
+          domain: name,
+          certDeleted: certificate?.certDeleted ?? false,
+          ...(certificate?.certRetained ? certificate : {}),
+        };
+      });
+      if (!result.ok) return result;
 
       console.log('[hubAgent] domain deleted:', name);
 
       // Reload nginx so the deleted domain stops being served
-      await run(isWindows ? nginxReloadCmd(nginxDir) : 'sudo -n /usr/bin/systemctl reload nginx', { cwd: nginxDir });
+      authorize();
+      await runFn(isWindows ? nginxReloadCmd(nginxDir) : 'sudo -n /usr/bin/systemctl reload nginx', { cwd: nginxDir });
       bumpHubRevision();
-      return { ok: true, action: 'delete', domain: name };
+      return result;
     }
 
     case 'toggle': {
@@ -267,38 +332,44 @@ export async function handleHubDomainCommand(payload) {
       const disabledPath = `${basePath}.disabled`;
 
       if (isEnabled) {
+        authorize();
         try { await fs.rename(enabledPath, disabledPath); } catch (err) {
           return { ok: false, error: `Could not disable: ${err.message}` };
         }
         const domains = getDomains();
         const idx = domains.findIndex((d) => d.name === name);
+        authorize();
         domains[idx] = { ...domain, enabled: false, configFile: disabledPath, updatedAt: new Date().toISOString() };
         saveDomains(domains);
       } else {
+        authorize();
         try { await fs.rename(disabledPath, enabledPath); } catch (err) {
           return { ok: false, error: `Could not enable: ${err.message}` };
         }
-        const testResult = await run(isWindows ? nginxTestCmd(nginxDir) : 'nginx -t', { cwd: nginxDir });
+        const testResult = await runFn(isWindows ? nginxTestCmd(nginxDir) : 'nginx -t', { cwd: nginxDir });
         if (!isNginxTestOk(testResult)) {
           await fs.rename(enabledPath, disabledPath).catch(() => {});
           return { ok: false, error: 'nginx rejected the config after enabling' };
         }
         const domains = getDomains();
         const idx = domains.findIndex((d) => d.name === name);
+        authorize();
         domains[idx] = { ...domain, enabled: true, configFile: enabledPath, updatedAt: new Date().toISOString() };
         saveDomains(domains);
       }
 
-      await run(isWindows ? nginxReloadCmd(nginxDir) : 'sudo -n /usr/bin/systemctl reload nginx', { cwd: nginxDir });
+      authorize();
+      await runFn(isWindows ? nginxReloadCmd(nginxDir) : 'sudo -n /usr/bin/systemctl reload nginx', { cwd: nginxDir });
       bumpHubRevision();
       console.log('[hubAgent] domain toggled:', name, '→', !isEnabled);
       return { ok: true, action: 'toggle', domain: name, enabled: !isEnabled };
     }
 
     case 'reload': {
-      const testResult = await run(isWindows ? nginxTestCmd(nginxDir) : 'nginx -t', { cwd: nginxDir });
+      const testResult = await runFn(isWindows ? nginxTestCmd(nginxDir) : 'nginx -t', { cwd: nginxDir });
       if (!isNginxTestOk(testResult)) return { ok: false, error: 'nginx config test failed' };
-      await run(isWindows ? nginxReloadCmd(nginxDir) : 'sudo -n /usr/bin/systemctl reload nginx', { cwd: nginxDir });
+      authorize();
+      await runFn(isWindows ? nginxReloadCmd(nginxDir) : 'sudo -n /usr/bin/systemctl reload nginx', { cwd: nginxDir });
       console.log('[hubAgent] nginx reloaded for domain:', name);
       return { ok: true, action: 'reload', domain: name };
     }

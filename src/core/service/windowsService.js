@@ -40,9 +40,15 @@ import {
   downloadWinsw,
   verifyWinsw,
 } from './winsw.js';
-import { requiredGrants, applyGrants, revokeGrants, compareGrants } from './acl.js';
+import {
+  requiredGrants, applyGrants, revokeGrants, compareGrants, systemTool,
+} from './acl.js';
 import { runtimeDir, copyRuntime, verifyNativeModules } from './runtime.js';
 import { grantOperator, revokeOperator, readServiceSddl, operatorAceState, prepareProtectedDir } from './operator.js';
+import {
+  completeLogLines,
+  readBoundedTailSync,
+} from './logTail.js';
 
 /** Where the wrapper, its config and its logs live. Admin-writable only. */
 export function binDir() {
@@ -160,6 +166,45 @@ function outputOf(result) {
 }
 
 /**
+ * Service Control Manager calls use direct argv in production. The legacy
+ * string runner remains injectable only so older focused tests can drive their
+ * existing command stubs; no production caller selects that branch.
+ */
+function scExecutor({ run, runFile }) {
+  if (run !== shellRun) {
+    return (args, options) => run(`${WINDOWS_SC} ${args.join(' ')}`, options);
+  }
+  return (args, options) => runFile(systemTool(WINDOWS_SC), args, options);
+}
+
+/**
+ * Filesystem inspection used by status and the first repair gate.
+ *
+ * Windows can deny access to a protected service file even though the file is
+ * present. `existsSync` normally returns false for such failures, but injected
+ * filesystems and future Node versions must not turn a status check into an
+ * unhandled exception. Keep the error so callers can explain what happened.
+ */
+function inspectPath(fsImpl, file) {
+  try {
+    // existsSync() collapses every error into false. On Windows that turns an
+    // EACCES/EPERM on a protected service file into "missing", which is both a
+    // false status and a reason repair refuses to start. lstatSync keeps the
+    // distinction; stat the link itself so a reparse point is still an entry.
+    if (typeof fsImpl.lstatSync === 'function') {
+      const stat = fsImpl.lstatSync(file, { throwIfNoEntry: false });
+      return { exists: Boolean(stat), error: null };
+    }
+    // Compatibility for small filesystem stubs. Production always takes the
+    // lstat path above.
+    return { exists: fsImpl.existsSync(file), error: null };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { exists: false, error: null };
+    return { exists: false, error: error?.message ?? String(error) };
+  }
+}
+
+/**
  * Whether the Service Control Manager knows a service called SERVICE_ID.
  *
  * Asked of `sc`, not of WinSW: a registration left behind by a failed or
@@ -168,10 +213,19 @@ function outputOf(result) {
  *
  * @returns {Promise<boolean|null>} null when `sc` itself gave no usable answer
  */
-export async function isRegistered({ run = shellRun } = {}) {
-  const result = await run(`${WINDOWS_SC} query ${SERVICE_ID}`, { timeout: 20_000 });
+export async function isRegistered({
+  run = shellRun,
+  runFile = shellRunFile,
+} = {}) {
+  const sc = scExecutor({ run, runFile });
+  let result;
+  try {
+    result = await sc(['query', SERVICE_ID], { timeout: 20_000 });
+  } catch {
+    return null;
+  }
   const output = outputOf(result);
-  if (result.success || /STATE\s*:/i.test(output)) return true;
+  if (/STATE\s*:/i.test(output)) return true;
   if (/1060|does not exist/i.test(output)) return false;
   return null;
 }
@@ -179,43 +233,72 @@ export async function isRegistered({ run = shellRun } = {}) {
 /**
  * Removes a registration of SERVICE_ID, whatever state it is in.
  *
- * WinSW's own `stop`/`uninstall` first, when the wrapper is present and has
- * its definition beside it — that is the clean path. Then, if the Service
- * Control Manager still knows the name, `sc stop` + `sc delete`, which work
- * without the wrapper. A service that is marked for deletion while a handle
- * is open (services.msc, for instance) disappears once that handle closes;
- * `sc delete` reports success in that case, and so does this.
+ * Removal uses `sc stop` + `sc delete` only. An existing wrapper is never
+ * executed before it has been hash-verified and replaced, because the folder
+ * may contain an administrator-writable or otherwise unverified binary. The
+ * Service Control Manager can stop and delete a registration without loading
+ * that binary. A service that is marked for deletion while a handle is open
+ * (services.msc, for instance) disappears once that handle closes.
  *
  * @returns {Promise<{ ok: boolean, removed: boolean, reason?: string }>}
  */
-export async function unregister({ run = shellRun, runFile = shellRunFile, log = () => {} } = {}) {
-  let removed = false;
+export async function unregister({
+  run = shellRun,
+  runFile = shellRunFile,
+  log = () => {},
+  force = false,
+  deleteWaitMs = 30_000,
+  deletePollMs = 500,
+} = {}) {
+  const sc = scExecutor({ run, runFile });
 
-  if (fs.existsSync(winswPath()) && fs.existsSync(serviceXmlPath())) {
-    await runFile(winswPath(), ['stop'], { timeout: 60_000 });
-    const viaWinsw = await runFile(winswPath(), ['uninstall'], { timeout: 60_000 });
-    if (viaWinsw.success) removed = true;
-  }
-
-  const still = await isRegistered({ run });
-  if (still === false) return { ok: true, removed };
-
-  await run(`${WINDOWS_SC} stop ${SERVICE_ID}`, { timeout: 60_000 });
-  const deleted = await run(`${WINDOWS_SC} delete ${SERVICE_ID}`, { timeout: 30_000 });
-  const output = outputOf(deleted);
-
-  if (deleted.success || /1060|does not exist/i.test(output)) {
-    log(`Removed the ${SERVICE_ID} service registration.`);
-    return { ok: true, removed: true };
-  }
-  if (/1072|marked for deletion/i.test(output)) {
+  const still = await isRegistered({ run, runFile });
+  if (still === null) {
     return {
-      ok: true,
-      removed: true,
-      reason: 'Windows has marked the service for deletion; close services.msc (or reboot) to finish it.',
+      ok: false,
+      removed: false,
+      reason: `Could not determine whether ${SERVICE_ID} is registered. Nothing was removed. `
+        + `Run ${WINDOWS_SC} query ${SERVICE_ID} in an Administrator PowerShell, then retry.`,
     };
   }
-  return { ok: false, removed, reason: output.slice(0, 400) || `${WINDOWS_SC} delete ${SERVICE_ID} failed` };
+  if (still === false && !force) return { ok: true, removed: false };
+
+  await sc(['stop', SERVICE_ID], { timeout: 60_000 });
+  const deleted = await sc(['delete', SERVICE_ID], { timeout: 30_000 });
+  const output = outputOf(deleted);
+
+  const waitForRemoval = async () => {
+    const deadline = Date.now() + deleteWaitMs;
+    let lastState = true;
+    let lastError = null;
+    do {
+      lastState = await isRegistered({ run, runFile });
+      if (lastState === false) return { ok: true, removed: true };
+      lastError = lastState === null
+        ? `SCM did not return a usable state for ${SERVICE_ID}`
+        : null;
+      if (Date.now() >= deadline) break;
+      await new Promise(resolve => setTimeout(resolve, deletePollMs));
+    } while (true);
+    return {
+      ok: false,
+      removed: false,
+      reason: lastError
+        ? `${lastError}. The service was not removed, so nothing may replace its runtime.`
+        : `Windows has marked ${SERVICE_ID} for deletion, but SCM still owns it. `
+          + 'Close services.msc and retry, or restart Windows before installing again.',
+    };
+  };
+
+  if (deleted.success || /1060|does not exist/i.test(output)) {
+    const removed = await waitForRemoval();
+    if (removed.ok) log(`Removed the ${SERVICE_ID} service registration.`);
+    return removed;
+  }
+  if (/1072|marked for deletion/i.test(output)) {
+    return waitForRemoval();
+  }
+  return { ok: false, removed: false, reason: output.slice(0, 400) || `${WINDOWS_SC} delete ${SERVICE_ID} failed` };
 }
 
 /** Removes the wrapper 1.4.0 left under its release name. Best effort. */
@@ -277,13 +360,47 @@ export async function install({
     return { ok: false, reason: elevationMessage(), needsElevation: true };
   }
 
+  // A service left by an earlier attempt must be stopped and unregistered
+  // before runtime/bin can be replaced. Deleting a running wrapper is refused
+  // by Windows, and leaving either executable directory for a merge would let
+  // content written by another account survive into the service runtime.
+  const existing = await isRegistered({ run, runFile });
+  if (existing === null) {
+    return {
+      ok: false,
+      registrationFailed: true,
+      reason: 'Could not determine whether an EasyDevOps service is already registered. '
+        + 'Nothing was replaced or registered. Run `sc.exe query EasyDevOps` in an '
+        + 'Administrator PowerShell to inspect the service manager, then retry.',
+    };
+  }
+  if (existing) {
+    log(`A ${SERVICE_ID} service is already registered; removing it before registering again…`);
+    const cleared = await unregister({ run, runFile, log });
+    if (!cleared.ok) {
+      return {
+        ok: false,
+        registrationFailed: true,
+        reason: `an existing ${SERVICE_ID} service could not be removed first:\n${cleared.reason}\n\n`
+          + `Hint: stop and delete it in an Administrator PowerShell (sc.exe stop ${SERVICE_ID}; `
+          + `sc.exe delete ${SERVICE_ID}), then run ezz service install again.`,
+      };
+    }
+  }
+
   // ── 0. The folders the service runs code from, protected while empty ──────
   //
   // An earlier install may have left the installing user a grant on the data
-  // directory, which a new folder would inherit. See operator.js.
-  for (const dir of [runtimeDir(dataDir), binDir()]) {
+  // directory, which a new folder would inherit. Runtime and bin are replaced
+  // outright, while the data directory is protected in place.
+  for (const dir of [dataDir, runtimeDir(dataDir), binDir()]) {
     const prepared = await (deps.prepareProtectedDir ?? prepareProtectedDir)({
-      dir, sid: operator?.sid ?? null, serviceAccount: false, runFile, log,
+      dir,
+      sid: operator?.sid ?? null,
+      serviceAccount: false,
+      fresh: dir !== dataDir,
+      runFile,
+      log,
     });
     if (!prepared.ok) return { ok: false, reason: `${prepared.reason}. Nothing was registered.` };
   }
@@ -335,25 +452,6 @@ export async function install({
   // exist as a security principal until a service of that name is registered,
   // and icacls refuses an unknown account.
   //
-  // A registration left by an earlier attempt (an interrupted install, or one
-  // that pointed at a wrapper that has since moved) is removed first:
-  // `winsw install` refuses a name that already exists, and re-registering is
-  // the only way to make it point at this wrapper and this definition.
-  const existing = await isRegistered({ run });
-  if (existing) {
-    log(`A ${SERVICE_ID} service is already registered; removing it before registering again…`);
-    const cleared = await unregister({ run, runFile, log });
-    if (!cleared.ok) {
-      return {
-        ok: false,
-        registrationFailed: true,
-        reason: `an existing ${SERVICE_ID} service could not be removed first:\n${cleared.reason}\n\n`
-          + `Hint: stop and delete it in an Administrator PowerShell (sc.exe stop ${SERVICE_ID}; `
-          + `sc.exe delete ${SERVICE_ID}), then run ezz service install again.`,
-      };
-    }
-  }
-
   // No path argument: WinSW v2 ignores it and reads `EasyDevOps.xml` beside
   // `EasyDevOps.exe`. Passing it suggested otherwise, which is how the name
   // mismatch went unnoticed.
@@ -368,7 +466,11 @@ export async function install({
     // WinSW can fail after the Service Control Manager accepted the name, so
     // a failed register is followed by a clean-up: nothing half-registered is
     // left for the next attempt to trip over.
-    const cleanup = await unregister({ run, runFile, log });
+    // SCM can report MISSING even after WinSW created and then lost part of a
+    // registration. Force the delete on this failure path so a partial name is
+    // not left to block the next install. Deleting a missing service is 1060,
+    // which unregister treats as already clean.
+    const cleanup = await unregister({ run, runFile, log, force: true });
     const leftover = cleanup.ok
       ? 'Nothing was left registered.'
       : `A partial registration could not be removed (${cleanup.reason}); `
@@ -514,14 +616,18 @@ export async function uninstall({ dataDir, config = {}, operator = null, log = (
  * "Access is denied" from them is the authoritative answer when they are not.
  * Nothing is pre-checked here, so an allowed user is never told to elevate.
  */
-export async function restart({ run = shellRun, stopWaitMs = 30_000 } = {}) {
-  const stopped = await stop({ run, stopWaitMs });
+export async function restart({
+  run = shellRun,
+  runFile = shellRunFile,
+  stopWaitMs = 30_000,
+} = {}) {
+  const stopped = await stop({ run, runFile, stopWaitMs });
   if (!stopped.ok) {
     return stopped.needsElevation
       ? { ok: false, needsElevation: true, reason: elevationFor('Restarting') }
       : { ok: false, reason: stopped.reason };
   }
-  const started = await start({ run });
+  const started = await start({ run, runFile });
   if (!started.ok) {
     return started.needsElevation
       ? { ok: false, needsElevation: true, reason: elevationFor('Restarting') }
@@ -534,13 +640,33 @@ export async function restart({ run = shellRun, stopWaitMs = 30_000 } = {}) {
  * The Service Control Manager's state for SERVICE_ID: 'RUNNING', 'STOPPED',
  * 'START_PENDING'…, 'MISSING' (1060) or null when `sc.exe` gave no answer.
  */
-export async function queryState({ run = shellRun } = {}) {
-  const result = await run(`${WINDOWS_SC} query ${SERVICE_ID}`, { timeout: 20_000 });
+export async function queryStateInfo({
+  run = shellRun,
+  runFile = shellRunFile,
+} = {}) {
+  const sc = scExecutor({ run, runFile });
+  let result;
+  try {
+    result = await sc(['query', SERVICE_ID], { timeout: 20_000 });
+  } catch (error) {
+    return {
+      state: null,
+      error: error?.message ?? String(error),
+    };
+  }
   const output = outputOf(result);
   const match = output.match(/STATE\s*:\s*\d+\s+(\w+)/i);
-  if (match) return match[1].toUpperCase();
-  if (/1060|does not exist/i.test(output)) return 'MISSING';
-  return null;
+  if (match) return { state: match[1].toUpperCase(), error: null };
+  if (/1060|does not exist/i.test(output)) return { state: 'MISSING', error: null };
+  return {
+    state: null,
+    error: output || `${WINDOWS_SC} query ${SERVICE_ID} returned no usable state`,
+  };
+}
+
+/** Backward-compatible state-only form used by lifecycle commands. */
+export async function queryState(options = {}) {
+  return (await queryStateInfo(options)).state;
 }
 
 /**
@@ -551,11 +677,17 @@ export async function queryState({ run = shellRun } = {}) {
  * copy over it in that window fails with EBUSY, which is how 1.4.0's repair
  * failed. STOPPED is reported only once the wrapper's child is gone.
  */
-export async function waitForState({ wanted, run = shellRun, timeoutMs = 30_000, intervalMs = 500 } = {}) {
+export async function waitForState({
+  wanted,
+  run = shellRun,
+  runFile = shellRunFile,
+  timeoutMs = 30_000,
+  intervalMs = 500,
+} = {}) {
   const deadline = Date.now() + timeoutMs;
   let state = null;
   while (Date.now() < deadline) {
-    state = await queryState({ run });
+    state = await queryState({ run, runFile });
     if (state === wanted || (wanted === 'STOPPED' && state === 'MISSING')) return { reached: true, state };
     await new Promise((r) => setTimeout(r, intervalMs));
   }
@@ -585,10 +717,15 @@ function elevationFor(action) {
  * it starts again at the next boot. `ezz service uninstall` is the permanent
  * removal.
  */
-export async function stop({ run = shellRun, stopWaitMs = 30_000 } = {}) {
+export async function stop({
+  run = shellRun,
+  runFile = shellRunFile,
+  stopWaitMs = 30_000,
+} = {}) {
+  const sc = scExecutor({ run, runFile });
   // Windows is asked, not the files: a registration whose wrapper is gone can
   // still be stopped, and files without a registration cannot.
-  if ((await isRegistered({ run })) === false) {
+  if ((await isRegistered({ run, runFile })) === false) {
     return { ok: false, reason: 'the service is not installed, so there is nothing to stop' };
   }
 
@@ -596,7 +733,7 @@ export async function stop({ run = shellRun, stopWaitMs = 30_000 } = {}) {
   // Manager's own verb, so it works even when the WinSW wrapper binary is
   // missing or broken, and its "Access is denied" is the authoritative answer
   // on elevation.
-  const result = await run(`${WINDOWS_SC} stop ${SERVICE_ID}`, { timeout: 60_000 });
+  const result = await sc(['stop', SERVICE_ID], { timeout: 60_000 });
   const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
 
   if (/Access is denied/i.test(output)) {
@@ -612,7 +749,12 @@ export async function stop({ run = shellRun, stopWaitMs = 30_000 } = {}) {
 
   // Accepted is not stopped. Callers replace files the process holds open
   // (repair, update, runtime update), so this returns only once it is gone.
-  const settled = await waitForState({ wanted: 'STOPPED', run, timeoutMs: stopWaitMs });
+  const settled = await waitForState({
+    wanted: 'STOPPED',
+    run,
+    runFile,
+    timeoutMs: stopWaitMs,
+  });
   if (!settled.reached) {
     return {
       ok: false,
@@ -624,12 +766,16 @@ export async function stop({ run = shellRun, stopWaitMs = 30_000 } = {}) {
 }
 
 /** `sc.exe start`. */
-export async function start({ run = shellRun } = {}) {
-  if ((await isRegistered({ run })) === false) {
+export async function start({
+  run = shellRun,
+  runFile = shellRunFile,
+} = {}) {
+  const sc = scExecutor({ run, runFile });
+  if ((await isRegistered({ run, runFile })) === false) {
     return { ok: false, reason: 'the service is not installed; run `ezz service install` first' };
   }
 
-  const result = await run(`${WINDOWS_SC} start ${SERVICE_ID}`, { timeout: 60_000 });
+  const result = await sc(['start', SERVICE_ID], { timeout: 60_000 });
   const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
 
   if (result.success) return { ok: true };
@@ -673,12 +819,19 @@ export async function start({ run = shellRun } = {}) {
  * @returns {{ restarts: number, cleanRestarts: number, crashRestarts: number,
  *             crashLooping: boolean, since: Date|null }}
  */
-export function countRecentRestarts({ windowMs = 10 * 60_000, now = Date.now(), text = null } = {}) {
+export function countRecentRestarts({
+  windowMs = 10 * 60_000,
+  now = Date.now(),
+  text = null,
+  file = null,
+  fsApi = fs,
+} = {}) {
   const none = { restarts: 0, cleanRestarts: 0, crashRestarts: 0, crashLooping: false, since: null };
 
   if (text === null) {
     try {
-      text = fs.readFileSync(wrapperLogPath(), 'utf8');
+      const tail = readBoundedTailSync(file ?? wrapperLogPath(), { fsApi });
+      text = completeLogLines(tail, 4000).join('\n');
     } catch {
       return none;
     }
@@ -745,16 +898,32 @@ export function countRecentRestarts({ windowMs = 10 * 60_000, now = Date.now(), 
  * @param {Object} [opts]
  * @returns {Promise<Object>}
  */
-export async function status({ dataDir, config = {}, run = shellRun, granted = [], operatorSid = null } = {}) {
-  const filesPresent = fs.existsSync(winswPath()) && fs.existsSync(serviceXmlPath());
+export async function status({
+  dataDir,
+  config = {},
+  run = shellRun,
+  runFile = shellRunFile,
+  granted = [],
+  operatorSid = null,
+  deps = {},
+} = {}) {
+  const fsImpl = deps.fs ?? fs;
+  const wrapperFile = inspectPath(fsImpl, winswPath());
+  const xmlFile = inspectPath(fsImpl, serviceXmlPath());
+  const filesPresent = wrapperFile.exists && xmlFile.exists;
+  const fileInspectionError = wrapperFile.error ?? xmlFile.error;
 
   // Windows is the authority on whether the service exists — not the files.
   // 1.4.0 said "Installed: yes" from the files alone while `sc query` answered
   // 1060, and (through the Set-Content alias) could not read the state at all.
-  const scState = await queryState({ run });
+  const scQuery = await queryStateInfo({ run, runFile });
+  const scState = scQuery.state;
   const registered = scState === 'MISSING' ? false : scState ? true : null;
+  const scWarning = scQuery.error
+    ? `Could not read the Windows service state: ${scQuery.error}`
+    : null;
 
-  if (registered === false || (registered === null && !filesPresent)) {
+  if (registered === false || (registered === null && !filesPresent && !scQuery.error)) {
     return {
       installed: false,
       registered,
@@ -766,19 +935,59 @@ export async function status({ dataDir, config = {}, run = shellRun, granted = [
       cleanRestarts: 0,
       crashRestarts: 0,
       crashLooping: false,
+      fileInspectionError,
+      warnings: fileInspectionError
+        ? [`Could not inspect the service files in ${binDir()}: ${fileInspectionError}`]
+        : [],
       winswPath: winswPath(),
       // Files left behind without a registration: a removed or never-finished
       // install. Said explicitly, because "not installed" alone is confusing
       // when the wrapper is sitting right there.
-      mismatch: filesPresent && registered === false
-        ? `${WINSW_EXE_NAME} and ${WINSW_XML_NAME} are in ${binDir()}, but Windows has no ${SERVICE_ID} service`
+      mismatch: fileInspectionError
+        ? `Could not inspect the service files in ${binDir()}: ${fileInspectionError}`
+        : filesPresent && registered === false
+          ? `${WINSW_EXE_NAME} and ${WINSW_XML_NAME} are in ${binDir()}, but Windows has no ${SERVICE_ID} service`
+          : null,
+    };
+  }
+
+  if (registered === null && !filesPresent && scQuery.error) {
+    return {
+      installed: null,
+      registered: null,
+      filesPresent: false,
+      running: null,
+      enabledOnBoot: null,
+      state: 'unknown',
+      restarts: 0,
+      cleanRestarts: 0,
+      crashRestarts: 0,
+      crashLooping: false,
+      fileInspectionError,
+      warnings: [
+        scWarning,
+        ...(fileInspectionError
+          ? [`Could not inspect the service files in ${binDir()}: ${fileInspectionError}`]
+          : []),
+      ].filter(Boolean),
+      winswPath: winswPath(),
+      mismatch: fileInspectionError
+        ? `Could not inspect the service files in ${binDir()}: ${fileInspectionError}`
         : null,
     };
   }
 
+  const sc = scExecutor({ run, runFile });
   const [config2, sddl] = await Promise.all([
-    run(`${WINDOWS_SC} qc ${SERVICE_ID}`, { timeout: 20_000 }),
-    operatorSid ? readServiceSddl({ run }) : Promise.resolve(null),
+    sc(['qc', SERVICE_ID], { timeout: 20_000 }).catch((error) => ({
+      success: false,
+      stdout: '',
+      stderr: error?.message ?? String(error),
+      exitCode: null,
+    })),
+    operatorSid
+      ? readServiceSddl({ run, runFile }).catch(() => null)
+      : Promise.resolve(null),
   ]);
   const startType = `${config2.stdout ?? ''}`.match(/START_TYPE\s*:\s*\d+\s+([\w_]+)/i)?.[1] ?? null;
 
@@ -797,11 +1006,20 @@ export async function status({ dataDir, config = {}, run = shellRun, granted = [
     installed: true,
     registered,
     filesPresent,
+    fileInspectionError,
+    warnings: [
+      ...(scWarning ? [scWarning] : []),
+      ...(fileInspectionError
+        ? [`Could not inspect the service files in ${binDir()}: ${fileInspectionError}`]
+        : []),
+    ],
     // Registered, but the wrapper or its definition is missing: the service
     // cannot start. A reinstall puts them back.
-    mismatch: registered && !filesPresent
-      ? `Windows has a ${SERVICE_ID} service, but ${WINSW_EXE_NAME} or ${WINSW_XML_NAME} is missing from ${binDir()}`
-      : null,
+    mismatch: fileInspectionError
+      ? `Could not inspect the service files in ${binDir()}: ${fileInspectionError}`
+      : registered && !filesPresent
+        ? `Windows has a ${SERVICE_ID} service, but ${WINSW_EXE_NAME} or ${WINSW_XML_NAME} is missing from ${binDir()}`
+        : null,
     running: scState === 'RUNNING',
     enabledOnBoot: startType ? /AUTO_START/i.test(startType) : null,
     state: scState ? scState.toLowerCase() : 'unknown',
@@ -822,24 +1040,33 @@ export async function status({ dataDir, config = {}, run = shellRun, granted = [
 }
 
 /** Recent log lines, newest last. */
-export function readLogs({ lines = 50, which = 'out' } = {}) {
-  const file = which === 'err' ? errLogPath() : which === 'wrapper' ? wrapperLogPath() : outLogPath();
+export function readLogs({
+  lines = 50,
+  which = 'out',
+  file = null,
+  fsApi = fs,
+} = {}) {
+  const selectedFile = file
+    ?? (which === 'err' ? errLogPath() : which === 'wrapper' ? wrapperLogPath() : outLogPath());
 
-  let text;
+  let tail;
   try {
-    text = fs.readFileSync(file, 'utf8');
+    tail = readBoundedTailSync(selectedFile, { fsApi });
   } catch (err) {
     return {
       ok: false,
-      file,
+      file: selectedFile,
       output: err.code === 'ENOENT'
-        ? `No log yet at ${file}. The service may not have started.`
-        : `Could not read ${file}: ${err.message}`,
+        ? `No log yet at ${selectedFile}. The service may not have started.`
+        : `Could not read ${selectedFile}: ${err.message}`,
     };
   }
 
-  const all = text.split(/\r?\n/).filter(Boolean);
-  return { ok: true, file, output: all.slice(-Math.max(1, Math.min(5000, Number(lines) || 50))).join('\n') };
+  return {
+    ok: true,
+    file: selectedFile,
+    output: completeLogLines(tail, lines).join('\n'),
+  };
 }
 
 /**
@@ -863,21 +1090,29 @@ export async function repair({
   if (!(deps.isWindows ?? isWindows)) return { ok: false, reason: 'Server mode is Windows-only' };
 
   const elevated = await (deps.isElevated ?? (() => isElevated({ run })))();
-  if (elevated === false || !(deps.canWrite ?? canWriteProgramData)()) {
+  if (elevated !== true || !(deps.canWrite ?? canWriteProgramData)()) {
     return { ok: false, needsElevation: true, reason: elevationMessage('ezz service repair') };
   }
 
-  if (!fs.existsSync(winswPath()) || (await isRegistered({ run })) === false) {
+  const fsImpl = deps.fs ?? fs;
+  const registered = await isRegistered({ run, runFile });
+  if (registered === false) {
     return { ok: false, reason: 'the service is not installed; run `ezz service install` instead' };
   }
-
-  // The wrapper itself is re-verified: a tampered or truncated WinSW is worth
-  // catching at repair time too, not only at install.
-  const wrapper = await (deps.verifyWinsw ?? verifyWinsw)(winswPath());
-  if (!wrapper.ok) {
-    log('The installed WinSW did not verify; re-downloading.');
-    const again = await downloadWinsw({ dest: winswPath(), log, verify: deps.verifyWinsw });
-    if (!again.ok) return { ok: false, reason: again.reason };
+  if (registered === null) {
+    // The SCM is the authority. Files alone do not prove a service exists, and
+    // an ACL error may hide an installed wrapper. Do not stop anything unless
+    // at least one authority is affirmative.
+    const wrapperFile = inspectPath(fsImpl, winswPath());
+    if (wrapperFile.error) {
+      return {
+        ok: false,
+        reason: `Could not determine whether the service is installed. The service manager query failed, and ${winswPath()} could not be inspected: ${wrapperFile.error}. Nothing was stopped or changed.`,
+      };
+    }
+    if (!wrapperFile.exists) {
+      return { ok: false, reason: 'the service is not installed; run `ezz service install` instead' };
+    }
   }
 
   // ── The runtime copy cannot be replaced while the service runs ──────────
@@ -891,27 +1126,75 @@ export async function repair({
   const prev = `${dir}.prev`;
 
   log('Stopping the service so the runtime copy can be replaced…');
-  const stopped = await stop({ run, stopWaitMs: deps.stopWaitMs ?? 30_000 });
+  const stopped = await stop({
+    run,
+    runFile,
+    stopWaitMs: deps.stopWaitMs ?? 30_000,
+  });
   if (!stopped.ok) {
     return { ok: false, reason: `the service could not be stopped first, so nothing was changed: ${stopped.reason}` };
   }
 
-  let previousXml;
-  try { previousXml = fs.readFileSync(serviceXmlPath()); } catch (error) {
-    await start({ run });
-    return { ok: false, reason: `Could not read the service definition: ${error.message}` };
-  }
   const startAgain = async () => {
-    const started = await start({ run });
+    const started = await start({ run, runFile });
     if (!started.ok) return { ok: false, reason: started.reason };
     const alive = await waitForStart();
     return alive.alive ? { ok: true } : { ok: false, reason: 'the daemon did not report in' };
   };
 
+  let previousXml;
+  try { previousXml = fs.readFileSync(serviceXmlPath()); } catch (error) {
+    const back = await startAgain();
+    return {
+      ok: false,
+      reason: `Could not read the service definition: ${error.message}`
+        + (back.ok ? ' The service was started again.' : ` The service did not start again: ${back.reason}`),
+      restarted: back.ok,
+    };
+  }
+
+  // Verify and, when necessary, replace the wrapper only after the service has
+  // stopped. Windows can deny a read while an executable is running, and a
+  // replacement cannot rename over a live image.
+  let wrapper;
+  try {
+    wrapper = await (deps.verifyWinsw ?? verifyWinsw)(winswPath());
+  } catch (error) {
+    const back = await startAgain();
+    return {
+      ok: false,
+      reason: `could not verify the installed service wrapper: ${error.message}. `
+        + (back.ok ? 'The service was started again.' : `The service did not start again: ${back.reason}`),
+      restarted: back.ok,
+    };
+  }
+  if (!wrapper.ok && wrapper.code) {
+    const back = await startAgain();
+    return {
+      ok: false,
+      reason: `${wrapper.reason}. The service wrapper was not replaced. `
+        + (back.ok ? 'The service was started again.' : `The service did not start again: ${back.reason}`),
+      restarted: back.ok,
+    };
+  }
+  if (!wrapper.ok) {
+    log('The installed WinSW did not verify; re-downloading.');
+    const again = await downloadWinsw({ dest: winswPath(), log, verify: deps.verifyWinsw });
+    if (!again.ok) {
+      const back = await startAgain();
+      return {
+        ok: false,
+        reason: `${again.reason}. `
+          + (back.ok ? 'The service was started again.' : `The service did not start again: ${back.reason}`),
+        restarted: back.ok,
+      };
+    }
+  }
+
   const restorePrevious = async (why) => {
     log(`Restoring the previous runtime copy (${why})…`);
     // A new copy that started but never reported in still holds its files.
-    await stop({ run, stopWaitMs: deps.stopWaitMs ?? 30_000 });
+    await stop({ run, runFile, stopWaitMs: deps.stopWaitMs ?? 30_000 });
     let restored = false;
     try {
       if (fs.existsSync(prev)) {

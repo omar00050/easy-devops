@@ -353,11 +353,15 @@ export function permissionForCommand(command, payload = {}) {
     }
 
     case 'hub:manageDomain': {
+      if (payload?.action === 'delete' || payload?.action === 'toggle') {
+        const mutation = payload.action === 'delete' ? 'domains.delete' : 'domains.toggle';
+        const needed = [mutation, 'nginx.reload'];
+        if (payload.action === 'delete' && payload.deleteCert === true) needed.push('ssl.delete');
+        return needed;
+      }
       const map = {
         create: 'domains.create',
         update: 'domains.edit',
-        toggle: 'domains.toggle',
-        delete: 'domains.delete',
         reload: 'nginx.reload',
       };
       return fromMap(map, payload?.action);
@@ -368,9 +372,9 @@ export function permissionForCommand(command, payload = {}) {
         renew: 'ssl.renew',
         renewAll: 'ssl.renewAll',
         issue: 'ssl.issue',
-        // Read-only lookup: it changes nothing, and a paired server is a
-        // monitored server.
-        suggest: null,
+        // Suggestions include absolute certificate paths, so they use the
+        // same path-disclosure permission as the nginx configuration view.
+        suggest: 'nginx.config.view',
         delete: 'ssl.delete',
       };
       return fromMap(map, payload?.action);
@@ -390,11 +394,12 @@ export function permissionForCommand(command, payload = {}) {
     case 'hub:manageDeploy': {
       const action = payload?.action;
 
-      // Linking writes a domain config, so managing an app is not enough:
-      // domains.create is required too, and issuing a certificate is its own
-      // permission. All of them must be granted.
+      // Linking may create or update an ordinary domain record and always
+      // reloads nginx. Both domain mutations are required because the payload
+      // does not decide whether an existing record will be found, and issuing
+      // a certificate is separately controlled.
       if (action === 'linkDomain') {
-        const needed = ['deploy.manage', 'domains.create'];
+        const needed = ['deploy.manage', 'domains.create', 'domains.edit', 'nginx.reload'];
         if (requestedSslMode(payload) === 'issue') needed.push('ssl.issue');
         return needed;
       }

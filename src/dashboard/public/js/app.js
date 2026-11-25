@@ -144,7 +144,7 @@ createApp({
         dashboardPort: '', nginxDir: '', sslDir: '', acmeEmail: '',
         password: '', loading: false, msg: '', error: '',
         platform: 'linux', // T022: Platform from settings API
-        dashboardBindAddress: '', bindsToLoopbackOnly: false,
+        dashboardBindAddress: '127.0.0.1', bindsToLoopbackOnly: true,
         dashboardAuth: 'password', canUseNoPassword: false, hasPassword: false,
       },
       settingsTab: 'general', // 'general' | 'notifications' | 'hub'

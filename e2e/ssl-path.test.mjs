@@ -273,6 +273,9 @@ async function main() {
 
   const legacyDb = path.join(ROOT, 'data', 'easy-devops.sqlite');
   const legacyBefore = fs.existsSync(legacyDb) ? fs.statSync(legacyDb).mtimeMs : null;
+  const legacyMarkerBefore = fs.existsSync(`${legacyDb}.migrated`)
+    ? fs.statSync(`${legacyDb}.migrated`).mtimeMs
+    : null;
 
   const all = [];
   for (const platform of ['win32', 'linux']) {
@@ -293,12 +296,15 @@ async function main() {
   // Prove the real config and the legacy database were left alone.
   process.stdout.write('\n── Isolation\n');
   const legacyAfter = fs.existsSync(legacyDb) ? fs.statSync(legacyDb).mtimeMs : null;
+  const legacyMarkerAfter = fs.existsSync(`${legacyDb}.migrated`)
+    ? fs.statSync(`${legacyDb}.migrated`).mtimeMs
+    : null;
   const untouched = legacyAfter === legacyBefore;
-  const noMigrated = !fs.existsSync(`${legacyDb}.migrated`);
+  const markerUnchanged = legacyMarkerAfter === legacyMarkerBefore;
   all.push({ group: 'Isolation', label: 'data/easy-devops.sqlite untouched', passed: untouched, detail: '' });
-  all.push({ group: 'Isolation', label: 'no .migrated file created', passed: noMigrated, detail: '' });
+  all.push({ group: 'Isolation', label: 'the legacy .migrated marker was neither created nor modified', passed: markerUnchanged, detail: '' });
   process.stdout.write(`   ${untouched ? 'PASS' : 'FAIL'}  data/easy-devops.sqlite untouched\n`);
-  process.stdout.write(`   ${noMigrated ? 'PASS' : 'FAIL'}  no .migrated file created\n`);
+  process.stdout.write(`   ${markerUnchanged ? 'PASS' : 'FAIL'}  the legacy .migrated marker was neither created nor modified\n`);
 
   fs.rmSync(tmpRoot, { recursive: true, force: true });
   process.stdout.write('   cleaned up temp config dir\n');

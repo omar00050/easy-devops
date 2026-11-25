@@ -5,9 +5,9 @@
  * last run, whether a deployment is in progress, and its PM2 process.
  *
  * Shared by the dashboard's Deployments page and the Hub agent, so the two
- * cannot describe the same app differently. The only thing that differs is
- * the `view`: the dashboard gets dashboardApp() (environment values included,
- * behind its own login), the Hub gets publicApp() (names only, no secrets).
+ * cannot describe the same app differently. Callers supply the projection:
+ * the dashboard uses dashboardApp() and full runs behind its own login, while
+ * the Hub uses publicApp() and a deploy.logs-aware run projector.
  */
 
 import * as defaultRunner from '../runner.js';
@@ -15,6 +15,25 @@ import { listApps, getApp, dashboardApp, pm2Name } from './apps.js';
 import { settingsWarnings } from './ezfile.js';
 import { describeRelease } from './engine.js';
 import { listRuns, readState, listReleases, lockHolder } from './store.js';
+import { isRedactedDeployRun } from './logSecurity.js';
+
+/**
+ * Local dashboard projection.
+ *
+ * Local authentication does not make an old raw log trustworthy. Until the
+ * run carries the 1.4.5 writer marker, every free-form diagnostic field is
+ * suppressed. Operational metadata remains available so the run still renders.
+ */
+const fullRun = (run) => {
+  if (!run || typeof run !== 'object' || isRedactedDeployRun(run)) return run;
+  return {
+    ...run,
+    error: null,
+    reason: null,
+    warnings: [],
+    logTail: [],
+  };
+};
 
 /**
  * PM2's view of every process, keyed by name — or an empty map.
@@ -56,8 +75,9 @@ export async function pm2Statuses({ runner = defaultRunner } = {}) {
  * @param {Object} app A registry record
  * @param {Map<string, Object>} processes From pm2Statuses()
  * @param {(app: Object) => Object} [view] dashboardApp (default) or publicApp
+ * @param {(run: Object) => Object} [runView] identity locally; a least-privilege projector for the Hub
  */
-export function describeApp(app, processes, view = dashboardApp) {
+export function describeApp(app, processes, view = dashboardApp, runView = fullRun) {
   const state = readState(app.id);
   const runs = listRuns(app.id, { limit: 1 });
   const holder = lockHolder(app.id);
@@ -75,7 +95,7 @@ export function describeApp(app, processes, view = dashboardApp) {
     previousRelease: state.previous,
     deploying: Boolean(holder),
     activeRunId: holder?.runId ?? null,
-    lastRun: runs[0] ?? null,
+    lastRun: runs[0] ? runView(runs[0]) : null,
     /** Advisory notes for the UI; empty unless the app runs a cluster. */
     warnings,
     /** What the live release was started with; settings when it never ran. */
@@ -92,15 +112,23 @@ export function describeApp(app, processes, view = dashboardApp) {
 }
 
 /** Every app, described. */
-export async function describeApps({ view = dashboardApp, runner = defaultRunner } = {}) {
+export async function describeApps({
+  view = dashboardApp,
+  runView = fullRun,
+  runner = defaultRunner,
+} = {}) {
   const processes = await pm2Statuses({ runner });
-  return listApps().map((app) => describeApp(app, processes, view));
+  return listApps().map((app) => describeApp(app, processes, view, runView));
 }
 
 /**
  * One app with its recent runs and the releases on disk, or null.
  */
-export async function describeAppDetail(appId, { view = dashboardApp, runner = defaultRunner } = {}) {
+export async function describeAppDetail(appId, {
+  view = dashboardApp,
+  runView = fullRun,
+  runner = defaultRunner,
+} = {}) {
   const app = getApp(appId);
   if (!app) return null;
 
@@ -108,8 +136,8 @@ export async function describeAppDetail(appId, { view = dashboardApp, runner = d
   const state = readState(app.id);
 
   return {
-    ...describeApp(app, processes, view),
-    runs: listRuns(app.id, { limit: 20 }),
+    ...describeApp(app, processes, view, runView),
+    runs: listRuns(app.id, { limit: 20 }).map(runView),
     releases: listReleases(app.id)
       .map((id) => describeRelease(app.id, id))
       .filter(Boolean)

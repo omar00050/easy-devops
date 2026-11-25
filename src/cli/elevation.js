@@ -56,12 +56,18 @@ export async function requireElevation({ args, what = 'This', yes = false, deps 
   if (!(deps.isWindows ?? isWindows)) return { proceed: true };
 
   const elevated = await (deps.isElevated ?? isElevated)({});
-  // Unknown is treated as elevated: the command's own checks still refuse
-  // with "Access is denied", and a relaunch nobody needed is worse.
-  if (elevated !== false) return { proceed: true };
+  if (elevated === true) return { proceed: true };
 
   const command = `ezz ${args.join(' ')}`;
   console.log();
+
+  if (elevated === null) {
+    console.log('  ' + chalk.yellow(`Could not verify administrator rights for ${what.toLowerCase()}.`));
+    console.log('  ' + chalk.gray('Nothing was changed. Open PowerShell with "Run as administrator" and run the command below.'));
+    printCommand(command);
+    return { proceed: false, code: NEEDS_ELEVATION_EXIT };
+  }
+
   console.log('  ' + chalk.yellow(`${what} needs administrator rights (Windows Server mode).`));
 
   if (!(deps.isInteractive ?? isInteractive)()) {

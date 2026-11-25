@@ -156,12 +156,23 @@ export function validateHubUrl(hubUrl) {
   if (!parsed.hostname) {
     return 'Hub URL is missing a host';
   }
+  if (parsed.protocol === 'http:' && !isLoopbackHubHostname(parsed.hostname)) {
+    return 'Hub URL must use https for a remote host (http is allowed only on loopback)';
+  }
   // The hub never issues credentials inside the URL; refuse to store any.
   if (parsed.username || parsed.password) {
     return 'Hub URL must not contain credentials';
   }
 
   return null;
+}
+
+/** Whether a parsed URL hostname names this machine. */
+export function isLoopbackHubHostname(hostname) {
+  const host = String(hostname ?? '').toLowerCase();
+  if (host === 'localhost' || host === '::1' || host === '[::1]') return true;
+  const match = host.match(/^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  return Boolean(match && match.slice(1).every((part) => Number(part) <= 255));
 }
 
 /** Upper bound on a pasted connection string (real ones are ~150 chars). */

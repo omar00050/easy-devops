@@ -899,7 +899,9 @@ export function ProcessesPage() {
                     <ServiceFact label="Uptime" value={formatUptime(serviceView.uptimeMs)} />
                     <ServiceFact
                       label="Installed"
-                      value={serviceView.installed ? 'Yes' : 'No'}
+                      value={serviceView.installed === null
+                        ? 'Unknown'
+                        : serviceView.installed ? 'Yes' : 'No'}
                     />
                     <ServiceFact
                       label="Mode"
@@ -954,6 +956,8 @@ export function ProcessesPage() {
                       title={
                         serviceView.stoppedByUser
                           ? 'The background service is stopped'
+                          : serviceView.installed === null
+                            ? 'The background service status is unavailable'
                           : !serviceView.installed
                             ? 'The background service is not set up'
                             : 'The background service is not running'
@@ -973,6 +977,12 @@ export function ProcessesPage() {
                               : 'when the service starts'}
                           . Use Start above, or run{' '}
                           <code className="font-mono">ezz service start</code>.
+                        </>
+                      ) : serviceView.installed === null ? (
+                        <>
+                          Windows could not inspect the installed service files. Review the warning
+                          above and run <code className="font-mono">ezz service status</code> from an
+                          Administrator PowerShell.
                         </>
                       ) : !serviceView.installed ? (
                         <>

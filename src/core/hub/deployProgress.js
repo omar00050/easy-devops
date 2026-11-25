@@ -25,12 +25,15 @@
  */
 
 import fs from 'fs';
+import path from 'node:path';
 
 import { getDataDir } from '../platform.js';
 import { listApps } from '../deploy/apps.js';
 import { logFile, lockHolder, listRuns, readRun } from '../deploy/store.js';
 import { RUN_STATUS, redactSecrets } from '../deploy/engine.js';
+import { isRedactedDeployRun } from '../deploy/logSecurity.js';
 import { getHubPermissions } from '../hubLink.js';
+import { openVerifiedChild } from '../safe-file.js';
 
 /** How often apps and their locks are scanned for a new run. */
 export const DETECT_INTERVAL_MS = 2_000;
@@ -43,6 +46,14 @@ export const EMIT_INTERVAL_MS = 1_000;
 export const MAX_LINES = 200;
 export const MAX_LINE_CHARS = 2_000;
 export const MAX_LINES_BYTES = 32 * 1024;
+/** One poll never allocates more than this much of a run log. */
+export const MAX_PROGRESS_READ_BYTES = 128 * 1024;
+/** File reads are fixed-size, so a sparse or fast-growing file cannot force one large allocation. */
+export const MAX_PROGRESS_CHUNK_BYTES = 16 * 1024;
+/** A newline-free producer is represented by this bounded tail. */
+export const MAX_PROGRESS_PARTIAL_CHARS = 32 * 1024;
+/** Remember enough completed runs to avoid re-announcing a crashed one, without growing forever. */
+export const MAX_SEEN_RUNS = 512;
 
 /** A deploy key must never travel, not even as part of a log line. */
 const PRIVATE_KEY_LINE = /PRIVATE KEY-----/;
@@ -172,8 +183,8 @@ export function createDeployProgress({
 
   /** runId → per-run cursor state */
   const active = new Map();
-  /** Runs already watched, so an interrupted run is not picked up twice. */
-  const seen = new Set();
+  /** Runs already watched, newest last, so an interrupted run is not picked up twice. */
+  const seen = new Map();
 
   let detectTimer = null;
   let pollTimer = null;
@@ -183,9 +194,19 @@ export function createDeployProgress({
     try { return fn(); } catch { return fallback; }
   };
 
+  function rememberRun(runId) {
+    seen.delete(runId);
+    seen.set(runId, true);
+    while (seen.size > MAX_SEEN_RUNS) {
+      const oldest = seen.keys().next().value;
+      if (active.has(oldest)) break;
+      seen.delete(oldest);
+    }
+  }
+
   function startRun(app, runId) {
     if (stopped || seen.has(runId) || active.has(runId)) return;
-    seen.add(runId);
+    rememberRun(runId);
 
     const state = {
       appId: app.id,
@@ -193,6 +214,8 @@ export function createDeployProgress({
       runId,
       offset: 0,
       partial: '',
+      partialDropped: 0,
+      skippedLines: 0,
       inKeyBlock: false,
       pending: [],
       lastEmitAt: 0,
@@ -238,40 +261,103 @@ export function createDeployProgress({
    * again from zero), and the last chunk ends mid-line (hold the fragment until
    * its newline arrives).
    *
-   * @returns {string[]} Whole lines, without their line endings
+   * @returns {{lines: string[], skipped: number}} Whole lines and the count
+   *          dropped by the fixed per-poll line budget
    */
   function readNewLines(state) {
     let file;
-    try { file = logFileFn(state.appId, state.runId, dataDir); } catch { return []; }
-
-    let size;
-    try { size = fs.statSync(file).size; } catch { return []; }
-
-    if (size < state.offset) {
-      state.offset = 0;
-      state.partial = '';
+    try { file = logFileFn(state.appId, state.runId, dataDir); } catch {
+      return { lines: [], skipped: 0 };
     }
-    if (size === state.offset) return [];
 
-    const length = size - state.offset;
-    const buffer = Buffer.alloc(length);
-    let fd;
-    let bytesRead = 0;
+    let opened;
     try {
-      fd = fs.openSync(file, 'r');
-      bytesRead = fs.readSync(fd, buffer, 0, length, state.offset);
+      opened = openVerifiedChild(file, { expectedDirectory: path.dirname(file) });
+      const size = opened.opened.size;
+      if (size < state.offset) {
+        state.offset = 0;
+        state.partial = '';
+        state.partialDropped = 0;
+        state.inKeyBlock = false;
+      }
+      if (size === state.offset) return { lines: [], skipped: 0 };
+
+      const jumped = size - state.offset > MAX_PROGRESS_READ_BYTES;
+      const start = jumped ? size - MAX_PROGRESS_READ_BYTES : state.offset;
+      let firstFragmentComplete = !jumped || start === 0;
+      if (jumped) {
+        state.partial = '';
+        state.partialDropped = 0;
+        state.inKeyBlock = false;
+      }
+
+      const lines = [];
+      let skippedLines = jumped && start > 0 ? 1 : 0;
+      const addLine = (rawLine) => {
+        const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+        if (state.partialDropped > 0) {
+          // The old prefix is deliberately not retained. Keep the newest bounded
+          // tail and make the truncation visible rather than pretending the line
+          // was complete.
+          lines.push(`[line truncated: ${state.partialDropped} characters] ${line}`);
+          state.partialDropped = 0;
+        } else {
+          lines.push(line);
+        }
+        if (lines.length > MAX_LINES) {
+          lines.shift();
+          skippedLines += 1;
+        }
+      };
+
+      let bytesRead = 0;
+      const decoder = new TextDecoder('utf-8');
+      while (start + bytesRead < size) {
+        const remaining = size - (start + bytesRead);
+        const length = Math.min(MAX_PROGRESS_CHUNK_BYTES, remaining);
+        const buffer = Buffer.allocUnsafe(length);
+        const got = fs.readSync(opened.fd, buffer, 0, length, start + bytesRead);
+        if (got <= 0) break;
+        bytesRead += got;
+
+        let text = decoder.decode(buffer.subarray(0, got), { stream: true });
+        if (!firstFragmentComplete) {
+          const newline = text.indexOf('\n');
+          if (newline === -1) continue;
+          text = text.slice(newline + 1);
+          firstFragmentComplete = true;
+        }
+
+        const parts = `${state.partial}${text}`.split('\n');
+        state.partial = parts.pop() ?? '';
+        for (const line of parts) addLine(line);
+
+        if (state.partial.length > MAX_PROGRESS_PARTIAL_CHARS) {
+          const drop = state.partial.length - MAX_PROGRESS_PARTIAL_CHARS;
+          state.partial = state.partial.slice(drop);
+          state.partialDropped += drop;
+        }
+      }
+
+      if (bytesRead > 0) {
+        let tail = decoder.decode();
+        if (!firstFragmentComplete) {
+          const newline = tail.indexOf('\n');
+          tail = newline === -1 ? '' : tail.slice(newline + 1);
+        }
+        if (tail) {
+          const parts = `${state.partial}${tail}`.split('\n');
+          state.partial = parts.pop() ?? '';
+          for (const line of parts) addLine(line);
+        }
+      }
+      state.offset = start + bytesRead;
+      return { lines, skipped: skippedLines };
     } catch {
-      return [];
+      return { lines: [], skipped: 0 };
     } finally {
-      if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+      opened?.close();
     }
-
-    state.offset += bytesRead;
-    const text = state.partial + buffer.subarray(0, bytesRead).toString('utf8');
-    const parts = text.split('\n');
-    state.partial = parts.pop() ?? '';
-
-    return parts.map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line));
   }
 
   function emitProgress(state, { status, steps, stage, skippedStages, done, now }) {
@@ -284,6 +370,8 @@ export function createDeployProgress({
     if (permissions['deploy.logs'] === true) {
       ({ lines, skipped } = batchLines(pending));
     }
+    skipped += state.skippedLines;
+    state.skippedLines = 0;
 
     const payload = {
       appId: state.appId,
@@ -325,19 +413,23 @@ export function createDeployProgress({
     }
 
     const app = state.app;
-    for (const line of readNewLines(state)) {
-      // Dropping only the BEGIN/END lines would still send the base64 between
-      // them. A block that never ends drops the rest of the run's log.
-      if (state.inKeyBlock) {
-        if (KEY_BLOCK_END.test(line)) state.inKeyBlock = false;
-        continue;
+    if (isRedactedDeployRun(run)) {
+      const read = readNewLines(state);
+      state.skippedLines += read.skipped;
+      for (const line of read.lines) {
+        // Dropping only the BEGIN/END lines would still send the base64 between
+        // them. A block that never ends drops the rest of the run's log.
+        if (state.inKeyBlock) {
+          if (KEY_BLOCK_END.test(line)) state.inKeyBlock = false;
+          continue;
+        }
+        if (KEY_BLOCK_BEGIN.test(line) && !KEY_BLOCK_END.test(line)) {
+          state.inKeyBlock = true;
+          continue;
+        }
+        const safeLine = safeLogLine(line, app);
+        if (safeLine !== null) state.pending.push(safeLine);
       }
-      if (KEY_BLOCK_BEGIN.test(line) && !KEY_BLOCK_END.test(line)) {
-        state.inKeyBlock = true;
-        continue;
-      }
-      const safeLine = safeLogLine(line, app);
-      if (safeLine !== null) state.pending.push(safeLine);
     }
 
     const status = typeof run.status === 'string' ? run.status : RUNNING;
@@ -377,6 +469,7 @@ export function createDeployProgress({
       if (detectTimer) { clearInterval(detectTimer); detectTimer = null; }
       if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
       active.clear();
+      seen.clear();
     },
 
     isRunning() {
@@ -385,6 +478,10 @@ export function createDeployProgress({
 
     activeRunIds() {
       return [...active.keys()];
+    },
+
+    seenRunIds() {
+      return [...seen.keys()];
     },
   };
 }

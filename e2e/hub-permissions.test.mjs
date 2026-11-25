@@ -199,17 +199,26 @@ async function main() {
     hp.checkCommandAllowed('hub:nginxAction', { action: 'stop' }, hp.defaultPermissions())
       .reason.includes('nginx.stop'));
 
-  check('domain delete maps to domains.delete',
-    hp.permissionForCommand('hub:manageDomain', { action: 'delete' }) === 'domains.delete');
+  check('domain delete maps to domains.delete and nginx.reload',
+    JSON.stringify(hp.permissionForCommand('hub:manageDomain', { action: 'delete' }))
+      === JSON.stringify(['domains.delete', 'nginx.reload']));
+  check('domain delete with certificate removal also needs ssl.delete',
+    JSON.stringify(hp.permissionForCommand('hub:manageDomain', {
+      action: 'delete', deleteCert: true,
+    })) === JSON.stringify(['domains.delete', 'nginx.reload', 'ssl.delete']));
+  check('domain toggle maps to domains.toggle and nginx.reload',
+    JSON.stringify(hp.permissionForCommand('hub:manageDomain', { action: 'toggle' }))
+      === JSON.stringify(['domains.toggle', 'nginx.reload']));
   check('ssl issue maps to ssl.issue',
     hp.permissionForCommand('hub:manageSSL', { action: 'issue' }) === 'ssl.issue');
-  // null, not undefined: the action is known and needs no permission. An
-  // undefined here would be refused as an unknown action.
-  check('ssl suggest needs no permission',
-    hp.permissionForCommand('hub:manageSSL', { action: 'suggest' }) === null);
-  check('ssl suggest is allowed with nothing granted',
+  check('ssl suggest maps to nginx.config.view',
+    hp.permissionForCommand('hub:manageSSL', { action: 'suggest' }) === 'nginx.config.view');
+  check('ssl suggest is refused with nothing granted',
     hp.checkCommandAllowed('hub:manageSSL', { action: 'suggest', domain: 'a.com' },
-      hp.defaultPermissions()).allowed === true);
+      hp.defaultPermissions()).allowed === false);
+  check('ssl suggest is allowed when nginx.config.view is granted',
+    hp.checkCommandAllowed('hub:manageSSL', { action: 'suggest', domain: 'a.com' },
+      { 'nginx.config.view': true }).allowed === true);
   check('saveConfig maps to nginx.config.edit',
     hp.permissionForCommand('hub:saveConfig') === 'nginx.config.edit');
 
@@ -292,7 +301,9 @@ async function main() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ez-perm-'));
   fs.writeFileSync(path.join(dataDir, 'easy-devops.sqlite'), '');
   const legacyDb = path.join(ROOT, 'data', 'easy-devops.sqlite');
+  const legacyMarker = `${legacyDb}.migrated`;
   const legacyBefore = fs.existsSync(legacyDb) ? fs.statSync(legacyDb).mtimeMs : null;
+  const markerBefore = fs.existsSync(legacyMarker) ? fs.statSync(legacyMarker).mtimeMs : null;
 
   const childFile = path.join(ROOT, 'hubperm.child.tmp.mjs');
   fs.writeFileSync(childFile, CHILD);
@@ -323,8 +334,10 @@ async function main() {
 
   setGroup('Isolation');
   const legacyAfter = fs.existsSync(legacyDb) ? fs.statSync(legacyDb).mtimeMs : null;
+  const markerAfter = fs.existsSync(legacyMarker) ? fs.statSync(legacyMarker).mtimeMs : null;
   check('data/easy-devops.sqlite untouched', legacyAfter === legacyBefore);
-  check('no .migrated file created', !fs.existsSync(`${legacyDb}.migrated`));
+  check('the legacy .migrated marker was neither created nor modified',
+    markerAfter === markerBefore);
   try {
     fs.rmSync(dataDir, { recursive: true, force: true });
     process.stdout.write('   cleaned up temp data dir\n');

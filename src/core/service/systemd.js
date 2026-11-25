@@ -213,8 +213,9 @@ export async function install({
   interactive = runInteractive,
   fileRunner = runFile,
   unitPath = UNIT_PATH,
+  stdin = process.stdin,
 } = {}) {
-  if (!process.stdin.isTTY) {
+  if (!stdin?.isTTY) {
     return {
       ok: false,
       reason: 'installing the service needs a real terminal, because sudo has to ask for your password. '
@@ -295,8 +296,14 @@ export async function refreshUnit({ entry, dataDir, unitPath = UNIT_PATH, ...opt
  * where the user removed the unit by hand, or they are left unable to clean up
  * through the tool at all.
  */
-export async function uninstall({ log = () => {}, interactive = runInteractive, fileRunner = runFile, unitPath = UNIT_PATH } = {}) {
-  if (!process.stdin.isTTY) {
+export async function uninstall({
+  log = () => {},
+  interactive = runInteractive,
+  fileRunner = runFile,
+  unitPath = UNIT_PATH,
+  stdin = process.stdin,
+} = {}) {
+  if (!stdin?.isTTY) {
     return {
       ok: false,
       reason: 'removing the service needs a real terminal, because sudo has to ask for your password.',

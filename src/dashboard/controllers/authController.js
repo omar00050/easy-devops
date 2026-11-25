@@ -38,7 +38,7 @@ import {
   validateNewPassword,
   MIN_PASSWORD_LENGTH,
 } from '../../core/passwords.js';
-import { isLoopbackAddress } from '../lib/localRequest.js';
+import { isDirectLoopbackRequest } from '../lib/localRequest.js';
 import { recordAttempt, clearAttempts } from '../lib/loginRateLimit.js';
 import * as setupCode from '../../core/setupCode.js';
 
@@ -74,7 +74,7 @@ function needsSetup(config) {
  * @returns {boolean}
  */
 function canUseNoPassword(req, config) {
-  return isNoAuthAllowed(config) && isLoopbackAddress(req.ip ?? req.socket?.remoteAddress);
+  return isNoAuthAllowed(config) && isDirectLoopbackRequest(req);
 }
 
 class AuthController {
@@ -222,23 +222,34 @@ class AuthController {
     const { mode, password, setupCode: submittedCode } = req.body ?? {};
 
     if (mode === AUTH_MODES.NONE) {
-      if (!canUseNoPassword(req, config)) {
-        return res.status(400).json({
-          ok: false,
-          error: isNoAuthAllowed(config)
-            ? 'Running without a password can only be chosen from this machine.'
-            : `Running without a password requires the dashboard to listen on this machine only (currently ${config.dashboardBindAddress}).`,
-        });
-      }
+      return setupCode.withSetupCodeLock(async () => {
+        const current = loadConfig();
+        const currentConfigured =
+          effectiveAuthMode(current) === AUTH_MODES.NONE || storedSecret(current) !== '';
+        if (currentConfigured) {
+          return res.status(409).json({
+            ok: false,
+            error: 'This dashboard is already configured. Sign in, then change it in Settings.',
+          });
+        }
+        if (!canUseNoPassword(req, current)) {
+          return res.status(400).json({
+            ok: false,
+            error: isNoAuthAllowed(current)
+              ? 'Running without a password can only be chosen from this machine.'
+              : `Running without a password requires the dashboard to listen on this machine only (currently ${current.dashboardBindAddress}).`,
+          });
+        }
 
-      saveConfig({ ...loadConfig(), dashboardAuth: AUTH_MODES.NONE });
+        saveConfig({ ...current, dashboardAuth: AUTH_MODES.NONE });
 
-      // Setup is done on this path too, so the code has no further purpose.
-      // Removed for the same reason as after a password: an outstanding
-      // credential nobody needs is one more thing that can be read.
-      setupCode.clear();
+        // Setup is done on this path too, so the code has no further purpose.
+        // Removed for the same reason as after a password: an outstanding
+        // credential nobody needs is one more thing that can be read.
+        await setupCode.clear();
 
-      return res.json({ ok: true, authMode: AUTH_MODES.NONE });
+        return res.json({ ok: true, authMode: AUTH_MODES.NONE });
+      });
     }
 
     // Counted before the password is validated, and in its own budget: a
@@ -254,7 +265,22 @@ class AuthController {
       });
     }
 
-    if (setupCode.required()) {
+    return setupCode.withSetupCodeLock(async () => {
+      // Re-read inside the cross-process critical section. Two concurrent
+      // correct submissions must not both pass the "unconfigured" check.
+      const current = loadConfig();
+      const currentConfigured =
+        effectiveAuthMode(current) === AUTH_MODES.NONE || storedSecret(current) !== '';
+      if (currentConfigured) {
+        return res.status(409).json({
+          ok: false,
+          error: 'This dashboard is already configured. Sign in, then change it in Settings.',
+        });
+      }
+
+      // Password setup always requires a live issuance. A missing or malformed
+      // record is not permission to skip proof: startup creates the record,
+      // and a damaged one has to be repaired from this machine's CLI.
       const checked = await setupCode.verify(submittedCode);
       if (!checked.ok) {
         // One message for missing, wrong and malformed, so a probe cannot tell
@@ -264,7 +290,9 @@ class AuthController {
           ? 'That setup code has expired. Issue a new one on the server: ezz dashboard setup-code'
           : checked.burned
             ? 'Too many incorrect setup codes. Issue a new one on the server: ezz dashboard setup-code'
-            : 'That setup code is not valid.';
+            : checked.reason === 'none' || checked.reason === 'replaced'
+              ? 'No usable setup code is outstanding. Issue one on the server: ezz dashboard setup-code'
+              : 'That setup code is not valid.';
 
         if (checked.burned) {
           console.error(
@@ -275,39 +303,50 @@ class AuthController {
 
         return res.status(400).json({ ok: false, error: message });
       }
-    }
 
-    const problem = validateNewPassword(password);
-    if (problem) {
-      return res.status(400).json({ ok: false, error: problem });
-    }
-
-    try {
-      const hashed = await hashPassword(password);
-      saveConfig({
-        ...loadConfig(),
-        dashboardAuth: AUTH_MODES.PASSWORD,
-        dashboardPasswordHash: hashed,
-        dashboardPassword: '',
-      });
-    } catch (err) {
-      return res.status(500).json({ ok: false, error: 'Could not save the password' });
-    }
-
-    // Setup is done, so the code has no further purpose. Removed rather than
-    // left to expire: an outstanding credential nobody needs is one more thing
-    // that can be read.
-    setupCode.clear();
-
-    // Sign the user straight in: they have just proven they can set it.
-    return req.session.regenerate((err) => {
-      if (err) {
-        return res.status(500).json({ ok: false, error: 'Could not start a session' });
+      const problem = validateNewPassword(password);
+      if (problem) {
+        return res.status(400).json({ ok: false, error: problem });
       }
-      req.session.authenticated = true;
-      clearAttempts(req);
-      clearAttempts(req, 'setup');
-      return res.json({ ok: true, authMode: AUTH_MODES.PASSWORD });
+
+      try {
+        const hashed = await hashPassword(password);
+        saveConfig({
+          ...loadConfig(),
+          dashboardAuth: AUTH_MODES.PASSWORD,
+          dashboardPasswordHash: hashed,
+          dashboardPassword: '',
+        });
+      } catch (err) {
+        return res.status(500).json({ ok: false, error: 'Could not save the password' });
+      }
+
+      // Setup is done, so the code has no further purpose. Compare-and-clear
+      // only the issuance that authorized this request; a rotated code wins.
+      const consumed = await setupCode.clear(checked.issuanceId);
+      if (!consumed) {
+        // This requires another process to have bypassed the shared lock.
+        // Refuse rather than silently accepting a setup against stale proof.
+        saveConfig(current);
+        return res.status(409).json({
+          ok: false,
+          error: 'The setup code changed while setup was being completed. Enter the new code and try again.',
+        });
+      }
+
+      // Sign the user straight in: they have just proven they can set it.
+      return new Promise((resolve) => {
+        req.session.regenerate((err) => {
+          if (err) {
+            resolve(res.status(500).json({ ok: false, error: 'Could not start a session' }));
+            return;
+          }
+          req.session.authenticated = true;
+          clearAttempts(req);
+          clearAttempts(req, 'setup');
+          resolve(res.json({ ok: true, authMode: AUTH_MODES.PASSWORD }));
+        });
+      });
     });
   }
 

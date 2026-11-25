@@ -16,7 +16,8 @@ import ora from 'ora';
 import { run, runLive, runInteractive, runInteractiveFile } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { ensureNginxInclude } from '../../core/nginx-conf-generator.js';
-import { isWindows, isNginxTestOk } from '../../core/platform.js';
+import { isWindows, isNginxTestOk, powerShellCall, powerShellLiteral } from '../../core/platform.js';
+import { completeLogLines, readBoundedTailSync } from '../../core/service/logTail.js';
 import { page, pause, BACK } from '../ui/page.js';
 import path from 'path';
 
@@ -29,6 +30,14 @@ async function pathExists(p) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function readLogTail(file, lines) {
+  try {
+    return completeLogLines(readBoundedTailSync(file), lines).join('\n');
+  } catch {
+    return '';
   }
 }
 
@@ -47,7 +56,7 @@ async function getNginxStatus(nginxDir) {
     const taskResult = await run('tasklist /FI "IMAGENAME eq nginx.exe" /NH');
     running = taskResult.success && taskResult.stdout.toLowerCase().includes('nginx.exe');
 
-    const versionResult = await run(`& "${nginxExe}" -v`);
+    const versionResult = await run(powerShellCall(nginxExe, ['-v']));
     const versionMatch = (versionResult.stderr + versionResult.stdout).match(/nginx\/(\S+)/);
     if (versionMatch) version = versionMatch[1];
   } else {
@@ -66,7 +75,7 @@ async function getNginxStatus(nginxDir) {
 
 async function testConfig(nginxExe, nginxDir) {
   await ensureNginxInclude(nginxDir);
-  const cmd = isWindows ? `& "${nginxExe}" -t` : 'nginx -t';
+  const cmd = isWindows ? powerShellCall(nginxExe, ['-t']) : 'nginx -t';
   const result = await run(cmd, { cwd: nginxDir });
 
   // On Linux: conf.d is directly under nginxDir (/etc/nginx/conf.d)
@@ -125,7 +134,7 @@ async function reloadNginx(nginxExe, nginxDir) {
   spinner.text = 'Reloading nginx…';
   let result;
   if (isWindows) {
-    result = await run(`& "${nginxExe}" -s reload`, { cwd: nginxDir });
+    result = await run(powerShellCall(nginxExe, ['-s', 'reload']), { cwd: nginxDir });
   } else {
     result = await runInteractive('sudo /usr/bin/systemctl reload nginx');
   }
@@ -160,7 +169,7 @@ async function restartNginx(nginxExe, nginxDir) {
   if (isWindows) {
     await run('taskkill /f /IM nginx.exe', { cwd: nginxDir });
     await new Promise(resolve => setTimeout(resolve, 2000));
-    result = await run(`& "${nginxExe}"`, { cwd: nginxDir });
+    result = await run(powerShellCall(nginxExe), { cwd: nginxDir });
   } else {
     result = await runInteractive('sudo /usr/bin/systemctl restart nginx');
   }
@@ -181,14 +190,9 @@ async function restartNginx(nginxExe, nginxDir) {
 // ─── viewErrorLog ─────────────────────────────────────────────────────────────
 
 async function viewErrorLog(logPath) {
-  const cmd = isWindows
-    ? `Get-Content -Tail 50 "${logPath}"`
-    : `tail -n 50 "${logPath}"`;
-
-  const result = await run(cmd);
-
-  if (result.success && result.stdout) {
-    console.log('\n' + result.stdout);
+  const output = readLogTail(logPath, 50);
+  if (output) {
+    console.log('\n' + output);
   } else {
     console.log(chalk.yellow('\n  No errors logged yet (log file not found or empty)\n'));
   }
@@ -212,7 +216,7 @@ async function startNginx(nginxExe, nginxDir) {
   if (isWindows) {
     // nginx.exe runs in the foreground on Windows and never exits, so we must
     // use Start-Process to launch it as a detached background process.
-    const startCmd = `Start-Process -FilePath "${nginxExe}" -WorkingDirectory "${nginxDir}" -WindowStyle Hidden`;
+    const startCmd = `Start-Process -FilePath ${powerShellLiteral(nginxExe)} -WorkingDirectory ${powerShellLiteral(nginxDir)} -WindowStyle Hidden`;
     await run(startCmd, { timeout: 10000 });
   } else {
     const result = await runInteractive('sudo /usr/bin/systemctl start nginx');
@@ -244,14 +248,11 @@ async function startNginx(nginxExe, nginxDir) {
   const logPath = isWindows
     ? `${nginxDir}\\logs\\error.log`
     : '/var/log/nginx/error.log';
-  const logCmd = isWindows
-    ? `Get-Content -Tail 20 "${logPath}" -ErrorAction SilentlyContinue`
-    : `tail -n 20 "${logPath}" 2>/dev/null`;
-  const logResult = await run(logCmd);
+  const logOutput = readLogTail(logPath, 20);
 
   console.log(chalk.yellow('\n  Recent error log:'));
-  if (logResult.success && logResult.stdout) {
-    console.log(chalk.red(logResult.stdout));
+  if (logOutput) {
+    console.log(chalk.red(logOutput));
   } else {
     console.log(chalk.gray('  (error log not found or empty)'));
   }
@@ -360,11 +361,12 @@ async function installNginx() {
 
   const { nginxDir } = loadConfig();
   const zipUrl = `https://nginx.org/download/nginx-${nginxVersion}.zip`;
+  const nginxDirLiteral = powerShellLiteral(nginxDir);
 
   spinner.text = `Downloading nginx ${nginxVersion}…`;
 
   const downloadResult = await run(
-    `$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '${zipUrl}' -OutFile "$env:TEMP\\nginx-${nginxVersion}.zip" -UseBasicParsing -TimeoutSec 120`,
+    `$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri ${powerShellLiteral(zipUrl)} -OutFile "$env:TEMP\\nginx-${nginxVersion}.zip" -UseBasicParsing -TimeoutSec 120`,
     { timeout: 130000 },
   );
 
@@ -378,7 +380,7 @@ async function installNginx() {
   spinner.text = 'Extracting nginx…';
 
   const extractResult = await run(
-    `$ProgressPreference='SilentlyContinue'; $tmp="$env:TEMP\\nginx-extract-${nginxVersion}"; if(Test-Path $tmp){Remove-Item -Recurse -Force $tmp}; Expand-Archive -Path "$env:TEMP\\nginx-${nginxVersion}.zip" -DestinationPath $tmp -Force; $src=Join-Path $tmp 'nginx-${nginxVersion}'; if(-not(Test-Path '${nginxDir}')){New-Item -ItemType Directory -Force '${nginxDir}'|Out-Null}; Copy-Item -Path "$src\\*" -Destination '${nginxDir}' -Recurse -Force; Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue; Remove-Item -Force "$env:TEMP\\nginx-${nginxVersion}.zip" -ErrorAction SilentlyContinue`,
+    `$ProgressPreference='SilentlyContinue'; $tmp="$env:TEMP\\nginx-extract-${nginxVersion}"; if(Test-Path $tmp){Remove-Item -Recurse -Force $tmp}; Expand-Archive -Path "$env:TEMP\\nginx-${nginxVersion}.zip" -DestinationPath $tmp -Force; $src=Join-Path $tmp 'nginx-${nginxVersion}'; if(-not(Test-Path ${nginxDirLiteral})){New-Item -ItemType Directory -Force ${nginxDirLiteral}|Out-Null}; Copy-Item -Path "$src\\*" -Destination ${nginxDirLiteral} -Recurse -Force; Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue; Remove-Item -Force "$env:TEMP\\nginx-${nginxVersion}.zip" -ErrorAction SilentlyContinue`,
     { timeout: 60000 },
   );
 
@@ -389,7 +391,7 @@ async function installNginx() {
   }
 
   // Verify nginx.exe is present
-  const verifyResult = await run(`Test-Path '${nginxDir}\\nginx.exe'`);
+  const verifyResult = await run(`Test-Path ${powerShellLiteral(`${nginxDir}\\nginx.exe`)}`);
   if (!verifyResult.success || !verifyResult.stdout.trim().toLowerCase().includes('true')) {
     spinner.fail(`nginx.exe not found in ${nginxDir} after extraction`);
     return { success: false, message: 'nginx.exe not found after extraction' };

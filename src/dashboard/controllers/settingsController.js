@@ -1,17 +1,18 @@
 import fs from 'fs/promises';
+import fsSync from 'node:fs';
 import path from 'path';
 import crypto from 'crypto';
 import {
-	loadConfig, saveConfig, BIND_ALL, BIND_LOOPBACK, BIND_LOOPBACK_V6,
+	loadConfig, saveConfig, BIND_LOOPBACK, BIND_LOOPBACK_V6,
 	AUTH_MODES, UI_MODES, isLoopbackBind, effectiveAuthMode,
 } from '../../core/config.js';
-import { isLoopbackAddress } from '../lib/localRequest.js';
+import { isDirectLoopbackRequest } from '../lib/localRequest.js';
 import { hashPassword, validateNewPassword } from '../../core/passwords.js';
 import { validatePort, validateEmail } from '../../core/validators.js';
 import {
 	getAutoRenewSettings, normalizeAutoRenewDays, MIN_AUTO_RENEW_DAYS, MAX_AUTO_RENEW_DAYS,
 } from '../../core/cert-renewal.js';
-import { isWindows } from '../../core/platform.js';
+import { getDataDir, isWindows } from '../../core/platform.js';
 import {
 	checkPermissionsConfigured, buildSetupScript, deriveOwnDirs,
 } from '../../core/permissions.js';
@@ -32,6 +33,41 @@ import { loadChannels, saveChannels, sendNotification } from '../../core/notifie
  */
 function resolveDashboardUi(config) {
 	return config?.dashboardUi === UI_MODES.NEW ? UI_MODES.NEW : UI_MODES.CLASSIC;
+}
+
+function comparablePath(target) {
+	const resolved = path.resolve(String(target ?? ''));
+	return isWindows ? resolved.toLowerCase() : resolved;
+}
+
+function pathsOverlap(left, right) {
+	const contains = (parent, child) => {
+		const relative = path.relative(comparablePath(parent), comparablePath(child));
+		return relative === ''
+			|| (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+	};
+	return contains(left, right) || contains(right, left);
+}
+
+/** Resolve symlinks in the nearest existing ancestor, then append the rest. */
+function containmentCanonical(target) {
+	let current = path.resolve(target);
+	const missing = [];
+	for (;;) {
+		try {
+			return path.join(fsSync.realpathSync.native(current), ...missing);
+		} catch (error) {
+			if (error?.code !== 'ENOENT') return path.resolve(target);
+			const parent = path.dirname(current);
+			if (parent === current) return path.resolve(target);
+			missing.unshift(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
+function canonicalPathsOverlap(left, right) {
+	return pathsOverlap(containmentCanonical(left), containmentCanonical(right));
 }
 
 class SettingsController {
@@ -67,7 +103,7 @@ class SettingsController {
 				// Whether the UI may offer 'none' at all: the bind must be loopback
 				// and the person asking must be on this machine.
 				canUseNoPassword: isLoopbackBind(dashboardBindAddress) &&
-					isLoopbackAddress(req.ip ?? req.socket?.remoteAddress),
+					isDirectLoopbackRequest(req),
 				hasPassword,
 				platform: isWindows ? 'win32' : 'linux',
 			});
@@ -98,9 +134,10 @@ class SettingsController {
 			}
 
 			if (dashboardBindAddress !== undefined &&
-					![BIND_ALL, BIND_LOOPBACK, BIND_LOOPBACK_V6].includes(dashboardBindAddress)) {
+					![BIND_LOOPBACK, BIND_LOOPBACK_V6].includes(dashboardBindAddress)) {
 				return res.status(400).json({
-					error: `Bind address must be ${BIND_LOOPBACK} (this machine only) or ${BIND_ALL} (all interfaces)`,
+					error: 'The dashboard must listen on this machine only. Put an HTTPS reverse proxy or secure tunnel on the same machine for remote access.',
+					reason: 'dashboard_requires_loopback',
 				});
 			}
 
@@ -118,33 +155,10 @@ class SettingsController {
 				});
 			}
 
-			// ── The auth/bind interlock ──────────────────────────────────────
-			//
-			// 'none' is only safe while nothing but this machine can reach the
-			// listener, so the two settings are validated TOGETHER against the
-			// state this request would produce — not against the current state.
-			// Otherwise a single request could set both and slip through by
-			// checking each against the old value.
-			const nextAuth = dashboardAuth ?? current.dashboardAuth;
-			const nextBind = dashboardBindAddress ?? current.dashboardBindAddress;
-
-			if (nextAuth === AUTH_MODES.NONE && !isLoopbackBind(nextBind)) {
-				// Which half the user is changing decides which message helps.
-				const changingBind = dashboardBindAddress !== undefined &&
-					dashboardBindAddress !== current.dashboardBindAddress;
-
-				return res.status(400).json({
-					error: changingBind
-						? 'This dashboard has no password, so it can only listen on this machine. Set a password first, then change where it listens.'
-						: `Running without a password requires the dashboard to listen on this machine only (currently ${nextBind}).`,
-					reason: changingBind ? 'bind_requires_password' : 'no_auth_requires_loopback',
-				});
-			}
-
 			// Turning auth OFF is only ever done from the machine itself.
 			if (dashboardAuth === AUTH_MODES.NONE &&
 					current.dashboardAuth !== AUTH_MODES.NONE &&
-					!isLoopbackAddress(req.ip ?? req.socket?.remoteAddress)) {
+					!isDirectLoopbackRequest(req)) {
 				return res.status(403).json({
 					error: 'Removing the password can only be done from this machine.',
 					reason: 'no_auth_requires_local_request',
@@ -156,6 +170,14 @@ class SettingsController {
 			}
 			if (sslDir !== undefined && (typeof sslDir !== 'string' || sslDir.trim() === '')) {
 				return res.status(400).json({ error: 'SSL directory must be a non-empty string' });
+			}
+			const effectiveSslDir = sslDir === undefined ? current.sslDir : sslDir.trim();
+			if (pathsOverlap(getDataDir(), effectiveSslDir)
+					|| canonicalPathsOverlap(getDataDir(), effectiveSslDir)) {
+				return res.status(400).json({
+					error: 'The SSL directory must not overlap the Easy DevOps data directory. Choose a dedicated directory for certificates and keys.',
+					reason: 'ssl_dir_overlaps_data_dir',
+				});
 			}
 
 			if (acmeEmail !== undefined) {

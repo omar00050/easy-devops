@@ -21,18 +21,21 @@
  * Both apply in BOTH auth modes. They are not a substitute for a password —
  * they stop a different attacker, one the password never protected against.
  *
- * ── On the Host check and non-loopback binds ───────────────────────────────
+ * ── Host checks and TLS termination ────────────────────────────────────────
  *
- * When the dashboard is bound to loopback, Host must be a loopback name. That
- * covers every `dashboardAuth: 'none'` install by construction, since that
- * mode requires a loopback bind.
+ * The dashboard listener is loopback-only because it speaks plain HTTP. A
+ * request may carry a public Host/Origin through a local HTTPS reverse proxy
+ * or authenticated tunnel. Those forwarded names are honoured only when all of
+ * these are true:
  *
- * When the user has deliberately bound to every interface to reach the
- * dashboard from another machine, demanding Host=localhost would make the
- * dashboard unreachable — so there the rule becomes same-origin instead:
- * Origin, when present, must match the Host the request arrived on. That
- * keeps the anti-CSRF guarantee without breaking the feature.
+ *   - the TCP peer is loopback;
+ *   - X-Forwarded-Proto is exactly https (not a comma-separated chain); and
+ *   - X-Forwarded-Host contains one host, not a list.
+ *
+ * A direct request cannot use forwarded headers to relax the loopback rule.
  */
+
+import net from 'node:net';
 
 import { isLoopbackBind } from '../../core/config.js';
 
@@ -40,11 +43,17 @@ import { isLoopbackBind } from '../../core/config.js';
 export const REQUEST_HEADER = 'x-ez-request';
 export const REQUEST_HEADER_VALUE = '1';
 
-/** Hostnames that mean "this machine". */
-const LOOPBACK_HOSTNAMES = Object.freeze(['localhost', '127.0.0.1', '::1', '[::1]']);
-
 /** Methods that change state, and therefore need the custom header. */
 const STATE_CHANGING = Object.freeze(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/** Headers that prove a request came through a proxy or tunnel. */
+const FORWARDING_HEADERS = Object.freeze([
+  'forwarded',
+  'x-forwarded-for',
+  'x-forwarded-host',
+  'x-forwarded-proto',
+  'x-real-ip',
+]);
 
 /**
  * Splits a Host header into hostname and port.
@@ -64,26 +73,70 @@ export function parseHost(hostHeader) {
     if (close === -1) return null;
     const hostname = raw.slice(1, close);
     const rest = raw.slice(close + 1);
-    const port = rest.startsWith(':') ? rest.slice(1) : null;
-    return { hostname, port: port || null };
+    if (net.isIP(hostname) !== 6) return null;
+    if (rest === '') return { hostname, port: null };
+    if (!/^:\d+$/.test(rest)) return null;
+    return { hostname, port: rest.slice(1) };
   }
 
   const colon = raw.lastIndexOf(':');
   if (colon === -1) return { hostname: raw, port: null };
-  return { hostname: raw.slice(0, colon), port: raw.slice(colon + 1) || null };
+  // An unbracketed IPv6 address is not a valid HTTP Host value, and a trailing
+  // colon does not mean "the default port".
+  if (raw.indexOf(':') !== colon || colon === 0 || colon === raw.length - 1) return null;
+  return { hostname: raw.slice(0, colon), port: raw.slice(colon + 1) };
 }
 
 /** True when a hostname means "this machine". */
 export function isLoopbackHostname(hostname) {
-  return LOOPBACK_HOSTNAMES.includes(String(hostname ?? '').toLowerCase());
+  const value = String(hostname ?? '').toLowerCase();
+  return value === 'localhost' || isLoopbackAddress(value);
 }
 
 /** True when a remote address is a loopback address. */
 export function isLoopbackAddress(addr) {
-  const a = String(addr ?? '');
-  // Express reports IPv4-mapped IPv6 as ::ffff:127.0.0.1.
-  return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1' ||
-    a.startsWith('127.');
+  let address = String(addr ?? '').trim().toLowerCase();
+  if (address.startsWith('[') && address.endsWith(']')) address = address.slice(1, -1);
+  const zone = address.indexOf('%');
+  if (zone !== -1) address = address.slice(0, zone);
+
+  // Express may report IPv4-mapped IPv6.
+  if (address.startsWith('::ffff:')) address = address.slice(7);
+
+  if (net.isIP(address) === 4) return address.startsWith('127.');
+  return address === '::1';
+}
+
+/** All values of one case-insensitive header from Node's rawHeaders array. */
+function rawHeaderValues(rawHeaders, wanted) {
+  if (!Array.isArray(rawHeaders)) return [];
+  const values = [];
+  for (let index = 0; index + 1 < rawHeaders.length; index += 2) {
+    if (String(rawHeaders[index]).toLowerCase() === wanted) {
+      values.push(String(rawHeaders[index + 1]));
+    }
+  }
+  return values;
+}
+
+/** Returns true when either the normalized or raw headers contain forwarding metadata. */
+function hasForwardingHeaders(req) {
+  const headers = req?.headers ?? {};
+  if (FORWARDING_HEADERS.some((name) => headers[name] !== undefined)) return true;
+  return Array.isArray(req?.rawHeaders)
+    && rawHeaderValues(req.rawHeaders, 'forwarded').length > 0;
+}
+
+/**
+ * True only for a direct local request.
+ *
+ * A loopback TCP peer can be an HTTPS reverse proxy. Such a request is still
+ * local at the transport layer, but it does not prove that the browser user is
+ * sitting at this machine. Passwordless mode must require both properties.
+ */
+export function isDirectLoopbackRequest(req) {
+  const peerAddress = req?.socket?.remoteAddress ?? req?.connection?.remoteAddress;
+  return isLoopbackAddress(peerAddress) && !hasForwardingHeaders(req);
 }
 
 /**
@@ -99,21 +152,70 @@ export function isLoopbackAddress(addr) {
 export function checkLocalRequest(req, { port, bindAddress, requireHeader } = {}) {
   const headers = req?.headers ?? {};
   const method = String(req?.method ?? 'GET').toUpperCase();
-  const loopbackOnly = isLoopbackBind(bindAddress);
+  // The listener itself must be loopback. Keeping this invariant here is
+  // defence in depth if a future caller accidentally passes a public bind.
+  const listenerLoopback = isLoopbackBind(bindAddress);
+  let loopbackOnly = true;
+  const peerAddress = req?.socket?.remoteAddress ?? req?.connection?.remoteAddress;
+
+  // A local HTTPS reverse proxy or authenticated tunnel may preserve the
+  // operator's public Host/Origin while connecting to loopback. Trust those
+  // two forwarded values only when the TCP peer itself is loopback and the
+  // proxy says the original scheme was HTTPS. A direct remote peer cannot set
+  // them because the dashboard has no non-loopback listener.
+  let forwardedTls = false;
+  let hostHeader = headers.host;
+  const rawHostValues = rawHeaderValues(req?.rawHeaders, 'host');
+  const rawProtoValues = rawHeaderValues(req?.rawHeaders, 'x-forwarded-proto');
+  const rawForwardedHostValues = rawHeaderValues(req?.rawHeaders, 'x-forwarded-host');
+  if (rawHostValues.length > 1 || rawProtoValues.length > 1 || rawForwardedHostValues.length > 1) {
+    return {
+      ok: false,
+      reason: 'duplicate_forwarding_header',
+      detail: 'Host and forwarded host/scheme headers may appear only once',
+    };
+  }
+  const forwardedProto = String(headers['x-forwarded-proto'] ?? '').toLowerCase().trim();
+  const forwardedHostRaw = headers['x-forwarded-host'];
+  if (
+    listenerLoopback
+    && isLoopbackAddress(peerAddress)
+    && forwardedProto === 'https'
+    && typeof forwardedHostRaw === 'string'
+    && forwardedHostRaw
+    && !forwardedHostRaw.includes(',')
+  ) {
+    hostHeader = forwardedHostRaw;
+    forwardedTls = true;
+    loopbackOnly = false;
+  }
 
   // ── Host ──────────────────────────────────────────────────────────────────
-  const host = parseHost(headers.host);
+  const host = parseHost(hostHeader);
   if (!host) {
     return { ok: false, reason: 'host_missing', detail: 'No Host header' };
+  }
+  if (
+    /[\s/\\@?#]/.test(host.hostname)
+    || (host.port !== null && !/^\d+$/.test(host.port))
+    || (host.port !== null && (Number(host.port) < 1 || Number(host.port) > 65535))
+  ) {
+    return { ok: false, reason: 'host_invalid', detail: 'Host is not a valid host name and port' };
   }
 
   // A mismatched port means the request was aimed somewhere else and arrived
   // here — exactly the shape of a rebinding attempt.
-  if (host.port !== null && port !== undefined && String(port) !== host.port) {
+  const effectivePort = forwardedTls ? (host.port ?? '443') : port;
+  if (
+    !forwardedTls
+    && port !== undefined
+    && host.port !== String(port)
+    && !(host.port === null && String(port) === '80')
+  ) {
     return {
       ok: false,
       reason: 'host_port_mismatch',
-      detail: `Host port ${host.port} is not the dashboard port ${port}`,
+      detail: `Host port ${host.port ?? '(default)'} is not the dashboard port ${port}`,
     };
   }
 
@@ -137,12 +239,21 @@ export function checkLocalRequest(req, { port, bindAddress, requireHeader } = {}
       return { ok: false, reason: 'origin_malformed', detail: `Origin '${originHeader}' is not a URL` };
     }
 
+    const expectedProtocol = forwardedTls ? 'https:' : 'http:';
+    if (origin.protocol !== expectedProtocol) {
+      return {
+        ok: false,
+        reason: 'origin_protocol_mismatch',
+        detail: `Origin protocol ${origin.protocol} is not the expected ${expectedProtocol}`,
+      };
+    }
+
     const originPort = origin.port || (origin.protocol === 'https:' ? '443' : '80');
-    if (port !== undefined && String(port) !== originPort) {
+    if (effectivePort !== undefined && String(effectivePort) !== originPort) {
       return {
         ok: false,
         reason: 'origin_port_mismatch',
-        detail: `Origin port ${originPort} is not the dashboard port ${port}`,
+        detail: `Origin port ${originPort} is not the expected port ${effectivePort}`,
       };
     }
 

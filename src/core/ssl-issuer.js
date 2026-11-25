@@ -34,6 +34,7 @@ import {
 import { run as defaultRun } from './shell.js';
 import {
   isDevDataDir,
+  getDataDir,
   nginxServiceStartCmd,
   nginxServiceStopCmd,
   nginxServiceReloadCmd,
@@ -48,8 +49,14 @@ import {
   hasChallengeLocation,
   DEFAULT_ACME_CHALLENGE_PORT,
 } from './nginx-conf-generator.js';
-import { protectKeyDirectory, loadAccountKey, replaceCertificateFile } from './ssl/private-keys.js';
+import { protectKeyDirectory, loadAccountKey } from './ssl/private-keys.js';
+import { recordManagedArtifacts } from './ssl/managed-artifacts.js';
+import { publishCertificateFiles } from './ssl/certificate-transaction.js';
 import { withChallengeServer } from './acme-challenge.js';
+import {
+  acquireArtifactLock,
+  SSL_ARTIFACT_LIFECYCLE_LOCK,
+} from './ssl/artifact-lock.js';
 
 /**
  * Written next to fullchain.pem after every successful issuance. It records
@@ -183,6 +190,16 @@ async function ensureCertDir(sslDir, domainName) {
       );
     }
     throw err;
+  }
+}
+
+async function pathIsPresentNoFollow(target) {
+  try {
+    await fs.lstat(target);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
   }
 }
 
@@ -484,6 +501,19 @@ async function applyNginxAndVerify({
  * }>}
  */
 export async function issueCertificate(domainName, options = {}) {
+  const lifecycle = await acquireArtifactLock({
+    dataDir: getDataDir(),
+    key: SSL_ARTIFACT_LIFECYCLE_LOCK,
+    timeoutMs: 6 * 60_000,
+  });
+  try {
+    return await issueCertificateLocked(domainName, options);
+  } finally {
+    lifecycle.release();
+  }
+}
+
+async function issueCertificateLocked(domainName, options = {}) {
   const {
     www = false,
     wildcard = false,
@@ -504,6 +534,7 @@ export async function issueCertificate(domainName, options = {}) {
   const acmeLib = deps.acme ?? acme;
   const preflightFn = deps.preflight ?? runPreflight;
   const challengeServer = deps.withChallengeServer ?? withChallengeServer;
+  const recordArtifacts = deps.recordManagedArtifacts ?? recordManagedArtifacts;
   const now = deps.now ?? Date.now;
   const opId = isValidOpId(rawOpId) ? rawOpId : newOpId();
   const progress = createSslProgress({
@@ -524,6 +555,7 @@ export async function issueCertificate(domainName, options = {}) {
   const config = loadConfig();
   const sslDir = config.sslDir;
   const nginxDir = config.nginxDir;
+  const certDir = path.join(sslDir, domainName);
   const challengePort = Number(config.acmeChallengePort) || DEFAULT_ACME_CHALLENGE_PORT;
   const staging = useStaging(config, stagingOverride);
 
@@ -665,10 +697,48 @@ export async function issueCertificate(domainName, options = {}) {
   let csr;
   let domainKey;
   let altNames;
+  let rootWasPresent = true;
+  let domainDirWasPresent = true;
+  let accountDirWasPresent = true;
+  let accountKeyWasPresent = true;
   try {
     report('account and order', 'running', "Preparing the Let's Encrypt account and order");
+    [rootWasPresent, domainDirWasPresent, accountDirWasPresent, accountKeyWasPresent] =
+      await Promise.all([
+        pathIsPresentNoFollow(sslDir),
+        pathIsPresentNoFollow(certDir),
+        pathIsPresentNoFollow(path.join(sslDir, '.account')),
+        pathIsPresentNoFollow(path.join(sslDir, '.account', 'account.key')),
+      ]);
     await ensureCertDir(sslDir, domainName);
-    const accountKey = await loadAccountKey(sslDir, () => acmeLib.crypto.createPrivateKey());
+
+    const createdCertificateDirectories = domainDirWasPresent ? [] : [domainName];
+    if (!rootWasPresent || createdCertificateDirectories.length) {
+      await recordArtifacts({
+        dataDir: getDataDir(),
+        sslDir,
+        rootCreated: !rootWasPresent,
+        directories: createdCertificateDirectories,
+      });
+    }
+
+    let accountKey;
+    try {
+      accountKey = await loadAccountKey(sslDir, () => acmeLib.crypto.createPrivateKey());
+    } finally {
+      const accountDirectoryNowExists = !accountDirWasPresent
+        && await pathIsPresentNoFollow(path.join(sslDir, '.account'));
+      const accountKeyNowExists = !accountKeyWasPresent
+        && await pathIsPresentNoFollow(path.join(sslDir, '.account', 'account.key'));
+      if (accountDirectoryNowExists || accountKeyNowExists) {
+        await recordArtifacts({
+          dataDir: getDataDir(),
+          sslDir,
+          directories: accountDirectoryNowExists ? ['.account'] : [],
+          files: accountKeyNowExists ? ['.account/account.key'] : [],
+        });
+      }
+    }
     client = new acmeLib.Client({ directoryUrl: directoryUrl(staging, acmeLib), accountKey });
 
     altNames = wildcard
@@ -681,30 +751,33 @@ export async function issueCertificate(domainName, options = {}) {
     return fail('account and order', err, 'No certificate was issued.');
   }
 
-  const certDir = path.join(sslDir, domainName);
   const writeCert = async (cert) => {
-    const certPath = path.join(certDir, 'fullchain.pem');
-    const keyPath = path.join(certDir, 'privkey.pem');
-    await replaceCertificateFile(keyPath, domainKey);
-    await replaceCertificateFile(certPath, cert);
-
-    // Best effort: a certificate without this file still renews — the names
-    // are read back out of the certificate — so a failed write must never
-    // turn a successful issuance into a reported failure.
-    try {
-      await replaceCertificateFile(
-        path.join(certDir, CERT_META_FILE),
-        JSON.stringify({
+    const dataDir = getDataDir();
+    return publishCertificateFiles({
+      dataDir,
+      sslDir,
+      domain: domainName,
+      files: {
+        'privkey.pem': domainKey,
+        'fullchain.pem': cert,
+        [CERT_META_FILE]: JSON.stringify({
           domain: domainName,
           altNames,
           validationMethod: validationMethod === 'dns' ? 'dns' : 'http',
           staging,
           issuedAt: new Date().toISOString(),
         }, null, 2),
-      );
-    } catch { /* non-fatal */ }
-
-    return { certPath, keyPath };
+      },
+      onPublished: () => recordArtifacts({
+        dataDir,
+        sslDir,
+        files: [
+          `${domainName}/fullchain.pem`,
+          `${domainName}/privkey.pem`,
+          `${domainName}/${CERT_META_FILE}`,
+        ],
+      }),
+    });
   };
 
   // ─── DNS-01 (wildcards) — nginx is never touched ──────────────────────────

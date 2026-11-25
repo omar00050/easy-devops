@@ -21,7 +21,11 @@ fs.mkdirSync(genuinePackage, { recursive: true });
 fs.writeFileSync(path.join(genuinePackage, 'package.json'), JSON.stringify({ name: 'snappy', main: 'index.js' }));
 fs.writeFileSync(path.join(genuinePackage, 'index.js'), 'module.exports = "genuine";\n');
 installRuntimeStubs(root);
-assert.equal(fs.readFileSync(path.join(genuinePackage, 'index.js'), 'utf8'), 'module.exports = "genuine";\n');
+assert.match(
+  fs.readFileSync(path.join(genuinePackage, 'easy-devops-optional.cjs'), 'utf8'),
+  /Optional module snappy unavailable/,
+);
+assert.equal(fs.existsSync(path.join(genuinePackage, 'index.js')), false);
 fs.rmSync(genuinePackage, { recursive: true, force: true });
 installRuntimeStubs(root);
 const external = path.join(TEST_DATA_DIR, 'node_modules', 'outside-fixture');
@@ -66,4 +70,4 @@ const real = spawnSync(process.execPath, [`--experimental-loader=${realLoader.hr
   fileURLToPath(boundary), '--input-type=module', '-e', `const boundary = await import(${JSON.stringify(boundary.href)}); boundary.default.install(); ${probe}`],
 { encoding: 'utf8', timeout: 30000 });
 assert.equal(real.status, 0, real.stderr);
-console.log('PASS  daemon rejects external CommonJS, ESM and native dependencies, preserves installed optionals and uses local fallbacks');
+console.log('PASS  daemon rejects external CommonJS, ESM and native dependencies, replaces pre-seeded optionals and uses local fallbacks');

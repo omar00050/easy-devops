@@ -518,6 +518,7 @@ async function main() {
       startedAt: '2026-01-01T12:00:00.000Z',
       finishedAt: '2026-01-01T12:01:00.000Z',
       logTail: [],
+      logSecurity: 'redacted-v1',
     };
     store.writeRun(run, TEST_DATA_DIR);
     fs.writeFileSync(

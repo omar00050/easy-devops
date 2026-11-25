@@ -132,7 +132,7 @@ export async function startDaemon({
   // of the daemon and the dashboard starts first issues it; the other says
   // one is outstanding, because nothing stores the cleartext to re-print.
   try {
-    const code = await ensureSetupCode({ config: loadConfig() });
+    const code = await ensureSetupCode({ config: loadConfig });
     if (code.pending) for (const line of describeSetupCode(code)) log(line);
   } catch (err) {
     log(`  setup code     : unavailable (${err.message})`);

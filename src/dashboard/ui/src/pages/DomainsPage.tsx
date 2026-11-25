@@ -229,7 +229,8 @@ export function DomainsPage() {
         'Domain deleted',
         result.certDeleted
           ? `${deleteTarget.name}, its nginx config and its certificate files were removed.`
-          : `${deleteTarget.name} and its nginx config were removed. The certificate files were kept.`
+          : result.certMessage
+            ?? `${deleteTarget.name} and its nginx config were removed. The certificate files were kept.`
       );
       setDeleteTarget(null);
       resource.reload();

@@ -29,6 +29,20 @@ export const DATA_DIR_ENV = 'EASY_DEVOPS_DATA_DIR';
 export const TEST_MODE_ENV = 'EZ_TEST';
 
 /**
+ * Windows system locations are resolved from fixed machine roots.
+ *
+ * An unprivileged process can set ProgramData and SystemRoot before asking
+ * Windows for elevation. Trusting either value inside the elevated child would
+ * let the caller choose where the service is installed or which icacls.exe is
+ * run. Tests may redirect ProgramData into their own temporary directory, but
+ * production never accepts a caller-supplied machine root.
+ */
+export const WINDOWS_SYSTEM_ROOT = 'C:\\Windows';
+export const WINDOWS_PROGRAM_DATA_ROOT = 'C:\\ProgramData';
+export const WINDOWS_PROGRAM_FILES_ROOT = 'C:\\Program Files';
+export const WINDOWS_PROGRAM_FILES_X86_ROOT = 'C:\\Program Files (x86)';
+
+/**
  * The per-user data directory: where a normal, non-service install lives.
  */
 function userDataDir() {
@@ -47,7 +61,14 @@ function userDataDir() {
  * dashboard all see one database.
  */
 export function programDataDir() {
-  return path.join(process.env.ProgramData || 'C:\\ProgramData', 'easy-devops');
+  let root = WINDOWS_PROGRAM_DATA_ROOT;
+  if (process.env[TEST_MODE_ENV] === '1') {
+    const testRoot = process.env.ProgramData?.trim();
+    if (testRoot && path.isAbsolute(testRoot) && isDirWithin(testRoot, os.tmpdir())) {
+      root = path.win32.resolve(testRoot);
+    }
+  }
+  return path.win32.join(root, 'easy-devops');
 }
 
 /**
@@ -342,17 +363,53 @@ export function windowsElevatedRelaunchCmd({ execPath, script, args = [], cwd, e
       || (sid !== undefined && !/^S-[0-9]+(?:-[0-9]+)+$/.test(sid))) {
     throw new Error('refusing to pass an unexpected environment value to an elevated process');
   }
-  const payload = Buffer.from(JSON.stringify({ execPath, script, args, cwd, sid }), 'utf8').toString('base64');
+  const payload = Buffer.from(JSON.stringify({ execPath, script, args, sid }), 'utf8').toString('base64');
   const lines = [
     `$p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}')) | ConvertFrom-Json`,
+    // The unelevated caller can set any inherited variable before UAC. Start
+    // the elevated copy from a clean environment, then rebuild the machine and
+    // user values it needs from Windows rather than from the caller.
+    'Get-ChildItem Env: | Remove-Item -ErrorAction SilentlyContinue',
+    "$env:SystemRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)",
+    "$env:ProgramData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)",
+    "$env:USERPROFILE = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)",
+    "$env:APPDATA = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)",
+    "$env:LOCALAPPDATA = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)",
+    "$env:SystemDrive = [Environment]::GetEnvironmentVariable('SystemDrive', 'Machine')",
+    '$env:WINDIR = $env:SystemRoot',
+    "$env:ProgramFiles = [Environment]::GetEnvironmentVariable('ProgramFiles', 'Machine')",
+    "${env:ProgramFiles(x86)} = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)', 'Machine')",
+    "$env:ProgramW6432 = [Environment]::GetEnvironmentVariable('ProgramW6432', 'Machine')",
+    "$env:CommonProgramFiles = [Environment]::GetEnvironmentVariable('CommonProgramFiles', 'Machine')",
+    "${env:CommonProgramFiles(x86)} = [Environment]::GetEnvironmentVariable('CommonProgramFiles(x86)', 'Machine')",
+    "$env:CommonProgramW6432 = [Environment]::GetEnvironmentVariable('CommonProgramW6432', 'Machine')",
+    "$env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine')",
+    "$env:PATHEXT = [Environment]::GetEnvironmentVariable('PATHEXT', 'Machine')",
+    "$env:TEMP = [Environment]::GetEnvironmentVariable('TEMP', 'Machine')",
+    "$env:TMP = [Environment]::GetEnvironmentVariable('TMP', 'Machine')",
+    "if (-not $env:TEMP) { $env:TEMP = Join-Path $env:SystemRoot 'Temp' }",
+    'if (-not $env:TMP) { $env:TMP = $env:TEMP }',
+    "$env:NUMBER_OF_PROCESSORS = [Environment]::GetEnvironmentVariable('NUMBER_OF_PROCESSORS', 'Machine')",
+    "$env:PROCESSOR_ARCHITECTURE = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE', 'Machine')",
+    "$env:ComSpec = Join-Path $env:SystemRoot 'System32\\cmd.exe'",
+    "$env:PSModulePath = @((Join-Path $env:ProgramFiles 'WindowsPowerShell\\Modules'), (Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\Modules')) -join ';'",
     'if ($p.sid) { $env:EZ_OPERATOR_SID = $p.sid } else { Remove-Item Env:EZ_OPERATOR_SID -ErrorAction SilentlyContinue }',
-    'Set-Location -LiteralPath $p.cwd -ErrorAction Stop',
+    // Never inherit a caller-controlled working directory. Node resolves the
+    // entry script from its absolute path, and any helper that searches the
+    // current directory must therefore see the protected Windows directory.
+    'Set-Location -LiteralPath $env:SystemRoot -ErrorAction Stop',
+    '$nodeItem = Get-Item -LiteralPath $p.execPath -Force -ErrorAction Stop',
+    "if ($nodeItem.PSIsContainer) { throw 'The selected node.exe is not a file.' }",
+    '$p.execPath = $nodeItem.FullName',
+    '$nodeSignature = Get-AuthenticodeSignature -FilePath $p.execPath -ErrorAction Stop',
+    "if ($nodeSignature.Status -ne 'Valid') { throw 'The selected node.exe does not have a valid Authenticode signature.' }",
     '$cliArgs = @($p.script) + @($p.args)',
     '& $p.execPath @cliArgs',
     'Write-Host "Easy DevOps finished (exit code $LASTEXITCODE). This window stays open; close it when you are done."',
   ];
   const encoded = Buffer.from(lines.join('\n'), 'utf16le').toString('base64');
-  return 'try { Start-Process -FilePath (Join-Path $PSHOME powershell.exe) -Verb RunAs -ErrorAction Stop '
+  return "try { Start-Process -FilePath 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' "
+    + '-Verb RunAs -ErrorAction Stop '
     + `-ArgumentList '-NoExit','-NoProfile','-EncodedCommand','${encoded}'; 'relaunched' } `
     + "catch { 'relaunch-failed: ' + $_.Exception.Message; exit 1 }";
 }
@@ -471,15 +528,44 @@ export async function readProcessCommandLine(pid) {
 }
 
 /**
- * Returns the nginx binary invocation string suitable for use in shell commands.
- * On Windows returns `& "path\nginx.exe"` (PowerShell call operator + quoted path).
+ * Quote one value as a PowerShell single-quoted literal.
+ *
+ * Values inserted into a PowerShell command can contain `$`, backticks or
+ * parentheses from a saved nginx directory. Single quotes make all of those
+ * literal. A single quote itself is represented by doubling it.
+ */
+export function powerShellLiteral(value) {
+  const text = String(value ?? '');
+  if (/[\0\r\n]/.test(text)) {
+    throw new Error('PowerShell arguments cannot contain control characters');
+  }
+  return `'${text.replace(/'/g, "''")}'`;
+}
+
+/**
+ * Builds a PowerShell invocation of an executable with literal arguments.
+ * Every value is single-quoted, so `$`, backticks, parentheses and quotes have
+ * no evaluator meaning.
+ *
+ * @param {string} file
+ * @param {string[]} [args]
+ * @returns {string}
+ */
+export function powerShellCall(file, args = []) {
+  const rendered = args.map((arg) => powerShellLiteral(String(arg)));
+  return `& ${powerShellLiteral(file)}${rendered.length ? ` ${rendered.join(' ')}` : ''}`;
+}
+
+/**
+ * Returns the nginx binary invocation string suitable for PowerShell.
+ * On Windows returns `& 'path\nginx.exe'`.
  * On Linux/macOS returns the plain `nginx` command (assumed to be on PATH).
  * @param {string} nginxDir
  * @returns {string}
  */
 export function getNginxExe(nginxDir) {
   if (isWindows) {
-    return `& "${nginxDir}\\nginx.exe"`;
+    return `& ${powerShellLiteral(`${nginxDir}\\nginx.exe`)}`;
   }
   return 'nginx';
 }
@@ -494,7 +580,7 @@ export function getNginxExe(nginxDir) {
 export function nginxTestCmd(nginxDir) {
   if (isWindows) {
     const confPath = `${nginxDir}\\conf\\nginx.conf`;
-    return `& "${nginxDir}\\nginx.exe" -c "${confPath}" -t`;
+    return `& ${powerShellLiteral(`${nginxDir}\\nginx.exe`)} -c ${powerShellLiteral(confPath)} -t`;
   }
   return 'nginx -t';
 }
@@ -506,7 +592,7 @@ export function nginxTestCmd(nginxDir) {
  */
 export function nginxReloadCmd(nginxDir) {
   if (isWindows) {
-    return `& "${nginxDir}\\nginx.exe" -s reload`;
+    return `& ${powerShellLiteral(`${nginxDir}\\nginx.exe`)} -s reload`;
   }
   return 'nginx -s reload';
 }
@@ -533,7 +619,7 @@ export function nginxServiceStartCmd(nginxDir) {
   if (isWindows) {
     const exe = path.join(nginxDir, 'nginx.exe');
     const conf = path.join(nginxDir, 'conf', 'nginx.conf');
-    return `Start-Process -FilePath "${exe}" -ArgumentList '-c','"${conf}"' -WorkingDirectory "${nginxDir}" -WindowStyle Hidden`;
+    return `Start-Process -FilePath ${powerShellLiteral(exe)} -ArgumentList @('-c', ${powerShellLiteral(conf)}) -WorkingDirectory ${powerShellLiteral(nginxDir)} -WindowStyle Hidden`;
   }
   return 'sudo -n /usr/bin/systemctl start nginx';
 }

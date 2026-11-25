@@ -7,7 +7,180 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [1.4.5] — 2026-11-25
+
+### Security
+
+- Deployment-generated PM2 configuration, launchers and release metadata are
+  published in an engine-owned directory outside the app checkout, using
+  exclusive temporary files and atomic replacement. Existing repository links
+  cannot redirect those writes.
+- Windows ACL grant and revoke operations call `icacls.exe` directly. They are
+  limited to approved, canonical, existing directories and refuse links,
+  reparse points, system trees, and container roots.
+- Windows Server data migration rejects linked, reparse-pointed, and
+  non-directory source or destination paths, and hard-linked destination files,
+  before copying. A hard-linked source file is only read. The Server mode
+  marker is created with exclusive access and atomic replacement, and a linked
+  or replaced marker is refused.
+- Windows service protection rewrites each directory and file in the approved
+  tree one object at a time, locking a directory before enumerating its
+  children and never using recursive `icacls /T`. It refuses links, native
+  reparse points, and hard-linked files before they can receive a changed ACL.
+  The data root grants no read access to `BUILTIN\Users`; only the runtime and
+  wrapper folders keep that read/execute grant.
+- Windows Server reinstall stops and removes the registered service through
+  the Windows service manager before replacing WinSW, so an unreadable or
+  replaced wrapper is never executed. An unknown service-query result now
+  fails closed instead of being treated as "not installed".
+- Windows nginx commands pass paths from settings to PowerShell as literal
+  values, so characters such as `$`, backticks, and quotes cannot be evaluated
+  as commands.
+- Linux nginx error-log views use the bounded log reader with direct process
+  arguments instead of interpolating a configured path into a shell command.
+- Raw Advanced nginx content requires `nginx.config.edit`. Typed values that
+  become nginx configuration reject line breaks, `;`, `{`, and `}` before a
+  file is written.
+- Backend URLs containing embedded usernames or passwords are rejected before
+  they can be written into nginx configuration.
+- Changing an app's repository origin clears its stored Git token. A new token
+  is required when the replacement repository uses token authentication.
+- Site and ACME account private keys are created with mode `0600` in
+  directories with mode `0700`. Renewal uses atomic replacement, and renewal
+  and service repair correct existing key and directory permissions.
+- Authenticated Git fetches receive credentials only through child-process
+  `GIT_CONFIG_*` environment variables. Tokens and their encoded forms stay out
+  of process arguments and deployment logs.
+- The daemon resolves modules only inside its pinned runtime. Admin-owned
+  throwing stubs replace optional WebSocket accelerators, and the Windows,
+  systemd, and Personal service environments set both `WS_NO_BUFFER_UTIL=1`
+  and `WS_NO_UTF_8_VALIDATE=1`. Install, repair, update, and runtime update
+  reapply these protections.
+- Windows Server install and repair replace the runtime and wrapper folders
+  instead of merging into existing content. Optional WebSocket package stubs
+  are recreated from admin-owned temporary packages even when an old package or
+  link already exists.
+- Linux systemd installation stages its unit in a fresh directory with mode
+  `0700`, creates the file exclusively with mode `0600`, passes `sudo install`
+  direct arguments, and removes the staging directory on every outcome.
+- The updater validates the complete version string before stopping a service
+  and passes the validated version as a separate process argument.
+- Deployment logs and progress now redact each run's secrets before they are
+  stored or sent. Unmarked logs from older versions are retired at startup and
+  before purge backups, and their free-form diagnostic fields are scrubbed.
+- Deployment log reads and retirement use verified child handles and refuse
+  links or parent-directory swaps. Deployment roots are kept under the data
+  directory, and orphaned deployment logs are retired when their app no longer
+  exists.
+- Windows installer downloads use a private per-attempt directory, verify the
+  expected SHA-256 before launch, and never execute stale or partial files.
+  The Linux installer uses bundled, hash-pinned helpers, and its nvm bootstrap
+  refuses mutable downloads instead of executing them. Automatic nvm-windows
+  installation remains disabled until a reviewed executable digest is
+  configured.
+- Linux permission setup accepts only the dedicated Easy DevOps SSL and nginx
+  configuration roots after checking links, ownership and writable ancestors.
+- Certificate issuance, deletion and purge use one cross-process lifecycle
+  lock. Removal is limited to files recorded in the managed-artifact manifest,
+  is never recursive, and preserves unrelated files, linked paths and unsafe
+  roots.
+- Lifecycle locks recover safely when an owner PID has been reused. Purging
+  preserves the data directory and managed-artifact manifest if certificate
+  cleanup cannot finish.
+- Deleting a domain with certificate removal enabled retains certificates that
+  are shared with another domain or nginx configuration, were not created by
+  Easy DevOps, or cannot be removed safely. The response names the reason and
+  any remaining configuration references by basename and line.
+- Certificate reference checks follow renamed hard links and linked nginx
+  configuration directories. Real-path cycle detection prevents repeated or
+  looping directory scans.
+- Settings refuse an SSL directory that overlaps the data directory, including
+  through a linked or canonical path.
+- The dashboard listens only on loopback. Remote access goes through a local
+  HTTPS reverse proxy or secure tunnel. Passwordless mode is limited to direct
+  local requests, proxied sessions use secure cookies, and remote Hub pairing
+  requires HTTPS.
+- Nginx logs, deployment progress, captured build output, and Windows
+  service/supervisor logs have fixed byte and line budgets, so a large file or
+  a noisy process cannot make the daemon or dashboard buffer it without a
+  limit.
+- Concurrent setup-code failures are counted atomically, and a stale attempt
+  cannot overwrite a newer setup code. Empty or truncated stale lock files left
+  by an interrupted process are recovered instead of blocking setup.
+- Hub pairing responses are read through a 16 KiB streaming limit. Malformed or
+  conflicting `Content-Length` headers and stalled bodies fail closed.
+- Routine Hub telemetry uses explicit monitoring projections. Certificate
+  paths and raw Advanced nginx fields require `nginx.config.view`. Deployment
+  crash details and captured output require `deploy.logs`. A legacy
+  credential-bearing backend host is omitted before transmission.
+- Hub permission updates accept only valid boolean grants. Revoking
+  `nginx.config.view` clears SSL path data retained by the Hub. Revoking
+  `deploy.logs` immediately removes diagnostics from the last deployment
+  payload before refreshing process state. Telemetry that was already loading
+  is projected again with the current permission state so a late response
+  cannot restore protected fields. Delayed Hub mutations, including cold
+  imports, PM2 discovery, and an nginx reload after a slow config save, recheck
+  the current grant immediately before the side effect. Side-channel events
+  and results are checked again, and queued progress is discarded when the
+  permission revision changes. Permission-driven telemetry refreshes run
+  serially so an older refresh cannot overwrite a newer revocation.
+- Hub commands remain bound to the socket connection that dispatched them, so
+  re-pairing cannot redirect an in-flight result, progress event, config, log,
+  or telemetry payload to the newly paired Hub.
+- Hub command permissions now match the exact mutation. Domain delete and
+  toggle require their specific mutation permission plus `nginx.reload`, delete
+  with certificate removal also requires `ssl.delete`, linking a domain
+  requires the app, domain-create, domain-edit, and reload grants plus
+  `ssl.issue` when requested, and certificate suggestions require
+  `nginx.config.view`.
+- Hub certificate paths are omitted from issuance, suggestion, missing-file,
+  and linked-domain responses unless `nginx.config.view` is granted. Backend
+  URLs containing query strings or fragments are rejected so URL credentials
+  cannot be written to nginx configuration.
+- Windows service-manager calls use direct executable argument arrays.
+- Windows access-control checks use direct executable argument arrays, accept
+  approved dedicated Easy DevOps directories beneath `ProgramData`, and refuse
+  system trees and container roots.
+- Elevated Windows commands start from a clean environment and rebuild machine,
+  profile, temporary-directory, and loader values from Windows or the machine
+  registry. Caller-supplied paths and loader configuration cannot choose the
+  trusted system tools, service locations, or Node startup behavior used after
+  UAC. The Windows bootstrap installer also executes its elevated service step
+  with an argument array instead of an interpolated PowerShell command string.
+- Elevated Windows execution starts in `%SystemRoot%`, canonicalizes the
+  selected `node.exe`, requires a valid Authenticode signature, and passes the
+  CLI script and arguments as one direct argument array.
+- The Windows Server data root is normalized to Administrators ownership before
+  the service or installing account receives access. The service gets Modify on
+  data and read/execute on runtime and wrapper folders.
+- Windows Server repair and status handle an unreadable existing wrapper
+  without ending with `EPERM`. Repair restores the running service, and status
+  reports individual probe failures as warnings. Access-denied service files
+  are reported as unknown rather than as an absent installation. A service
+  marked for deletion remains pending until Windows releases its registration,
+  and an unresolved service-manager state fails closed.
+- Setup code is re-read after acquiring its lock, so a concurrent attempt
+  cannot consume stale state or overwrite a newer code.
+- Deployment-log retirement covers configured deployment roots outside the data
+  directory. It accepts only canonical, non-linked app directories named with a
+  valid app id and leaves unrelated files in the operator-selected root alone.
+- Dashboard update starts reserve one run before any registry lookup, validate
+  the bounded persisted status and dashboard process fields, and use an atomic
+  per-run claim so two requests or worker processes cannot launch overlapping
+  updates. Reading update status rejects a file that grows beyond the fixed
+  bound or changes size after it is opened.
+
+### Upgrading
+
+Run `ezz update` for an npm installation. After updating to 1.4.5, Windows
+Server mode users must run `ezz service repair` from an Administrator PowerShell
+to apply the service protections. Linux users who saved custom certificate or
+nginx paths outside the dedicated Easy DevOps roots must move them back to the
+supported locations before running the permissions setup again.
+
 ## [1.4.4] — 2026-11-24
+
+**Not recommended: security issues fixed in 1.4.5. Update to 1.4.5.**
 
 ### Security
 
@@ -28,7 +201,7 @@ users must run `ezz service repair` from an Administrator PowerShell to apply th
 
 ## [1.4.3] — 2026-11-20
 
-**Not recommended: security issues fixed in 1.4.4. Update to 1.4.4.**
+**Not recommended: security issues fixed in 1.4.5. Update to 1.4.5.**
 
 ### Added
 

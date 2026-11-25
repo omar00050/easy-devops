@@ -36,6 +36,30 @@ function check(label, passed, detail = '') {
 const srcUrl = (rel) => pathToFileURL(path.join(ROOT, 'src', rel)).href;
 const token = () => crypto.randomBytes(32).toString('base64url');
 
+function streamedResponse(status, chunks, headers = {}) {
+  let chunksConsumed = 0;
+  let cancelCalls = 0;
+  const response = new Response(new ReadableStream({
+    pull(controller) {
+      if (chunksConsumed === chunks.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunks[chunksConsumed]);
+      chunksConsumed += 1;
+    },
+    cancel() {
+      cancelCalls += 1;
+    },
+  }, { highWaterMark: 0 }), { status, headers });
+
+  return {
+    response,
+    stats: () => ({ chunksConsumed, cancelCalls }),
+    isLocked: () => response.body.locked,
+  };
+}
+
 function scratch(name) {
   const dir = path.join(TEST_DATA_DIR, 'scratch', name);
   assertInsideTestDataDir(dir, `create the scratch dir ${name}`);
@@ -362,6 +386,152 @@ async function testHubConnectUnitChecks() {
     raw.ok === true && raw.source === 'string' && raw.connectionString.includes('srv'));
   check('the resolved value carries no token/link path',
     !raw.connectionString.includes('/connect/cli/'));
+
+  const remoteHttpRaw = `ezops://http://hub.example.com|srv|${secret}`;
+  const rawRejected = await hc.resolveConnectInput(remoteHttpRaw);
+  check('a raw pairing to a remote plain-HTTP Hub is rejected before saving',
+    rawRejected.ok === false && /https.*remote host/i.test(rawRejected.error ?? ''),
+    rawRejected.error ?? String(rawRejected.ok));
+
+  let fetchedBodies = 0;
+  const remoteHttpFetched = await hc.fetchConnectionString(good, {
+    fetch: async () => {
+      fetchedBodies += 1;
+      return new Response(JSON.stringify({ connectionString: remoteHttpRaw }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    },
+    timeoutMs: 1_000,
+  });
+  check('a fetched pairing that downgrades to remote plain HTTP is rejected',
+    remoteHttpFetched.ok === false && remoteHttpFetched.code === hc.CONNECT_ERRORS.REJECTED
+      && fetchedBodies === 1,
+    remoteHttpFetched.error ?? remoteHttpFetched.code);
+
+  const db = await import(srcUrl('core/db.js'));
+  const links = await import(srcUrl('core/hubLink.js'));
+  db.dbSet('hub-link', {
+    hubUrl: 'http://legacy.example.com',
+    serverId: 'legacy-server',
+    secret,
+  });
+  check('a legacy stored remote plain-HTTP link fails closed',
+    links.getHubLink() === null && links.isLinked() === false);
+}
+
+async function testStreamedResponseBounds() {
+  setGroup('11. Hub responses are byte-bounded while streaming');
+
+  const hc = await import(srcUrl('core/hubConnect.js'));
+  const link = `https://hub.example.com/api/v1/connect/cli/${token()}`;
+  const chunks = Array.from({ length: 16 }, () => new Uint8Array(4 * 1024).fill(0x20));
+
+  for (const c of [
+    { status: 200, code: hc.CONNECT_ERRORS.REJECTED },
+    { status: 500, code: hc.CONNECT_ERRORS.UNREACHABLE },
+  ]) {
+    const fixture = streamedResponse(c.status, chunks);
+    check(`${c.status}: fixture declares no Content-Length`,
+      !fixture.response.headers.has('content-length'));
+
+    const result = await hc.fetchConnectionString(link, {
+      fetch: async () => fixture.response,
+      timeoutMs: 1_000,
+    });
+    const stats = fixture.stats();
+    check(`${c.status}: an undeclared oversized body is rejected`,
+      result.ok === false && result.code === c.code);
+    check(`${c.status}: reading stops in the first chunk over 16 KiB`,
+      stats.chunksConsumed === 5, `${stats.chunksConsumed} chunks`);
+    check(`${c.status}: the reader is cancelled`, stats.cancelCalls === 1);
+    check(`${c.status}: the response body is unlocked`, fixture.isLocked() === false);
+  }
+
+  const declared = streamedResponse(200, chunks, { 'Content-Length': String(16 * 1024 + 1) });
+  const declaredResult = await hc.fetchConnectionString(link, {
+    fetch: async () => declared.response,
+    timeoutMs: 1_000,
+  });
+  const declaredStats = declared.stats();
+  check('a declared oversized body is rejected before any chunk is read',
+    declaredResult.ok === false && declaredResult.code === hc.CONNECT_ERRORS.REJECTED);
+  check('the declared oversized body is not consumed', declaredStats.chunksConsumed === 0);
+  check('the declared oversized body is cancelled', declaredStats.cancelCalls === 1);
+  check('the rejected response body is unlocked', declared.isLocked() === false);
+
+  const exactChunks = Array.from({ length: 4 }, () => new Uint8Array(4 * 1024).fill(0x20));
+  const exact = streamedResponse(200, exactChunks, { 'Content-Length': '16384' });
+  const exactResult = await hc.fetchConnectionString(link, {
+    fetch: async () => exact.response,
+    timeoutMs: 1_000,
+  });
+  const exactStats = exact.stats();
+  check('a body at exactly 16 KiB is accepted by the byte limiter',
+    exactStats.chunksConsumed === 4 && exactResult.code === hc.CONNECT_ERRORS.REJECTED,
+    `${exactStats.chunksConsumed} chunks, ${exactResult.code}`);
+
+  for (const value of ['abc', '-1', '1, 1', '1.5']) {
+    const malformed = streamedResponse(200, chunks, { 'Content-Length': value });
+    const malformedResult = await hc.fetchConnectionString(link, {
+      fetch: async () => malformed.response,
+      timeoutMs: 1_000,
+    });
+    const malformedStats = malformed.stats();
+    check('malformed or conflicting Content-Length ' + JSON.stringify(value) + ' is refused without reading',
+      malformedResult.code === hc.CONNECT_ERRORS.REJECTED
+        && malformedStats.chunksConsumed === 0
+        && malformedStats.cancelCalls === 1,
+      JSON.stringify({ code: malformedResult.code, ...malformedStats }));
+  }
+
+  const invalidUtf8 = streamedResponse(200, [new Uint8Array([0xc3, 0x28])]);
+  const invalidResult = await hc.fetchConnectionString(link, {
+    fetch: async () => invalidUtf8.response,
+    timeoutMs: 1_000,
+  });
+  const invalidStats = invalidUtf8.stats();
+  check('invalid UTF-8 is rejected rather than replaced',
+    invalidResult.ok === false && invalidResult.code === hc.CONNECT_ERRORS.REJECTED);
+  check('a UTF-8 decoding error also cancels and releases the reader',
+    invalidStats.chunksConsumed === 1 && invalidStats.cancelCalls === 1 &&
+      invalidUtf8.isLocked() === false);
+
+  const encoded = new TextEncoder().encode(JSON.stringify({
+    connectionString: connectionStringFor('https://hub.example.com', 'streamed-success'),
+  }));
+  const success = streamedResponse(200, [
+    encoded.slice(0, 7),
+    encoded.slice(7, 19),
+    encoded.slice(19),
+  ]);
+  const successResult = await hc.fetchConnectionString(link, {
+    fetch: async () => success.response,
+    timeoutMs: 1_000,
+  });
+  check('a body below 16 KiB is decoded across chunks', successResult.ok === true);
+  check('the successful response body is unlocked', success.isLocked() === false);
+
+  const stalled = await startStub((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.write('{"connectionString":');
+    // Deliberately leave the chunked body open. The request timeout must cover
+    // body reads, not only receipt of the response headers.
+  });
+  try {
+    const started = Date.now();
+    const stalledResult = await hc.fetchConnectionString(stalled.link(token()), {
+      timeoutMs: 150,
+    });
+    const elapsed = Date.now() - started;
+    check('a Hub that sends headers and then stalls the body times out',
+      stalledResult.ok === false && stalledResult.code === hc.CONNECT_ERRORS.TIMEOUT,
+      JSON.stringify({ code: stalledResult.code, elapsed }));
+    check('the stalled-body timeout closes promptly',
+      elapsed < 2_000, `${elapsed}ms`);
+  } finally {
+    await stalled.close();
+  }
 }
 
 async function main() {
@@ -369,6 +539,7 @@ async function main() {
   process.stdout.write(`data dir: ${TEST_DATA_DIR}\n`);
 
   await testHubConnectUnitChecks();
+  await testStreamedResponseBounds();
   await testHappyPathAndLifecycle();
   await testDeadLinks();
   await testSecondUseOfTheSameLink();

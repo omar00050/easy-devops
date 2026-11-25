@@ -13,6 +13,15 @@ const { findDomain, handleHubDomainCommand } = await import('../src/core/domains
 const { saveHubPermissions } = await import('../src/core/hubLink.js');
 const { writeConfWithTest } = await import('../src/core/nginx-apply.js');
 const { default: DomainsController } = await import('../src/dashboard/controllers/domainsController.js');
+const {
+  isWindows,
+  powerShellLiteral,
+  powerShellCall,
+  getNginxExe,
+  nginxTestCmd,
+  nginxReloadCmd,
+  nginxServiceStartCmd,
+} = await import('../src/core/platform.js');
 
 const nginxDir = path.join(process.env.EASY_DEVOPS_DATA_DIR, 'nginx');
 const sslDir = path.join(process.env.EASY_DEVOPS_DATA_DIR, 'certs');
@@ -34,6 +43,40 @@ const spawn = mock.method(childProcess, 'spawn', (_file, args, options) => {
 syncBuiltinESMExports();
 
 try {
+  assert.equal(powerShellLiteral("C:\\nginx\\$()"), "'C:\\nginx\\$()'");
+  assert.equal(powerShellLiteral("C:\\nginx\\`Write-Host injected`"), "'C:\\nginx\\`Write-Host injected`'");
+  assert.equal(powerShellLiteral("C:\\nginx\\o'brien"), "'C:\\nginx\\o''brien'");
+  assert.throws(() => powerShellLiteral('C:\\nginx\\bad\nWrite-Host injected'), /control characters/);
+  assert.equal(
+    powerShellCall("C:\\nginx\\$()\\`whoami`", ['-v']),
+    "& 'C:\\nginx\\$()\\`whoami`' '-v'",
+  );
+
+  // Windows command sites that take nginx settings must have no double-quoted
+  // interpolation left to PowerShell.
+  for (const [label, file] of [
+    ['detector', '../src/core/detector.js'],
+    ['core nginx service', '../src/core/nginx-service.js'],
+    ['CLI nginx manager', '../src/cli/managers/nginx-manager.js'],
+  ]) {
+    const source = await fs.readFile(new URL(file, import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /&\s*"\$\{(?:nginxExe|configuredExe|nginxDir)\}/, label);
+    assert.doesNotMatch(source, /Get-Content[^\n]*"\$\{(?:logPath|nginxDir)\}/, label);
+    assert.doesNotMatch(source, /tail -n[^\n]*\$\{(?:logPath|nginxDir)\}/, label);
+  }
+  if (isWindows) {
+    const hostileDir = "C:\\nginx\\$()\\`whoami`";
+    for (const value of [
+      getNginxExe(hostileDir),
+      nginxTestCmd(hostileDir),
+      nginxReloadCmd(hostileDir),
+      nginxServiceStartCmd(hostileDir),
+    ]) {
+      assert.ok(value.includes("'C:\\nginx\\$()\\`whoami`"), value);
+      assert.ok(!value.includes('"C:\\nginx\\$()'), value);
+    }
+  }
+
   const denied = await command('create', { ...basic, advanced: { customLocations: raw } });
   assert.match(denied.error, /nginx\.config\.edit/);
   assert.equal(findDomain(basic.name), undefined);
@@ -61,6 +104,20 @@ try {
     assert.throws(() => buildConf(basic, nginxDir, sslDir, { acmeChallengePort: bad }), /acmeChallengePort/);
     assert.throws(() => buildConf(basic, nginxDir, sslDir, { deployHookPort: bad }), /deployHookPort/);
   }
+  const credentialUrl = 'https://operator:secret@backend.example';
+  await assert.rejects(generateConf({
+    name: 'credential-url.example',
+    port: 3000,
+    backendHost: credentialUrl,
+  }), /backendHost/i);
+  const credentialRefused = await command('create', {
+    ...basic,
+    name: 'credential-url.example',
+    backendHost: credentialUrl,
+  });
+  assert.equal(credentialRefused.ok, false);
+  assert.match(credentialRefused.error, /backendHost/i);
+  assert.equal(findDomain('credential-url.example'), undefined);
   await assert.rejects(fs.stat(nginxDir), { code: 'ENOENT' });
   assert.equal(spawn.mock.callCount(), 0);
   const controller = new DomainsController();

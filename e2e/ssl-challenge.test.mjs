@@ -117,6 +117,9 @@ async function main() {
 
   const legacyDb = path.join(ROOT, 'data', 'easy-devops.sqlite');
   const legacyBefore = fs.existsSync(legacyDb) ? fs.statSync(legacyDb).mtimeMs : null;
+  const legacyMarkerBefore = fs.existsSync(`${legacyDb}.migrated`)
+    ? fs.statSync(`${legacyDb}.migrated`).mtimeMs
+    : null;
 
   // Point nginxDir and sslDir at throwaway folders so nothing touches the real
   // nginx installation or the real certificate directory.
@@ -352,8 +355,12 @@ async function main() {
   setGroup('Isolation');
 
   const legacyAfter = fs.existsSync(legacyDb) ? fs.statSync(legacyDb).mtimeMs : null;
+  const legacyMarkerAfter = fs.existsSync(`${legacyDb}.migrated`)
+    ? fs.statSync(`${legacyDb}.migrated`).mtimeMs
+    : null;
   check('data/easy-devops.sqlite untouched', legacyAfter === legacyBefore);
-  check('no .migrated file created', !fs.existsSync(`${legacyDb}.migrated`));
+  check('the legacy .migrated marker was neither created nor modified',
+    legacyMarkerAfter === legacyMarkerBefore);
   check('the real nginx conf.d was never written to',
     !fs.existsSync(path.join('C:\\nginx\\conf\\conf.d', 'never-stops.test.conf')) &&
     !fs.existsSync('/etc/nginx/conf.d/never-stops.test.conf'));

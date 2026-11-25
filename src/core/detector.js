@@ -29,6 +29,7 @@ import chalk from 'chalk';
 import { dbGet, dbSet } from './db.js';
 import { run } from './shell.js';
 import { loadConfig } from './config.js';
+import { powerShellCall } from './platform.js';
 
 // ─── runDetection ─────────────────────────────────────────────────────────────
 
@@ -74,7 +75,7 @@ export async function runDetection() {
     // Step 2: configured path fallback (if PATH check found nothing)
     if (!combined.includes('nginx/')) {
       const configuredExe = `${nginxDir}\\nginx.exe`;
-      const r = await run(`& "${configuredExe}" -v`);
+      const r = await run(powerShellCall(configuredExe, ['-v']));
       combined = r.stdout + r.stderr;
       if (combined.includes('nginx/')) {
         detectedPath = configuredExe;

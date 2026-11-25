@@ -263,7 +263,7 @@ async function main() {
   });
 
   const configOf = (id, run) => JSON.parse(
-    fs.readFileSync(path.join(store.releaseDir(id, run.releaseId), engine.PM2_CONFIG_FILE), 'utf8'),
+    fs.readFileSync(path.join(store.engineReleaseDir(id, run.releaseId), engine.PM2_CONFIG_FILE), 'utf8'),
   ).apps[0];
 
   const callsSince = (mark) => pm2.calls.slice(mark);

@@ -59,7 +59,12 @@ function bannerFor(view: ServiceView): BannerCopy {
     code: 'not_running',
     tone: 'warning',
     title: 'The background service is not running',
-    body: view.installed ? (
+    body: view.installed === null ? (
+      <>
+        Windows could not inspect the installed service files. Run{' '}
+        <Command>ezz service status</Command> from an Administrator PowerShell.
+      </>
+    ) : view.installed ? (
       <>
         Monitoring and notifications run in this dashboard and stop when it closes. Start the service
         with <Command>ezz service start</Command>.

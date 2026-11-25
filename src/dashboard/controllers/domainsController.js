@@ -1,11 +1,13 @@
 import fs from 'fs/promises';
-import path from 'path';
 import { run } from '../../core/shell.js';
 import { loadConfig } from '../../core/config.js';
 import { getDomains, saveDomains, findDomain, createDomain, DOMAIN_DEFAULTS } from '../../core/domains-db.js';
 import { writeConfWithTest } from '../../core/nginx-apply.js';
 import { nginxDomainError } from '../../core/nginx-fields.js';
-import { missingCertFiles, CERT_MISSING_HINT } from '../../core/cert-usage.js';
+import {
+  missingCertFiles, CERT_MISSING_HINT,
+  withCertificateLifecycleLock, deleteCertificateUnderLock,
+} from '../../core/cert-usage.js';
 import { getCertExpiry } from '../../core/cert-reader.js';
 import { findCertificateForDomain } from '../../core/cert-suggest.js';
 import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk, hasBackslashPath } from '../../core/platform.js';
@@ -33,6 +35,28 @@ function applyErrorResponse(applied) {
 
 function certMissingBody({ certPath, keyPath }) {
   return { error: 'cert_missing', certPath, keyPath, hint: CERT_MISSING_HINT };
+}
+
+function publicCertificateOutcome(result) {
+  if (result.ok) return { certDeleted: true, certificate: result.domain };
+  const references = Array.isArray(result.references)
+    ? result.references.map((reference) => ({
+      file: String(reference.file ?? '').split(/[\\/]/).pop(),
+      line: Number(reference.line) || null,
+    }))
+    : [];
+  return {
+    certDeleted: false,
+    certRetained: true,
+    certReason: result.code ?? 'delete_failed',
+    certMessage: result.code === 'cert_in_use'
+      ? 'The domain was deleted, but its certificate is still used by another domain or nginx configuration and was retained.'
+      : result.code === 'cert_not_managed'
+        ? 'The domain was deleted, but Easy DevOps did not create that certificate, so it was retained.'
+        : 'The domain was deleted, but its certificate could not be removed safely and was retained.',
+    usedBy: Array.isArray(result.usedBy) ? result.usedBy : [],
+    references,
+  };
 }
 
 class DomainsController {
@@ -97,76 +121,79 @@ class DomainsController {
         return res.status(400).json({ error: cloudflareError });
       }
 
-      // Check for duplicate
-      if (findDomain(body.name)) {
-        return res.status(409).json({ error: `Domain already exists: ${body.name}` });
-      }
+      return await withCertificateLifecycleLock(async () => {
+        // Recheck under the lifecycle lock: a concurrent create or certificate
+        // deletion must not pass the same preflight and then race the write.
+        if (findDomain(body.name)) {
+          return res.status(409).json({ error: `Domain already exists: ${body.name}` });
+        }
 
-      // Build domain object with defaults
-      const domain = createDomain({
-        name: body.name,
-        port: backendIsUrl && body.port == null ? null : Number(body.port),
-        backendHost: body.backendHost ?? DOMAIN_DEFAULTS.backendHost,
-        upstreamType: body.upstreamType ?? DOMAIN_DEFAULTS.upstreamType,
-        www: body.www ?? false,
-        ssl: {
-          enabled: body.ssl?.enabled ?? false,
-          certPath: body.ssl?.certPath ?? '',
-          keyPath: body.ssl?.keyPath ?? '',
-          redirect: body.ssl?.redirect ?? true,
-          hsts: body.ssl?.hsts ?? false,
-          hstsMaxAge: body.ssl?.hstsMaxAge ?? DOMAIN_DEFAULTS.ssl.hstsMaxAge,
-        },
-        performance: {
-          maxBodySize: body.performance?.maxBodySize ?? DOMAIN_DEFAULTS.performance.maxBodySize,
-          readTimeout: body.performance?.readTimeout ?? DOMAIN_DEFAULTS.performance.readTimeout,
-          connectTimeout: body.performance?.connectTimeout ?? DOMAIN_DEFAULTS.performance.connectTimeout,
-          proxyBuffers: body.performance?.proxyBuffers ?? false,
-          gzip: body.performance?.gzip ?? true,
-          gzipTypes: body.performance?.gzipTypes ?? DOMAIN_DEFAULTS.performance.gzipTypes,
-        },
-        security: {
-          rateLimit: body.security?.rateLimit ?? false,
-          rateLimitRate: body.security?.rateLimitRate ?? DOMAIN_DEFAULTS.security.rateLimitRate,
-          rateLimitBurst: body.security?.rateLimitBurst ?? DOMAIN_DEFAULTS.security.rateLimitBurst,
-          securityHeaders: body.security?.securityHeaders ?? false,
-          custom404: body.security?.custom404 ?? false,
-          custom50x: body.security?.custom50x ?? false,
-        },
-        advanced: {
-          accessLog: body.advanced?.accessLog ?? true,
-          customLocations: body.advanced?.customLocations ?? '',
-        },
-        wildcard: body.wildcard ?? false,
-        behindCloudflare: body.behindCloudflare ?? false,
-        enabled: true,
+        // Build domain object with defaults
+        const domain = createDomain({
+          name: body.name,
+          port: backendIsUrl && body.port == null ? null : Number(body.port),
+          backendHost: body.backendHost ?? DOMAIN_DEFAULTS.backendHost,
+          upstreamType: body.upstreamType ?? DOMAIN_DEFAULTS.upstreamType,
+          www: body.www ?? false,
+          ssl: {
+            enabled: body.ssl?.enabled ?? false,
+            certPath: body.ssl?.certPath ?? '',
+            keyPath: body.ssl?.keyPath ?? '',
+            redirect: body.ssl?.redirect ?? true,
+            hsts: body.ssl?.hsts ?? false,
+            hstsMaxAge: body.ssl?.hstsMaxAge ?? DOMAIN_DEFAULTS.ssl.hstsMaxAge,
+          },
+          performance: {
+            maxBodySize: body.performance?.maxBodySize ?? DOMAIN_DEFAULTS.performance.maxBodySize,
+            readTimeout: body.performance?.readTimeout ?? DOMAIN_DEFAULTS.performance.readTimeout,
+            connectTimeout: body.performance?.connectTimeout ?? DOMAIN_DEFAULTS.performance.connectTimeout,
+            proxyBuffers: body.performance?.proxyBuffers ?? false,
+            gzip: body.performance?.gzip ?? true,
+            gzipTypes: body.performance?.gzipTypes ?? DOMAIN_DEFAULTS.performance.gzipTypes,
+          },
+          security: {
+            rateLimit: body.security?.rateLimit ?? false,
+            rateLimitRate: body.security?.rateLimitRate ?? DOMAIN_DEFAULTS.security.rateLimitRate,
+            rateLimitBurst: body.security?.rateLimitBurst ?? DOMAIN_DEFAULTS.security.rateLimitBurst,
+            securityHeaders: body.security?.securityHeaders ?? false,
+            custom404: body.security?.custom404 ?? false,
+            custom50x: body.security?.custom50x ?? false,
+          },
+          advanced: {
+            accessLog: body.advanced?.accessLog ?? true,
+            customLocations: body.advanced?.customLocations ?? '',
+          },
+          wildcard: body.wildcard ?? false,
+          behindCloudflare: body.behindCloudflare ?? false,
+          enabled: true,
+        });
+
+        // Cert existence check (FR-001): prevent saving a config that references non-existent cert files
+        const missingCert = await missingCertFiles(domain);
+        if (missingCert) {
+          return res.status(422).json(certMissingBody(missingCert));
+        }
+
+        // Shared core apply: writes, tests via isNginxTestOk(), and on Windows
+        // retries once with escaped backslash cert paths before rolling back.
+        const applied = await writeConfWithTest(domain);
+        if (!applied.ok) {
+          return res.status(500).json(applyErrorResponse(applied));
+        }
+
+        const domains = getDomains();
+        domains.push(domain);
+        saveDomains(domains);
+
+        // Save per-domain notification config if provided
+        if (body.notifications && typeof body.notifications === 'object') {
+          try {
+            saveDomainNotifConfig(domain.name, body.notifications);
+          } catch { /* ignore validation errors — fall back to defaults */ }
+        }
+
+        return res.status(201).json({ ...domain, notifications: getDomainNotifConfig(domain.name) });
       });
-
-      // Cert existence check (FR-001): prevent saving a config that references non-existent cert files
-      const missingCert = await missingCertFiles(domain);
-      if (missingCert) {
-        return res.status(422).json(certMissingBody(missingCert));
-      }
-
-      // Shared core apply: writes, tests via isNginxTestOk(), and on Windows
-      // retries once with escaped backslash cert paths before rolling back.
-      const applied = await writeConfWithTest(domain);
-      if (!applied.ok) {
-        return res.status(500).json(applyErrorResponse(applied));
-      }
-
-      const domains = getDomains();
-      domains.push(domain);
-      saveDomains(domains);
-
-      // Save per-domain notification config if provided
-      if (body.notifications && typeof body.notifications === 'object') {
-        try {
-          saveDomainNotifConfig(domain.name, body.notifications);
-        } catch { /* ignore validation errors — fall back to defaults */ }
-      }
-
-      res.status(201).json({ ...domain, notifications: getDomainNotifConfig(domain.name) });
     } catch (error) {
       next(error);
     }
@@ -210,49 +237,58 @@ class DomainsController {
         }
       }
 
-      // name is immutable — merge everything except name, configFile, and notifications
-      const { name: _ignored, configFile: _cf, notifications, ...updates } = body;
+      return await withCertificateLifecycleLock(async () => {
+        // Re-read and revalidate under the lifecycle lock so this write cannot
+        // race a certificate deletion or overwrite a newer domain update.
+        const current = findDomain(name);
+        if (!current) {
+          return res.status(404).json({ error: `Domain not found: ${name}` });
+        }
 
-      // Deep merge nested objects
-      const updatedDomain = {
-        ...existing,
-        ...updates,
-        ssl: { ...existing.ssl, ...updates.ssl },
-        performance: { ...existing.performance, ...updates.performance },
-        security: { ...existing.security, ...updates.security },
-        advanced: { ...existing.advanced, ...updates.advanced },
-        wildcard: updates.wildcard ?? existing.wildcard ?? false,
-        updatedAt: new Date().toISOString(),
-      };
+        // name is immutable — merge everything except name, configFile, and notifications
+        const { name: _ignored, configFile: _cf, notifications, ...updates } = body;
 
-      // An update must not point nginx at certificate files that are not on disk.
-      const mergedError = nginxDomainError(updatedDomain);
-      if (mergedError) return res.status(400).json({ error: mergedError });
-      const missingCert = await missingCertFiles(updatedDomain);
-      if (missingCert) {
-        return res.status(422).json(certMissingBody(missingCert));
-      }
+        // Deep merge nested objects
+        const updatedDomain = {
+          ...current,
+          ...updates,
+          ssl: { ...current.ssl, ...updates.ssl },
+          performance: { ...current.performance, ...updates.performance },
+          security: { ...current.security, ...updates.security },
+          advanced: { ...current.advanced, ...updates.advanced },
+          wildcard: updates.wildcard ?? current.wildcard ?? false,
+          updatedAt: new Date().toISOString(),
+        };
 
-      // Shared core apply — snapshots the current file and restores it exactly
-      // if every attempt fails, so no .bak juggling is needed here.
-      const applied = await writeConfWithTest(updatedDomain);
-      if (!applied.ok) {
-        return res.status(500).json(applyErrorResponse(applied));
-      }
+        // An update must not point nginx at certificate files that are not on disk.
+        const mergedError = nginxDomainError(updatedDomain);
+        if (mergedError) return res.status(400).json({ error: mergedError });
+        const missingCert = await missingCertFiles(updatedDomain);
+        if (missingCert) {
+          return res.status(422).json(certMissingBody(missingCert));
+        }
 
-      const domains = getDomains();
-      const idx = domains.findIndex((d) => d.name === name);
-      domains[idx] = updatedDomain;
-      saveDomains(domains);
+        // Shared core apply — snapshots the current file and restores it exactly
+        // if every attempt fails, so no .bak juggling is needed here.
+        const applied = await writeConfWithTest(updatedDomain);
+        if (!applied.ok) {
+          return res.status(500).json(applyErrorResponse(applied));
+        }
 
-      // Save per-domain notification config if provided
-      if (notifications && typeof notifications === 'object') {
-        try {
-          saveDomainNotifConfig(name, notifications);
-        } catch { /* ignore validation errors — keep existing config */ }
-      }
+        const domains = getDomains();
+        const idx = domains.findIndex((d) => d.name === name);
+        domains[idx] = updatedDomain;
+        saveDomains(domains);
 
-      res.json({ ...updatedDomain, notifications: getDomainNotifConfig(name) });
+        // Save per-domain notification config if provided
+        if (notifications && typeof notifications === 'object') {
+          try {
+            saveDomainNotifConfig(name, notifications);
+          } catch { /* ignore validation errors — keep existing config */ }
+        }
+
+        return res.json({ ...updatedDomain, notifications: getDomainNotifConfig(name) });
+      });
     } catch (error) {
       next(error);
     }
@@ -262,35 +298,38 @@ class DomainsController {
     try {
       const { name } = req.params;
       const deleteCert = req.query.deleteCert === 'true';
-      const domain = findDomain(name);
-      if (!domain) {
-        return res.status(404).json({ error: `Domain not found: ${name}` });
-      }
+      return await withCertificateLifecycleLock(async (lifecycle) => {
+        const domain = findDomain(name);
+        if (!domain) {
+          return res.status(404).json({ error: `Domain not found: ${name}` });
+        }
 
-      // Delete nginx conf file
-      if (domain.configFile) {
-        try {
-          await fs.unlink(domain.configFile);
-        } catch (err) {
-          if (err.code !== 'ENOENT') {
-            return res.status(500).json({ error: 'Failed to delete conf file', details: err.message });
+        // Remove the nginx reference before asking the shared certificate
+        // deletion path whether anything else still uses the key material.
+        if (domain.configFile) {
+          try {
+            await fs.unlink(domain.configFile);
+          } catch (err) {
+            if (err.code !== 'ENOENT') {
+              return res.status(500).json({ error: 'Failed to delete conf file', details: err.message });
+            }
           }
         }
-      }
 
-      // Optionally delete the SSL certificate directory for this domain
-      if (deleteCert && domain.ssl?.enabled) {
-        const { sslDir } = loadConfig();
-        const certDir = path.join(sslDir, name);
-        try {
-          await fs.rm(certDir, { recursive: true, force: true });
-        } catch { /* ignore — cert dir may not exist */ }
-      }
+        saveDomains(getDomains().filter((d) => d.name !== name));
 
-      const domains = getDomains().filter((d) => d.name !== name);
-      saveDomains(domains);
+        let certificate = null;
+        if (deleteCert && domain.ssl?.enabled) {
+          const result = await deleteCertificateUnderLock(name, lifecycle);
+          certificate = publicCertificateOutcome(result);
+        }
 
-      res.json({ deleted: name, certDeleted: deleteCert && domain.ssl?.enabled });
+        return res.json({
+          deleted: name,
+          certDeleted: certificate?.certDeleted ?? false,
+          ...(certificate?.certRetained ? certificate : {}),
+        });
+      });
     } catch (error) {
       next(error);
     }

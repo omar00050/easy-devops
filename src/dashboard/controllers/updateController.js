@@ -35,7 +35,7 @@ import { loadConfig } from '../../core/config.js';
 import { checkForUpdate, currentVersion, isUpdateVersion } from '../../core/updater.js';
 import { detectInstallSource } from '../../core/installSource.js';
 import {
-	readStatus, writeStatus, describeRun, runIsActive,
+	readStatus, writeStatus, clearStatus, describeRun, runIsActive,
 } from '../../core/updateStatus.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -104,6 +104,7 @@ class UpdateController {
 		this.detectInstallSource = deps.detectInstallSource ?? detectInstallSource;
 		this.readStatus = deps.readStatus ?? ((dataDir) => readStatus(dataDir));
 		this.writeStatus = deps.writeStatus ?? ((patch, opts) => writeStatus(patch, opts));
+		this.clearStatus = deps.clearStatus ?? ((id, opts) => clearStatus(id, opts));
 		this.spawnWorker = deps.spawnWorker ?? spawnWorker;
 		this.runId = deps.runId ?? (() => `${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`);
 		this.now = deps.now ?? (() => Date.now());
@@ -200,31 +201,12 @@ class UpdateController {
 				res.status(400).json({ error: 'Supply a complete release version.' });
 				return;
 			}
-			if (target === undefined) {
-				const check = await this.checkForUpdate();
-				if (!check.reachable || !isUpdateVersion(check.latest)) {
-					res.status(502).json({
-						error: 'Could not reach the npm registry to find the latest version.',
-					});
-					return;
-				}
-				if (!check.updateAvailable) {
-					res.status(409).json({
-						error: `Easy DevOps is already up to date (v${check.current}).`,
-						current: check.current,
-						latest: check.latest,
-					});
-					return;
-				}
-				target = check.latest;
-			}
-
 			const run = {
 				id: this.runId(),
 				phase: 'starting',
 				from: this.currentVersion(),
-				to: target,
-				step: null,
+				to: target ?? null,
+				step: target === undefined ? 'registry' : null,
 				reason: null,
 				logTail: [],
 				startedAt: this.now(),
@@ -236,16 +218,46 @@ class UpdateController {
 					port: req.socket?.localPort ?? loadConfig().dashboardPort,
 				},
 			};
+
+			// Reserve the one update slot synchronously, before the registry
+			// lookup yields. Concurrent requests then observe an active run and
+			// cannot both spawn a worker or overwrite this record.
 			this.writeStatus(run, { dataDir, replace: true });
 
-			const child = this.spawnWorker({
-				args: ['--run-id', run.id],
-				logPath: path.join(dataDir, 'logs', 'update.log'),
-				dataDir,
-			});
+			let committed = false;
+			try {
+				if (target === undefined) {
+					const check = await this.checkForUpdate();
+					if (!check.reachable || !isUpdateVersion(check.latest)) {
+						res.status(502).json({
+							error: 'Could not reach the npm registry to find the latest version.',
+						});
+						return;
+					}
+					if (!check.updateAvailable) {
+						res.status(409).json({
+							error: `Easy DevOps is already up to date (v${check.current}).`,
+							current: check.current,
+							latest: check.latest,
+						});
+						return;
+					}
+					target = check.latest;
+				}
 
-			const written = this.writeStatus({ workerPid: child?.pid ?? null }, { dataDir });
-			res.status(202).json({ started: true, run: written });
+				this.writeStatus({ to: target, step: null }, { dataDir });
+				const child = this.spawnWorker({
+					args: ['--run-id', run.id],
+					logPath: path.join(dataDir, 'logs', 'update.log'),
+					dataDir,
+				});
+				committed = true;
+
+				const written = this.writeStatus({ workerPid: child?.pid ?? null }, { dataDir });
+				res.status(202).json({ started: true, run: written });
+			} finally {
+				if (!committed) this.clearStatus(run.id, { dataDir });
+			}
 		} catch {
 			res.status(500).json({ error: 'Internal server error' });
 		}

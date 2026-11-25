@@ -32,7 +32,7 @@ export interface ServiceView {
   mechanismDetail: string;
   startsAt: ServiceStart;
   startsAtLabel: string;
-  installed: boolean;
+  installed: boolean | null;
   stoppedByUser: boolean;
   stoppedAt: string | null;
   /** Local time, ready to render next to "Stopped by you". */
@@ -130,7 +130,7 @@ export function describeService(service: ServiceStatus | null): ServiceView | nu
     mechanismDetail: MECHANISM_DETAIL[mechanism],
     startsAt,
     startsAtLabel: startsAtLabel(startsAt),
-    installed: bg.installed === true,
+    installed: bg.installed ?? null,
     stoppedByUser: bg.stoppedByUser === true,
     stoppedAt,
     stoppedAtLabel: stoppedAt ? formatDateTime(stoppedAt) : null,
@@ -151,6 +151,7 @@ export function serviceStateLabel(view: ServiceView | null): string {
   if (!view) return 'Unknown';
   if (view.running) return 'Running';
   if (view.stoppedByUser) return 'Stopped by you';
+  if (view.installed === null) return 'Status unavailable';
   if (!view.installed) return 'Not installed';
   return 'Not running';
 }

@@ -32,7 +32,9 @@ import { generateDeployKey, testDeployKey } from './deployKey.js';
 import { hookSettings } from './hookServer.js';
 import { describeApps, describeAppDetail } from './status.js';
 import { isId, lockHolder, readLogTail, readRun } from './store.js';
+import { isRedactedDeployRun } from './logSecurity.js';
 import { safeLogText } from '../hub/deployProgress.js';
+import { projectRunForHub } from '../hub/telemetry.js';
 
 /** An error whose message is safe to show the Hub user as-is. */
 function refuse(message) {
@@ -184,18 +186,33 @@ export async function addAppDeployKeyToGithub(id, token, { fetchImpl } = {}) {
  * @param {(run: Object) => void} [opts.onFinished] Called when a deployment or rollback started here ends
  * @returns {Promise<Object>} The command's result data. Throws to refuse.
  */
-export async function handleHubDeployCommand(payload, { onFinished = null, onProgress = null } = {}) {
+export async function handleHubDeployCommand(payload, {
+  onFinished = null,
+  onProgress = null,
+  permissions = null,
+  recheck = null,
+  linkDomainFn = linkDomain,
+} = {}) {
   const { action, id } = payload ?? {};
+  const authorize = () => {
+    if (typeof recheck === 'function') recheck();
+  };
+  // The agent always supplies a permission snapshot. Direct core callers keep
+  // the historical full-result contract and are responsible for their own
+  // authorization, just as they are for create/update/delete.
+  const runView = permissions
+    ? (run) => projectRunForHub(run, permissions)
+    : (run) => run;
   const watch = (started) => {
     if (onFinished) started.done.then((run) => { try { onFinished(run); } catch { /* ignore */ } });
   };
 
   switch (action) {
     case 'list':
-      return { apps: await describeApps({ view: publicApp }) };
+      return { apps: await describeApps({ view: publicApp, runView }) };
 
     case 'detail': {
-      const detail = await describeAppDetail(String(id ?? ''), { view: publicApp });
+      const detail = await describeAppDetail(String(id ?? ''), { view: publicApp, runView });
       if (!detail) throw refuse(`No app named "${id}".`);
       return detail;
     }
@@ -206,20 +223,31 @@ export async function handleHubDeployCommand(payload, { onFinished = null, onPro
     }
 
     case 'run': {
+      if (permissions && permissions['deploy.logs'] !== true) {
+        throw refuse("Reading a deployment log needs 'deploy.logs', which this server has switched off.");
+      }
       const app = requireApp(id);
       const run = isId(payload.runId) ? readRun(app.id, payload.runId) : null;
       if (!run) throw refuse('No such run.');
-      // A smaller tail than the dashboard's: this travels over the agent
-      // socket and through the Hub to a browser.
-      const log = readLogTail(app.id, run.id, { maxBytes: 32 * 1024 });
-      // The log on disk is the raw build output. What leaves the server gets
-      // the same treatment as live progress: secrets redacted, keys dropped.
-      return { ...run, log: safeLogText(log.text, app), logTruncated: log.truncated };
+      // A pre-1.4.5 run has no trustworthy marker. Re-redacting it with the
+      // current app values cannot remove a secret that has since been rotated,
+      // so return no log at all for that format.
+      const available = isRedactedDeployRun(run);
+      const log = available
+        ? readLogTail(app.id, run.id, { maxBytes: 32 * 1024 })
+        : { text: '', truncated: false };
+      return {
+        ...(permissions ? projectRunForHub(run, permissions) : run),
+        log: safeLogText(log.text, app),
+        logTruncated: log.truncated,
+        logUnavailable: available ? undefined : 'legacy-format',
+      };
     }
 
     case 'deploy': {
       const app = requireApp(id);
       const ref = typeof payload.ref === 'string' && payload.ref.trim() ? payload.ref.trim() : null;
+      authorize();
       const started = startDeployment(app.id, { trigger: 'hub', ref, actor: payload.actor ? `hub: ${String(payload.actor).slice(0, 80)}` : 'hub' });
       if (!started.ok) throw refuse(started.error);
       watch(started);
@@ -230,6 +258,7 @@ export async function handleHubDeployCommand(payload, { onFinished = null, onPro
       const app = requireApp(id);
       const releaseId = typeof payload.releaseId === 'string' && payload.releaseId ? payload.releaseId : null;
       if (releaseId !== null && !isId(releaseId)) throw refuse('Invalid release id.');
+      authorize();
       const started = startRollback(app.id, { releaseId, actor: 'hub' });
       if (!started.ok) throw refuse(started.error);
       watch(started);
@@ -239,6 +268,7 @@ export async function handleHubDeployCommand(payload, { onFinished = null, onPro
     case 'deleteRelease': {
       const app = requireApp(id);
       if (!isId(payload.releaseId)) throw refuse('Invalid release id.');
+      authorize();
       const result = removeRelease(app.id, payload.releaseId);
       if (!result.ok) throw refuse(result.error);
       return { deleted: result.deleted };
@@ -246,6 +276,7 @@ export async function handleHubDeployCommand(payload, { onFinished = null, onPro
 
     case 'create': {
       const input = appInputFromHub(payload.app);
+      authorize();
       const result = createApp({ ...input, id: String(payload.app?.id ?? '').trim() });
       if (!result.ok) throw refuse(result.errors[0]);
       // Creating an app never starts a deployment. The key, when asked for, is
@@ -255,6 +286,7 @@ export async function handleHubDeployCommand(payload, { onFinished = null, onPro
     }
 
     case 'regenerateKey': {
+      authorize();
       const result = regenerateAppDeployKey(id);
       if (!result.ok) throw refuse(result.error);
       return result.value;
@@ -266,6 +298,7 @@ export async function handleHubDeployCommand(payload, { onFinished = null, onPro
     }
 
     case 'addKeyToGithub': {
+      authorize();
       const result = await addAppDeployKeyToGithub(id, payload.token);
       // A missing app or key is a refusal; a GitHub failure is a result the
       // caller reads (ok:false, steps, error), exactly like the dashboard.
@@ -276,6 +309,7 @@ export async function handleHubDeployCommand(payload, { onFinished = null, onPro
 
     case 'update': {
       requireApp(id);
+      authorize();
       const result = updateApp(id, appInputFromHub(payload.app));
       if (!result.ok) throw refuse(result.errors[0]);
       return publicApp(result.app);
@@ -289,7 +323,12 @@ export async function handleHubDeployCommand(payload, { onFinished = null, onPro
         throw refuse("Deleting the linked domain needs 'domains.delete', which this server has switched off. Delete the app without its domain, or enable it in Settings → Hub.");
       }
       // Persistent data is kept unless asked for, exactly as on the dashboard.
-      const result = await removeApp(id, { deleteDomain, purgeData: payload.purgeData === true });
+      authorize();
+      const result = await removeApp(id, {
+        deleteDomain,
+        purgeData: payload.purgeData === true,
+        deps: { recheck: authorize },
+      });
       if (!result.ok) throw refuse(result.error);
       return {
         deleted: id, domainDeleted: result.domainDeleted, warning: result.warning ?? null,
@@ -302,27 +341,33 @@ export async function handleHubDeployCommand(payload, { onFinished = null, onPro
       // Permissions are checked in core/hub/agent.js before this runs: the map
       // there requires deploy.manage + domains.create, plus ssl.issue when the
       // link asks for a new certificate.
-      const result = await linkDomain(id, {
+      const result = await linkDomainFn(id, {
         domain: payload.domain,
         www: payload.www,
         ssl: payload.ssl,
         redirect: payload.redirect,
         behindCloudflare: payload.behindCloudflare,
-      }, { onProgress });
+      }, { onProgress, recheck });
       if (!result.ok) throw refuse(result.error);
+      const ssl = result.ssl && typeof result.ssl === 'object' ? { ...result.ssl } : result.ssl;
+      if (ssl && getHubPermissions()['nginx.config.view'] !== true) {
+        delete ssl.certPath;
+        delete ssl.keyPath;
+      }
       return {
         domain: result.domain,
         created: result.created,
         port: result.port,
         www: result.www,
         behindCloudflare: result.behindCloudflare,
-        ssl: result.ssl,
+        ssl,
         redirect: result.redirect,
         nginxReloaded: result.nginxReloaded,
       };
     }
 
     case 'unlinkDomain': {
+      authorize();
       const result = unlinkDomain(id);
       if (!result.ok) throw refuse(result.error);
       return { unlinked: true };
@@ -330,13 +375,15 @@ export async function handleHubDeployCommand(payload, { onFinished = null, onPro
 
     case 'move': {
       requireApp(id);
-      const result = await moveApp(id, payload.path);
+      authorize();
+      const result = await moveApp(id, payload.path, { deps: { recheck: authorize } });
       if (!result.ok) throw refuse(result.error);
       return { from: result.from, to: result.to, restarted: result.restarted, warning: result.warning ?? null };
     }
 
     case 'issueToken': {
       requireApp(id);
+      authorize();
       const issued = rotateHookToken(id);
       // The one moment the token exists in clear. It passes through the Hub to
       // the person who asked for it; the Hub does not keep it.
@@ -352,6 +399,7 @@ export async function handleHubDeployCommand(payload, { onFinished = null, onPro
       requireApp(id);
       const env = normalizeEnv(payload.env);
       if (!env.ok) throw refuse(env.error);
+      authorize();
       const result = updateApp(id, { env: env.value });
       if (!result.ok) throw refuse(result.errors[0]);
       return { envKeys: Object.keys(env.value).sort() };
@@ -376,8 +424,12 @@ export async function handleHubDeployCommand(payload, { onFinished = null, onPro
  * @param {Object} payload { action: 'trigger'|'status', appId, token, ref?, runId? }
  * @returns {Promise<Object>}
  */
-export async function handleHubDeployHook(payload, { onFinished = null } = {}) {
+export async function handleHubDeployHook(payload, {
+  onFinished = null,
+  permissions = getHubPermissions(),
+} = {}) {
   const { action, appId, token } = payload ?? {};
+  const logsAllowed = permissions?.['deploy.logs'] === true;
 
   const app = typeof appId === 'string' && validateAppId(appId) === null ? getApp(appId) : null;
   if (!app || !verifyHookToken(app, typeof token === 'string' ? token : '')) {
@@ -388,7 +440,12 @@ export async function handleHubDeployHook(payload, { onFinished = null } = {}) {
     const ref = typeof payload.ref === 'string' && payload.ref.trim() ? payload.ref.trim() : null;
     const started = startDeployment(app.id, { trigger: 'webhook', ref, actor: 'deploy hook (via Hub)' });
     if (!started.ok) {
-      return { started: false, status: started.status ?? 500, error: started.error, runId: started.runId ?? null };
+      return {
+        started: false,
+        status: started.status ?? 500,
+        error: logsAllowed ? started.error : null,
+        runId: started.runId ?? null,
+      };
     }
     if (onFinished) started.done.then((run) => { try { onFinished(run); } catch { /* ignore */ } });
     return { started: true, runId: started.runId };
@@ -397,21 +454,11 @@ export async function handleHubDeployHook(payload, { onFinished = null } = {}) {
   if (action === 'status') {
     const run = isId(payload.runId) ? readRun(app.id, payload.runId) : null;
     if (!run) return { found: false };
+    const projected = projectRunForHub(run, permissions);
+    const { id: runId, ...safeRun } = projected;
     return {
       found: true,
-      run: {
-        runId: run.id,
-        status: run.status,
-        step: run.step,
-        sha: run.sha,
-        error: run.error,
-        rolledBackTo: run.rolledBackTo ?? null,
-        reason: run.reason ?? null,
-        logTail: Array.isArray(run.logTail) ? run.logTail : [],
-        rollbackSucceeded: run.rollbackSucceeded ?? null,
-        startedAt: run.startedAt,
-        finishedAt: run.finishedAt,
-      },
+      run: { runId, ...safeRun },
     };
   }
 

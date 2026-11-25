@@ -32,6 +32,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'node:crypto';
 
 import {
   isWindows,
@@ -75,8 +76,170 @@ export function assertNotInUse(dir) {
  * hand-rolled walk so symlinks and empty directories behave predictably.
  */
 function copyTree(from, to) {
-  fs.mkdirSync(to, { recursive: true });
-  fs.cpSync(from, to, { recursive: true, force: true, errorOnExist: false });
+  fs.cpSync(from, to, {
+    recursive: true,
+    force: true,
+    errorOnExist: false,
+    dereference: false,
+  });
+}
+
+function pathExists(file) {
+  try {
+    return fs.lstatSync(file, { throwIfNoEntry: false }) ?? null;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function isLink(stat) {
+  return Boolean(stat?.isSymbolicLink());
+}
+
+/**
+ * Refuse any existing path component that can redirect filesystem operations.
+ *
+ * Windows junctions and other reparse points appear as symbolic links through
+ * Node's lstat(). The walk is repeated after creating a directory so a link
+ * inserted in the meantime cannot be followed by the copy or marker write.
+ */
+function unsafePathComponent(dir) {
+  const resolved = path.resolve(dir);
+  const root = path.parse(resolved).root;
+  const parts = resolved.slice(root.length).split(path.sep).filter(Boolean);
+  let current = root;
+
+  for (const part of parts) {
+    current = path.join(current, part);
+    let stat;
+    try {
+      stat = pathExists(current);
+    } catch (error) {
+      return `${current} could not be inspected: ${error.message}`;
+    }
+    if (!stat) break;
+    if (isLink(stat)) return `${current} is a link or reparse point`;
+    if (current !== resolved && !stat.isDirectory()) {
+      return `${current} is not a directory`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Verify that an existing tree contains no links, reparse points, or hard
+ * linked destination files. The source may contain hard links because it is
+ * only read. A destination hard link would let force-overwrite change a file
+ * outside the approved directory.
+ */
+function unsafeTreeEntry(dir, { destination = false } = {}) {
+  let root;
+  try {
+    root = pathExists(dir);
+  } catch (error) {
+    return `${dir} could not be inspected: ${error.message}`;
+  }
+  if (!root) return null;
+  if (isLink(root)) return `${dir} is a link or reparse point`;
+  if (!root.isDirectory()) return `${dir} is not a directory`;
+
+  const pending = [dir];
+  while (pending.length) {
+    const current = pending.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch (error) {
+      return `${current} could not be inspected: ${error.message}`;
+    }
+
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      let stat;
+      try {
+        stat = fs.lstatSync(full);
+      } catch (error) {
+        return `${full} could not be inspected: ${error.message}`;
+      }
+      if (isLink(stat)) return `${full} is a link or reparse point`;
+      if (stat.isDirectory()) {
+        pending.push(full);
+        continue;
+      }
+      if (!stat.isFile()) return `${full} is not a regular file`;
+      if (destination && stat.nlink !== 1) {
+        return `${full} is a hard link; refusing to overwrite it`;
+      }
+    }
+  }
+  return null;
+}
+
+function ensureSafeDirectory(dir) {
+  const redirected = unsafePathComponent(dir);
+  if (redirected) return { ok: false, reason: redirected };
+
+  const resolved = path.resolve(dir);
+  const root = path.parse(resolved).root;
+  const parts = resolved.slice(root.length).split(path.sep).filter(Boolean);
+  let current = root;
+
+  for (const part of parts) {
+    current = path.join(current, part);
+    const existing = pathExists(current);
+    if (!existing) {
+      try {
+        fs.mkdirSync(current, { mode: 0o700 });
+      } catch (error) {
+        return { ok: false, reason: `could not create ${current}: ${error.message}` };
+      }
+      continue;
+    }
+    if (isLink(existing)) {
+      return { ok: false, reason: `${current} became a link or reparse point` };
+    }
+    if (!existing.isDirectory()) {
+      return { ok: false, reason: `${current} is not a directory` };
+    }
+  }
+
+  const after = unsafePathComponent(dir);
+  return after
+    ? { ok: false, reason: after }
+    : { ok: true };
+}
+
+function writeMarker(target, marker, payload) {
+  const before = pathExists(marker);
+  if (before) {
+    if (isLink(before)) return { ok: false, reason: `${marker} is a link or reparse point` };
+    if (!before.isFile() || before.nlink !== 1) {
+      return { ok: false, reason: `${marker} is not a regular file` };
+    }
+    return { ok: true, existed: true };
+  }
+
+  const temp = path.join(path.dirname(marker), `.server-mode.${randomUUID()}.tmp`);
+  let fd;
+  try {
+    fd = fs.openSync(temp, 'wx', 0o600);
+    fs.writeFileSync(fd, payload);
+    fs.closeSync(fd);
+    fd = undefined;
+    if (unsafePathComponent(target) || unsafePathComponent(marker)) {
+      throw new Error('the Server-mode directory changed during migration');
+    }
+    fs.renameSync(temp, marker);
+    return { ok: true, existed: false };
+  } catch (error) {
+    try { fs.rmSync(temp, { force: true }); } catch { /* best effort */ }
+    return { ok: false, reason: error.message };
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* already closed */ }
+    }
+  }
 }
 
 /** Every file in a tree, as paths relative to its root. */
@@ -155,10 +318,19 @@ export function backupPathFor(dir, now = new Date()) {
  *          | { ok: false, reason: string }}
  */
 export function moveDataDir({ from, to, keepBackup = true, log = () => {} }) {
-  if (!fs.existsSync(from)) {
+  let fromStat;
+  try {
+    fromStat = pathExists(from);
+  } catch (error) {
+    return { ok: false, reason: `${from} could not be inspected: ${error.message}` };
+  }
+  if (!fromStat) {
     // Nothing to move is a success: a fresh install has no per-user data, and
     // the service simply starts with an empty ProgramData directory.
     return { ok: true, moved: false, backup: null, originalAt: null, reason: `${from} does not exist` };
+  }
+  if (!fromStat.isDirectory() || isLink(fromStat)) {
+    return { ok: false, reason: `${from} is not a safe, real directory` };
   }
 
   if (path.resolve(from).toLowerCase() === path.resolve(to).toLowerCase()) {
@@ -168,11 +340,28 @@ export function moveDataDir({ from, to, keepBackup = true, log = () => {} }) {
   const busy = assertNotInUse(from);
   if (!busy.ok) return { ok: false, reason: busy.reason };
 
+  // Validate both trees before the first mkdir or copy. Existing links could
+  // otherwise redirect the complete data-tree copy outside either directory.
+  const unsafeSource = unsafeTreeEntry(from);
+  if (unsafeSource) {
+    return { ok: false, reason: `source is not safe to copy: ${unsafeSource}. Nothing was changed.` };
+  }
+  const unsafeDestination = unsafeTreeEntry(to, { destination: true });
+  if (unsafeDestination) {
+    return { ok: false, reason: `destination is not safe to write: ${unsafeDestination}. Nothing was changed.` };
+  }
+
   // A destination that already holds a database is not overwritten: that is
   // either a previous install's data or a second machine's, and silently
   // replacing it would destroy whichever one the user actually wanted.
   const destDb = path.join(to, 'easy-devops.sqlite');
-  if (fs.existsSync(destDb)) {
+  let destDbStat;
+  try {
+    destDbStat = pathExists(destDb);
+  } catch (error) {
+    return { ok: false, reason: `${destDb} could not be inspected: ${error.message}. Nothing was changed.` };
+  }
+  if (destDbStat) {
     return {
       ok: false,
       reason: `${to} already contains a database. Move or remove it first if you want to replace it; `
@@ -181,8 +370,16 @@ export function moveDataDir({ from, to, keepBackup = true, log = () => {} }) {
   }
 
   log(`Copying ${from} → ${to}`);
+  const ensured = ensureSafeDirectory(to);
+  if (!ensured.ok) {
+    return { ok: false, reason: `destination is not safe to write: ${ensured.reason}. Nothing was changed.` };
+  }
   try {
+    const beforeCopy = unsafeTreeEntry(from) || unsafeTreeEntry(to, { destination: true });
+    if (beforeCopy) throw new Error(beforeCopy);
     copyTree(from, to);
+    const afterCopy = unsafeTreeEntry(to, { destination: true });
+    if (afterCopy) throw new Error(afterCopy);
   } catch (err) {
     return { ok: false, reason: `copy failed: ${err.message}. Nothing was removed.` };
   }
@@ -270,20 +467,49 @@ export function enableServerMode({ log = () => {} } = {}) {
   const target = programDataDir();
   const marker = serverModeMarkerPath();
 
-  try {
-    fs.mkdirSync(target, { recursive: true });
-  } catch (err) {
+  const safeTarget = ensureSafeDirectory(target);
+  if (!safeTarget.ok) {
     return {
       ok: false,
       dataDir: target,
       migrated: false,
       backup: null,
-      reason: `could not create ${target}: ${err.message}. `
+      reason: `could not create ${target}: ${safeTarget.reason}. `
         + 'Creating a directory under ProgramData needs an elevated terminal.',
     };
   }
 
-  if (fs.existsSync(marker)) {
+  let markerStat;
+  try {
+    markerStat = pathExists(marker);
+  } catch (error) {
+    return {
+      ok: false,
+      dataDir: target,
+      migrated: false,
+      backup: null,
+      reason: `could not inspect ${marker}: ${error.message}. Nothing was changed.`,
+    };
+  }
+  if (markerStat) {
+    if (isLink(markerStat)) {
+      return {
+        ok: false,
+        dataDir: target,
+        migrated: false,
+        backup: null,
+        reason: `${marker} is a link or reparse point; refusing to treat it as the Server-mode marker`,
+      };
+    }
+    if (!markerStat.isFile() || markerStat.nlink !== 1) {
+      return {
+        ok: false,
+        dataDir: target,
+        migrated: false,
+        backup: null,
+        reason: `${marker} is not a regular Server-mode marker`,
+      };
+    }
     log(`Already in Server mode: ${target}`);
     return { ok: true, dataDir: target, migrated: false, backup: null, reason: 'the marker already exists' };
   }
@@ -295,19 +521,18 @@ export function enableServerMode({ log = () => {} } = {}) {
     return { ok: false, dataDir: target, migrated: false, backup: null, reason: moved.reason };
   }
 
-  try {
-    fs.writeFileSync(
-      marker,
-      `${JSON.stringify({ enabledAt: new Date().toISOString(), migratedFrom: userDataDir(), backup: moved.backup })}\n`,
-      'utf8',
-    );
-  } catch (err) {
+  const marked = writeMarker(
+    target,
+    marker,
+    `${JSON.stringify({ enabledAt: new Date().toISOString(), migratedFrom: userDataDir(), backup: moved.backup })}\n`,
+  );
+  if (!marked.ok) {
     return {
       ok: false,
       dataDir: target,
       migrated: moved.moved,
       backup: moved.backup,
-      reason: `the data was migrated but the marker could not be written: ${err.message}`,
+      reason: `the data was migrated but the marker could not be written: ${marked.reason}`,
     };
   }
 

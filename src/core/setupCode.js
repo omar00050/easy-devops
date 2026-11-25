@@ -48,14 +48,182 @@
  * The cleartext exists in this process only long enough to be printed.
  */
 
-import { randomInt } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
 
 import { dbGet, dbSet } from './db.js';
 import { hashPassword, verifyPassword } from './passwords.js';
 import { AUTH_MODES, effectiveAuthMode } from './config.js';
+import { getDataDir } from './platform.js';
 
 /** DB key holding the outstanding code's hash and its counters. */
 const KEY = 'setup-code';
+
+/** Cross-process serialization for every read/modify/write of the record. */
+const LOCK_FILE = 'setup-code.lock';
+const LOCK_STALE_MS = 30_000;
+const LOCK_HEARTBEAT_MS = 5_000;
+const LOCK_TIMEOUT_MS = 10_000;
+const LOCK_RETRY_MS = 20;
+
+const lockContext = new AsyncLocalStorage();
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function detachOwnedLock(lockPath, predicate) {
+  let handle;
+  try {
+    handle = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const before = fs.fstatSync(handle);
+    if (!before.isFile() || before.nlink !== 1) return false;
+    let record;
+    try {
+      record = JSON.parse(fs.readFileSync(handle, 'utf8'));
+    } catch {
+      // A crash between the exclusive create and the ownership write leaves an
+      // empty or truncated lock. Staleness recovery must be able to detach it;
+      // owner-based release has no matching token and still leaves it alone.
+      record = null;
+    }
+    if (!predicate(record, before)) return false;
+
+    const detached = `${lockPath}.released-${process.pid}-${randomUUID()}`;
+    try {
+      fs.renameSync(lockPath, detached);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return false;
+      throw error;
+    }
+    const moved = fs.lstatSync(detached);
+    if (!moved.isFile()
+        || moved.isSymbolicLink()
+        || moved.dev !== before.dev
+        || moved.ino !== before.ino) {
+      try {
+        if (!fs.existsSync(lockPath)) fs.renameSync(detached, lockPath);
+      } catch { /* the safe result is to leave the detached entry alone */ }
+      return false;
+    }
+    fs.unlinkSync(detached);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  } finally {
+    if (handle !== undefined) {
+      try { fs.closeSync(handle); } catch { /* already closed */ }
+    }
+  }
+}
+
+/**
+ * Detach one stale lock without deleting a replacement that won a race.
+ *
+ * A PID is not an identity: Windows and Unix both reuse them. The heartbeat
+ * mtime is the authority. The checked entry is renamed aside and compared by
+ * device/inode before it is unlinked, so a new owner that appears between the
+ * stale check and recovery is never discarded.
+ */
+function detachStaleLock(lockPath) {
+  return detachOwnedLock(
+    lockPath,
+    (_record, stat) => Date.now() - stat.mtimeMs > LOCK_STALE_MS,
+  );
+}
+
+/**
+ * Serializes setup-code changes across the dashboard, daemon and CLI.
+ *
+ * The lock is deliberately a file beside the database rather than a SQL
+ * transaction: all persistence still goes through dbGet/dbSet, and the lock
+ * covers asynchronous work (scrypt verification and the controller's config
+ * write) as well as the final database mutation.
+ *
+ * Calls made while this process already owns the lock run re-entrantly. That
+ * lets the controller hold one critical section while calling the lower-level
+ * functions below without deadlocking itself.
+ */
+export async function withSetupCodeLock(fn) {
+  const lockPath = path.join(getDataDir(), LOCK_FILE);
+  if (lockContext.getStore() === lockPath) return fn();
+
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+
+  let ownerToken;
+  while (true) {
+    ownerToken = randomUUID();
+    let fd;
+    try {
+      fd = fs.openSync(lockPath, 'wx', 0o600);
+      try {
+        fs.writeFileSync(fd, JSON.stringify({
+          pid: process.pid,
+          token: ownerToken,
+          createdAt: Date.now(),
+        }));
+      } finally {
+        fs.closeSync(fd);
+      }
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      try {
+        const stat = fs.statSync(lockPath);
+        const age = Date.now() - stat.mtimeMs;
+        if (age > LOCK_STALE_MS && detachStaleLock(lockPath)) {
+          continue;
+        }
+      } catch (statError) {
+        if (statError.code === 'ENOENT') continue;
+        throw statError;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error('Timed out waiting for the setup code lock. Try again.');
+      }
+      await sleep(LOCK_RETRY_MS);
+    }
+  }
+
+  // A live process may legitimately hold this lock while scrypt and a config
+  // write run. Refresh the mtime so an older build, which ignores liveness,
+  // does not mistake a slow but healthy owner for a crash.
+  const heartbeat = setInterval(() => {
+    let fd;
+    try {
+      fd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || stat.nlink !== 1) return;
+      const held = JSON.parse(fs.readFileSync(fd, 'utf8'));
+      if (held?.token !== ownerToken) return;
+      const now = new Date();
+      fs.futimesSync(fd, now, now);
+    } catch {
+      /* the owner check or release below reports an invalid lock */
+    } finally {
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch { /* already closed */ }
+      }
+    }
+  }, LOCK_HEARTBEAT_MS);
+  heartbeat.unref?.();
+
+  try {
+    return await lockContext.run(lockPath, fn);
+  } finally {
+    clearInterval(heartbeat);
+    try {
+      detachOwnedLock(lockPath, (held) => held?.token === ownerToken);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        // A damaged or replaced lock is recovered by the stale timer. Never
+        // unlink a path this invocation cannot prove it still owns.
+      }
+    }
+  }
+}
 
 /** Six digits: readable off a terminal, typable on a phone. */
 const DIGITS = 6;
@@ -77,6 +245,13 @@ function read() {
   const value = dbGet(KEY);
   if (!value || typeof value !== 'object' || typeof value.hash !== 'string') return null;
   return value;
+}
+
+/** A stable identifier for records written before issuanceId was introduced. */
+function issuanceId(record) {
+  if (!record) return null;
+  if (typeof record.issuanceId === 'string' && record.issuanceId) return record.issuanceId;
+  return `legacy-${createHash('sha256').update(record.hash).digest('hex').slice(0, 24)}`;
 }
 
 /**
@@ -172,19 +347,22 @@ export function publicState({ now = Date.now() } = {}) {
  * @returns {Promise<{ code: string, expiresAt: number }>}
  */
 export async function issue({ now = Date.now() } = {}) {
-  // randomInt, not Math.random: this is a credential.
-  const code = String(randomInt(0, 10 ** DIGITS)).padStart(DIGITS, '0');
-  const expiresAt = now + CODE_TTL_MS;
+  return withSetupCodeLock(async () => {
+    // randomInt, not Math.random: this is a credential.
+    const code = String(randomInt(0, 10 ** DIGITS)).padStart(DIGITS, '0');
+    const expiresAt = now + CODE_TTL_MS;
 
-  dbSet(KEY, {
-    hash: await hashPassword(code),
-    issuedAt: now,
-    expiresAt,
-    failures: 0,
-    burned: false,
+    dbSet(KEY, {
+      issuanceId: randomUUID(),
+      hash: await hashPassword(code),
+      issuedAt: now,
+      expiresAt,
+      failures: 0,
+      burned: false,
+    });
+
+    return { code, expiresAt };
   });
-
-  return { code, expiresAt };
 }
 
 /**
@@ -197,32 +375,38 @@ export async function issue({ now = Date.now() } = {}) {
  * re-printing would require storing the cleartext.
  *
  * @param {Object} opts
- * @param {Object} opts.config
+ * @param {Object|Function} opts.config Configuration, or a reader evaluated
+ *   only after the cross-process lock has been acquired.
  * @returns {Promise<{ pending: boolean, code: string|null, expiresAt: number|null, state: string }>}
  */
 export async function ensureCode({ config, now = Date.now() } = {}) {
-  if (!setupPending(config)) {
-    // Nothing to protect. An outstanding code from before a password was set
-    // is removed rather than left to expire.
-    clear();
-    return { pending: false, code: null, expiresAt: null, state: 'not-needed' };
-  }
+  return withSetupCodeLock(async () => {
+    // A setup that completes while this process waits for the lock must be
+    // visible before an obsolete code is issued.
+    const currentConfig = typeof config === 'function' ? config() : config;
+    if (!setupPending(currentConfig)) {
+      // Nothing to protect. An outstanding code from before a password was set
+      // is removed rather than left to expire.
+      await clear();
+      return { pending: false, code: null, expiresAt: null, state: 'not-needed' };
+    }
 
-  const existing = read();
-  const state = usable(existing, now);
+    const existing = read();
+    const state = usable(existing, now);
 
-  if (state.ok) {
-    return { pending: true, code: null, expiresAt: Number(existing.expiresAt), state: 'outstanding' };
-  }
+    if (state.ok) {
+      return { pending: true, code: null, expiresAt: Number(existing.expiresAt), state: 'outstanding' };
+    }
 
-  // Expired or burned: a fresh one, so a pending setup stays completable.
-  const issued = await issue({ now });
-  return {
-    pending: true,
-    code: issued.code,
-    expiresAt: issued.expiresAt,
-    state: existing ? `reissued-${state.reason}` : 'issued',
-  };
+    // Expired or burned: a fresh one, so a pending setup stays completable.
+    const issued = await issue({ now });
+    return {
+      pending: true,
+      code: issued.code,
+      expiresAt: issued.expiresAt,
+      state: existing ? `reissued-${state.reason}` : 'issued',
+    };
+  });
 }
 
 /**
@@ -233,45 +417,86 @@ export async function ensureCode({ config, now = Date.now() } = {}) {
  * @returns {Promise<{ ok: boolean, reason: string, failures: number, burned: boolean }>}
  */
 export async function verify(input, { now = Date.now() } = {}) {
-  const record = read();
-  const state = usable(record, now);
+  return withSetupCodeLock(async () => {
+    const record = read();
+    const state = usable(record, now);
 
-  if (!state.ok) {
+    if (!state.ok) {
+      return {
+        ok: false,
+        reason: state.reason,
+        failures: Number(record?.failures ?? 0),
+        burned: state.reason === 'burned',
+      };
+    }
+
+    const snapshotId = issuanceId(record);
+    const digits = normalize(input);
+    if (digits.length !== DIGITS) {
+      // Counted: a malformed guess is still a guess.
+      return countFailure(snapshotId, 'invalid');
+    }
+
+    const matches = await verifyPassword(digits, record.hash);
+    if (!matches) return countFailure(snapshotId, 'invalid');
+
+    // Defensive check even though every caller serializes: another process
+    // could predate this build or have a stale lock. A success against a
+    // retired code must never authorize the current one.
+    const current = read();
+    if (!current || issuanceId(current) !== snapshotId || !usable(current, now).ok) {
+      return {
+        ok: false,
+        reason: 'replaced',
+        failures: Number(current?.failures ?? 0),
+        burned: Boolean(current?.burned),
+      };
+    }
+
+    return {
+      ok: true,
+      reason: 'ok',
+      failures: Number(current.failures ?? 0),
+      burned: false,
+      issuanceId: snapshotId,
+    };
+  });
+}
+
+/** Records one failure, but only against the issuance that was checked. */
+function countFailure(snapshotId, reason) {
+  const current = read();
+  if (!current || issuanceId(current) !== snapshotId) {
     return {
       ok: false,
-      reason: state.reason,
-      failures: Number(record?.failures ?? 0),
-      burned: state.reason === 'burned',
+      reason: 'replaced',
+      failures: Number(current?.failures ?? 0),
+      burned: Boolean(current?.burned),
     };
   }
 
-  const digits = normalize(input);
-  if (digits.length !== DIGITS) {
-    // Counted: a malformed guess is still a guess.
-    return countFailure(record, 'invalid');
-  }
-
-  const matches = await verifyPassword(digits, record.hash);
-  if (!matches) return countFailure(record, 'invalid');
-
-  return { ok: true, reason: 'ok', failures: Number(record.failures ?? 0), burned: false };
-}
-
-/** Records one failure, burning the code at the cap. */
-function countFailure(record, reason) {
-  const failures = Number(record.failures ?? 0) + 1;
+  const failures = Number(current.failures ?? 0) + 1;
   const burned = failures >= MAX_GLOBAL_FAILURES;
 
-  dbSet(KEY, { ...record, failures, burned });
+  dbSet(KEY, { ...current, issuanceId: snapshotId, failures, burned });
 
   return { ok: false, reason: burned ? 'burned' : reason, failures, burned };
 }
 
-/** Removes the outstanding code. Called once a password is set. */
-export function clear() {
-  if (read() === null) return false;
-  dbSet(KEY, null);
-  return true;
+/**
+ * Consumes one verified issuance after setup has been saved.
+ *
+ * Passing an issuance id makes this a compare-and-clear: rotation wins, and a
+ * stale setup request cannot erase the new code.
+ */
+export async function clear(expectedIssuanceId = null) {
+  return withSetupCodeLock(() => {
+    const current = read();
+    if (current === null) return false;
+    if (expectedIssuanceId !== null && issuanceId(current) !== expectedIssuanceId) return false;
+    dbSet(KEY, null);
+    return true;
+  });
 }
 
 /**

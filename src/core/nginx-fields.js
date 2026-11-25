@@ -12,10 +12,17 @@ export function nginxPathError(value, field) {
   return null;
 }
 
-function validBackend(value) {
+export function isSafeBackendHost(value) {
   if (typeof value !== 'string' || unsafe.test(value) || /[\s"'#$\\]/u.test(value)) return false;
   if (/^https?:\/\//i.test(value)) {
-    try { return Boolean(new URL(value).hostname); } catch { return false; }
+    try {
+      const parsed = new URL(value);
+      return Boolean(parsed.hostname)
+        && !parsed.username
+        && !parsed.password
+        && parsed.search === ''
+        && parsed.hash === '';
+    } catch { return false; }
   }
   return /^[a-z\d_.-]+$/i.test(value) ||
     (value.startsWith('[') && value.endsWith(']') && isIP(value.slice(1, -1)) === 6);
@@ -33,7 +40,7 @@ export function nginxDomainError(domain) {
     const error = validateDomainName(name);
     if (error) return error;
   }
-  if (backendHost != null && !validBackend(backendHost)) return 'Invalid backendHost. Use a hostname, IP address or HTTP(S) URL.';
+  if (backendHost != null && !isSafeBackendHost(backendHost)) return 'Invalid backendHost. Use a hostname, IP address or HTTP(S) URL.';
   const schemeError = validateUpstreamType(upstreamType);
   if (schemeError) return schemeError;
   // A full URL supplies its own port. Existing clients may send zero or an empty port alongside it.
