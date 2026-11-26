@@ -43,6 +43,106 @@ export const WINDOWS_PROGRAM_FILES_ROOT = 'C:\\Program Files';
 export const WINDOWS_PROGRAM_FILES_X86_ROOT = 'C:\\Program Files (x86)';
 
 /**
+ * Who this process is running as, and whether that is the Windows service
+ * account.
+ *
+ * On a Windows Server install the background service runs as the virtual
+ * account `NT SERVICE\EasyDevOps`. That account has its own profile
+ * (`C:\Windows\ServiceProfiles\EasyDevOps`, or the system profile for some
+ * service accounts) and its own environment; it cannot see the installing
+ * user's `%APPDATA%` or that user's PM2. Callers compare this answer before
+ * touching a per-user resource.
+ *
+ * Linux always reports false: a root or user systemd service runs as the
+ * operator's own account, so there is no second identity to protect.
+ *
+ * Never throws: an unreadable account is reported as unknown (`null`), which
+ * callers must treat as "not proven to be the service account".
+ *
+ * @param {{
+ *   env?: Object,
+ *   userInfo?: Function|Object,
+ *   homedir?: Function|string,
+ * }} [deps] Injectable for tests; every default is the real process.
+ * @returns {{ user: string|null, home: string|null, serviceAccount: boolean }}
+ */
+export function currentAccount({ env = process.env, userInfo = os.userInfo, homedir = os.homedir } = {}) {
+  const text = (value) => {
+    const s = typeof value === 'string' ? value.trim() : '';
+    return s || null;
+  };
+
+  let user = null;
+  let home = null;
+
+  try {
+    const info = typeof userInfo === 'function' ? userInfo() : userInfo;
+    if (info && typeof info === 'object') {
+      user = text(info.username);
+      home = text(info.homedir);
+    }
+  } catch {
+    // An account Windows will not describe is unknown, not fatal.
+  }
+
+  if (!user) user = text(env?.USERNAME) ?? text(env?.USER) ?? text(env?.LOGNAME);
+  if (!home) {
+    try {
+      home = text(typeof homedir === 'function' ? homedir() : homedir);
+    } catch {
+      home = null;
+    }
+  }
+
+  let serviceAccount = false;
+  if (isWindows) {
+    try {
+      // os.userInfo().username is `EasyDevOps` for the virtual account; be
+      // tolerant of a `DOMAIN\name` or `NT SERVICE\name` spelling too.
+      const name = String(user ?? '').split('\\').pop().toLowerCase();
+      if (name === 'easydevops') serviceAccount = true;
+
+      if (!serviceAccount && home) {
+        const normalize = (p) => path.win32.resolve(String(p)).replace(/[\\/]+$/, '').toLowerCase();
+        const candidate = normalize(home);
+        const serviceProfiles = [
+          path.win32.join(WINDOWS_SYSTEM_ROOT, 'ServiceProfiles'),
+          path.win32.join(WINDOWS_SYSTEM_ROOT, 'System32', 'config', 'systemprofile'),
+        ].map(normalize);
+        serviceAccount = serviceProfiles.some(
+          (root) => candidate === root || candidate.startsWith(`${root}\\`),
+        );
+      }
+    } catch {
+      serviceAccount = false;
+    }
+  }
+
+  return { user, home, serviceAccount };
+}
+
+/**
+ * True when this process was started by the OS service manager.
+ *
+ * Linux: systemd sets `INVOCATION_ID` for a unit it starts. Windows: only a
+ * process running as the service account counts — a Task Scheduler task or a
+ * Startup-folder launcher is not a service, and `INVOCATION_ID` means nothing
+ * there.
+ *
+ * @param {{ env?: Object, account?: { serviceAccount?: boolean } }} [deps]
+ * @returns {boolean}
+ */
+export function runningUnderServiceManager({ env = process.env, account = currentAccount() } = {}) {
+  try {
+    const who = typeof account === 'function' ? account() : account;
+    if (isWindows) return who?.serviceAccount === true;
+    return Boolean(env?.INVOCATION_ID);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The per-user data directory: where a normal, non-service install lives.
  */
 function userDataDir() {

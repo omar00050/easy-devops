@@ -23,7 +23,15 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { run as defaultRun, SHELL_CAPTURE_TAIL_BYTES } from './shell.js';
-import { quoteExe, pm2StartupCmd, pm2UnstartupCmd, isWindows } from './platform.js';
+import {
+  quoteExe,
+  pm2StartupCmd,
+  pm2UnstartupCmd,
+  isWindows,
+  isServerMode,
+  currentAccount,
+} from './platform.js';
+import { dbGet } from './db.js';
 
 /** PM2 can be slow to answer while the daemon is starting up. */
 const PM2_TIMEOUT_MS = 60_000;
@@ -55,6 +63,149 @@ export function isEzApp(name) {
 }
 
 /**
+ * Whether this process may talk to PM2 at all.
+ *
+ * On a Windows Server install the background service runs as
+ * `NT SERVICE\EasyDevOps`. PM2 is a per-user program: the service account's
+ * `where.exe` does not find the operator's global npm bin, its `PM2_HOME` is
+ * its own profile, and every pm2 command starts a daemon when none answers
+ * (PM2's Client.js) — so a status read from the service could create a SECOND,
+ * service-owned PM2 daemon. Constructing the PM2 model the owner chose
+ * (standard PM2 of the recorded operator) therefore stops here: a service
+ * account never spawns pm2 or npm at all.
+ *
+ * Everywhere else — Linux, Windows Personal, and the operator's own CLI or
+ * dashboard on a Server — this returns `{ ok: true }` and the callers behave
+ * exactly as before.
+ *
+ * @param {{ deps?: Object }} [opts] `deps` is injectable for tests:
+ *   `isWindows`, `serverMode`, `account`, and `operator`/`readOperator`/`dbGet`.
+ * @returns {{ ok: true } | {
+ *   ok: false, reason: 'service_account', user: string|null,
+ *   message: string, fix: string,
+ * }}
+ */
+export function pm2Access({ deps = {} } = {}) {
+  const windows = valueOrCall(deps.isWindows, isWindows);
+  const serverMode = valueOrCall(deps.serverMode, isServerMode());
+  // Only a Windows Server-mode install has a second identity to protect. Stop
+  // before asking for the account on every other platform/mode.
+  if (!windows || !serverMode) return { ok: true };
+
+  const account = valueOrCall(deps.account, currentAccount());
+  if (account?.serviceAccount !== true) return { ok: true };
+
+  const operator = readOperatorRecord(deps);
+  const user = typeof operator?.user === 'string' && operator.user.trim() ? operator.user.trim() : null;
+
+  const message = user
+    ? `PM2 runs under the user ${user}; the Easy DevOps service (NT SERVICE\\EasyDevOps) cannot see it.`
+    : 'PM2 runs under the account that started it; the Easy DevOps service (NT SERVICE\\EasyDevOps) cannot see it.';
+  const fix = user
+    ? `Manage these apps on the server as ${user} (the Easy DevOps dashboard there, or pm2 list). Hub process actions and Hub deploys need that PM2, so this server refuses them.`
+    : 'Run ezz service repair in an Administrator PowerShell, signed in as the user who runs PM2, so the Hub can name that user. Manage the apps on the server meanwhile.';
+
+  return { ok: false, reason: 'service_account', user, message, fix };
+}
+
+/**
+ * What the Hub needs to say about PM2, in one record.
+ *
+ * States:
+ *   - `available`  — the daemon answers and has at least one app;
+ *   - `empty`      — the daemon answers and has no apps;
+ *   - `not_running`— PM2 is installed but its daemon is not up (this read never
+ *                    starts one: the pid file is checked first);
+ *   - `not_installed`;
+ *   - `unavailable`— this process may not use PM2 (`service_account`), or the
+ *                    list did not answer (`list_failed`).
+ *
+ * `version` is deliberately null unless a caller has already probed it: asking
+ * PM2 for its version is itself a PM2 command, and a status read must never be
+ * the thing that starts a daemon.
+ *
+ * @param {{ deps?: Object }} [opts] `run`, `pm2Path`, `isRunning` plus the
+ *   `pm2Access` deps (`isWindows`, `serverMode`, `account`, `operator`).
+ * @returns {Promise<{
+ *   state: 'available'|'empty'|'not_running'|'not_installed'|'unavailable',
+ *   reason: string|null, message: string|null, fix: string|null,
+ *   user: string|null, version: string|null,
+ * }>}
+ */
+export async function pm2State({ deps = {} } = {}) {
+  const access = pm2Access({ deps });
+  const operator = readOperatorRecord(deps);
+  const user = typeof operator?.user === 'string' && operator.user.trim() ? operator.user.trim() : null;
+
+  if (!access.ok) {
+    return {
+      state: 'unavailable',
+      reason: access.reason,
+      message: access.message,
+      fix: access.fix,
+      user: access.user,
+      version: null,
+    };
+  }
+
+  const run = deps.run ?? defaultRun;
+  const pm2Path = deps.pm2Path ?? 'pm2';
+  const isRunning = deps.isRunning ?? isDaemonRunning;
+
+  let running = false;
+  try {
+    running = Boolean(isRunning({ deps }));
+  } catch {
+    running = false;
+  }
+
+  if (running) {
+    const listed = await list({ run, pm2Path, deps });
+    if (!listed.ok) {
+      return {
+        state: 'unavailable',
+        reason: 'list_failed',
+        message: `PM2 did not answer: ${listed.error ?? 'unknown error'}`,
+        fix: 'Run pm2 list on the server.',
+        user,
+        version: null,
+      };
+    }
+    return {
+      state: listed.apps.length > 0 ? 'available' : 'empty',
+      reason: null,
+      message: null,
+      fix: null,
+      user,
+      version: null,
+    };
+  }
+
+  // Installed but not running: ask only whether the binary exists
+  // (`probeVersion: false`), so this read cannot start a daemon.
+  const detected = await detect({ run, pm2Path, probeVersion: false, deps });
+  if (detected.installed) {
+    return {
+      state: 'not_running',
+      reason: 'not_running',
+      message: 'PM2 is installed but its daemon is not running.',
+      fix: 'Start an app with PM2, or run pm2 resurrect.',
+      user,
+      version: detected.version ?? null,
+    };
+  }
+
+  return {
+    state: 'not_installed',
+    reason: 'not_installed',
+    message: 'PM2 is not installed.',
+    fix: 'Run npm i -g pm2 on the server.',
+    user,
+    version: null,
+  };
+}
+
+/**
  * Locates the pm2 executable and its version.
  *
  * Resolution is deliberately a plain `pm2 --version`: PM2 is installed
@@ -66,10 +217,15 @@ export function isEzApp(name) {
  * when you only need to know whether PM2 exists — a status read must not
  * spawn a daemon on a machine that does not use PM2.
  *
- * @param {{ run?: Function, probeVersion?: boolean }} [deps]
+ * @param {{ run?: Function, probeVersion?: boolean, deps?: Object }} [deps]
  * @returns {Promise<{ installed: boolean, version: string|null, path: string|null, error: string|null }>}
  */
-export async function detect({ run = defaultRun, probeVersion = true } = {}) {
+export async function detect({ run = defaultRun, probeVersion = true, deps = {} } = {}) {
+  const access = pm2Access({ deps });
+  if (!access.ok) {
+    return unavailableResult(access, { installed: false, version: null, path: null, error: access.message });
+  }
+
   const which = isWindows ? 'where.exe pm2' : 'command -v pm2';
   const located = await run(which, { timeout: 15_000 });
 
@@ -123,10 +279,13 @@ export function pickExecutable(candidates) {
  *
  * The caller MUST have asked the user first — see the module header.
  *
- * @param {{ run?: Function }} [deps]
+ * @param {{ run?: Function, deps?: Object }} [deps]
  * @returns {Promise<{ ok: boolean, output: string }>}
  */
-export async function install({ run = defaultRun } = {}) {
+export async function install({ run = defaultRun, deps = {} } = {}) {
+  const access = pm2Access({ deps });
+  if (!access.ok) return unavailableResult(access, { ok: false, output: access.message });
+
   const r = await run('npm install -g pm2', { timeout: INSTALL_TIMEOUT_MS });
   return { ok: r.success, output: combine(r) };
 }
@@ -143,10 +302,13 @@ export async function install({ run = defaultRun } = {}) {
  * every consumer would see "no list". If even the full cap is exceeded the
  * answer is a clear error naming that cause — never a quietly cut capture.
  *
- * @param {{ run?: Function, pm2Path?: string }} [deps]
+ * @param {{ run?: Function, pm2Path?: string, deps?: Object }} [deps]
  * @returns {Promise<{ ok: boolean, apps: Array<Object>, error: string|null }>}
  */
-export async function list({ run = defaultRun, pm2Path = 'pm2' } = {}) {
+export async function list({ run = defaultRun, pm2Path = 'pm2', deps = {} } = {}) {
+  const access = pm2Access({ deps });
+  if (!access.ok) return unavailableResult(access, { ok: false, apps: [], error: access.message });
+
   const r = await run(`${quoteExe(pm2Path)} jlist`, { timeout: PM2_TIMEOUT_MS, output: 'full' });
 
   const dropped = (r?.truncated?.stdout ?? 0) + (r?.truncated?.stderr ?? 0);
@@ -188,13 +350,19 @@ export async function list({ run = defaultRun, pm2Path = 'pm2' } = {}) {
  * subprocess. `isRunning` is injectable so tests can prove that.
  *
  * @param {string} name PM2 app name
- * @param {{ run?: Function, pm2Path?: string, isRunning?: () => boolean }} [deps]
+ * @param {{ run?: Function, pm2Path?: string, isRunning?: Function, deps?: Object }} [deps]
  * @returns {Promise<{ ok: boolean, app: Object|null, daemonRunning: boolean, error: string|null }>}
  */
-export async function status(name, { run = defaultRun, pm2Path = 'pm2', isRunning = isDaemonRunning } = {}) {
-  const all = await statusAll(name, { run, pm2Path, isRunning });
+export async function status(name, { run = defaultRun, pm2Path = 'pm2', isRunning = isDaemonRunning, deps = {} } = {}) {
+  const all = await statusAll(name, { run, pm2Path, isRunning, deps });
   if (!all.ok) {
-    return { ok: false, app: null, daemonRunning: all.daemonRunning, error: all.error };
+    return {
+      ok: false,
+      app: null,
+      daemonRunning: all.daemonRunning,
+      error: all.error,
+      ...(all.unavailable ? unavailableFields(all) : {}),
+    };
   }
   return {
     ok: true,
@@ -213,15 +381,20 @@ export async function status(name, { run = defaultRun, pm2Path = 'pm2', isRunnin
  * not hidden behind the first entry PM2 happens to list.
  *
  * @param {string} name PM2 app name
- * @param {{ run?: Function, pm2Path?: string, isRunning?: () => boolean }} [deps]
+ * @param {{ run?: Function, pm2Path?: string, isRunning?: Function, deps?: Object }} [deps]
  * @returns {Promise<{ ok: boolean, apps: Array<Object>, daemonRunning: boolean, error: string|null }>}
  */
-export async function statusAll(name, { run = defaultRun, pm2Path = 'pm2', isRunning = isDaemonRunning } = {}) {
-  if (!isRunning()) {
+export async function statusAll(name, { run = defaultRun, pm2Path = 'pm2', isRunning = isDaemonRunning, deps = {} } = {}) {
+  const access = pm2Access({ deps });
+  if (!access.ok) {
+    return unavailableResult(access, { ok: false, apps: [], daemonRunning: false, error: access.message });
+  }
+
+  if (!isRunning({ deps })) {
     return { ok: false, apps: [], daemonRunning: false, error: 'PM2 is not running.' };
   }
 
-  const listed = await list({ run, pm2Path });
+  const listed = await list({ run, pm2Path, deps });
   if (!listed.ok) {
     return { ok: false, apps: [], daemonRunning: true, error: listed.error };
   }
@@ -285,9 +458,13 @@ export function normalizeApp(app) {
  * @param {string} [opts.cwd]      Working directory
  * @param {Function} [opts.run]
  * @param {string} [opts.pm2Path]
+ * @param {Object} [opts.deps]
  * @returns {Promise<{ ok: boolean, output: string }>}
  */
-export async function start({ script, name, args = [], cwd, run = defaultRun, pm2Path = 'pm2' }) {
+export async function start({ script, name, args = [], cwd, run = defaultRun, pm2Path = 'pm2', deps = {} }) {
+  const access = pm2Access({ deps });
+  if (!access.ok) return unavailableResult(access, { ok: false, output: access.message });
+
   const parts = [`${quoteExe(pm2Path)} start "${script}"`, `--name "${name}"`];
   if (args.length > 0) parts.push('--', ...args);
 
@@ -304,30 +481,33 @@ export async function start({ script, name, args = [], cwd, run = defaultRun, pm
  * recognises the file as a config by its `.json` extension.
  *
  * @param {string} file Absolute path to the config file
- * @param {{ run?: Function, pm2Path?: string }} [deps]
+ * @param {{ run?: Function, pm2Path?: string, deps?: Object }} [deps]
  * @returns {Promise<{ ok: boolean, output: string }>}
  */
-export async function startConfig(file, { run = defaultRun, pm2Path = 'pm2' } = {}) {
+export async function startConfig(file, { run = defaultRun, pm2Path = 'pm2', deps = {} } = {}) {
+  const access = pm2Access({ deps });
+  if (!access.ok) return unavailableResult(access, { ok: false, output: access.message });
+
   const r = await run(`${quoteExe(pm2Path)} start "${file}"`, { timeout: PM2_TIMEOUT_MS });
   return { ok: r.success, output: combine(r) };
 }
 
 /** @returns {Promise<{ ok: boolean, output: string }>} */
-export async function stop(name, { run = defaultRun, pm2Path = 'pm2' } = {}) {
-  return simple('stop', name, run, pm2Path);
+export async function stop(name, { run = defaultRun, pm2Path = 'pm2', deps = {} } = {}) {
+  return simple('stop', name, run, pm2Path, deps);
 }
 
 /** @returns {Promise<{ ok: boolean, output: string }>} */
-export async function restart(name, { run = defaultRun, pm2Path = 'pm2' } = {}) {
-  return simple('restart', name, run, pm2Path);
+export async function restart(name, { run = defaultRun, pm2Path = 'pm2', deps = {} } = {}) {
+  return simple('restart', name, run, pm2Path, deps);
 }
 
 /**
  * Graceful reload (zero-downtime for apps in cluster mode).
  * @returns {Promise<{ ok: boolean, output: string }>}
  */
-export async function reload(name, { run = defaultRun, pm2Path = 'pm2' } = {}) {
-  return simple('reload', name, run, pm2Path);
+export async function reload(name, { run = defaultRun, pm2Path = 'pm2', deps = {} } = {}) {
+  return simple('reload', name, run, pm2Path, deps);
 }
 
 /**
@@ -339,17 +519,20 @@ export async function reload(name, { run = defaultRun, pm2Path = 'pm2' } = {}) {
  * cluster mode; a fork app cannot overlap its old and new process.
  *
  * @param {string} file Absolute path to the PM2 config file
- * @param {{ run?: Function, pm2Path?: string }} [deps]
+ * @param {{ run?: Function, pm2Path?: string, deps?: Object }} [deps]
  * @returns {Promise<{ ok: boolean, output: string }>}
  */
-export async function reloadConfig(file, { run = defaultRun, pm2Path = 'pm2' } = {}) {
+export async function reloadConfig(file, { run = defaultRun, pm2Path = 'pm2', deps = {} } = {}) {
+  const access = pm2Access({ deps });
+  if (!access.ok) return unavailableResult(access, { ok: false, output: access.message });
+
   const r = await run(`${quoteExe(pm2Path)} reload "${file}" --update-env`, { timeout: PM2_TIMEOUT_MS });
   return { ok: r.success, output: combine(r) };
 }
 
 /** Removes the app from PM2 entirely. @returns {Promise<{ ok: boolean, output: string }>} */
-export async function del(name, { run = defaultRun, pm2Path = 'pm2' } = {}) {
-  return simple('delete', name, run, pm2Path);
+export async function del(name, { run = defaultRun, pm2Path = 'pm2', deps = {} } = {}) {
+  return simple('delete', name, run, pm2Path, deps);
 }
 
 /**
@@ -358,10 +541,13 @@ export async function del(name, { run = defaultRun, pm2Path = 'pm2' } = {}) {
  * `--nostream` is what makes this return instead of tailing forever.
  *
  * @param {string} name
- * @param {{ lines?: number, run?: Function, pm2Path?: string }} [opts]
+ * @param {{ lines?: number, run?: Function, pm2Path?: string, deps?: Object }} [opts]
  * @returns {Promise<{ ok: boolean, lines: string[], output: string }>}
  */
-export async function logs(name, { lines = 200, run = defaultRun, pm2Path = 'pm2' } = {}) {
+export async function logs(name, { lines = 200, run = defaultRun, pm2Path = 'pm2', deps = {} } = {}) {
+  const access = pm2Access({ deps });
+  if (!access.ok) return unavailableResult(access, { ok: false, lines: [], output: access.message });
+
   const n = Math.max(1, Math.min(5000, Number(lines) || 200));
   const r = await run(`${quoteExe(pm2Path)} logs "${name}" --lines ${n} --nostream`, {
     timeout: PM2_TIMEOUT_MS,
@@ -376,7 +562,10 @@ export async function logs(name, { lines = 200, run = defaultRun, pm2Path = 'pm2
  * itself is a native service and does not depend on it.
  * @returns {Promise<{ ok: boolean, output: string }>}
  */
-export async function save({ run = defaultRun, pm2Path = 'pm2' } = {}) {
+export async function save({ run = defaultRun, pm2Path = 'pm2', deps = {} } = {}) {
+  const access = pm2Access({ deps });
+  if (!access.ok) return unavailableResult(access, { ok: false, output: access.message });
+
   const r = await run(`${quoteExe(pm2Path)} save`, { timeout: PM2_TIMEOUT_MS });
   return { ok: r.success, output: combine(r) };
 }
@@ -392,10 +581,15 @@ export async function save({ run = defaultRun, pm2Path = 'pm2' } = {}) {
  * for the user to run under sudo. That command is returned verbatim rather
  * than executed, so Easy DevOps never needs broad sudoers rules.
  *
- * @param {{ run?: Function, pm2Path?: string }} [deps]
+ * @param {{ run?: Function, pm2Path?: string, deps?: Object }} [deps]
  * @returns {Promise<{ ok: boolean, sudoCommand: string|null, output: string }>}
  */
-export async function startup({ run = defaultRun, pm2Path = 'pm2' } = {}) {
+export async function startup({ run = defaultRun, pm2Path = 'pm2', deps = {} } = {}) {
+  const access = pm2Access({ deps });
+  if (!access.ok) {
+    return unavailableResult(access, { ok: false, sudoCommand: null, output: access.message });
+  }
+
   const r = await run(pm2StartupCmd(pm2Path), { timeout: PM2_TIMEOUT_MS });
   const output = combine(r);
   return { ok: r.success, sudoCommand: parseSudoCommand(output), output };
@@ -406,7 +600,12 @@ export async function startup({ run = defaultRun, pm2Path = 'pm2' } = {}) {
  * Like startup(), this may only print a sudo command for the user to run.
  * @returns {Promise<{ ok: boolean, sudoCommand: string|null, output: string }>}
  */
-export async function unstartup({ run = defaultRun, pm2Path = 'pm2' } = {}) {
+export async function unstartup({ run = defaultRun, pm2Path = 'pm2', deps = {} } = {}) {
+  const access = pm2Access({ deps });
+  if (!access.ok) {
+    return unavailableResult(access, { ok: false, sudoCommand: null, output: access.message });
+  }
+
   const r = await run(pm2UnstartupCmd(pm2Path), { timeout: PM2_TIMEOUT_MS });
   const output = combine(r);
   return { ok: r.success, sudoCommand: parseSudoCommand(output), output };
@@ -468,9 +667,17 @@ export function pm2HomeDir() {
  *
  * Checked by pid file rather than by asking PM2, for the same reason.
  *
+ * Under the Windows service account this returns false WITHOUT reading the
+ * service profile's pid file: that file belongs to a different PM2_HOME which
+ * the operator's PM2 does not use, and reading it would only mislead.
+ *
+ * @param {{ deps?: Object }} [opts]
  * @returns {boolean}
  */
-export function isDaemonRunning() {
+export function isDaemonRunning({ deps = {} } = {}) {
+  const access = pm2Access({ deps });
+  if (!access.ok) return false;
+
   try {
     const pidFile = path.join(pm2HomeDir(), 'pm2.pid');
     const pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
@@ -485,7 +692,53 @@ export function isDaemonRunning() {
 
 // ─── internals ────────────────────────────────────────────────────────────────
 
-async function simple(verb, name, run, pm2Path) {
+/** A value, or the result of calling it when it is a function. */
+function valueOrCall(value, fallback) {
+  try {
+    const answer = typeof value === 'function' ? value() : value;
+    return answer ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * The operator recorded by the Windows Server install, from the
+ * `service-state` database key. A missing record is unknown, never false.
+ * `deps` may carry the record itself or a reader, which is what tests use.
+ */
+function readOperatorRecord(deps = {}) {
+  try {
+    if (deps.operator !== undefined) return deps.operator;
+    if (typeof deps.readOperator === 'function') return deps.readOperator();
+    const state = typeof deps.dbGet === 'function' ? deps.dbGet('service-state') : dbGet('service-state');
+    return state?.operator ?? null;
+  } catch {
+    // An unreadable database is "no recorded operator", not a crash.
+    return null;
+  }
+}
+
+/** The fields every refused call carries, so a UI can explain itself. */
+function unavailableFields(access) {
+  return {
+    unavailable: true,
+    reason: access.reason,
+    message: access.message,
+    fix: access.fix,
+    user: access.user,
+  };
+}
+
+/** A refused call: the caller's usual failure shape plus the reason. */
+function unavailableResult(access, shape) {
+  return { ...shape, ...unavailableFields(access) };
+}
+
+async function simple(verb, name, run, pm2Path, deps = {}) {
+  const access = pm2Access({ deps });
+  if (!access.ok) return unavailableResult(access, { ok: false, output: access.message });
+
   const r = await run(`${quoteExe(pm2Path)} ${verb} "${name}"`, { timeout: PM2_TIMEOUT_MS });
   return { ok: r.success, output: combine(r) };
 }

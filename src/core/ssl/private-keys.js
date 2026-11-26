@@ -8,6 +8,7 @@ import { approvedGrantDirs, canonicalAclDirectory } from '../service/acl.js';
 import { runFile } from '../shell.js';
 import { validateDomainName } from '../validators.js';
 import { recoverCertificateFiles } from './certificate-transaction.js';
+import { renameWithRetryAsync } from '../atomicState.js';
 
 const aclScript = fileURLToPath(new URL('./key-permissions.ps1', import.meta.url));
 
@@ -77,7 +78,10 @@ async function publishFile(file, data, replace) {
   const handle = await fs.open(tmp, 'wx', 0o600);
   try {
     try { await handle.writeFile(data); } finally { await handle.close(); }
-    if (replace) await fs.rename(tmp, file);
+    // Async retry: this path is awaited on request handling, so the waits must
+    // not block the event loop. A certificate reader holding the old file open
+    // for a moment is a denial to ride out, not a failed issuance.
+    if (replace) await renameWithRetryAsync(tmp, file);
     else await fs.link(tmp, file); // Publish the complete account key once, even across processes.
   } finally { await fs.rm(tmp, { force: true }); }
 }

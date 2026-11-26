@@ -45,6 +45,7 @@ import { randomUUID } from 'node:crypto';
 
 import { runFile } from '../shell.js';
 import { getDataDir, isWindows } from '../platform.js';
+import { retrySharing } from '../atomicState.js';
 import { runtimeDir, runtimeNodePath } from './runtime.js';
 import { serviceXmlPath } from './windowsService.js';
 import { launcherPath, supervisorPath } from './windowsPersonal.js';
@@ -72,18 +73,15 @@ function exists(file) {
  * rename(2), retried briefly on the codes Windows uses for "another process
  * has this open". A rename of our own files should not fail because a reader
  * looked at them at the wrong moment.
+ *
+ * The loop is the shared one in core/atomicState.js; this caller keeps its own
+ * schedule (51 attempts, 10 ms apart) because a rollback runs while the service
+ * manager is still tearing the old process down.
  */
+const RENAME_RETRY_DELAYS_MS = Object.freeze(Array.from({ length: 50 }, () => 10));
+
 function renameWithRetry(from, to) {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      fs.renameSync(from, to);
-      return;
-    } catch (error) {
-      const transient = ['EPERM', 'EBUSY', 'EACCES'].includes(error?.code);
-      if (!transient || attempt >= 50) throw error;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-    }
-  }
+  retrySharing(() => fs.renameSync(from, to), { delays: RENAME_RETRY_DELAYS_MS });
 }
 
 /** Makes a rename durable. Unavailable on some Windows filesystems. */
@@ -174,12 +172,12 @@ function replaceFile(source, target) {
   fs.copyFileSync(source, temporary);
   try {
     fs.chmodSync(temporary, 0o600);
-    if (exists(target)) fs.renameSync(target, displaced);
+    if (exists(target)) renameWithRetry(target, displaced);
     try {
-      fs.renameSync(temporary, target);
+      renameWithRetry(temporary, target);
       fs.rmSync(displaced, { force: true });
     } catch (error) {
-      if (exists(displaced)) fs.renameSync(displaced, target);
+      if (exists(displaced)) renameWithRetry(displaced, target);
       throw error;
     }
   } finally {

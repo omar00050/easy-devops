@@ -824,6 +824,7 @@ ignored, so a malformed request cannot widen access.
 | GET | `/api/processes` | session | PM2 process list |
 | GET | `/api/processes/:name/logs` | session | Recent lines for one process |
 | POST | `/api/processes/:name/:action` | session | `action` ∈ `start`, `stop`, `restart`, `reload` |
+| POST | `/api/pm2/install` | session | Install PM2 globally (`npm i -g pm2`), 1.4.9 |
 
 > **This section describes the NATIVE background service.** Easy DevOps used to
 > run itself as a PM2 app named `ez-dashboard`, started at boot by a Windows
@@ -1063,6 +1064,29 @@ to 200 —
 no such process · `409` PM2 not installed, or the process belongs to another OS
 user (PM2 keeps one process list per user).
 
+**`POST /api/pm2/install`** (1.4.9) takes **no body** and is behind the same
+session auth as every other route. It installs the **standard** PM2 globally —
+`npm i -g pm2`, the user's own default `PM2_HOME` — and nothing else. PM2 is
+never installed silently: the client asks first (the dashboard and the CLI offer
+it where PM2 is missing, and the Hub offers the command rather than calling
+this route itself).
+
+- `200 { ok: true, version, output }` — `version` is read from the install
+  output, or `null` when it could not be; `output` is the command's text.
+- `409 { ok: false, reason: "already_installed", message: "PM2 is already installed.", version, path }`
+  — PM2 was already usable, so nothing was run. `version` and `path` are the
+  detected PM2's, or `null` when they could not be read (`probeVersion: false`,
+  so this check never starts the daemon).
+- `409 { ok: false, reason: "in_progress", message: "A PM2 install is already running. Wait for it to finish.", fix: "npm i -g pm2" }`
+  — one install at a time: a second request while `npm i -g pm2` is running
+  starts nothing and says so.
+- `403 { ok: false, reason: "service_account", message, fix }` — this process
+  runs as the Windows Server service account (`NT SERVICE\EasyDevOps`). PM2
+  belongs to the operator; installing one for the service would create a second,
+  service-owned PM2 daemon the operator cannot see. `message` and `fix` are the
+  same texts `pm2` carries in §3.5.
+- `500 { ok: false, reason: "install_failed", output, command: "npm i -g pm2" }`.
+
 ### 2.8 Deployments — `src/dashboard/routes/deployments.js` (mounted at `/api/deployments`)
 
 Added in 2.4.0. Puts a project from a git repository on the server, builds it
@@ -1235,6 +1259,20 @@ on invalid input, `409` when the id is taken. `PUT /:id` takes any subset of the
 same fields except `id` and `generateKey`. `settings` accepts `steps` and
 `runtime` (2.15.0) and still accepts the old `install`/`build`/`migrate` fields;
 an update that carries `steps` stores it and drops the old fields.
+
+**The PM2 offer (1.4.9).** A `POST /api/deployments` response also carries
+`pm2: { state, reason, message, fix, user, offer }` — the same object the agent
+sends in `service:state` (§3.5), plus `offer`:
+
+- `offer: { "command": "npm i -g pm2", "endpoint": "POST /api/pm2/install" }`
+  when `state` is `"not_installed"`;
+- `offer: null` otherwise, including when the state is unknown (`unavailable`).
+
+Creating an app does not start it, so a missing PM2 is a warning here rather
+than a failure; the offer is what lets the UI install it in one step. The Hub's
+`hub:deploy { action: "create" }` command result carries the same `pm2` object,
+but with `offer.endpoint: null`: the Hub cannot install PM2 on a server
+remotely, so it shows `offer.command` for the user to run there.
 
 **Step order warnings (2.15.0).** Validation and app responses carry them in
 `warnings`, not `errors`: a `migrate` step before `install`, a `build` before
@@ -1798,6 +1836,29 @@ a separate process list per user, so that app is not controllable from here).
 `{ name, action, managed, output }`, where `managed` says whether Easy DevOps
 created the app.
 
+**Refused on a Windows Server service account (1.4.9).** When the agent runs as
+`NT SERVICE\EasyDevOps` in Server mode, PM2 belongs to the operator and the
+service account cannot reach it without spawning a second, service-owned daemon.
+The command is refused **before anything is spawned, listed or acted on**, with
+the shape every refused Hub command uses — `command:result` with `ok: false`,
+`error` set to the message, and the refusal in `data`:
+
+```json
+{
+  "ok": false,
+  "reason": "service_account",
+  "message": "PM2 runs under the user admin; the Easy DevOps service (NT SERVICE\\EasyDevOps) cannot see it.",
+  "fix": "Manage these apps on the server as admin (the Easy DevOps dashboard there, or pm2 list). Hub process actions and Hub deploys need that PM2, so this server refuses them.",
+  "user": "admin"
+}
+```
+
+`user` is the operator recorded at install, or `null` when none was recorded (the
+texts then say "the account that started it"). This is the same `{ state,
+reason, message, fix, user }` vocabulary as the `pm2` object in §3.5, minus
+`state` (a refusal is always `unavailable`). A client must treat a missing field
+as unknown, never as `false`.
+
 ### 3.5 Events the agent sends to the Hub
 
 The other direction of the same outbound socket (`core/hub/agent.js`). These
@@ -1815,8 +1876,8 @@ the push is skipped and the next reconnect re-sends the full state.
 | `domain:configs` | An explicit Hub projection of every stored domain. It always carries monitoring and ordinary editable fields such as `name`, `enabled`, `port`, `backendHost`, `upstreamType`, `www`, `wildcard`, `behindCloudflare`, safe nested SSL/performance/security values, `advanced.accessLog`, and notification routing. `backendHost` is `null` when a legacy stored value contains URL credentials. `certStatus` (`valid` \| `expiring` \| `expired` \| `not_issued` \| `unreadable`) and `certLabel` may also be present. With `nginx.config.view`, it additionally carries `ssl.certPath`, `ssl.keyPath`, `configFile`, and `advanced.customLocations`. It never carries certificate contents, credentials, or unknown stored fields | On connect, every 5 min, after a pairing/permission revision moves, and after any Hub domain command |
 | `channels:list` | `[{ id, name, type }]` — no webhook URL or bot token | On connect and every 5 min |
 | `cert:expiry` | `[{ domain, expiresAt, daysLeft, status?, label? }]` — `expiresAt` is an ISO string or `null`, `daysLeft` may be negative, and `status`/`label` use the same values as `domain:configs` | On connect and every 12 h, and after any Hub SSL command |
-| `service:state` | `{ installed, running, status, mechanism, mode, startsAt, stoppedByUser, jobsRunningHere, enabledOnBoot, dev, pm2Installed, pm2Version, uptimeMs }`; `installed` is `boolean \| null`, where `null` means protected service files could not be inspected | On connect, every 5 min, and whenever the shared revision moves. It describes the **native** service; `pm2*` is the user's own PM2, a different thing |
-| `processes:list` | `{ daemonRunning, apps }` — the same app objects as `GET /api/processes`, and `daemonRunning: false` with `apps: []` when PM2 is absent or its daemon is down | On connect and every 60 s. It never starts a PM2 daemon just to report |
+| `service:state` | `{ installed, running, status, mechanism, mode, startsAt, stoppedByUser, jobsRunningHere, enabledOnBoot, dev, pm2Installed, pm2Version, uptimeMs, versionDrift, runningAsService, version, dataDir, serverMode, runAs, pm2 }` — see **Service state and PM2** below. `installed` is `boolean \| null`, where `null` means protected service files could not be inspected. **A field that is missing means unknown, not false**, which is how a Hub keeps working with an agent older than 1.4.9 | On connect, every 5 min, whenever the shared revision moves, and again as soon as the live service registration has been probed. It describes the **native** service; `pm2` is the user's own PM2, a different thing |
+| `processes:list` | `{ daemonRunning, apps, pm2 }` — the same app objects as `GET /api/processes`, the `pm2` object below, and `daemonRunning` as `boolean \| null` (`null` = unknown). Sent on **every** cycle — connect, every 60 s, and after a process action — and never skipped, so an empty list always carries `pm2.reason`. It never starts a PM2 daemon and never runs two `jlist`s for one push. An agent older than 1.4.9 sends `{ daemonRunning, apps }` only | On connect, every 60 s, and after any process action |
 | `deploy:apps` | The **public** app array: `envKeys` (sorted names, never values) instead of `env`, and no credentials. Every `lastRun` is an explicit operational projection. `error`, `reason`, `warnings`, and `logTail` are null/empty unless `deploy.logs` is granted. See §6 | On connect, every 20 s, when any deployment begins or ends, and when a permission revision changes so a revocation takes effect promptly |
 | `deploy:progress` | `{ appId, runId, status, steps: [{ name, status }], stage, skippedStages: string[], lines: string[], skipped?, done, at }`. `steps` comes from the run record's `step` field; `stage` (2.17.0) is the canonical stage the run is in, or `null` when the record has none; `skippedStages` (2.17.0) is the record's own `skippedStages`, or `[]` when it has none. `at` is an ISO string. `lines` is empty unless `deploy.logs` is granted. See §6 | Every second while a run is active, and once with `done: true` when it ends (status no longer running or its lock is released) |
 | `permissions:state` | `{ tree, permissions, comingSoon }` — the catalog plus this server's grant map | On connect and whenever permissions change |
@@ -1824,6 +1885,70 @@ the push is skipped and the next reconnect re-sends the full state.
 | `nginx:logs` | `{ lines }` — the error log, without the REST response's `file` echo | After a `hub:getLogs` command, in addition to its `command:result` |
 | `command:result` | `{ requestId, ok, error, data }` | Exactly once for every command in §3.4, and also passed to the socket.io acknowledgement when the Hub supplied one |
 | `command:progress` | `{ requestId, step, status, detail?, domain?, at }` — `status` is `running`, `ok`, `failed` or `skipped`; `step` is the stage or run step name (kebab ids such as `nginx-reload`, or lower-case words separated by single spaces such as `waiting for validation`, at most 40 characters in total); `domain` is optional and names the domain an SSL stage belongs to; `detail` is at most 300 characters and never contains a secret or file contents; `at` is an ISO string | While a command runs, at most 5 events per second per `requestId`; beyond that the extra events are dropped except the last of each step. Emitted by `hub:manageDeploy { action: "linkDomain" }` (with or without a certificate) and, since 2.16.0, by `hub:manageSSL { action: "issue" \| "renew" \| "renewAll" }` |
+
+**Service state and PM2 (1.4.9).** `service:state` and `processes:list` are how
+the Hub sees what the local dashboard sees. On a Windows Server in Server mode
+the agent runs as `NT SERVICE\EasyDevOps`, a different OS account from the
+operator's PM2, and reporting that wrongly is what made the Hub say "not
+installed" over a working service and a working PM2 (1.4.8). Every field below
+is additive: an agent older than 1.4.9 omits it, and **an omitted field means
+unknown, never `false`**.
+
+`service:state`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `installed` | `boolean \| null` | The native service is registered on this machine. `null` when protected service files could not be inspected. **Never `false` from a process that is the running service**: a process the service manager started reports `true`. |
+| `running` | `boolean` | A daemon holds the lock with a fresh heartbeat. |
+| `status` | `string \| null` | The lock's reason, or the installed-state detail; `null` when there is nothing to say. |
+| `mechanism` | `string \| null` | `systemd`, `winsw`, `startup-supervisor`, or `null` when unknown. |
+| `mode` | `"server" \| "personal" \| null` | |
+| `startsAt` | `"boot" \| "logon" \| null` | |
+| `stoppedByUser` | `boolean` | A stop was requested and no daemon holds the lock. |
+| `jobsRunningHere` | `boolean` | This process owns the background jobs. |
+| `enabledOnBoot` | `boolean \| null` | `installed === true ? startsAt === "boot" : (installed === false ? false : null)`. |
+| `dev` | `boolean` | A development run (`--dev` or a `.dev-data` directory). |
+| `pm2Installed` | `boolean \| null` | Whether PM2 is installed for an account this process can use. `null` = unknown: the Windows Server service account cannot see the operator's PM2 safely, so it does not guess. |
+| `pm2Version` | `string \| null` | Always `null` from this event: `pm2 --version` is itself a PM2 command and would start the daemon. |
+| `uptimeMs` | `number \| null` | Time since the daemon lock's `startedAt`. |
+| `versionDrift` | `object \| null` | `{ drift: boolean \| null, cliVersion, serviceVersion, mode, reason, message }`, or `null` when it could not be measured. `drift: null` means the installed CLI version could not be read from the service account (no per-user npm prefix), **not** "no drift". |
+| `runningAsService` | `boolean` | This process holds the daemon lock AND the service manager started it. |
+| `version` | `string \| null` | The running daemon's version, from the lock. |
+| `dataDir` | `string \| null` | The data directory in use. |
+| `serverMode` | `boolean` | The Windows Server-mode marker is present. |
+| `runAs` | `string \| null` | The OS account this process runs as; `NT SERVICE\EasyDevOps` when `runningAsService` is true, otherwise the OS user. |
+| `pm2` | object | `{ state, reason, message, fix, user }`, below. |
+
+The `pm2` object, in both events:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `state` | `"available" \| "empty" \| "not_running" \| "not_installed" \| "unavailable"` | `available`: the daemon answers and has at least one app. `empty`: it answers with no apps. `not_running`: PM2 is installed but its daemon is down (this read never starts one). `not_installed`. `unavailable`: this process may not use PM2 safely (`service_account`), or the list did not answer (`list_failed`). |
+| `reason` | `string \| null` | `service_account`, `list_failed`, `not_running`, `not_installed`, or `null` for `available`/`empty`. |
+| `message` | `string \| null` | One sentence for the operator; `null` for `available`/`empty`. |
+| `fix` | `string \| null` | What to do next; `null` for `available`/`empty`. |
+| `user` | `string \| null` | The operator recorded at install (`service-state.operator.user`), or `null` when unknown. |
+
+The exact texts, so the Hub can show them verbatim:
+
+- `service_account`, operator known — message
+  `PM2 runs under the user <user>; the Easy DevOps service (NT SERVICE\EasyDevOps) cannot see it.`
+  and fix
+  `Manage these apps on the server as <user> (the Easy DevOps dashboard there, or pm2 list). Hub process actions and Hub deploys need that PM2, so this server refuses them.`
+- `service_account`, operator unknown — message
+  `PM2 runs under the account that started it; the Easy DevOps service (NT SERVICE\EasyDevOps) cannot see it.`
+  and fix
+  `Run ezz service repair in an Administrator PowerShell, signed in as the user who runs PM2, so the Hub can name that user. Manage the apps on the server meanwhile.`
+- `not_installed` — `PM2 is not installed.` / `Run npm i -g pm2 on the server.`
+- `not_running` — `PM2 is installed but its daemon is not running.` /
+  `Start an app with PM2, or run pm2 resurrect.`
+- `list_failed` — `PM2 did not answer: <error>` / `Run pm2 list on the server.`
+
+`processes:list` carries the same `pm2` object, so a Hub must show `pm2.message`
+and `pm2.fix` instead of "Waiting for the process list…" when `apps` is empty.
+`daemonRunning` is `true` for `available`/`empty`, `false` for
+`not_running`/`not_installed`, and `null` when the state is unknown. A payload
+is never an empty `apps` with no `pm2.reason`.
 
 **Live command progress.** `command:progress` fills the silence between a long
 command's dispatch and its single `command:result`. Steps are reported

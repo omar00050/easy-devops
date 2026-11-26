@@ -19,6 +19,7 @@ import {
 import { validateDomainName } from '../validators.js';
 import { acquireArtifactLockSync } from './artifact-lock.js';
 import { rmdirVerifiedChild, unlinkVerifiedChild } from '../safe-file.js';
+import { renameWithRetry } from '../atomicState.js';
 
 export const MANAGED_ARTIFACT_MANIFEST = 'ssl-managed-artifacts.json';
 export const MANAGED_ARTIFACT_VERSION = 2;
@@ -385,7 +386,10 @@ function atomicWriteManifest(dataDir, manifest) {
     fs.closeSync(handle);
     handle = undefined;
     fs.chmodSync(temporary, 0o600);
-    fs.renameSync(temporary, target);
+    // A manifest rewrite happens while a daemon or the dashboard may be reading
+    // the current file, so the replace retries a Windows sharing denial through
+    // the shared helper rather than failing the issuance.
+    renameWithRetry(temporary, target);
     fs.chmodSync(target, 0o600);
   } finally {
     if (handle !== undefined) fs.closeSync(handle);

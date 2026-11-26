@@ -43,6 +43,11 @@ import {
   windowsEditionQueryCmd,
   windowsProductNameCmd,
 } from '../platform.js';
+// The namespace, beside the named imports above, for the two identity helpers
+// added for 1.4.9. Reaching them through the namespace (with a typeof guard)
+// keeps this file loadable by a build where that change has not landed yet,
+// instead of failing at link time on a missing named export.
+import * as platform from '../platform.js';
 import { run as shellRun, runFile as shellRunFile } from '../shell.js';
 import { loadConfig } from '../config.js';
 import { dbGet, dbSet, closeDb, reopenDb } from '../db.js';
@@ -51,6 +56,10 @@ import { inspect as inspectLock, HEARTBEAT_INTERVAL_MS } from '../daemon/lock.js
 import { requestStop, clearStopRequest, readStopRequest } from '../daemon/stopRequest.js';
 import { inspect as inspectOwner } from '../jobs/owner.js';
 import { probe, invalidate } from '../probeCache.js';
+// The pinned pm2 locator, for the operator record only (which PM2 the installing
+// user runs). It spawns one `where.exe pm2` when the record is written, and
+// nothing else in this module calls it.
+import * as runnerModule from '../runner.js';
 
 import * as systemd from './systemd.js';
 import * as windowsService from './windowsService.js';
@@ -156,9 +165,17 @@ export function resolveMechanism({
       platform: 'windows',
       mode: MODES.SERVER,
       mechanism: 'winsw',
-      registered: registered ?? false,
+      // UNKNOWN stays unknown. This used to be `registered ?? false`, which
+      // turned "no sc query has run in this process" (the daemon, the agent)
+      // into a positive "the service is not registered" (1.4.9, finding 1).
+      // `backgroundServiceState()` now decides `installed` from the WinSW files
+      // when there is no live registration answer, and `inspectInstalled()`
+      // keeps an explicit `false` (sc 1060) meaning not installed.
+      registered: registered ?? null,
       edition,
-      installed: false,
+      // Not a claim about this machine: `installed` is measured by
+      // inspectInstalled() from the file evidence or a live registration.
+      installed: null,
     };
   }
 
@@ -739,6 +756,209 @@ export async function waitForDaemonGone({ dataDir, timeoutMs = STOP_GRACE_MS } =
 }
 
 /**
+ * A platform helper added for 1.4.9, only when this build has it.
+ *
+ * Lanes land separately: `platform.js` gains `currentAccount()` and
+ * `runningUnderServiceManager()`, and this file must stay loadable before that
+ * change is in place. A missing export means "not proven to be the service",
+ * which is the safe direction — never a throw at import time.
+ *
+ * @param {string} name
+ * @returns {Function|null}
+ */
+function platformFunction(name) {
+  return typeof platform?.[name] === 'function' ? platform[name] : null;
+}
+
+/**
+ * True when this process was started by the OS service manager.
+ *
+ * `deps.runningUnderServiceManager` (a boolean or a function) replaces the
+ * platform answer in a test. `deps.account` is passed through so a suite can
+ * describe the service identity without changing the process token.
+ *
+ * @param {Object} [deps]
+ * @returns {boolean}
+ */
+function runningUnderServiceManagerFor(deps = {}) {
+  const supplied = deps.runningUnderServiceManager;
+  if (typeof supplied === 'boolean') return supplied;
+  const fn = typeof supplied === 'function' ? supplied : platformFunction('runningUnderServiceManager');
+  if (!fn) return false;
+
+  const opts = {};
+  if (deps.account !== undefined) opts.account = deps.account;
+  if (deps.env !== undefined) opts.env = deps.env;
+  try {
+    return Boolean(fn(opts));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Who this process runs as, or null when the platform cannot say.
+ *
+ * @param {Object} [deps]
+ * @returns {{ user: string|null, home: string|null, serviceAccount: boolean }|null}
+ */
+function currentAccountFor(deps = {}) {
+  if (deps.account !== undefined && deps.account !== null) {
+    return typeof deps.account === 'object' ? deps.account : null;
+  }
+  const fn = deps.currentAccount ?? platformFunction('currentAccount');
+  if (!fn) return null;
+  try {
+    const who = fn();
+    return who && typeof who === 'object' ? who : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeText(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return text || null;
+}
+
+/** One operator record with no known value replaced by an unknown one. */
+function mergeOperator(existing, incoming) {
+  const out = { ...(existing ?? {}) };
+  for (const [key, value] of Object.entries(incoming ?? {})) {
+    if (value === null || value === undefined) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/** Which pm2 the operator runs, without starting one (`probeVersion: false`). */
+async function detectOperatorPm2({ deps = {} } = {}) {
+  const detect = deps.detectPm2
+    ?? (hasExport(runnerModule, 'detect') ? runnerModule.detect : null);
+  if (!detect) return null;
+  try {
+    const run = deps.windowsServiceOpts?.run ?? deps.run ?? shellRun;
+    const found = await detect({ run, probeVersion: false });
+    return found && typeof found === 'object' ? found : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The operator's own profile: who runs PM2 on this machine and where it is.
+ *
+ * Written beside the SID the ACLs use, so the daemon (running as
+ * `NT SERVICE\EasyDevOps`, with no access to a per-user profile) and the Hub can
+ * NAME the account whose PM2 the machine uses — and can say so honestly when
+ * that PM2 is out of reach, instead of "not installed" (1.4.9).
+ *
+ * NEVER written from the service account: the daemon cannot know the operator's
+ * profile, and writing its own would replace a real answer with a wrong one.
+ * A missing value never replaces a recorded one.
+ *
+ * @param {Object} [opts]
+ * @param {Object} [opts.deps]
+ * @returns {Promise<Object|null>}
+ */
+async function operatorProfile({ deps = {} } = {}) {
+  if (!isWindows) return null;
+
+  const account = currentAccountFor(deps);
+  if (account?.serviceAccount === true) return null;
+  // A process the platform calls a service is never the operator, even when the
+  // account object is missing.
+  if (runningUnderServiceManagerFor(deps)) return null;
+
+  let userName = safeText(account?.user);
+  let home = safeText(account?.home);
+  if (!userName) {
+    try { userName = safeText(os.userInfo().username); } catch { userName = null; }
+  }
+  if (!home) {
+    try { home = safeText(os.homedir()); } catch { home = null; }
+  }
+  if (!userName && !home) return null;
+
+  const pm2 = await detectOperatorPm2({ deps });
+  return {
+    user: userName,
+    home,
+    pm2Path: safeText(pm2?.path),
+    recordedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * The `service-state.operator` value an install or repair should keep.
+ *
+ * Merged, never replaced: the SID and grants from the service manager stay, the
+ * profile is refreshed, and a field this process could not measure keeps its
+ * recorded value.
+ *
+ * @param {Object} opts
+ * @param {Object|null} [opts.incoming] The operator the service manager resolved
+ * @param {Object} [opts.deps]
+ * @returns {Promise<Object|null>}
+ */
+async function operatorForState({ incoming = null, deps = {} } = {}) {
+  const existing = dbGet(STATE_KEY)?.operator ?? null;
+  const merged = mergeOperator(existing, incoming);
+  const profile = await operatorProfile({ deps });
+  const next = profile ? mergeOperator(merged, profile) : merged;
+  if (Object.keys(next).length > 0) return next;
+  return existing;
+}
+
+/**
+ * Records what the live `sc query` knows, once per process.
+ *
+ * `backgroundServiceState()` is synchronous and cannot run `sc query`, so a
+ * process that never runs `status()` — the daemon, and therefore the Hub agent —
+ * used to keep `registered: null` for ever. The agent calls this once on
+ * connect, without awaiting the push on it.
+ *
+ * One run per process, and one run per injected `deps` object (a suite exercises
+ * several answers in one process). A failure leaves `registered` unknown rather
+ * than turning it into a "not installed" claim.
+ *
+ * @param {Object} [opts]
+ * @param {Object} [opts.deps] Injected for tests
+ * @returns {Promise<{ registered: boolean|null, edition: string|null,
+ *   leftover: boolean|null, primed: boolean }>}
+ */
+export async function primeServiceFacts({ deps = {} } = {}) {
+  const injected = deps !== null && typeof deps === 'object' && Object.keys(deps).length > 0;
+  if (injected) {
+    if (!primedByDeps.has(deps)) primedByDeps.set(deps, runPrime({ deps }));
+    return primedByDeps.get(deps);
+  }
+  if (!primedOnce) primedOnce = runPrime({ deps: {} });
+  return primedOnce;
+}
+
+/** Memo for primeServiceFacts(): the real machine, once. */
+let primedOnce = null;
+/** Memo keyed by the injected deps object, so a suite can ask several times. */
+const primedByDeps = new WeakMap();
+
+async function runPrime({ deps }) {
+  let facts = null;
+  try {
+    facts = await gatherFacts({ deps });
+  } catch {
+    facts = null;
+  }
+  if (facts) rememberFacts(facts);
+  return {
+    registered: facts?.registered ?? null,
+    edition: facts?.edition ?? null,
+    leftover: facts?.leftover ?? null,
+    primed: Boolean(facts),
+  };
+}
+
+/**
  * The background-service state, cheaply and synchronously.
  *
  * This is the object the UI treats as the single authority, and it is
@@ -756,12 +976,31 @@ export async function waitForDaemonGone({ dataDir, timeoutMs = STOP_GRACE_MS } =
  */
 export function backgroundServiceState({ dataDir = getDataDir(), deps = {} } = {}) {
   const mech = deps.mechanism ?? resolveMechanism();
+  const lock = inspectLock({ dataDir });
+  const owner = inspectOwner({ dataDir });
+
+  // "AM I the service?" — the one question no per-user path can answer.
+  //
+  // Two facts together: this process holds the daemon lock, and the OS started
+  // it as the service manager's process. A daemon started by hand holds the
+  // lock but fails the second test; the service account fails neither. The
+  // virtual account has no %APPDATA% of the installing user and, on 1.4.8,
+  // reported "installed: false, starts: not set up" from inside a registered,
+  // RUNNING service (1.4.9, finding 1).
+  const runningAsService = Boolean(
+    lock.running
+    && Number(lock.lock?.pid) === process.pid
+    && runningUnderServiceManagerFor(deps),
+  );
+
   const installedState = inspectInstalled({
     mech,
     fsImpl: deps.fs ?? fs,
+    runningAsService,
+    // Test hook: a suite cannot write /etc/systemd/system, and must not. In
+    // production this is always the real unit path.
+    unitPath: deps.unitPath,
   });
-  const lock = inspectLock({ dataDir });
-  const owner = inspectOwner({ dataDir });
 
   // "Stopped by you" is live state only: a request file that is still there
   // and no daemon holding the lock. A RECORDED stop (service-state.stoppedAt)
@@ -793,7 +1032,8 @@ export function backgroundServiceState({ dataDir = getDataDir(), deps = {} } = {
     mechanism: mech.mechanism,
     mode: mech.mode,
     installed: installedState.installed,
-    startsAt: startsAtFor(mech),
+    runningAsService,
+    startsAt: runningAsService ? 'boot' : startsAtFor(mech),
 
     stoppedByUser,
     stoppedAt: stoppedByUser ? stopRequest.at ?? null : null,
@@ -809,8 +1049,26 @@ export function backgroundServiceState({ dataDir = getDataDir(), deps = {} } = {
 /**
  * Whether a native service is installed, by the only cheap evidence there is:
  * the artifact each mechanism leaves behind.
+ *
+ * On Windows Server the order matters: a live `sc query` answer wins (`false`
+ * from `sc 1060` means "not installed" even with the wrapper still on disk);
+ * with NO live answer (registered unknown — the daemon never runs `sc query`)
+ * the WinSW files decide, because they are the evidence a service account can
+ * read and the 1.4.8 daemon never consulted. Unreadable is `null`, never
+ * `false`.
+ *
+ * @param {Object} [opts]
+ * @param {Object} [opts.mech] `resolveMechanism()`'s answer
+ * @param {Object} [opts.fsImpl] Injected for tests
+ * @param {boolean} [opts.runningAsService] This process IS the registered service
+ * @param {string} [opts.unitPath] Test hook for the Linux unit file
  */
-function inspectInstalled({ mech = resolveMechanism(), fsImpl = fs } = {}) {
+function inspectInstalled({
+  mech = resolveMechanism(),
+  fsImpl = fs,
+  runningAsService = false,
+  unitPath = undefined,
+} = {}) {
   const inspect = (file) => {
     if (!file) return { exists: false, detail: null };
     try {
@@ -833,13 +1091,25 @@ function inspectInstalled({ mech = resolveMechanism(), fsImpl = fs } = {}) {
 
   try {
     if (!isWindows) {
-      const unit = inspect(systemd.UNIT_PATH);
+      const unit = inspect(unitPath ?? systemd.UNIT_PATH);
+      // Linux keeps the unit file as the evidence: `installed` means the unit is
+      // registered, and `runningAsService` (INVOCATION_ID) is reported beside
+      // it. Nothing here changes for Linux.
       return { installed: unit.exists, detail: unit.detail };
     }
+
+    // This process IS the registered service: the service manager started it, so
+    // "installed" is true even if the files could not be read back. That is the
+    // 1.4.9 case the daemon reported backwards.
+    if (runningAsService && mech.mode === MODES.SERVER) {
+      return { installed: true, detail: null };
+    }
+
     // A live `sc query` result, when the async entry points have one, beats the
     // artifact check: `sc 1060` with the wrapper still on disk is NOT installed
     // (the 1.4.0 failure). `backgroundServiceState()` stays synchronous; it
-    // uses whatever the last live probe recorded.
+    // uses whatever the last live probe recorded — and when nothing recorded
+    // one, `registered` is unknown and the WinSW files below answer.
     if (mech.registered === false && mech.mode === MODES.SERVER) {
       return { installed: false, detail: null };
     }
@@ -847,6 +1117,10 @@ function inspectInstalled({ mech = resolveMechanism(), fsImpl = fs } = {}) {
       return { installed: true, detail: null };
     }
     if (mech.mode === MODES.SERVER) {
+      // The WinSW definition and wrapper in ProgramData: the only install
+      // evidence the service account can read for itself (its own %APPDATA% is
+      // not the operator's). Both must be there — either one missing is not a
+      // working install, and one unreadable is unknown rather than absent.
       const wrapper = inspect(windowsService.winswPath());
       const xml = inspect(windowsService.serviceXmlPath());
       if (wrapper.exists === false || xml.exists === false) {
@@ -1256,6 +1530,10 @@ async function installWindowsServer({
   // ACLs against an empty list.
   if (installed.ok || installed.registered) {
     rememberFacts({ registered: true });
+    // The operator profile is written HERE, in the CLI process the person ran,
+    // and never by the daemon: only this process can see the account whose PM2
+    // the machine uses (1.4.9).
+    const operator = await operatorForState({ incoming: installed.operator ?? null, deps });
     record({
       mode: MODES.SERVER,
       mechanism: 'winsw',
@@ -1263,7 +1541,7 @@ async function installWindowsServer({
       entry: installed.runtime?.entry ?? entry,
       dataDir,
       granted: installed.granted ?? [],
-      operator: installed.operator ?? null,
+      operator,
     });
   }
 
@@ -2559,10 +2837,15 @@ export async function repair({ log = () => {}, deps = {} } = {}) {
     if (result.ok) {
       rememberFacts({ registered: true });
       const existing = dbGet(STATE_KEY) ?? {};
+      // Repair is the second writer of the operator profile, and it is the fix
+      // for an install made before 1.4.9: the 1.4.8 record has the SID but does
+      // not name the account whose PM2 the service cannot reach. Merged, so the
+      // ACL fields stay and no known value is replaced by null.
+      const operator = await operatorForState({ incoming: result.operator ?? null, deps });
       dbSet(STATE_KEY, {
         ...existing,
         granted: result.granted ?? existing.granted ?? [],
-        operator: result.operator ?? existing.operator ?? null,
+        operator: operator ?? existing.operator ?? null,
         repairedAt: new Date().toISOString(),
       });
     }
@@ -2585,7 +2868,13 @@ export async function repair({ log = () => {}, deps = {} } = {}) {
 /** Records what was installed, merged over whatever is already there. */
 function record(details) {
   const existing = dbGet(STATE_KEY) ?? {};
-  dbSet(STATE_KEY, { ...existing, ...details, installedAt: new Date().toISOString() });
+  const merged = { ...existing, ...details, installedAt: new Date().toISOString() };
+  // A null never replaces a recorded operator: an install or repair that could
+  // not learn who the operator is must not erase who it learned before (a
+  // Windows Server where the account could not be read, or a record written by
+  // an older version). Readers treat a missing operator as unknown.
+  if (!merged.operator && existing.operator) merged.operator = existing.operator;
+  dbSet(STATE_KEY, merged);
 }
 
 /** The recorded install details, for callers that only need to read them. */

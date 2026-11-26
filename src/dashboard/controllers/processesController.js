@@ -20,7 +20,7 @@ import * as runner from '../../core/runner.js';
 import * as service from '../../core/service/index.js';
 import { MODES } from '../../core/service/index.js';
 import { daemonStatus } from '../lib/daemonBridge.js';
-import { probe } from '../../core/probeCache.js';
+import { invalidate as invalidateProbe, probe } from '../../core/probeCache.js';
 
 const SERVER_MODE = MODES.SERVER;
 
@@ -163,7 +163,54 @@ const ACTIONS = {
   reload: runner.reload,
 };
 
+/**
+ * True while one `npm i -g pm2` is running in this process.
+ *
+ * One install at a time, and the request that finds one running is refused
+ * with 409 `in_progress` rather than starting a second npm. Two concurrent
+ * installs into the same global prefix corrupt it.
+ */
+let pm2InstallInFlight = false;
+
+/**
+ * The version inside npm's own install output (`+ pm2@6.0.14`), or null.
+ *
+ * Read from the output rather than by running `pm2 --version`: that command
+ * STARTS the PM2 daemon, and a just-finished install is not a reason to bring
+ * one to life on a machine that does not use PM2 yet.
+ *
+ * @param {string} output
+ * @returns {string|null}
+ */
+function versionFromInstallOutput(output) {
+  const match = String(output ?? '').match(/pm2@(\d+\.\d+\.\d+)/i);
+  return match ? match[1] : null;
+}
+
+/**
+ * The PM2 probes this dashboard caches, dropped after an install attempt.
+ *
+ * `service.invalidateProbes()` covers the `service:` prefix, which is where
+ * this controller keeps its own `service:pm2` detection. Both are dropped so
+ * the next Processes page and `GET /api/service` measure the new state instead
+ * of replaying "not installed" from before the install.
+ */
+function invalidatePm2Probes() {
+  try { service.invalidateProbes(); } catch { /* nothing cached */ }
+  try { invalidateProbe(PM2_PROBE_KEY); } catch { /* nothing cached */ }
+}
+
 class ProcessesController {
+  /**
+   * @param {{ runner?: Object, invalidate?: Function }} [deps] Injected by
+   *   tests, so an install can be proved against a stub npm and never runs the
+   *   real one. Production uses the real runner and drops the real probes.
+   */
+  constructor({ runner: runnerApi = runner, invalidate = invalidatePm2Probes } = {}) {
+    this.runner = runnerApi;
+    this.invalidate = invalidate;
+  }
+
   /**
    * GET /api/processes
    * The PM2 app list plus enough service context for the page header.
@@ -266,6 +313,94 @@ class ProcessesController {
       res.json({ name, lines: result.lines });
     } catch (err) {
       res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+
+  /**
+   * POST /api/pm2/install
+   *
+   * Installs the standard PM2 — `npm i -g pm2` — for the account this
+   * dashboard runs as. That is the whole model: no PM2_HOME, no second daemon,
+   * no sudo and no elevation. The dashboard cannot elevate, and a password is
+   * never involved.
+   *
+   * The request body is ignored on purpose: there is nothing to configure, so
+   * nothing a caller sends can change the command. Answers:
+   *
+   *   403 { ok:false, reason:'service_account', message, fix } — this process
+   *       may not use PM2 at all (the Windows service); installing here would
+   *       create a service-owned PM2 daemon.
+   *   409 { ok:false, reason:'already_installed' } — nothing to do.
+   *   409 { ok:false, reason:'in_progress' } — one install at a time.
+   *   200 { ok:true, version, output }
+   *   500 { ok:false, reason:'install_failed', output, command }
+   *
+   * Every answer drops the cached PM2 probes, so the next read measures again.
+   */
+  async installPm2(req, res) {
+    // `req` is deliberately not read: there is no body to accept, so nothing a
+    // caller sends can change the command.
+    const access = this.runner.pm2Access();
+    if (!access.ok) {
+      return res.status(403).json({
+        ok: false,
+        reason: access.reason ?? 'service_account',
+        message: access.message,
+        fix: access.fix,
+      });
+    }
+
+    if (pm2InstallInFlight) {
+      return res.status(409).json({
+        ok: false,
+        reason: 'in_progress',
+        message: 'A PM2 install is already running. Wait for it to finish.',
+        fix: 'npm i -g pm2',
+      });
+    }
+
+    pm2InstallInFlight = true;
+    try {
+      // "Already installed" is a precondition, not a failure. `probeVersion:
+      // false` so this check cannot start the PM2 daemon.
+      const detected = await this.runner.detect({ probeVersion: false });
+      if (detected?.installed) {
+        return res.status(409).json({
+          ok: false,
+          reason: 'already_installed',
+          message: 'PM2 is already installed.',
+          version: detected.version ?? null,
+          path: detected.path ?? null,
+        });
+      }
+
+      const installed = await this.runner.install();
+      this.invalidate();
+
+      if (!installed.ok) {
+        return res.status(500).json({
+          ok: false,
+          reason: 'install_failed',
+          output: installed.output ?? '',
+          command: 'npm i -g pm2',
+        });
+      }
+
+      return res.json({
+        ok: true,
+        version: versionFromInstallOutput(installed.output),
+        output: installed.output ?? '',
+      });
+    } catch (err) {
+      this.invalidate();
+      return res.status(500).json({
+        ok: false,
+        reason: 'install_failed',
+        output: err?.message ?? String(err),
+        command: 'npm i -g pm2',
+      });
+    } finally {
+      pm2InstallInFlight = false;
     }
   }
 

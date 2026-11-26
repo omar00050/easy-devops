@@ -79,6 +79,7 @@ import {
   validateDeployDir, writeRun, writeState,
 } from './store.js';
 import { openVerifiedChild, writeFileEventual } from '../safe-file.js';
+import { copyFileWithRetry, renameWithRetry } from '../atomicState.js';
 import {
   LOG_SECURITY_REDACTED_V1,
   createDeployLogRedactor,
@@ -204,6 +205,125 @@ function resolveDeps(deps = {}) {
     recheck: typeof deps.recheck === 'function' ? deps.recheck : null,
     now: deps.now ?? (() => Date.now()),
   };
+}
+
+/**
+ * The names a global npm install of PM2 leaves on PATH.
+ *
+ * Every spelling is asked for on every OS: an extra `fs.existsSync` on a file
+ * that cannot exist costs nothing, and it keeps `process.platform` out of this
+ * module (core/platform.js owns OS branching).
+ */
+const PM2_PATH_NAMES = Object.freeze(['pm2', 'pm2.cmd', 'pm2.exe', 'pm2.bat', 'pm2.ps1']);
+
+/**
+ * Whether a `pm2` executable is on PATH right now — decided WITHOUT spawning
+ * anything.
+ *
+ * A deployment cannot be started without PM2 (the release is started and
+ * watched through it), so a missing PM2 has to refuse before the first write
+ * rather than fail at the `start` step with a lock held and a release folder
+ * half built. The check has to be synchronous because `startDeployment` is:
+ * callers use its answer before awaiting anything, and the lock is taken in the
+ * same turn. `runner.detect()` spawns `where.exe`, which cannot be awaited
+ * here, so this is the cheap equivalent: the same PATH lookup `where.exe
+ * pm2` performs, in-process.
+ *
+ * It is deliberately conservative: only "nothing named pm2 anywhere on PATH"
+ * refuses. Anything it cannot read (an unreadable PATH entry) counts as
+ * "maybe", so an unusual installation is never blocked — it fails later, as it
+ * did before, rather than refusing a working machine's deploy.
+ *
+ * @param {Object} [env]
+ * @returns {boolean}
+ */
+function pm2OnPath(env = process.env) {
+  const raw = env.PATH ?? env.Path ?? '';
+  if (!String(raw).trim()) return false;
+
+  const names = new Set(PM2_PATH_NAMES);
+  for (const ext of String(env.PATHEXT ?? '').split(';')) {
+    const clean = ext.trim().toLowerCase();
+    if (!clean) continue;
+    names.add(`pm2${clean.startsWith('.') ? clean : `.${clean}`}`);
+  }
+
+  for (const entry of String(raw).split(path.delimiter)) {
+    const dir = entry.trim().replace(/^"(.*)"$/, '$1');
+    if (!dir) continue;
+    for (const name of names) {
+      try {
+        if (fs.existsSync(path.join(dir, name))) return true;
+      } catch {
+        // A PATH entry we cannot read is not an answer about PM2.
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * The PM2 precondition for starting a deployment, checked before the lock,
+ * the run record, a release folder or any step.
+ *
+ * Two refusals, both shaped like every other engine refusal (`ok`, `status`,
+ * `error`) plus the `reason`, `message` and `fix` a UI can show:
+ *
+ *   - `service_account`: this process is the Windows service, which must never
+ *     spawn pm2 or npm (see core/runner.js pm2Access). The message and fix are
+ *     runner's own, so the Hub shows the same words the dashboard would.
+ *   - `not_installed`: there is nothing to start the release with. The fix is
+ *     the one command to run, instead of discovering it at the start step.
+ *
+ * `deps.pm2Installed` is the test seam: a synchronous predicate. Without it the
+ * real PATH lookup is used, and only for the real runner — a test double is not
+ * the real PM2 model and must not be judged by the machine's PATH.
+ *
+ * @param {Object} d Resolved dependencies (see resolveDeps)
+ * @param {Object} deps The caller's raw deps
+ * @returns {{ ok: true } | {
+ *   ok: false, status: number, reason: string, message: string, fix: string, error: string,
+ * }}
+ */
+function pm2Preflight(d, deps) {
+  const access = typeof d.runner.pm2Access === 'function' ? d.runner.pm2Access() : { ok: true };
+  if (access && access.ok === false) {
+    const message = access.message ?? 'PM2 is not available to this process.';
+    const fix = access.fix ?? 'Manage these apps as the user who runs PM2.';
+    return {
+      ok: false,
+      status: 403,
+      reason: access.reason ?? 'service_account',
+      message,
+      fix,
+      error: `${message} ${fix}`,
+    };
+  }
+
+  let installed = true;
+  if (typeof deps.pm2Installed === 'function') {
+    try {
+      installed = Boolean(deps.pm2Installed());
+    } catch {
+      installed = true;
+    }
+  } else if (d.runner === defaultRunner) {
+    installed = pm2OnPath();
+  }
+
+  if (!installed) {
+    return {
+      ok: false,
+      status: 409,
+      reason: 'not_installed',
+      message: 'PM2 is not installed.',
+      fix: 'npm i -g pm2',
+      error: 'PM2 is not installed, so nothing could start the release. Install it first: npm i -g pm2',
+    };
+  }
+
+  return { ok: true };
 }
 
 /**
@@ -586,7 +706,10 @@ function linkPersistentPaths(appId, dir, paths, log, inheritDir = null) {
         fs.mkdirSync(path.dirname(sharedAt), { recursive: true });
         const from = inPrevious === 'file' ? previousAt : inRelease === 'file' ? linkAt : null;
         if (from) {
-          fs.copyFileSync(from, sharedAt);
+          // Onto a persistent path a previous release may still hold open —
+          // a scanner or the live app on Windows — so the copy rides out a
+          // momentary sharing denial instead of failing the whole deployment.
+          copyFileWithRetry(from, sharedAt);
           sources.push(from === linkAt ? 'the repository' : 'the live release');
         } else {
           // Nothing anywhere: start empty, so the app can open and fill it.
@@ -1116,6 +1239,7 @@ async function notify(app, run, d) {
  * @param {string|null} [opts.ref] Commit, tag or branch to deploy instead of the app's branch
  * @param {string|null} [opts.actor] Who asked, for the record
  * @param {Object} [opts.deps] Injected collaborators (testing only)
+ * @param {Function} [opts.deps.pm2Installed] Synchronous PM2 presence predicate (testing only)
  * @returns {{ ok: true, runId: string, done: Promise<Object> }
  *          | { ok: false, status: number, error: string, runId?: string|null }}
  */
@@ -1134,8 +1258,16 @@ export function startDeployment(appId, { trigger = 'manual', ref = null, actor =
   }
 
   const d = resolveDeps(deps);
-  const runId = newReleaseId(new Date(d.now()));
 
+  // Nothing has been written yet, and nothing will be when this refuses: no
+  // lock, no run record, no release folder, no step. A deployment started by a
+  // process that cannot use PM2 (the Windows service) or on a machine without
+  // PM2 used to take the lock and fail at the start step, which left a failed
+  // run and a half-built folder behind for a reason the Hub could not explain.
+  const preflight = pm2Preflight(d, deps);
+  if (!preflight.ok) return preflight;
+
+  const runId = newReleaseId(new Date(d.now()));
   const lock = acquireLock(appId, { runId });
   if (!lock.ok) return { ok: false, status: 409, error: lock.reason, runId: lock.runId };
 
@@ -1766,7 +1898,11 @@ function isInside(child, parent) {
 function moveDirectory(from, to) {
   fs.mkdirSync(path.dirname(to), { recursive: true });
   try {
-    fs.renameSync(from, to);
+    // A folder another process (a scanner, a just-stopped app releasing its
+    // files) still holds open is a momentary Windows denial; retrying it is
+    // what stops the whole move — and its rollback — failing on the first try.
+    // Every other code, EXDEV included, is rethrown at once.
+    renameWithRetry(from, to);
   } catch (err) {
     // EXDEV: the destination is on another disk or mount. Copy, then remove.
     if (err.code !== 'EXDEV') throw err;

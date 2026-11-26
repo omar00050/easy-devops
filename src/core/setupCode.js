@@ -57,6 +57,7 @@ import { dbGet, dbSet } from './db.js';
 import { hashPassword, verifyPassword } from './passwords.js';
 import { AUTH_MODES, effectiveAuthMode } from './config.js';
 import { getDataDir } from './platform.js';
+import { renameWithRetry } from './atomicState.js';
 
 /** DB key holding the outstanding code's hash and its counters. */
 const KEY = 'setup-code';
@@ -91,7 +92,10 @@ function detachOwnedLock(lockPath, predicate) {
 
     const detached = `${lockPath}.released-${process.pid}-${randomUUID()}`;
     try {
-      fs.renameSync(lockPath, detached);
+      // Three processes contend for this lock (dashboard, daemon, CLI) and each
+      // checks the owner by reading it, so the detach rename must ride out their
+      // momentary opens: shared retry, same schedule as every other state file.
+      renameWithRetry(lockPath, detached);
     } catch (error) {
       if (error?.code === 'ENOENT') return false;
       throw error;
@@ -102,7 +106,7 @@ function detachOwnedLock(lockPath, predicate) {
         || moved.dev !== before.dev
         || moved.ino !== before.ino) {
       try {
-        if (!fs.existsSync(lockPath)) fs.renameSync(detached, lockPath);
+        if (!fs.existsSync(lockPath)) renameWithRetry(detached, lockPath);
       } catch { /* the safe result is to leave the detached entry alone */ }
       return false;
     }

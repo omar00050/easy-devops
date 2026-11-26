@@ -10,6 +10,9 @@
 #   --keep-node          Skip Node.js management; proceed to dependency install
 #   --service            Install the background service without asking
 #   --no-service         Skip the background service without asking
+#   --pm2                Install standard PM2 globally (npm i -g pm2) without
+#                        asking, when it is missing
+#   --no-pm2             Do not install PM2, and do not ask
 #
 # Exit codes:
 #   0  Installation completed successfully
@@ -55,7 +58,7 @@ EASYDEVOPS_DIR="${EASYDEVOPS_DIR:-${SCRIPT_DIR:-$PWD}}"
 # Defined as functions and called AFTER the flags are parsed, so `--help` costs
 # no network request and writes nothing.
 # ---------------------------------------------------------------------------
-_LIB_MODULES="progress.sh detect.sh node-versions.sh picker.sh nvm-bootstrap.sh"
+_LIB_MODULES="progress.sh detect.sh node-versions.sh picker.sh nvm-bootstrap.sh pm2.sh"
 _LIB_BASE_URL_DEFAULT="https://raw.githubusercontent.com/omar00050/Easy-DevOps/main"
 LIB_DIR=""
 _LIB_VERIFIED_DIR=""
@@ -79,6 +82,7 @@ _lib_expected_sha256() {
     node-versions.sh) printf '%s\n' 'e05267a04edccc249e236e6945d6cb3146e804086af400db8611c56cee7d6c84' ;;
     picker.sh)        printf '%s\n' 'd43092378a324beb3f0002c0e4cc176a1e0144c2c8bfb079f04b5902d3e911c1' ;;
     nvm-bootstrap.sh) printf '%s\n' '5fb6404c543c941372495d4e2b9002a0e37e5b6fc6544d13177245be784ec7cf' ;;
+    pm2.sh)           printf '%s\n' '13342821a58b5734fba7235bd46eb7d8e8ad372f314fe9ec4aba4ad1ffc97af4' ;;
     *) return 1 ;;
   esac
 }
@@ -323,6 +327,10 @@ Options:
                        dependency installation with whatever Node.js is active
   --service            Install the background service without asking
   --no-service         Do not install the background service, and do not ask
+  --pm2                Install standard PM2 globally (npm i -g pm2) without
+                       asking, when it is missing. Never installs a second PM2
+                       or a PM2 home of its own
+  --no-pm2             Do not install PM2, and do not ask
 
 Testing:
   --check-helpers      Load (fetching them when they are not beside the script)
@@ -340,6 +348,7 @@ Examples:
   bash install.sh --keep-node       # Skip Node.js management
   bash install.sh --service         # Unattended, with the background service
   bash install.sh --no-service      # Unattended, without it
+  bash install.sh --pm2             # Also install PM2 globally, if missing
 EOF
 }
 
@@ -350,6 +359,9 @@ FORCED_VERSION=""
 KEEP_NODE=false
 # ask | yes | no — whether to install the background service at the end.
 SERVICE_CHOICE="ask"
+# ask | yes | no — whether to install standard PM2 globally when it is missing.
+# Asked before the service offer; the default answer is No.
+PM2_CHOICE="ask"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -379,6 +391,14 @@ while [ "$#" -gt 0 ]; do
       ;;
     --no-service)
       SERVICE_CHOICE="no"
+      shift
+      ;;
+    --pm2)
+      PM2_CHOICE="yes"
+      shift
+      ;;
+    --no-pm2)
+      PM2_CHOICE="no"
       shift
       ;;
     --check-helpers)
@@ -741,6 +761,23 @@ else
   printf '    node src/cli/index.js\n'
 fi
 printf '\n'
+
+# ---------------------------------------------------------------------------
+# Offer to install PM2 (standard, global, this user's own)
+#
+# After the package is in place and BEFORE the service offer. The order is the
+# point: PM2 is what runs the apps, and the service is how Easy DevOps keeps
+# running with no terminal, so a missing PM2 should be settled while the user
+# is still looking at this installer.
+#
+# One model only, and it is the user's own PM2: `npm i -g pm2`, with the npm
+# that just installed Easy DevOps, as this account, in its default PM2 home.
+# No PM2 home of our own, no second PM2, no daemon started here, and no
+# existing app touched. A failed PM2 install never fails this install -- the
+# reason and the exact command are printed instead. See
+# src/lib/installer/pm2.sh.
+# ---------------------------------------------------------------------------
+maybe_install_pm2
 
 # ---------------------------------------------------------------------------
 # Offer to install the background service

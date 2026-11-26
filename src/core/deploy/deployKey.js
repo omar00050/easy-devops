@@ -28,6 +28,7 @@ import path from 'path';
 
 import { run as shellRun } from '../shell.js';
 import { getApp, isSshUrl, setDeployKeyRecord } from './apps.js';
+import { renameWithRetry } from '../atomicState.js';
 import { appPaths, ensureAppDirs } from './store.js';
 
 // ─── GitHub's host keys ───────────────────────────────────────────────────────
@@ -164,7 +165,10 @@ export function generateDeployKey(id, { now = () => new Date() } = {}) {
     fs.rmSync(tmp, { force: true });
     fs.writeFileSync(tmp, pair.privateKey, { mode: 0o600, flag: 'wx' });
     try { fs.chmodSync(tmp, 0o600); } catch { /* no POSIX modes on Windows; the data dir's ACL applies */ }
-    fs.renameSync(tmp, p.deployKey);
+    // A deploy in flight may be reading the previous key at this instant, and a
+    // virus scanner may hold the new one: ride out the sharing denial through
+    // the shared helper so a key rotation does not fail on a momentary open.
+    renameWithRetry(tmp, p.deployKey);
   } catch (err) {
     fs.rmSync(tmp, { force: true });
     throw new Error(`Could not write the deploy key in ${p.root}: ${err.code ?? err.message}. Check that this folder is writable by the user Easy DevOps runs as.`);

@@ -63,7 +63,7 @@ import {
   operatorAceState,
   prepareProtectedDir,
 } from './operator.js';
-import { replaceStateFile } from '../atomicState.js';
+import { renameWithRetry, replaceStateFile } from '../atomicState.js';
 import { probe } from '../probeCache.js';
 import {
   completeLogLines,
@@ -2461,7 +2461,7 @@ export async function repair({
           const removed = await removeCodeTree({ dir, runFile, log });
           if (removed?.ok === false) throw new Error(removed.reason ?? `could not remove ${dir}`);
         }
-        fs.renameSync(prev, dir);
+        renameWithRetry(prev, dir);
         fs.writeFileSync(serviceXmlPath(), previousXml);
         restored = true;
       }
@@ -2488,7 +2488,7 @@ export async function repair({
       const discarded = await removeCodeTree({ dir: prev, runFile, log });
       if (discarded?.ok === false) throw new Error(discarded.reason ?? `could not remove ${prev}`);
     }
-    if (fs.existsSync(dir)) fs.renameSync(dir, prev);
+    if (fs.existsSync(dir)) renameWithRetry(dir, prev);
   } catch (err) {
     const back = await startAgain();
     return {
@@ -2611,7 +2611,7 @@ export function refreshServiceDefinition({ dataDir, runtime, nodeVersion = null 
     dataDir, logDir: logDir(), workingDir: path.join(runtime.dir, 'app'),
     nodeVersion: nodeVersion ?? runtime?.version ?? runtime?.nodeVersion ?? null });
   fs.writeFileSync(temp, xml, { flag: 'wx', mode: 0o600 });
-  try { fs.renameSync(temp, target); } finally { fs.rmSync(temp, { force: true }); }
+  try { renameWithRetry(temp, target); } finally { fs.rmSync(temp, { force: true }); }
 }
 
 export { SERVICE_ID, SERVICE_DISPLAY_NAME };

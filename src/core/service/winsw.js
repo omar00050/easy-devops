@@ -33,6 +33,7 @@ import { createHash } from 'crypto';
 import { pipeline } from 'stream/promises';
 
 import { isDefaultDataDir } from '../platform.js';
+import { renameWithRetry } from '../atomicState.js';
 import { daemonNodeArgs, knownNodeVersion } from './runtime.js';
 
 /** The pinned release. Changing any of these three means re-computing the hash. */
@@ -182,7 +183,7 @@ export async function downloadWinsw({ dest, log = () => {}, fetchImpl = fetch, v
     try {
       if (old.ok) {
         fs.rmSync(dest, { force: true });
-        fs.renameSync(legacy, dest);
+        renameWithRetry(legacy, dest);
         log(`Renamed the verified ${LEGACY_WINSW_NAME} to ${path.basename(dest)}.`);
         return { ok: true, path: dest, sha256: old.sha256 };
       }
@@ -222,7 +223,7 @@ export async function downloadWinsw({ dest, log = () => {}, fetchImpl = fetch, v
 
   try {
     fs.rmSync(dest, { force: true });
-    fs.renameSync(temp, dest);
+    renameWithRetry(temp, dest);
   } catch (err) {
     return { ok: false, reason: `could not put the verified file in place: ${err.message}` };
   }

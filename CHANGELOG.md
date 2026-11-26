@@ -7,6 +7,152 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [1.4.9] — 2026-11-26
+
+**The Hub now sees what the server sees.** On a Windows Server in Server mode the
+agent ran inside `NT SERVICE\EasyDevOps`, a different Windows account from the
+administrator's, and 1.4.8 reported the service as "not installed" and a working
+PM2 as "not installed" — while the local dashboard showed both correctly. 1.4.9
+reports the service from the inside, gives PM2 an explicit state with a reason on
+every push, refuses what the service account must not do on that machine, and
+makes PM2 easy to install without creating a second copy. It also fixes the
+session-file EPERM that answered a request with a 500, gives every atomic write
+the same retry, and stops the dashboard's shutdown from timing out.
+
+### Fixed
+
+- **The Hub sees the service from inside the Windows service.** A server whose
+  service was RUNNING reported `installed: false`, `starts: "Not set up"` and the
+  warning "not running as a background service here", because nothing in the
+  daemon ever ran the live registration check and "unknown" became "not
+  registered". A process that holds the daemon lock AND was started by the
+  service manager now reports `runningAsService`, and that alone makes
+  `installed` true and `startsAt` `boot`. When the live check has not run, the
+  WinSW wrapper and definition in `C:\ProgramData` are the evidence; a file that
+  cannot be read is `null` (unknown), never `false`. The push also carries the
+  running version, the data directory, `serverMode` and `runAs`
+  (`NT SERVICE\EasyDevOps`). The live facts are primed once on connect, and the
+  state is re-pushed when the answer arrives.
+- **PM2 has an explicit state, with a reason, on every push.** `service:state`
+  and `processes:list` carry `pm2: { state, reason, message, fix, user }`:
+  `available`, `empty`, `not_running`, `not_installed`, or `unavailable` with
+  `service_account` or `list_failed`. On a Windows Server service account the
+  message names the account whose PM2 the machine uses
+  (`PM2 runs under the user admin; the Easy DevOps service
+  (NT SERVICE\EasyDevOps) cannot see it.`) with the next step; when no account
+  was recorded it says so and points at `ezz service repair`. The process list is
+  now sent on every cycle and an empty list always carries a reason, so the Hub
+  no longer sits on "Waiting for the process list…". `pm2Installed` and
+  `enabledOnBoot` are `boolean | null`, and `versionDrift.drift` may be `null`:
+  a field that is missing or null means unknown, never false, so an older Hub
+  keeps working with a newer agent and the other way round. The read still
+  checks the daemon's pid file first and runs one `pm2 jlist`, so it never starts
+  a PM2 daemon.
+- **Windows Server mode: the service never spawns PM2 or npm.** PM2 belongs to
+  the operator's own account. The service account's `where.exe` does not find
+  that user's global npm bin, its `PM2_HOME` is its own profile, and every pm2
+  command starts a daemon when none answers — so a "status read" from the
+  service could leave a second, service-owned PM2 daemon the operator cannot
+  see. Every PM2 call (detect, list, start, stop, restart, reload, delete, logs,
+  save, startup, install) now refuses before spawning anything, returning its
+  usual failure shape plus `unavailable`, `reason`, `message`, `fix` and `user`.
+  No Easy DevOps-owned PM2, no `PM2_HOME` under `ProgramData`, no second daemon
+  and no migration are created. Linux and Windows Personal are unchanged: there
+  the daemon and the operator are the same account.
+- **A Hub deploy on Windows Server mode is refused before anything is written.**
+  A deploy used to take the deploy lock, write a run record and a release folder
+  and then fail at the start step. A preflight now runs first: the service
+  account gets `403 service_account` with the same message and fix the PM2
+  record carries, and a server without PM2 gets `409 not_installed` with
+  `npm i -g pm2`, before the lock, the run record, the release folder or any
+  step. `hub:manageProcess` refuses the same way before it spawns, lists or acts
+  on anything.
+- **A transient Windows sharing error no longer turns a session write into a
+  500.** On a Windows Server a virus scanner or the indexer holding a session
+  file for a few microseconds made `write-file-atomic`'s single `rename` fail
+  with EPERM (errno -4048); session-file-store passed that straight to
+  express-session, which answered 500 with a stack trace. The dashboard's store
+  now writes `set` and `touch` through `core/atomicState.js`, which retries
+  EPERM/EBUSY/EACCES. A write that still fails is logged once per failure streak
+  (not once per request), the session stays usable in memory, the callback gets
+  no error, and the next request tries again. A touch skips the rewrite while
+  the file is younger than 60 seconds — capped at a tenth of the session's
+  lifetime, so an active session can never expire — which removes most of the
+  renames an open tab used to cause. The file name, folder and JSON format are
+  unchanged, so existing sessions keep loading.
+- **Every atomic write retries EPERM/EBUSY/EACCES from one shared helper.**
+  `core/atomicState.js` now exports its retry (`retrySharing`,
+  `retrySharingAsync`, `renameWithRetry`, `renameWithRetryAsync`,
+  `copyFileWithRetry`), and the copies that had grown elsewhere were replaced:
+  the daemon lock, the jobs marker, `daemon-state.json`, the stop request,
+  notification claims and the update status already used it, and the session
+  store, deploy state and run files, the SSL managed-artifacts manifest, private
+  keys, the certificate transaction journal and the artifact lock, the setup-code
+  lock, the legacy database copy, nginx site enable/disable in the domain store,
+  the dashboard controller and the CLI domain manager, the deploy key, deploy
+  folder moves and persistent-file copies, and the service's WinSW definition,
+  pinned wrapper, unit backups, runtime swaps, update-transaction rollback and
+  Server data-directory marker and migration now do too. The file retry uses the
+  same schedule as before where a caller had its own (the runtime swap keeps
+  9 × 300 ms, the update transaction 50 × 10 ms); a share denial is ridden out,
+  and a genuinely stuck file still reaches the caller as an error.
+- **The dashboard shuts down cleanly with a browser tab open.** The listener
+  close was awaited before socket.io was told to close, and Node's
+  `server.close()` never closes an upgraded WebSocket, so one open tab kept it
+  pending until the CLI's five-second timer printed "Shutdown timed out —
+  exiting anyway." Socket.io is now closed first (that is what disconnects the
+  tabs), the listener close runs alongside it and drops idle connections at once
+  and every remaining connection after 500 ms, and every step has a time limit
+  (socket.io 1.5 s, listener 1 s, background jobs 0.7 s). The session reaper is
+  cleared first, and repeated Ctrl+C returns the same shutdown promise.
+
+### Added
+
+- **The installers offer PM2.** After Easy DevOps is installed and before the
+  background-service question, `install.sh` and `install.ps1` offer to install
+  standard PM2 globally when it is missing — `npm i -g pm2`, with the npm that
+  just installed Easy DevOps, as the account running the installer, into that
+  account's prefix and its usual `PM2_HOME`. The default answer is No; only an
+  explicit yes installs; with no terminal nothing is installed and the command
+  is printed. A PM2 install that fails never fails the Easy DevOps install —
+  the reason and the command are printed. The version is read from
+  `<npm root -g>/pm2/package.json`, never by running `pm2`, because every pm2
+  command starts the daemon. `--pm2` / `--no-pm2` and `-Pm2` / `-NoPm2` skip
+  the question (`-NoPm2` wins), and `install.bat` maps the two dashes forms to
+  the PowerShell switches. An existing PM2 is reported and left alone; a second
+  copy or a PM2 home of Easy DevOps's own is never created.
+- **The first deploy app offers PM2, and the dashboard can install it.**
+  `POST /api/deployments` still creates the app when PM2 is missing — creating
+  does not start it — and its answer carries `pm2` with
+  `offer: { command: "npm i -g pm2", endpoint: "POST /api/pm2/install" }`; the
+  Deployments page shows the warning with an **Install PM2** button. The Hub's
+  create command carries the same record with no endpoint, because it cannot
+  install PM2 on a server remotely; it shows the command. `POST /api/pm2/install`
+  takes no body, runs the same global install, and answers `200` with the
+  version, `409 already_installed`, `409 in_progress` (one install at a time),
+  `403 service_account` on a Windows Server service account, or `500` with the
+  output. Nothing is ever installed without the user asking.
+- **`ezz service install` and `ezz service repair` record who runs PM2.** A
+  Windows Server install now stores the operator's profile —
+  `{ user, home, pm2Path, recordedAt }` — beside the SID the permissions already
+  use, written by the CLI process and never by the daemon, merged so a value it
+  cannot read never replaces a recorded one. Repair is the fix for a 1.4.8
+  install, which has the SID but not the profile: run it in an Administrator
+  PowerShell signed in as the user who runs PM2, and the Hub can name that user
+  in its PM2 message. Data and certificates are untouched.
+
+### Updating to 1.4.9
+
+A Windows Server in Server mode needs an administrator for the update:
+`ezz update` in an Administrator PowerShell, or `npm i -g easy-devops@1.4.9`
+followed by `ezz service repair`. Then run `ezz service repair` once as the user
+who runs PM2 so the Hub can name that account. Until the Hub itself is updated
+to read the 1.4.9 fields it may keep showing its old labels on a 1.4.8 server;
+the local dashboard is authoritative meanwhile. Nothing about PM2 is migrated,
+moved or restarted by this release, and the docs page
+"PM2 on Windows Server" sets out the model, the reboot behaviour and the
+troubleshooting entry for the old labels.
+
 ## [1.4.8] — 2026-11-26
 
 **A stability release.** 1.4.7 was published, then failed on a real Windows

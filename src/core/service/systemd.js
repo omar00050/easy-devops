@@ -52,6 +52,7 @@ import { fileURLToPath } from 'url';
 
 import { run, runFile, runInteractive } from '../shell.js';
 import { getDataDir, isDefaultDataDir } from '../platform.js';
+import { renameWithRetry } from '../atomicState.js';
 import { clearStopRequest, readStopRequest, stopRequestPath } from '../daemon/stopRequest.js';
 import { daemonNodeArgs, linkRuntime, readNodeVersion, runtimeNodePath } from './runtime.js';
 
@@ -569,7 +570,7 @@ async function backupUnit(previous, {
   const temporary = `${backupPath}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(temporary, previous, { mode: 0o600 });
-    fs.renameSync(temporary, backupPath);
+    renameWithRetry(temporary, backupPath);
     return { ok: true, path: backupPath };
   } catch { /* the folder needs sudo; fall through */ }
   try { fs.rmSync(temporary, { force: true }); } catch { /* nothing to clean up */ }

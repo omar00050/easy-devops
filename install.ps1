@@ -28,6 +28,14 @@
 .PARAMETER NoService
   Do not install the background service, and do not ask.
 
+.PARAMETER Pm2
+  Install standard PM2 globally (`npm i -g pm2`) as the account running this
+  installer, without asking, when PM2 is missing. One PM2 only: the installer
+  never creates a PM2 home of its own and never installs a second copy.
+
+.PARAMETER NoPm2
+  Do not install PM2, and do not ask. Wins if both -Pm2 and -NoPm2 are given.
+
 .PARAMETER Yes
   Answer yes to the winget Node.js LTS install prompt. Nothing else is
   auto-confirmed.
@@ -39,6 +47,7 @@
   .\install.ps1                  # Interactive install
   .\install.ps1 -Version 20      # Install Node.js 20.x (latest patch via nvm)
   .\install.ps1 -KeepNode        # Skip Node.js management
+  .\install.ps1 -Pm2             # Also install PM2 globally, if missing
 #>
 param(
   [switch]$Help,
@@ -46,6 +55,8 @@ param(
   [switch]$KeepNode,
   [switch]$Service,
   [switch]$NoService,
+  [switch]$Pm2,
+  [switch]$NoPm2,
   [switch]$Yes,
   [switch]$NonInteractive
 )
@@ -71,6 +82,10 @@ $NVM_WINDOWS_SHA256  = ''
 $WINGET_INSTALL_PS1_SHA256 = '44972db6280d6f1bb7e7bb62ef6da2cb98393ce694e52882775e1393ac7aa3c5'
 
 $NODE_FALLBACK       = '20'
+
+# Standard PM2, exactly as a user installs it. One string, used by the offer and
+# by every message that prints the command, so they cannot drift apart.
+$PM2_INSTALL_COMMAND = 'npm i -g pm2'
 
 # ─── Summary tracking (mirrors install.sh add_result) ────────────────────────
 
@@ -177,6 +192,9 @@ function Print-Help {
   Write-Host "  -KeepNode        Skip Node.js management; use current Node.js on PATH"
   Write-Host "  -Service         Install the background service without asking"
   Write-Host "  -NoService       Do not install the background service, and do not ask"
+  Write-Host "  -Pm2             Install standard PM2 globally (npm i -g pm2) without"
+  Write-Host "                   asking, when it is missing"
+  Write-Host "  -NoPm2           Do not install PM2, and do not ask"
   Write-Host "  -Yes             Install Node.js LTS with winget without asking"
   Write-Host "  -NonInteractive  Never prompt; print the command to run instead"
   Write-Host ""
@@ -189,6 +207,7 @@ function Print-Help {
   Write-Host "  .\install.ps1                  # Interactive install"
   Write-Host "  .\install.ps1 -Version 20      # Install Node.js 20.x"
   Write-Host "  .\install.ps1 -KeepNode        # Skip Node.js management"
+  Write-Host "  .\install.ps1 -Pm2             # Also install PM2 globally, if missing"
   Write-Host ""
 }
 
@@ -500,6 +519,181 @@ function Invoke-NodeLtsFallback {
   }
   Write-Warn "Node.js is still not on PATH in this window; open a new terminal and run install.ps1 again."
   return $false
+}
+
+# ─── PM2 offer ────────────────────────────────────────────────────────────────
+#
+# One model, and it is the user's own PM2, exactly as anyone installs it:
+# `npm i -g pm2` with the npm that installed Easy DevOps, as the account running
+# this installer, into that account's npm prefix and its default PM2 home under
+# %APPDATA%. Easy DevOps never creates a PM2 home of its own, never installs a
+# second copy, never starts a daemon here, and never moves, restarts or touches
+# an app that already exists.
+#
+# PM2 being absent is not an Easy DevOps error: the package installs and runs
+# without it, and every PM2 action says what is missing. So nothing here may
+# turn a failed PM2 install into a failed Easy DevOps install.
+#
+# The offer is made after the package is installed and before the background
+# service offer, and its default answer is No.
+
+function Get-Pm2Command {
+  return (Get-Command 'pm2' -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1)
+}
+
+function Get-NpmCommand {
+  return (Get-Command 'npm' -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1)
+}
+
+# The version, read from the installed PM2 package -- never by running pm2.
+# Every pm2 command starts the PM2 daemon when none is running (PM2's own
+# lib/Client.js does it), and an installer must not be what starts one.
+# `npm root -g` is the same npm that installed it, so the package.json beside
+# it is the copy this account actually has. Unknown only changes the wording.
+function Get-Pm2Version {
+  $npm = Get-NpmCommand
+  if (-not $npm) { return 'unknown' }
+
+  $root = $null
+  try { $root = (& $npm.Source 'root' '-g' 2>$null | Select-Object -First 1) } catch { return 'unknown' }
+  if ([string]::IsNullOrWhiteSpace([string]$root)) { return 'unknown' }
+
+  $pkg = Join-Path (Join-Path ([string]$root).Trim() 'pm2') 'package.json'
+  if (-not (Test-Path -LiteralPath $pkg -PathType Leaf)) { return 'unknown' }
+
+  try {
+    $json = Get-Content -LiteralPath $pkg -Raw -ErrorAction Stop | ConvertFrom-Json
+    if ($json.version) { return [string]$json.version }
+  } catch {}
+  return 'unknown'
+}
+
+# Runs the installer's own npm, in this account's prefix. Never elevated: the
+# installer must not ask for consent or a password on PM2's behalf.
+function Invoke-Pm2Install {
+  param([Parameter(Mandatory = $true)][object]$Npm)
+  & $Npm.Source 'i' '-g' 'pm2'
+  return ($LASTEXITCODE -eq 0)
+}
+
+# Only an explicit yes installs. Empty, "n", "no", and anything unexpected
+# all mean no.
+function Test-Pm2AnswerAccepted {
+  param([string]$Answer = '')
+  return ($Answer.Trim() -imatch '^(y|yes)$')
+}
+
+function Invoke-Pm2Offer {
+  param(
+    [switch]$Install,
+    [switch]$Skip,
+    [switch]$NoPrompt,
+    [switch]$OnServer
+  )
+
+  $pm2 = Get-Pm2Command
+  if ($pm2) {
+    $version = Get-Pm2Version
+    Write-Host ""
+    if ($version -eq 'unknown') {
+      Write-Host "  PM2 is already installed; nothing to install." -ForegroundColor Green
+    } else {
+      Write-Host "  PM2 $version is already installed; nothing to install." -ForegroundColor Green
+    }
+    return
+  }
+
+  if ($Skip) {
+    Write-Host ""
+    Write-Host "  Skipping PM2 (-NoPm2). Install it later with: $PM2_INSTALL_COMMAND" -ForegroundColor Gray
+    Write-Host ""
+    return
+  }
+
+  $wanted = $false
+  if ($Install) {
+    $wanted = $true
+  } elseif ($NoPrompt -or [Console]::IsInputRedirected) {
+    # No terminal: a CI run, a scheduled task, or a redirected session. Never
+    # guess on an install question; say exactly what to run instead.
+    Write-Host ""
+    Write-Host "  PM2 is not installed." -ForegroundColor Gray
+    Write-Host "  No terminal is available, so it was not installed. Install it with:" -ForegroundColor Gray
+    Write-Host "    $PM2_INSTALL_COMMAND" -ForegroundColor Cyan
+    Write-Host ""
+    return
+  } else {
+    Write-Host ""
+    Write-Host "  Easy DevOps runs the apps it deploys with PM2, and shows the PM2 apps" -ForegroundColor White
+    Write-Host "  you already have. PM2 is not installed yet." -ForegroundColor White
+    Write-Host ""
+    Write-Host "  It would be installed globally for this account ($([Environment]::UserName))," -ForegroundColor Gray
+    Write-Host "  with this account's npm and its usual PM2 home. Nothing else is" -ForegroundColor Gray
+    Write-Host "  created, and existing apps are not touched." -ForegroundColor Gray
+    Write-Host ""
+    $answer = Read-Host "  Install PM2 now? [y/N]"
+    if (Test-Pm2AnswerAccepted -Answer $answer) { $wanted = $true }
+  }
+
+  if (-not $wanted) {
+    Write-Host ""
+    Write-Host "  PM2 was not installed. Install it later with: $PM2_INSTALL_COMMAND" -ForegroundColor Gray
+    Write-Host ""
+    return
+  }
+
+  $npm = Get-NpmCommand
+  if (-not $npm) {
+    Write-Host ""
+    Write-Host "  npm is not on PATH, so PM2 was not installed." -ForegroundColor Yellow
+    Write-Host "  Install it with: $PM2_INSTALL_COMMAND" -ForegroundColor Cyan
+    Write-Host ""
+    return
+  }
+
+  Write-Host ""
+  Write-Host "  Installing PM2 globally: $PM2_INSTALL_COMMAND" -ForegroundColor Cyan
+  Write-Host "  with $($npm.Source), as $([Environment]::UserName) (this can take a minute)" -ForegroundColor Gray
+  Write-Host ""
+
+  $ok = $false
+  try {
+    $ok = Invoke-Pm2Install -Npm $npm
+  } catch {
+    Write-Host "  npm could not run: $($_.Exception.Message)" -ForegroundColor Red
+    $ok = $false
+  }
+
+  if ($ok) {
+    # The npm prefix is normally on PATH already, so a fresh lookup usually
+    # finds the new command at once.
+    $now = Get-Pm2Command
+    Write-Host ""
+    $version = Get-Pm2Version
+    if ($version -ne 'unknown') {
+      Write-Host "  PM2 $version installed." -ForegroundColor Green
+    } elseif ($now) {
+      Write-Host "  PM2 installed." -ForegroundColor Green
+    } else {
+      Write-Host "  PM2 was installed. Open a new terminal if the pm2 command is not found yet." -ForegroundColor Green
+    }
+    if ($OnServer) {
+      Write-Host "  This is this account's PM2. The background service runs as" -ForegroundColor Gray
+      Write-Host "  NT SERVICE\EasyDevOps and cannot use another account's PM2; Easy DevOps" -ForegroundColor Gray
+      Write-Host "  reports that instead of creating a second one." -ForegroundColor Gray
+    }
+    Write-Host ""
+    return
+  }
+
+  Write-Host ""
+  Write-Host "  PM2 was not installed. Easy DevOps is installed and works without it." -ForegroundColor Yellow
+  Write-Host "  The command was:" -ForegroundColor Gray
+  Write-Host "    $PM2_INSTALL_COMMAND" -ForegroundColor Cyan
+  Write-Host "  Fix the npm error above, then run that command in this same window." -ForegroundColor Gray
+  Write-Host ""
 }
 
 # E2E loads only the installer functions above, then replaces download and
@@ -1317,6 +1511,18 @@ function Invoke-ServiceOffer {
   }
   Write-Host ""
 }
+
+# ─── PM2 first, then the background service ──────────────────────────────────
+#
+# PM2 is asked about BEFORE the service, and after the package is installed,
+# because PM2 is what runs the apps. Both functions are defined by now, and
+# neither may fail this install. -NoPm2 wins over -Pm2; a non-interactive
+# session is never asked, and nothing is ever installed silently.
+Invoke-Pm2Offer `
+  -Install:($Pm2 -and -not $NoPm2) `
+  -Skip:$NoPm2 `
+  -NoPrompt:$NonInteractive `
+  -OnServer:(Get-IsWindowsServer)
 
 Invoke-ServiceOffer
 }

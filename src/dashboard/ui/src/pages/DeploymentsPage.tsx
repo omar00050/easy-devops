@@ -1,5 +1,4 @@
-import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect, useState } from 'react';
 import {
   GitBranch,
   Globe2,
@@ -12,7 +11,7 @@ import {
   Webhook,
 } from 'lucide-react';
 import { api, ApiError } from '../lib/api';
-import type { DeployApp, DeploymentsResponse } from '../lib/types';
+import type { DeployApp, DeploymentsResponse, Pm2OfferState } from '../lib/types';
 import { formatBytes, formatUptime, pluralize, timeAgo, truncateMiddle } from '../lib/format';
 import { RUN_STATUS, modeSummary, processTone, runStageLabel, shortSha } from '../lib/deployments';
 import {
@@ -26,9 +25,10 @@ import { AppDetailModal } from '../components/deployments/AppDetailModal';
 import { AppFormModal } from '../components/deployments/AppFormModal';
 import { DeleteAppModal } from '../components/deployments/AppSetupTabs';
 import { HookSettingsModal } from '../components/deployments/HookSettingsModal';
+import { Pm2InstallDialog } from '../components/deployments/Pm2InstallDialog';
 import { Card, CardBody, CardHeader } from '../components/ui/Card';
 import { Badge, StatusDot } from '../components/ui/Badge';
-import { Button, IconButton, buttonClasses } from '../components/ui/Button';
+import { Button, IconButton } from '../components/ui/Button';
 import {
   EmptyState,
   ErrorState,
@@ -253,6 +253,25 @@ export function DeploymentsPage() {
   const [detail, setDetail] = useState<{ id: string; tab: DetailTab } | null>(null);
   const [starting, setStarting] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<DeployApp | null>(null);
+  const [installOpen, setInstallOpen] = useState(false);
+  // A create answer may carry the PM2 install offer. It waits until the form
+  // that produced it is closed, so two dialogs never compete for the keyboard.
+  const [offerPending, setOfferPending] = useState(false);
+  const [pm2Unavailable, setPm2Unavailable] = useState<Pm2OfferState | null>(null);
+
+  useEffect(() => {
+    if (formOpen || !offerPending) return;
+    setOfferPending(false);
+    setInstallOpen(true);
+  }, [formOpen, offerPending]);
+
+  /** Reads the `pm2` object a create answer carries; an older server sends none. */
+  const noteCreatedPm2 = (saved: DeployApp) => {
+    const pm2 = (saved as DeployApp & { pm2?: Pm2OfferState }).pm2;
+    if (!pm2) return;
+    setPm2Unavailable(pm2.state === 'unavailable' ? pm2 : null);
+    if (pm2.offer) setOfferPending(true);
+  };
 
   const openCreate = () => {
     setEditing(null);
@@ -329,18 +348,36 @@ export function DeploymentsPage() {
             Easy DevOps service.
           </InlineAlert>
         )}
-        {!data.requirements.pm2 && (
+        {!data.requirements.pm2 && !pm2Unavailable && (
           <InlineAlert
             tone="warning"
             title="PM2 is not installed"
             action={
-              <Link to="/processes" className={buttonClasses('secondary', 'sm')}>
-                Open Processes
-              </Link>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => setInstallOpen(true)}
+              >
+                Install PM2
+              </Button>
             }
           >
-            Deployed apps are kept running by PM2. Install it from the Processes page, or with{' '}
-            <code className="font-mono">npm install -g pm2</code>.
+            Deployed apps are kept running by PM2. Install it here, or with{' '}
+            <code className="font-mono">npm i -g pm2</code> yourself on the server.
+          </InlineAlert>
+        )}
+        {pm2Unavailable && (
+          <InlineAlert
+            tone="warning"
+            title="PM2 cannot be used from here"
+            action={
+              <Button variant="ghost" size="sm" onClick={() => setPm2Unavailable(null)}>
+                Dismiss
+              </Button>
+            }
+          >
+            {pm2Unavailable.message && <p>{pm2Unavailable.message}</p>}
+            {pm2Unavailable.fix && <p className="mt-1">{pm2Unavailable.fix}</p>}
           </InlineAlert>
         )}
 
@@ -407,7 +444,10 @@ export function DeploymentsPage() {
         meta={data}
         onClose={() => setFormOpen(false)}
         onRefresh={resource.reload}
-        onCreated={() => resource.reload()}
+        onCreated={(app) => {
+          noteCreatedPm2(app);
+          resource.reload();
+        }}
         onDeployNow={(id) => {
           setFormOpen(false);
           setDetail({ id, tab: 'activity' });
@@ -417,6 +457,7 @@ export function DeploymentsPage() {
           setFormOpen(false);
           resource.reload();
           if (created) {
+            noteCreatedPm2(saved);
             toast.success(`${saved.id} created`, 'Press Deploy to build and start it.');
           } else {
             toast.success(`${saved.id} saved`, 'It applies to the next deployment.');
@@ -452,6 +493,15 @@ export function DeploymentsPage() {
         onDeleted={() => {
           setDeleting(null);
           setDetail(null);
+          resource.reload();
+        }}
+      />
+
+      <Pm2InstallDialog
+        open={installOpen}
+        onClose={() => setInstallOpen(false)}
+        onInstalled={() => {
+          setPm2Unavailable(null);
           resource.reload();
         }}
       />

@@ -23,6 +23,7 @@ import { writeConfWithTest, findBackslashCertPaths } from '../../core/nginx-appl
 import { prepareDomainForHttpChallenge, describeIssuance } from '../../core/ssl-issuer.js';
 import { issueCert } from './ssl-manager.js';
 import { isWindows, nginxTestCmd, nginxReloadCmd, combineOutput, isNginxTestOk } from '../../core/platform.js';
+import { renameWithRetryAsync } from '../../core/atomicState.js';
 import { page, pause, BACK } from '../ui/page.js';
 
 // ─── List Domains ───────────────────────────────────────────────────────
@@ -570,14 +571,14 @@ async function toggleDomainAction() {
 
   try {
     if (isEnabled) {
-      await fs.rename(enabledPath, disabledPath);
+      await renameWithRetryAsync(enabledPath, disabledPath);
     } else {
-      await fs.rename(disabledPath, enabledPath);
+      await renameWithRetryAsync(disabledPath, enabledPath);
       // Test config before reload
       const testCmd = isWindows ? nginxTestCmd(nginxDir) : 'nginx -t';
   const testResult = await run(testCmd, { cwd: nginxDir });
       if (!isNginxTestOk(testResult)) {
-        await fs.rename(enabledPath, disabledPath).catch(() => {});
+        await renameWithRetryAsync(enabledPath, disabledPath).catch(() => {});
         spinner.fail('Config test failed — rolled back');
         console.log(chalk.red('\n' + combineOutput(testResult)));
         return;

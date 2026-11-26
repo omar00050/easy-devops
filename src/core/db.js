@@ -3,6 +3,7 @@ import path from 'path';
 import { createRequire } from 'module';
 import { fileURLToPath } from 'url';
 import { getDataDir, isDefaultDataDir, isWindows } from './platform.js';
+import { copyFileWithRetry, renameWithRetry } from './atomicState.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -271,8 +272,13 @@ function migrateIfNeeded() {
     // Server-mode switch filling this directory — an existing database is
     // NEVER overwritten. A database that is already there is the live one; the
     // legacy file is simply left where it is.
+    //
+    // The copy retries the Windows sharing codes through the shared helper. A
+    // sharing denial is an open-time failure — the source is held by another
+    // process for a moment — so a retry cannot find a half-copied destination
+    // of its own; an EEXIST from a real race is still handled below.
     try {
-      fs.copyFileSync(OLD_DB_PATH, DB_PATH, fs.constants.COPYFILE_EXCL);
+      copyFileWithRetry(OLD_DB_PATH, DB_PATH, fs.constants.COPYFILE_EXCL);
     } catch (error) {
       if (error?.code === 'EEXIST') return;
       throw error;
@@ -283,7 +289,7 @@ function migrateIfNeeded() {
     // rename onto an existing name succeeds on Linux and would delete it.
     let retired = `${OLD_DB_PATH}.migrated`;
     if (fs.existsSync(retired)) retired = `${retired}-${Date.now()}`;
-    fs.renameSync(OLD_DB_PATH, retired);
+    renameWithRetry(OLD_DB_PATH, retired);
   } catch (err) {
     // non-fatal — new install will start fresh
     migrationFailure = describeError(err).text;

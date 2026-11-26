@@ -16,6 +16,7 @@ import {
   validateMaxBodySize, validateBehindCloudflare,
 } from '../../core/validators.js';
 import { getDomainNotifConfig, saveDomainNotifConfig } from '../../core/domainNotifier.js';
+import { renameWithRetryAsync } from '../../core/atomicState.js';
 
 /**
  * Maps a failed writeConfWithTest() result to an API error body, preserving
@@ -359,7 +360,7 @@ class DomainsController {
       if (isEnabled) {
         // Disable: rename .conf → .conf.disabled, then reload nginx
         try {
-          await fs.rename(enabledPath, disabledPath);
+          await renameWithRetryAsync(enabledPath, disabledPath);
         } catch (err) {
           return res.status(500).json({ error: 'Failed to rename config file', details: err.message });
         }
@@ -376,7 +377,7 @@ class DomainsController {
       } else {
         // Enable: rename .conf.disabled → .conf, test, reload
         try {
-          await fs.rename(disabledPath, enabledPath);
+          await renameWithRetryAsync(disabledPath, enabledPath);
         } catch (err) {
           return res.status(500).json({ error: 'Failed to rename config file', details: err.message });
         }
@@ -385,7 +386,7 @@ class DomainsController {
         const testResult = await run(testCmd, { cwd: nginxDir });
         if (!isNginxTestOk(testResult)) {
           // Roll back rename
-          await fs.rename(enabledPath, disabledPath).catch(() => {});
+          await renameWithRetryAsync(enabledPath, disabledPath).catch(() => {});
           const output = testResult.stderr || testResult.stdout;
           const error = !isWindows && output.includes('password is required')
             ? 'Linux permissions not configured. Open Settings → Setup Linux Permissions.'

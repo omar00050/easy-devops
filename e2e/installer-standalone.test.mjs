@@ -34,7 +34,7 @@ const ROOT = path.resolve(__dirname, '..');
 const SCRIPT = path.join(ROOT, 'install.sh');
 const PS_SCRIPT = path.join(ROOT, 'install.ps1');
 const BAT_SCRIPT = path.join(ROOT, 'install.bat');
-const MODULES = ['progress.sh', 'detect.sh', 'node-versions.sh', 'picker.sh', 'nvm-bootstrap.sh'];
+const MODULES = ['progress.sh', 'detect.sh', 'node-versions.sh', 'picker.sh', 'nvm-bootstrap.sh', 'pm2.sh'];
 
 const results = [];
 let group = '';
@@ -189,8 +189,8 @@ async function testShellStandalone(bash) {
 
   check('a standalone --check-helpers run exits 0', result.code === 0,
     `exit ${result.code}: ${output.slice(0, 300)}`);
-  check('all five helpers were downloaded and verified',
-    /check-helpers: verified 5 helper module\(s\)/.test(output), output.slice(0, 300));
+  check(`all ${MODULES.length} helpers were downloaded and verified`,
+    new RegExp(`check-helpers: verified ${MODULES.length} helper module\\(s\\)`).test(output), output.slice(0, 300));
   check('they lived in a private directory requested as 0700',
     /in a private directory \(requested 0700/.test(output), output.slice(0, 300));
   if (process.platform !== 'win32') {
@@ -521,7 +521,7 @@ async function testBatchMapping() {
   const result = await run('cmd.exe', [
     '/d', '/c', path.join(dir, 'install.bat'),
     '--help', '--version', '20', '--keep-node', '--service', '--no-service',
-    '--yes', '--non-interactive', '--custom-flag',
+    '--pm2', '--no-pm2', '--yes', '--non-interactive', '--custom-flag',
   ], {
     cwd: dir,
     env: {
@@ -540,6 +540,8 @@ async function testBatchMapping() {
     /\s-Help(\s|$)/.test(line) && /\s-Version 20(\s|$)/.test(line) && !/--help|--version/.test(line), line);
   check('--keep-node, --service and --no-service are mapped',
     /\s-KeepNode(\s|$)/.test(line) && /\s-Service(\s|$)/.test(line) && /\s-NoService(\s|$)/.test(line), line);
+  check('--pm2 and --no-pm2 are mapped to -Pm2 and -NoPm2',
+    /\s-Pm2(\s|$)/.test(line) && /\s-NoPm2(\s|$)/.test(line) && !/--pm2|--no-pm2/.test(line), line);
   check('--yes and --non-interactive are mapped',
     /\s-Yes(\s|$)/.test(line) && /\s-NonInteractive(\s|$)/.test(line), line);
   check('anything else is passed through unchanged', /\s--custom-flag(\s|$)/.test(line), line);

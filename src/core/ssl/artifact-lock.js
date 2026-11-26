@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { renameWithRetry } from '../atomicState.js';
 
 export const ARTIFACT_LOCK_STALE_MS = 120_000;
 export const SSL_ARTIFACT_LIFECYCLE_LOCK = 'ssl-artifact-lifecycle';
@@ -284,7 +285,11 @@ function replaceStale(names, key, now) {
       if (!ownsRecoveryGuard(names, guard.owner.token)) {
         return { ok: false, reason: 'the recovery guard changed before lock replacement' };
       }
-      fs.renameSync(candidate, names.lock);
+      // The one replacement outside this module's own contention loops (those
+      // are verified under load in 1.4.8 and stay as they are): a waiter reading
+      // the lock for its owner check can deny this rename for a moment, and the
+      // shared retry rides that out with the same EPERM/EBUSY/EACCES codes.
+      renameWithRetry(candidate, names.lock);
       if (!ownsRecoveryGuard(names, guard.owner.token)) {
         try {
           const installed = readOwner(names.lock);

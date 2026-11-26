@@ -44,6 +44,7 @@ import {
   getDataDir,
 } from '../platform.js';
 import { inspect, lockPath, STALE_AFTER_MS } from '../daemon/lock.js';
+import { retrySharing, retrySharingAsync } from '../atomicState.js';
 import {
   UNINSTALL_STAGE_TIMEOUT_MS,
   remainingStageMs,
@@ -504,7 +505,7 @@ async function writeMarker(target, marker, payload, {
     }
     remainingStageMs(deadline, stage, timeoutMs);
     signal?.throwIfAborted();
-    await fsApi.promises.rename(temp, marker);
+    await retrySharingAsync(() => fsApi.promises.rename(temp, marker));
     return { ok: true, existed: false };
   } catch (error) {
     try { await fsApi.promises.rm(temp, { force: true }); } catch { /* best effort */ }
@@ -632,7 +633,7 @@ async function unpublishMergedEntries({
     for (const name of names) {
       remainingStageMs(deadline, 'Rolling back data move', timeoutMs);
       signal?.throwIfAborted();
-      await fsApi.promises.rename(path.join(to, name), path.join(staging, name));
+      await retrySharingAsync(() => fsApi.promises.rename(path.join(to, name), path.join(staging, name)));
     }
   } catch (error) {
     throwIfStageInterrupted(error, signal);
@@ -872,7 +873,7 @@ export async function moveDataDir({
         if (alreadyThere) {
           throw new Error(`${destination} appeared while the data was copied; refusing to overwrite it`);
         }
-        await fsApi.promises.rename(path.join(staging, name), destination);
+        await retrySharingAsync(() => fsApi.promises.rename(path.join(staging, name), destination));
         mergedEntries.push(name);
       }
       log('Data placed beside the existing service folders; they were not changed.');
@@ -887,7 +888,7 @@ export async function moveDataDir({
         }
         await fsApi.promises.rmdir(to);
       }
-      await fsApi.promises.rename(staging, to);
+      await retrySharingAsync(() => fsApi.promises.rename(staging, to));
     }
     copied = true;
     remainingStageMs(deadline, 'Moving data', timeoutMs);
@@ -955,7 +956,7 @@ export async function moveDataDir({
   try {
     remainingStageMs(deadline, 'Moving data', timeoutMs);
     signal?.throwIfAborted();
-    await fsApi.promises.rename(from, backup);
+    await retrySharingAsync(() => fsApi.promises.rename(from, backup));
     sourceRenamed = true;
     // rename() is not cancellable. If it completed after the stage deadline,
     // the caller has already received a timeout. Restore the source before
@@ -974,7 +975,7 @@ export async function moveDataDir({
     // destination when the rename back cannot be completed.
     if (sourceRenamed) {
       try {
-        await fsApi.promises.rename(backup, from);
+        await retrySharingAsync(() => fsApi.promises.rename(backup, from));
         sourceRestored = true;
         log(`Restored the original live directory at ${from}`);
       } catch (restoreError) {
@@ -1337,7 +1338,7 @@ export async function setAsideLeftoverServerData({
   }
 
   try {
-    fsApi.renameSync(source, movedTo);
+    retrySharing(() => fsApi.renameSync(source, movedTo));
   } catch (error) {
     const code = String(error?.code ?? '').trim();
     return refuse(
@@ -1364,7 +1365,7 @@ export async function setAsideLeftoverServerData({
   if (!verified) {
     let restored = false;
     try {
-      fsApi.renameSync(movedTo, source);
+      retrySharing(() => fsApi.renameSync(movedTo, source));
       restored = true;
     } catch { /* both locations are reported below */ }
     return {

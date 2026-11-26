@@ -49,6 +49,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { runFile } from '../shell.js';
 import { isWindows, programDataDir } from '../platform.js';
+import { renameWithRetry, retrySharing } from '../atomicState.js';
 
 /** Where the pinned runtime lives, per platform. */
 export function runtimeDir(dataDir) {
@@ -413,13 +414,13 @@ export function installRuntimeStubs(appDir) {
           }
           assertRuntimeDirectory(target, root);
           displaced = path.join(parent, `.easy-devops-old-${randomUUID()}`);
-          fs.renameSync(target, displaced);
+          renameWithRetry(target, displaced);
         }
       }
 
       // Always replace the package. A directory with the expected name may be
       // executable content left by an earlier or less trustworthy install.
-      fs.renameSync(temporary, target);
+      renameWithRetry(temporary, target);
       if (displaced) fs.rmSync(displaced, { recursive: true, force: true });
       displaced = null;
     } finally {
@@ -439,23 +440,21 @@ function samePath(a, b) {
 }
 
 /**
- * copyFileSync, retried briefly on EBUSY/EPERM.
+ * copyFileSync, retried briefly on EBUSY/EPERM/EACCES.
  *
  * A service that has just reported STOPPED can hold node.exe for a moment
  * longer while Windows tears the process down; a few hundred milliseconds of
  * patience turns that race into a success. Anything still locked after the
  * retries is a real lock, and the error says so.
+ *
+ * The retry itself is the shared one in core/atomicState.js; only the schedule
+ * is this caller's (ten attempts, 300 ms apart) because a service that is
+ * still shutting down needs more patience than a state file.
  */
-function copyFileRetrying(from, to, { tries = 10, delayMs = 300 } = {}) {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      fs.copyFileSync(from, to);
-      return;
-    } catch (err) {
-      if (attempt >= tries || !(err.code === 'EBUSY' || err.code === 'EPERM')) throw err;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
-    }
-  }
+const COPY_RETRY_DELAYS_MS = Object.freeze(Array.from({ length: 9 }, () => 300));
+
+function copyFileRetrying(from, to) {
+  retrySharing(() => fs.copyFileSync(from, to), { delays: COPY_RETRY_DELAYS_MS });
 }
 
 /**

@@ -47,6 +47,7 @@ import { createRequire } from 'module';
 
 import { run, runFile } from '../shell.js';
 import { isWindows, getDataDir } from '../platform.js';
+import { copyFileWithRetry, renameWithRetry } from '../atomicState.js';
 import { detectInstallSource } from '../installSource.js';
 import * as windowsPersonal from './windowsPersonal.js';
 import { protectServiceFiles } from './operator.js';
@@ -573,16 +574,16 @@ async function applyWindowsServer({ nodeExe, dataDir, log, deps = {} }) {
       // One generation only: the older .prev has already been superseded, and
       // `ezz cleanup` is what removes it.
       try { fs.rmSync(prev, { force: true }); } catch { /* nothing there */ }
-      fs.renameSync(dest, prev);
+      renameWithRetry(dest, prev);
       log(`Kept the previous runtime at ${prev}`);
     }
-    fs.copyFileSync(fs.realpathSync(nodeExe), dest);
+    copyFileWithRetry(fs.realpathSync(nodeExe), dest);
     log(`Copied ${nodeExe} -> ${dest}`);
   } catch (err) {
     // Put it back immediately: a half-swapped runtime directory is the one
     // state nobody can diagnose.
     if (hadPrevious && !fs.existsSync(dest) && fs.existsSync(prev)) {
-      try { fs.renameSync(prev, dest); } catch { /* reported below */ }
+      try { renameWithRetry(prev, dest); } catch { /* reported below */ }
     }
     return { ok: false, reason: `could not replace ${dest}: ${err.message}` };
   }
@@ -598,13 +599,13 @@ async function applyWindowsServer({ nodeExe, dataDir, log, deps = {} }) {
     let setAside = false;
     try {
       if (fs.existsSync(dest)) {
-        fs.renameSync(dest, failed);
+        renameWithRetry(dest, failed);
         setAside = true;
       }
-      fs.renameSync(prev, dest);
+      renameWithRetry(prev, dest);
     } catch (err) {
       if (setAside) {
-        try { fs.renameSync(failed, dest); } catch { /* keep both, reported below */ }
+        try { renameWithRetry(failed, dest); } catch { /* keep both, reported below */ }
       }
       return {
         ok: false,

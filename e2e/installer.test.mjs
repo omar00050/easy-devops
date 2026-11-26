@@ -47,7 +47,7 @@ function check(label, passed, detail = '') {
 
 const SCRIPT = path.join(ROOT, 'install.sh');
 const PS_SCRIPT = path.join(ROOT, 'install.ps1');
-const MODULES = ['progress.sh', 'detect.sh', 'node-versions.sh', 'picker.sh', 'nvm-bootstrap.sh'];
+const MODULES = ['progress.sh', 'detect.sh', 'node-versions.sh', 'picker.sh', 'nvm-bootstrap.sh', 'pm2.sh'];
 
 function scratch(name) {
   const dir = path.join(TEST_DATA_DIR, 'scratch', name);
@@ -219,6 +219,126 @@ function snapshot(dir) {
   return out;
 }
 
+// ─── PM2 fixtures ────────────────────────────────────────────────────────────
+
+/**
+ * A PATH whose pm2 / easy-devops resolution is decided ONLY by the stub
+ * directory passed in.
+ *
+ * This machine can have a real pm2 and a real easy-devops on PATH, so a case
+ * that says "PM2 is missing" must not find either one, and a case that tests
+ * the package install must not fall into "already installed" mode. Every other
+ * directory is kept: the installer needs sed, awk, sha256sum and the shell
+ * builtins, and stubbing those would test nothing.
+ */
+function controlledPath(binDir) {
+  const hidden = ['pm2', 'pm2.cmd', 'pm2.exe', 'easy-devops', 'easy-devops.cmd', 'easy-devops.exe'];
+  const dirs = (process.env.PATH || '').split(path.delimiter).filter((dir) => (
+    dir && !hidden.some((name) => fs.existsSync(path.join(dir, name)))
+  ));
+  return [binDir, ...dirs].join(path.delimiter);
+}
+
+/** Reads the calls a stub recorded next to itself. */
+function readCallLog(stubPath) {
+  try {
+    const text = fs.readFileSync(`${stubPath}.called`, 'utf8');
+    return text.split(/\r?\n/).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Stubs for a PM2 run: npm (recording, with an optional failure), pm2 when the
+ * case wants it present, and downloaders that fail at once so nothing leaves
+ * the machine.
+ *
+ * The pm2 stub is a TRIPWIRE: it records any execution. Every PM2 path must
+ * read the version from `<npm root -g>/pm2/package.json` instead, because
+ * `pm2 --version` is itself a PM2 command and starts the daemon.
+ */
+function pm2Stubs(name, { pm2 = true, npmPm2Exit = 0, version = '5.4.2' } = {}) {
+  const dir = scratch(name);
+  const root = path.join(dir, 'npm-root');
+  const pkgDir = path.join(root, 'pm2');
+  const npmRoot = root.replace(/\\/g, '/');
+  const pkgPath = `${npmRoot}/pm2/package.json`;
+  fs.mkdirSync(dir, { recursive: true });
+
+  const write = (file, body) => {
+    fs.writeFileSync(path.join(dir, file), body);
+    fs.chmodSync(path.join(dir, file), 0o755);
+  };
+
+  write('npm', [
+    '#!/usr/bin/env bash',
+    'printf "%s\\n" "$*" >> "${0}.called"',
+    `if [ "$*" = "root -g" ]; then printf '%s\\n' "${npmRoot}"; exit 0; fi`,
+    'case "$*" in',
+    '  *"-g pm2"*)',
+    `    if [ "${npmPm2Exit}" != "0" ]; then`,
+    '      printf "npm ERR! code EACCES: permission denied, mkdir /usr/lib/node_modules/pm2\\n" >&2',
+    `      exit ${npmPm2Exit}`,
+    '    fi',
+    `    mkdir -p "${npmRoot}/pm2" && printf '{"name":"pm2","version":"${version}"}\\n' > "${pkgPath}"`,
+    '    ;;',
+    'esac',
+    'exit 0',
+    '',
+  ].join('\n'));
+
+  if (pm2) {
+    // Present, and reachable, but running it is the failure this test watches.
+    write('pm2', [
+      '#!/usr/bin/env bash',
+      'printf "%s\\n" "$*" >> "${0}.called"',
+      'printf "TRIPWIRE: pm2 must never be executed by the installer\\n" >&2',
+      'exit 0',
+      '',
+    ].join('\n'));
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: 'pm2', version }));
+  }
+
+  // The installer probes nodejs.org unless --keep-node is given. These make the
+  // probe fail immediately and offline instead of reaching the network.
+  for (const tool of ['curl', 'wget', 'ping']) {
+    write(tool, '#!/usr/bin/env bash\nexit 1\n');
+  }
+
+  return dir;
+}
+
+/** A full installer run with the PM2 stubs in front of PATH. */
+async function runPm2Installer(bash, name, { args = [], pm2 = false, npmPm2Exit = 0 } = {}) {
+  const dir = layout(name);
+  const bin = pm2Stubs(`${name}-bin`, { pm2, npmPm2Exit });
+  const result = await runScript(bash, {
+    cwd: dir,
+    scriptPath: path.join(dir, 'install.sh'),
+    args: ['--keep-node', ...args],
+    env: { PATH: controlledPath(bin), HOME: path.join(dir, 'home') },
+  });
+  return {
+    dir,
+    bin,
+    result,
+    output: result.stdout + result.stderr,
+    npmCalls: readCallLog(path.join(bin, 'npm')),
+    pm2Calls: readCallLog(path.join(bin, 'pm2')),
+  };
+}
+
+/** Is there a real terminal behind this runner? A child with piped stdin can
+ *  still inherit one from the console that started the suite. */
+async function environmentHasTty(bash) {
+  const probe = await runBashCommand(bash, [
+    '-c', 'if { exec 3</dev/tty; } 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi',
+  ], { cwd: TEST_DATA_DIR });
+  return /HAS_TTY/.test(probe.stdout);
+}
+
 // ─── 1. --help costs nothing ─────────────────────────────────────────────────
 
 async function testHelp(bash) {
@@ -332,7 +452,8 @@ async function testPiped(bash) {
   check('a piped run without local helpers loads the verified bundle', run.code === 0,
     `exit ${run.code}: ${output.slice(0, 260)}`);
   check('the helpers were verified from the configured base',
-    /check-helpers: verified 5 helper module\(s\).*downloaded from/.test(output), output.slice(0, 260));
+    new RegExp(`check-helpers: verified ${MODULES.length} helper module\\(s\\).*downloaded from`).test(output),
+    output.slice(0, 260));
   check('the private helper directory is requested 0700',
     /requested 0700/.test(output), output.slice(0, 260));
   if (process.platform !== 'win32') {
@@ -498,6 +619,65 @@ async function testStaticHardening() {
   check('the elevated Windows bootstrap executes the CLI with a direct argument array',
     /&\s+\$Invocation\.ExecPath\s+@\(\$Invocation\.Args\)/.test(windows)
       && /&\s+\$p\.execPath\s+@\(\$p\.args\)/.test(windows));
+
+  // ── PM2: one standard install, asked before the service offer ───────────────
+  //
+  // The owner's decision is standard PM2 only: `npm i -g pm2` as the user who
+  // ran the installer, with that user's own npm and default PM2 home. No PM2
+  // home of our own, no second copy, no second daemon, and never an install
+  // without an answer.
+  const pm2Helper = fs.readFileSync(path.join(ROOT, 'src', 'lib', 'installer', 'pm2.sh'), 'utf8');
+  const batText = fs.readFileSync(path.join(ROOT, 'install.bat'), 'utf8');
+  const pm2Executable = withoutCommentLines(pm2Helper);
+
+  check('install.sh installs PM2 with exactly npm i -g pm2',
+    /_LIB_MODULES="[^"]*\bpm2\.sh\b/.test(text)
+      && /PM2_INSTALL_CMD="npm i -g pm2"/.test(pm2Helper));
+  check('install.ps1 installs PM2 with exactly npm i -g pm2',
+    /\$PM2_INSTALL_COMMAND = 'npm i -g pm2'/.test(windows));
+  check('no installer sets or creates a PM2 home of its own',
+    !/PM2_HOME=/.test(text) && !/PM2_HOME=/.test(pm2Helper) && !/env:PM2_HOME/.test(windows));
+  check('no installer runs pm2 startup, save, resurrect or install',
+    !/\bpm2\s+(startup|unstartup|install|save|resurrect)\b/.test(withoutCommentLines(text))
+      && !/\bpm2\s+(startup|unstartup|install|save|resurrect)\b/.test(withoutCommentLines(windows))
+      && !/\bpm2\s+(startup|unstartup|install|save|resurrect)\b/.test(pm2Executable));
+  check('no installer runs sudo itself',
+    !/^\s*sudo\s/m.test(withoutCommentLines(text))
+      && !/^\s*sudo\s/m.test(withoutCommentLines(windows))
+      && !/^\s*sudo\s/m.test(pm2Executable));
+
+  check('install.ps1 declares the -Pm2 and -NoPm2 switches',
+    /\[switch\]\$Pm2\b/.test(windows) && /\[switch\]\$NoPm2\b/.test(windows));
+  check('the Linux help documents --pm2 and --no-pm2',
+    /--pm2\s+Install standard PM2 globally/.test(text) && /--no-pm2\s+Do not install PM2/.test(text));
+  check('the Windows help documents -Pm2 and -NoPm2',
+    /-Pm2\s+Install standard PM2 globally/.test(windows) && /-NoPm2\s+Do not install PM2/.test(windows));
+  check('install.bat maps --pm2 and --no-pm2 to the PowerShell switches',
+    /"%~1"=="--pm2"[\s\S]{0,90}\s-Pm2"/i.test(batText)
+      && /"%~1"=="--no-pm2"[\s\S]{0,90}\s-NoPm2"/i.test(batText));
+  check('both prompts default to No',
+    /\[y\/N\]/.test(pm2Helper) && /\[y\/N\]/.test(windows));
+  check('the shell installer reads the PM2 version from its package, never by running pm2',
+    /npm root -g/.test(pm2Helper)
+      && !/\bpm2\s+(--version|-v)\b/.test(pm2Executable)
+      && /pm2\/package\.json/.test(pm2Helper));
+  check('the Windows installer reads the PM2 version from its package, never by running pm2',
+    /'root' '-g'/.test(windows)
+      && !/& \$pm2\b/.test(windows)
+      && !/\bpm2\s+--version\b/.test(windows));
+
+  const shellPm2Call = text.replace(/\r\n/g, '\n').indexOf('\nmaybe_install_pm2\n');
+  const shellSummary = text.indexOf('=== Installation Summary ===');
+  const shellServiceCall = text.replace(/\r\n/g, '\n').indexOf('\nmaybe_install_service\n');
+  check('install.sh offers PM2 after the package install and before the service offer',
+    shellPm2Call > 0 && shellPm2Call > shellSummary && shellPm2Call < shellServiceCall,
+    `pm2=${shellPm2Call}, summary=${shellSummary}, service=${shellServiceCall}`);
+  const psNorm = windows.replace(/\r\n/g, '\n');
+  const psPm2Call = psNorm.indexOf('\nInvoke-Pm2Offer `');
+  const psServiceCall = psNorm.lastIndexOf('\nInvoke-ServiceOffer');
+  check('install.ps1 offers PM2 before the service offer',
+    psPm2Call > 0 && psPm2Call < psServiceCall,
+    `pm2=${psPm2Call}, service=${psServiceCall}`);
 }
 
 // ─── 6. Altered bundled bytes are rejected before they run ──────────────────
@@ -577,10 +757,182 @@ async function testNvmBootstrap(bash) {
   check('user shell rc files were not sourced', !fs.existsSync(rcMarker));
 }
 
-// ─── 8. Windows verifies a fresh per-attempt file before launching it ───────
+// ─── 9. PM2: present, --pm2, --no-pm2, a failure, and the order ──────────────
+
+async function testPm2Offer(bash) {
+  setGroup('9. PM2 is offered after the package and before the service');
+
+  // Present: version printed, nothing installed, no question asked.
+  const present = await runPm2Installer(bash, 'pm2-present', { args: ['--no-service'], pm2: true });
+  check('a present PM2 is reported with its version and never installed again',
+    present.result.code === 0 && /PM2 5\.4\.2 is already installed/.test(present.output),
+    `exit ${present.result.code}: ${present.output.slice(-260)}`);
+  check('and npm was never asked for PM2',
+    !present.npmCalls.some((call) => /-g pm2/.test(call)), present.npmCalls.join(' | '));
+
+  // --pm2: installs without asking, exactly once, and in the right order.
+  const forced = await runPm2Installer(bash, 'pm2-forced', { args: ['--pm2', '--no-service'] });
+  const pm2Installs = forced.npmCalls.filter((call) => call === 'i -g pm2');
+  check('--pm2 installs without a terminal and without asking',
+    forced.result.code === 0 && pm2Installs.length === 1,
+    `exit ${forced.result.code}: ${forced.npmCalls.join(' | ')}`);
+  check('it runs exactly npm i -g pm2, once',
+    pm2Installs.length === 1 && !forced.npmCalls.some((call) => call !== 'i -g pm2' && /-g pm2/.test(call)),
+    forced.npmCalls.join(' | '));
+  check('the PM2 install runs after the package install',
+    forced.npmCalls.indexOf('i -g pm2') > 0
+      && forced.npmCalls.findIndex((call) => /^(install|link)\b/.test(call)) !== -1
+      && forced.npmCalls.indexOf('i -g pm2')
+        > forced.npmCalls.findIndex((call) => /^(install|link)\b/.test(call)),
+    forced.npmCalls.join(' | '));
+  check('the PM2 offer comes after the summary and before the service offer',
+    forced.output.indexOf('Installing PM2 globally') > forced.output.indexOf('=== Installation Summary ===')
+      && forced.output.indexOf('Installing PM2 globally') < forced.output.indexOf('Skipping the background service (--no-service)'),
+    `pm2=${forced.output.indexOf('Installing PM2 globally')}, summary=${forced.output.indexOf('=== Installation Summary ===')}, service=${forced.output.indexOf('Skipping the background service (--no-service)')}`);
+  check('and it says it installed PM2 for this account',
+    /Installing PM2 globally: npm i -g pm2/.test(forced.output), forced.output.slice(-320));
+
+  // --no-pm2: one line, no npm call for PM2.
+  const skipped = await runPm2Installer(bash, 'pm2-skip', { args: ['--no-pm2', '--no-service'] });
+  const pm2Lines = skipped.output.split(/\r?\n/).filter((line) => /PM2/.test(line));
+  check('--no-pm2 skips without asking and never calls npm for PM2',
+    skipped.result.code === 0
+      && !skipped.npmCalls.some((call) => /-g pm2/.test(call))
+      && /Skipping PM2 \(--no-pm2\)/.test(skipped.output),
+    skipped.npmCalls.join(' | '));
+  check('and it is one line, with the command to run later',
+    pm2Lines.length === 1 && /npm i -g pm2/.test(pm2Lines[0]), pm2Lines.join(' | '));
+
+  // A failed PM2 install is never a failed Easy DevOps install.
+  const failed = await runPm2Installer(bash, 'pm2-failed', { args: ['--pm2', '--no-service'], npmPm2Exit: 1 });  check('a failed PM2 install still exits 0',
+    failed.result.code === 0, `exit ${failed.result.code}: ${failed.output.slice(-260)}`);
+  check('and prints npm\'s own error',
+    /npm ERR! code EACCES/.test(failed.output), failed.output.slice(-320));
+  check('and the exact command to run instead',
+    /The command was:\s*\n\s*npm i -g pm2/.test(failed.output), failed.output.slice(-320));
+  check('and says Easy DevOps still works without it',
+    /Easy DevOps is installed and works without it/.test(failed.output));
+
+  // `pm2 --version` is itself a PM2 command and starts the daemon, so every
+  // path above must have read the version from <npm root -g>/pm2/package.json
+  // instead. The pm2 stub is a tripwire; running it at all is the failure.
+  const tripwire = [
+    ...present.pm2Calls, ...forced.pm2Calls, ...skipped.pm2Calls, ...failed.pm2Calls,
+  ];
+  check('no PM2 path executes the pm2 command',
+    tripwire.length === 0, tripwire.join(' | '));
+
+  // No terminal and no flag: nothing installed, the command printed. Only
+  // measurable where the runner really has no terminal; with one, the module
+  // case below covers the same branch without guessing the default.
+  if (await environmentHasTty(bash)) {
+    check('the unattended PM2 case', true,
+      'skipped: this terminal has a /dev/tty, so a full run would wait for an answer; the module case covers the branch');
+  } else {
+    const unattended = await runPm2Installer(bash, 'pm2-unattended', { args: ['--no-service'] });
+    check('with no terminal and no flag, PM2 is not installed',
+      unattended.result.code === 0 && !unattended.npmCalls.some((call) => /-g pm2/.test(call)),
+      unattended.npmCalls.join(' | '));
+    check('and the exact command is printed instead',
+      /No terminal is available[\s\S]{0,120}npm i -g pm2/.test(unattended.output),
+      unattended.output.slice(-320));
+  }
+}
+
+// ─── 10. The PM2 question: only a real terminal, only an explicit yes ────────
+
+async function testPm2Prompt(bash) {
+  setGroup('10. the PM2 prompt reads a terminal and installs only on an explicit yes');
+
+  const helper = path.join(ROOT, 'src', 'lib', 'installer', 'pm2.sh');
+  const runOffer = async (name, body) => {
+    const dir = scratch(name);
+    const bin = pm2Stubs(`${name}-bin`, { pm2: false });
+    const result = await runBashCommand(bash, ['-c', body, 'harness', helper], {
+      cwd: dir,
+      env: { PATH: controlledPath(bin), HOME: dir },
+    });
+    return {
+      code: result.code,
+      output: result.stdout + result.stderr,
+      npmCalls: readCallLog(path.join(bin, 'npm')),
+    };
+  };
+
+  // No terminal: never guess, always print the command.
+  const noTty = await runOffer('pm2-no-tty', [
+    '. "$1"',
+    'PM2_CHOICE=ask',
+    'pm2_open_terminal() { return 1; }',
+    'maybe_install_pm2',
+  ].join('\n'));
+  check('with no terminal the offer exits cleanly',
+    noTty.code === 0, `exit ${noTty.code}: ${noTty.output.slice(0, 240)}`);
+  check('with no terminal npm is never called',
+    !noTty.npmCalls.some((call) => /-g pm2/.test(call)), noTty.npmCalls.join(' | '));
+  check('with no terminal the exact command is printed',
+    /No terminal is available/.test(noTty.output) && /npm i -g pm2/.test(noTty.output),
+    noTty.output.slice(0, 320));
+
+  // A terminal and "y".
+  const yes = await runOffer('pm2-tty-yes', [
+    '. "$1"',
+    'PM2_CHOICE=ask',
+    'pm2_open_terminal() { return 0; }',
+    'pm2_prompt_answer() { _PM2_ANSWER="y"; }',
+    'maybe_install_pm2',
+  ].join('\n'));
+  check('a terminal and "y" installs PM2',
+    yes.code === 0 && yes.npmCalls.filter((call) => call === 'i -g pm2').length === 1,
+    `${yes.code}: ${yes.npmCalls.join(' | ')}`);
+  check('and the question defaults to No',
+    /Install PM2 now\? \[y\/N\]/.test(yes.output), yes.output.slice(0, 400));
+
+  // A terminal and "n".
+  const no = await runOffer('pm2-tty-no', [
+    '. "$1"',
+    'PM2_CHOICE=ask',
+    'pm2_open_terminal() { return 0; }',
+    'pm2_prompt_answer() { _PM2_ANSWER="n"; }',
+    'maybe_install_pm2',
+  ].join('\n'));
+  check('a terminal and "n" installs nothing and says how',
+    no.code === 0
+      && !no.npmCalls.some((call) => /-g pm2/.test(call))
+      && /PM2 was not installed\. Install it later with: npm i -g pm2/.test(no.output),
+    `${no.code}: ${no.npmCalls.join(' | ')} ${no.output.slice(-200)}`);
+
+  // A terminal and an empty answer: the default, which is No.
+  const empty = await runOffer('pm2-tty-empty', [
+    '. "$1"',
+    'PM2_CHOICE=ask',
+    'pm2_open_terminal() { return 0; }',
+    'pm2_prompt_answer() { _PM2_ANSWER=""; }',
+    'maybe_install_pm2',
+  ].join('\n'));
+  check('an empty answer is the default, and the default is No',
+    empty.code === 0 && !empty.npmCalls.some((call) => /-g pm2/.test(call)),
+    `${empty.code}: ${empty.npmCalls.join(' | ')}`);
+
+  // The answer parser itself: only y/yes, in any case.
+  const answers = await runOffer('pm2-answers', [
+    '. "$1"',
+    'for a in y Y yes YES n no "" x; do',
+    '  if pm2_answer_is_yes "$a"; then printf "YES:%s\\n" "$a"; else printf "NO:%s\\n" "$a"; fi',
+    'done',
+  ].join('\n'));
+  check('only y and yes install; every other answer is no',
+    /YES:y\n/.test(answers.output) && /YES:Y\n/.test(answers.output)
+      && /YES:yes\n/.test(answers.output) && /YES:YES\n/.test(answers.output)
+      && /NO:n\n/.test(answers.output) && /NO:no\n/.test(answers.output)
+      && /NO:\n/.test(answers.output) && /NO:x\n/.test(answers.output),
+    answers.output.replace(/\n/g, ' '));
+}
+
+// ─── 11. Windows verifies a fresh per-attempt file before launching it ──────
 
 async function testWindowsInstaller(powerShell) {
-  setGroup('8. Windows download, digest and launch checks');
+  setGroup('11. Windows download, digest and launch checks');
 
   const dir = scratch('inst-windows-security');
   const harness = path.join(dir, 'harness.ps1');
@@ -806,6 +1158,179 @@ if ($failed.Count -gt 0) {
     fs.readFileSync(path.join(dir, 'nvm-setup.exe'), 'utf8') === 'STALE SENTINEL - MUST NOT RUN');
 }
 
+// ─── 12. Windows PM2 offer: standard install, flags, default No ─────────────
+
+async function testWindowsPm2(powerShell) {
+  setGroup('12. install.ps1 offers standard PM2 and never installs without an answer');
+
+  const dir = scratch('inst-windows-pm2');
+  const withPm2 = path.join(dir, 'bin-with-pm2');
+  const withoutPm2 = path.join(dir, 'bin-without-pm2');
+  const rootWithPm2 = path.join(dir, 'npm-root-with-pm2');
+  const rootWithoutPm2 = path.join(dir, 'npm-root-without-pm2');
+  fs.mkdirSync(withPm2, { recursive: true });
+  fs.mkdirSync(withoutPm2, { recursive: true });
+  fs.mkdirSync(path.join(rootWithPm2, 'pm2'), { recursive: true });
+  fs.mkdirSync(rootWithoutPm2, { recursive: true });
+  fs.writeFileSync(path.join(rootWithPm2, 'pm2', 'package.json'),
+    JSON.stringify({ name: 'pm2', version: '9.9.9' }));
+
+  // `pm2 --version` is itself a PM2 command and starts the daemon, so the npm
+  // stub answers `root -g` with a fake global root and writes the PM2 package
+  // there when PM2 is installed. The pm2 stub is a tripwire.
+  const npmStub = [
+    '@echo off',
+    'echo %*>>"%EZ_TEST_NPM_CALLS%"',
+    'if /i "%*"=="root -g" (',
+    '  echo %EZ_TEST_NPM_ROOT%',
+    '  exit /b 0',
+    ')',
+    'if /i "%*"=="i -g pm2" (',
+    '  if not "%EZ_TEST_NPM_EXIT%"=="0" (',
+    '    echo npm ERR! code EACCES, permission denied 1>&2',
+    '    exit /b %EZ_TEST_NPM_EXIT%',
+    '  )',
+    '  if not exist "%EZ_TEST_NPM_ROOT%\\pm2" mkdir "%EZ_TEST_NPM_ROOT%\\pm2"',
+    '  > "%EZ_TEST_NPM_ROOT%\\pm2\\package.json" echo {"name":"pm2","version":"9.9.9"}',
+    ')',
+    'exit /b 0',
+    '',
+  ].join('\r\n');
+  fs.writeFileSync(path.join(withPm2, 'npm.cmd'), npmStub);
+  fs.writeFileSync(path.join(withoutPm2, 'npm.cmd'), npmStub);
+  fs.writeFileSync(path.join(withPm2, 'pm2.cmd'), [
+    '@echo off',
+    'echo ran>>"%EZ_TEST_PM2_MARKER%"',
+    'echo 9.9.9',
+    'exit /b 0',
+    '',
+  ].join('\r\n'));
+
+  const pm2Marker = path.join(dir, 'pm2-ran.txt');
+  const resultsFile = path.join(dir, 'results.json');
+  const harness = path.join(dir, 'harness.ps1');
+  fs.writeFileSync(harness, String.raw`
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$script:checks = [System.Collections.Generic.List[object]]::new()
+
+function Add-Check {
+  param([string]$Name, [bool]$Passed, [string]$Detail = '')
+  $script:checks.Add([PSCustomObject]@{ name = $Name; passed = $Passed; detail = $Detail })
+}
+
+$env:EZ_INSTALLER_TEST_FUNCTIONS_ONLY = '1'
+. $env:EZ_TEST_INSTALLER_SCRIPT
+
+function Invoke-Case {
+  param([string]$Name, [string]$Bin, [string]$Root, [string]$NpmExit, [scriptblock]$Action)
+  $env:Path = $Bin
+  $env:EZ_TEST_NPM_ROOT = $Root
+  $env:EZ_TEST_NPM_EXIT = $NpmExit
+  $callsFile = Join-Path $env:EZ_TEST_SCRATCH ("npm-calls-{0}.txt" -f $Name)
+  $env:EZ_TEST_NPM_CALLS = $callsFile
+  if (Test-Path -LiteralPath $callsFile) { Remove-Item -LiteralPath $callsFile -Force }
+  $output = ''
+  $threw = $null
+  try {
+    $output = (& $Action *>&1 | Out-String)
+  } catch {
+    $threw = $_.Exception.Message
+  }
+  $calls = ''
+  if (Test-Path -LiteralPath $callsFile) { $calls = [System.IO.File]::ReadAllText($callsFile) }
+  return [PSCustomObject]@{ output = $output; calls = $calls; threw = $threw }
+}
+
+$presentBin = $env:EZ_TEST_BIN_WITH_PM2
+$missingBin = $env:EZ_TEST_BIN_WITHOUT_PM2
+$rootWithPm2 = $env:EZ_TEST_ROOT_WITH_PM2
+$rootWithoutPm2 = $env:EZ_TEST_ROOT_WITHOUT_PM2
+
+$present = Invoke-Case 'present' $presentBin $rootWithPm2 '0' { Invoke-Pm2Offer -Install -NoPrompt }
+Add-Check 'a present PM2 prints its version' ($present.output -match 'PM2 9\.9\.9 .*already installed') $present.output
+Add-Check 'a present PM2 is never installed again' (-not ($present.calls -match 'i -g pm2')) $present.calls
+
+$forced = Invoke-Case 'forced' $missingBin $rootWithoutPm2 '0' { Invoke-Pm2Offer -Install -NoPrompt }
+Add-Check 'the install switch runs npm i -g pm2 exactly once' (
+  (@($forced.calls -split '\r?\n' | Where-Object { $_ -eq 'i -g pm2' }).Count -eq 1)) $forced.calls
+Add-Check 'and never throws' ($null -eq $forced.threw) $forced.threw
+Add-Check 'and says PM2 was installed' ($forced.output -match 'PM2 9\.9\.9 installed|PM2 was installed') $forced.output
+
+$skipped = Invoke-Case 'skipped' $missingBin $rootWithoutPm2 '0' { Invoke-Pm2Offer -Skip }
+Add-Check 'the skip switch never calls npm' ($skipped.calls -eq '') $skipped.calls
+Add-Check 'and says how to install it later' (
+  ($skipped.output -match 'Skipping PM2 \(-NoPm2\)') -and ($skipped.output -match 'npm i -g pm2')) $skipped.output
+
+$noPrompt = Invoke-Case 'noprompt' $missingBin $rootWithoutPm2 '0' { Invoke-Pm2Offer -NoPrompt }
+Add-Check 'no terminal and no switch installs nothing' ($noPrompt.calls -eq '') $noPrompt.calls
+Add-Check 'and prints the exact command' (
+  ($noPrompt.output -match 'No terminal is available') -and ($noPrompt.output -match 'npm i -g pm2')) $noPrompt.output
+
+$failed = Invoke-Case 'failed' $missingBin $rootWithoutPm2 '1' { Invoke-Pm2Offer -Install -NoPrompt }
+Add-Check 'a failed PM2 install does not throw' ($null -eq $failed.threw) $failed.threw
+Add-Check 'a failed PM2 install prints the command to run' (
+  ($failed.output -match 'PM2 was not installed') -and ($failed.output -match 'npm i -g pm2')) $failed.output
+Add-Check 'a failed PM2 install says Easy DevOps still works' (
+  $failed.output -match 'works without it') $failed.output
+
+Add-Check 'only y and yes are accepted, in any case' (
+  (Test-Pm2AnswerAccepted -Answer 'y') -and
+  (Test-Pm2AnswerAccepted -Answer 'Y') -and
+  (Test-Pm2AnswerAccepted -Answer 'yes') -and
+  (Test-Pm2AnswerAccepted -Answer 'YES') -and
+  -not (Test-Pm2AnswerAccepted -Answer '') -and
+  -not (Test-Pm2AnswerAccepted -Answer 'n') -and
+  -not (Test-Pm2AnswerAccepted -Answer 'no') -and
+  -not (Test-Pm2AnswerAccepted -Answer 'x'))
+
+Add-Check 'the pm2 command was never executed' (
+  -not (Test-Path -LiteralPath $env:EZ_TEST_PM2_MARKER))
+
+[System.IO.File]::WriteAllText(
+  $env:EZ_TEST_RESULTS,
+  (ConvertTo-Json -InputObject ([PSCustomObject]@{ checks = @($script:checks) }) -Depth 5 -Compress)
+)
+
+$failedChecks = @($script:checks | Where-Object { -not $_.passed })
+if ($failedChecks.Count -gt 0) { exit 1 }
+`);
+
+  const result = await runBashCommand(powerShell, [
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', harness,
+  ], {
+    cwd: dir,
+    env: {
+      TEMP: dir,
+      TMP: dir,
+      EZ_TEST_INSTALLER_SCRIPT: PS_SCRIPT,
+      EZ_TEST_BIN_WITH_PM2: withPm2,
+      EZ_TEST_BIN_WITHOUT_PM2: withoutPm2,
+      EZ_TEST_ROOT_WITH_PM2: rootWithPm2,
+      EZ_TEST_ROOT_WITHOUT_PM2: rootWithoutPm2,
+      EZ_TEST_PM2_MARKER: pm2Marker,
+      EZ_TEST_SCRATCH: dir,
+      EZ_TEST_RESULTS: resultsFile,
+    },
+  });
+
+  let observed = null;
+  try {
+    observed = JSON.parse(fs.readFileSync(resultsFile, 'utf8'));
+  } catch {
+    // The process result below carries the useful failure text.
+  }
+
+  check('the PowerShell PM2 harness exits cleanly', result.code === 0 && observed !== null,
+    `exit ${result.code}: ${(result.stderr || result.stdout).slice(0, 320)}`);
+  for (const item of observed?.checks ?? []) {
+    check(item.name, item.passed, item.detail);
+  }
+}
+
 // ─── main ────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -826,6 +1351,8 @@ async function main() {
     await testLegacyLayout(bash);
     await testAlteredModule(bash);
     await testNvmBootstrap(bash);
+    await testPm2Offer(bash);
+    await testPm2Prompt(bash);
   }
 
   const powerShell = await findPowerShell();
@@ -834,6 +1361,7 @@ async function main() {
   } else {
     process.stdout.write(`\nPowerShell: ${powerShell}\n`);
     await testWindowsInstaller(powerShell);
+    await testWindowsPm2(powerShell);
   }
 
   const failed = results.filter((r) => !r.passed);

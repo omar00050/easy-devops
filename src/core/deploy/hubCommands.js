@@ -20,6 +20,7 @@
 import { loadConfig } from '../config.js';
 import { getDomains } from '../domains-db.js';
 import { getHubLink, getHubPermissions, resolveHubOrigin } from '../hubLink.js';
+import * as runner from '../runner.js';
 
 import {
   getApp, createApp, updateApp, publicApp, normalizeEnv, rotateHookToken, verifyHookToken, validateAppId, isSshUrl,
@@ -108,6 +109,54 @@ export function generateKeyForApp(id) {
 }
 
 /**
+ * The `pm2` object a "create an app" answer carries, so the first app created
+ * on a machine without PM2 can offer to install it instead of failing later.
+ *
+ * Creating an app never fails because PM2 is missing: a probe that throws is
+ * reported as `unavailable` with the reason, and the app is created either way.
+ * `offer` is non-null ONLY for `not_installed` — the one case where a single
+ * command fixes it. The endpoint is the dashboard's own install route for a
+ * local create, and `null` for the Hub, which relays the command to the person
+ * on the server rather than calling a route it cannot reach.
+ *
+ * @param {{ installEndpoint?: string|null, deps?: Object }} [opts]
+ * @returns {Promise<{
+ *   state: string, reason: string|null, message: string|null,
+ *   fix: string|null, user: string|null,
+ *   offer: { command: string, endpoint: string|null } | null,
+ * }>}
+ */
+export async function pm2StateForNewApp({ installEndpoint = null, deps = {} } = {}) {
+  let state;
+  try {
+    state = await runner.pm2State({ deps });
+  } catch (err) {
+    state = {
+      state: 'unavailable',
+      reason: 'probe_failed',
+      message: `PM2 could not be checked: ${err?.message ?? String(err)}`,
+      fix: 'Run pm2 list on the server.',
+      user: null,
+    };
+  }
+
+  const value = {
+    state: state.state,
+    reason: state.reason ?? null,
+    message: state.message ?? null,
+    fix: state.fix ?? null,
+    user: state.user ?? null,
+    offer: null,
+  };
+
+  if (value.state === 'not_installed') {
+    value.offer = { command: 'npm i -g pm2', endpoint: installEndpoint };
+  }
+
+  return value;
+}
+
+/**
  * Regenerates an app's deploy key. Shared by the dashboard route and the Hub
  * command so both enforce the same auth, URL and deploy-lock rules.
  *
@@ -184,6 +233,8 @@ export async function addAppDeployKeyToGithub(id, token, { fetchImpl } = {}) {
  * @param {Object} payload { action, id?, ... }
  * @param {Object} [opts]
  * @param {(run: Object) => void} [opts.onFinished] Called when a deployment or rollback started here ends
+ * @param {Function} [opts.deployFn] startDeployment, injectable for tests
+ * @param {Function} [opts.pm2State] The create-app PM2 state helper, injectable for tests
  * @returns {Promise<Object>} The command's result data. Throws to refuse.
  */
 export async function handleHubDeployCommand(payload, {
@@ -192,6 +243,8 @@ export async function handleHubDeployCommand(payload, {
   permissions = null,
   recheck = null,
   linkDomainFn = linkDomain,
+  pm2State = pm2StateForNewApp,
+  deployFn = startDeployment,
 } = {}) {
   const { action, id } = payload ?? {};
   const authorize = () => {
@@ -248,7 +301,10 @@ export async function handleHubDeployCommand(payload, {
       const app = requireApp(id);
       const ref = typeof payload.ref === 'string' && payload.ref.trim() ? payload.ref.trim() : null;
       authorize();
-      const started = startDeployment(app.id, { trigger: 'hub', ref, actor: payload.actor ? `hub: ${String(payload.actor).slice(0, 80)}` : 'hub' });
+      // A refusal here is the deploy preflight (no PM2, or a process that may
+      // not use PM2). It carries the message and the fix, so throwing its error
+      // is what puts the real reason on the Hub instead of a mid-deploy failure.
+      const started = deployFn(app.id, { trigger: 'hub', ref, actor: payload.actor ? `hub: ${String(payload.actor).slice(0, 80)}` : 'hub' });
       if (!started.ok) throw refuse(started.error);
       watch(started);
       return { runId: started.runId, status: 'running' };
@@ -282,7 +338,11 @@ export async function handleHubDeployCommand(payload, {
       // Creating an app never starts a deployment. The key, when asked for, is
       // generated in this same command.
       const extra = wantsGeneratedKey(input) ? generateKeyForApp(result.app.id) : {};
-      return { ...publicApp(getApp(result.app.id) ?? result.app), ...extra };
+      // The first app on a machine without PM2 answers with the PM2 state and
+      // an offer to install it. `endpoint: null`: the Hub relays the command
+      // to the person on the server; it cannot call a route there itself.
+      const pm2 = await pm2State({ installEndpoint: null });
+      return { ...publicApp(getApp(result.app.id) ?? result.app), ...extra, pm2 };
     }
 
     case 'regenerateKey': {

@@ -17,9 +17,9 @@ import { run } from '../shell.js';
 import { getStatus, start as nginxStart, stop as nginxStop, restart as nginxRestart, test as nginxTest, reload as nginxReload, listConfigs, getConfig, saveConfig, getLogs } from '../nginx-service.js';
 import { publish } from '../jobs/bus.js';
 import { getLastDomainHealth, probeDomains, DOMAIN_HEALTH_POLL_MS } from '../jobs/monitors.js';
-import { isWindows, platformName, isDevDataDir } from '../platform.js';
+import { isWindows, platformName, isDevDataDir, currentAccount } from '../platform.js';
 import { listAllCerts, getCertExpiry } from '../cert-reader.js';
-import { backgroundServiceState } from '../service/index.js';
+import { backgroundServiceState, primeServiceFacts } from '../service/index.js';
 import { checkDrift } from '../service/versionDrift.js';
 import * as runner from '../runner.js';
 import { loadChannels } from '../notifier.js';
@@ -260,48 +260,235 @@ async function pushChannelsList({ target = socket } = {}) {
   } catch { /* non-fatal */ }
 }
 
+/** The Windows service's virtual account, as the Hub should display it. */
+const SERVICE_ACCOUNT_RUN_AS = 'NT SERVICE\\EasyDevOps';
+
+/** PM2 states that mean PM2 is installed on this machine. */
+const PM2_INSTALLED_STATES = new Set(['available', 'empty', 'not_running']);
+
 /**
- * Reports whether the dashboard is running as a background service.
+ * Wraps a shell `run` so the one `pm2 jlist` a pm2State() cycle performs is
+ * kept, and the process list can come from that same subprocess.
  *
- * This is what lets the Hub say "offline means really down": if the dashboard
- * runs under PM2 with start-on-boot arranged, an agent that stops reporting is
- * a genuine outage rather than someone having closed a terminal.
+ * `pm2State()` already reads the list when the daemon answers. Asking again for
+ * the same payload would be a second `jlist` (1.4.9), which is slow on Windows
+ * and pointless.
+ *
+ * @param {Function} runShell core/shell.js `run`
+ */
+function tapListing(runShell) {
+  let stdout = null;
+  let seen = false;
+  return {
+    run: async (command, options) => {
+      const result = await runShell(command, options);
+      if (/\sjlist\s*$/i.test(String(command ?? '').trim())) {
+        seen = true;
+        stdout = typeof result?.stdout === 'string' ? result.stdout : '';
+      }
+      return result;
+    },
+    listing: () => (seen ? stdout : null),
+  };
+}
+
+/**
+ * The app objects from a captured `pm2 jlist` buffer, or null when it cannot be
+ * read. The same extraction `runner.list()` uses, so both agree on the shape.
+ */
+function appsFromListing(text) {
+  if (typeof text !== 'string' || text === '') return null;
+  const raw = runner.extractJsonArray(text);
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map(runner.normalizeApp) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The contract's PM2 record: exactly the fields the Hub renders. */
+function pm2Record(state) {
+  return {
+    state: typeof state?.state === 'string' ? state.state : 'unavailable',
+    reason: state?.reason ?? null,
+    message: state?.message ?? null,
+    fix: state?.fix ?? null,
+    user: state?.user ?? null,
+  };
+}
+
+/**
+ * The PM2 record for a read that failed outright: `unavailable` /
+ * `list_failed`, with the reason and the next step. A payload must never be an
+ * empty list with nothing to explain it.
+ */
+function pm2ReadFailure(error) {
+  return pm2Record({
+    state: 'unavailable',
+    reason: 'list_failed',
+    message: `PM2 did not answer: ${error?.message ?? 'unknown error'}`,
+    fix: 'Run pm2 list on the server.',
+  });
+}
+
+/**
+ * `pm2Installed`: true, false, or null when PM2 state is unknown.
+ *
+ * Null is the 1.4.9 value for "this process cannot see PM2 safely" (the
+ * Windows Server service account). Reporting `false` there is what made the Hub
+ * say "PM2 not installed" over a working PM2 owned by the operator.
+ */
+function pm2InstalledFor(state) {
+  if (PM2_INSTALLED_STATES.has(state)) return true;
+  if (state === 'not_installed') return false;
+  return null;
+}
+
+/** `daemonRunning`: true/false, or null when PM2 state is unknown. */
+function daemonRunningFor(state) {
+  if (state === 'available' || state === 'empty') return true;
+  if (state === 'not_running' || state === 'not_installed') return false;
+  return null;
+}
+
+/**
+ * One PM2 read for one payload.
+ *
+ * Calls `pm2State()` once — it checks the daemon's pid file before anything, so
+ * this can never start a PM2 daemon — and takes the app list from the same
+ * `jlist` that call ran. A service account refuses in pm2Access() first, so
+ * nothing is spawned at all there.
+ *
+ * `deps` is the test seam: `runner`, `pm2State`, `pm2Deps` (passed to
+ * pm2State), `run` (the shell `run`) and `list`.
+ *
+ * @returns {Promise<{ pm2: Object, apps: Array<Object> }>}
+ */
+async function readPm2({ deps = {} } = {}) {
+  const pm2Runner = deps.runner ?? runner;
+  const readState = deps.pm2State ?? pm2Runner.pm2State ?? runner.pm2State;
+  const baseDeps = deps.pm2Deps ?? {};
+  const shellRun = deps.run ?? run;
+  const tap = tapListing(shellRun);
+
+  const state = await readState({ deps: { ...baseDeps, run: tap.run } });
+  const pm2 = pm2Record(state);
+
+  let apps = [];
+  if (pm2.state === 'available' || pm2.state === 'empty') {
+    const captured = appsFromListing(tap.listing());
+    if (captured) {
+      apps = captured;
+    } else {
+      // Only when a caller injected a pm2State that listed nothing (a test
+      // seam): read the list once, here.
+      const listFn = deps.list ?? pm2Runner.list ?? runner.list;
+      try {
+        const listed = await listFn({ run: shellRun, deps: baseDeps });
+        apps = listed?.ok ? listed.apps : [];
+      } catch {
+        apps = [];
+      }
+    }
+  }
+
+  return { pm2, apps };
+}
+
+/**
+ * Reports whether Easy DevOps is running as a background service.
+ *
+ * This is what lets the Hub say "offline means really down": if Easy DevOps
+ * runs as the native service with start-on-boot arranged, an agent that stops
+ * reporting is a genuine outage rather than someone having closed a terminal.
  *
  * Deliberately cheap and side-effect free: the state is a lock read and a few
- * existsSync calls, and the PM2 probe never starts a PM2 daemon — so a server
+ * existsSync calls, and the PM2 read never starts a PM2 daemon — so a server
  * that does not use PM2 is not given one just because it is paired with a Hub.
+ *
+ * 1.4.9 adds the fields the Hub needed to stop contradicting the local
+ * dashboard for a Windows Server service (`runningAsService`, `version`,
+ * `dataDir`, `serverMode`, `runAs`, `pm2`). Every pre-1.4.9 field keeps its name
+ * and type; `enabledOnBoot`, `pm2Installed` and `versionDrift` may now be null,
+ * which an old Hub reads as "unknown" rather than "false".
+ *
+ * The one claim that must NEVER go out wrong: a process the service manager
+ * started is the registered service, so `installed` is not false there — not
+ * even if a per-user path the service account cannot read said otherwise.
+ *
+ * @param {{ target?: Object, deps?: Object }} [opts] `deps` is the test seam.
  */
-async function pushServiceState({ target = socket } = {}) {
+export async function pushServiceState({ target = socket, deps = {} } = {}) {
   if (!target?.connected) return;
   try {
-    // The NATIVE service, not the PM2 app. This used to report a PM2
+    // The NATIVE service, not a PM2 app. This used to report a PM2
     // installation, which made "offline means really down" a much weaker
     // signal than the Hub believed: the agent lived inside the dashboard, so
     // there was nothing left to report when the dashboard closed.
-    const s = backgroundServiceState();
-    const pm2 = await runner.detect({ probeVersion: false });
+    const readState = deps.serviceState ?? backgroundServiceState;
+    const s = readState({ deps: deps.serviceDeps ?? {} }) ?? {};
+
+    // A PM2 read that fails must not cost the Hub its service state: the two
+    // are separate answers, and the service one is the safety-critical half.
+    let pm2;
+    try {
+      ({ pm2 } = await readPm2({ deps }));
+    } catch (error) {
+      pm2 = pm2ReadFailure(error);
+    }
+
+    let installed = s.installed ?? null;
+    if (s.runningAsService === true && installed !== true) installed = true;
+
+    const enabledOnBoot = installed === true
+      ? s.startsAt === 'boot'
+      : (installed === false ? false : null);
+
+    const account = deps.account ?? currentAccount();
+    const runAs = isWindows && (s.runningAsService === true || account?.serviceAccount === true)
+      ? SERVICE_ACCOUNT_RUN_AS
+      : (account?.user ?? null);
+
+    // Inside the daemon the installed CLI cannot always be read (the service
+    // account has no per-user npm prefix), so drift is UNKNOWN — null, never
+    // false (1.4.9).
+    let versionDrift = null;
+    try {
+      versionDrift = (deps.checkDrift ?? checkDrift)() ?? null;
+    } catch {
+      versionDrift = null;
+    }
 
     if (!target.connected) return;
     target.emit('service:state', {
-      installed: s.installed,
-      running: s.running,
-      status: s.detail,
-      mechanism: s.mechanism,
-      mode: s.mode,
-      startsAt: s.startsAt,
-      stoppedByUser: s.stoppedByUser,
-      jobsRunningHere: s.jobsRunningHere,
-      enabledOnBoot: s.installed,
-      dev: isDevDataDir(),
+      // ── pre-1.4.9 fields, unchanged names and types ──────────────────────
+      installed,
+      running: s.running === true,
+      status: s.detail ?? null,
+      mechanism: s.mechanism ?? null,
+      mode: s.mode ?? null,
+      startsAt: s.startsAt ?? null,
+      stoppedByUser: s.stoppedByUser === true,
+      jobsRunningHere: s.jobsRunningHere === true,
+      enabledOnBoot,
+      dev: deps.dev ?? isDevDataDir(),
       // The user's OWN PM2 installation, which is a different thing and the
       // only reason these two fields still exist.
-      pm2Installed: pm2.installed,
-      pm2Version: pm2.version,
+      pm2Installed: pm2InstalledFor(pm2.state),
+      // A `pm2 --version` is itself a PM2 command and would start the daemon:
+      // it is never asked for from a status push (unchanged from 1.4.8).
+      pm2Version: null,
       uptimeMs: s.startedAt ? Date.now() - s.startedAt : null,
-      // A service running an older runtime copy than the installed CLI package
-      // (Windows Server, after a plain `npm i -g`). One field, so the Hub can
-      // say so without knowing how it was measured.
-      versionDrift: checkDrift(),
+      versionDrift,
+      // ── 1.4.9 ────────────────────────────────────────────────────────────
+      runningAsService: s.runningAsService === true,
+      version: s.version ?? null,
+      dataDir: s.dataDir ?? null,
+      serverMode: s.serverMode === true,
+      runAs,
+      pm2,
     });
   } catch { /* non-fatal */ }
 }
@@ -313,28 +500,37 @@ async function pushServiceState({ target = socket } = {}) {
  * server is a monitored server. Acting on a process is a separate matter and
  * needs process.start / process.stop / process.restart (hub:manageProcess).
  *
- * Skipped entirely when the PM2 daemon is not running, so that reporting never
- * starts one.
+ * Sent on EVERY cycle — connect, the 60-second timer, and after a process
+ * action — because the Hub has no way to ask for it. It is never skipped: a
+ * payload the Hub cannot tell apart from "nothing to report" is what left it
+ * on "Waiting for the process list…" for ever (1.4.9). When PM2 cannot be read
+ * safely the payload says so in `pm2.reason` and `daemonRunning` is null.
+ *
+ * `readPm2()` checks the daemon's pid file first and reuses the one `jlist`, so
+ * this never starts a PM2 daemon and never lists twice.
+ *
+ * @param {{ target?: Object, deps?: Object }} [opts] `deps` is the test seam.
  */
-async function pushProcesses({ target = socket } = {}) {
+export async function pushProcesses({ target = socket, deps = {} } = {}) {
   if (!target?.connected) return;
   try {
-    if (!runner.isDaemonRunning()) {
-      target.emit('processes:list', { daemonRunning: false, apps: [] });
-      return;
-    }
-    const pm2 = await runner.detect({ probeVersion: false });
-    if (!pm2.installed) {
-      target.emit('processes:list', { daemonRunning: false, apps: [] });
-      return;
-    }
-    const listed = await runner.list({ pm2Path: pm2.path ?? 'pm2' });
+    const { pm2, apps } = await readPm2({ deps });
     if (!target.connected) return;
     target.emit('processes:list', {
-      daemonRunning: true,
-      apps: listed.ok ? listed.apps : [],
+      daemonRunning: daemonRunningFor(pm2.state),
+      apps,
+      pm2,
     });
-  } catch { /* non-fatal */ }
+  } catch (error) {
+    // Never silent, and never an empty list without a reason: the Hub would
+    // otherwise keep waiting for a frame that is not coming.
+    if (!target?.connected) return;
+    target.emit('processes:list', {
+      daemonRunning: null,
+      apps: [],
+      pm2: pm2ReadFailure(error),
+    });
+  }
 }
 
 async function pushCertExpiry({ target = socket } = {}) {
@@ -983,9 +1179,25 @@ export async function handleDeployHook(
 export async function handleManageProcess(
   payload,
   ack,
-  { runner: processRunner = runner, target = socket } = {},
+  { runner: processRunner = runner, target = socket, deps = {} } = {},
 ) {
   return runCommand('hub:manageProcess', payload, async ({ action, name }, stillAllowed) => {
+    // A Windows Server service account cannot reach the operator's PM2 without
+    // spawning a second, service-owned daemon (see runner.pm2Access). Refuse
+    // BEFORE anything is spawned, listed or acted on, and say why — the Hub
+    // renders `data` from this shape (`ok: false` plus the four explanatory
+    // fields) exactly as it does for every other refused command.
+    const access = (processRunner.pm2Access ?? runner.pm2Access)({ deps });
+    if (!access.ok) {
+      throw refusalError({
+        ok: false,
+        reason: access.reason,
+        message: access.message,
+        fix: access.fix,
+        user: access.user ?? null,
+      }, access.message);
+    }
+
     const processActions = {
       // PM2 "start" for an app that exists is a restart.
       start: processRunner.restart,
@@ -1026,7 +1238,7 @@ export async function handleManageProcess(
     // The Hub's process table is fed by this push; without it the row would
     // keep showing the old status until the next 60-second heartbeat.
     stillAllowed();
-    pushProcesses({ target });
+    pushProcesses({ target, deps: { runner: processRunner } });
     return { name, action, managed: Boolean(app.managed), output: result.output ?? '' };
   }, ack, { target });
 }
@@ -1194,6 +1406,33 @@ function startHeartbeats() {
   pushServiceState();
   pushProcesses();
   pushDeployApps();
+  // The daemon never runs `sc query` (core/daemon/run.js does not import the
+  // service status code), so a synchronous backgroundServiceState() there has
+  // no live registration answer. Prime it once per process, WITHOUT delaying
+  // the pushes above, and re-push service:state when the answer is in.
+  primeServiceFactsThenPush();
+}
+
+/**
+ * Primes the live service registration and re-sends service:state when it is
+ * known.
+ *
+ * Called on connect, never awaited: the first push must not wait for a
+ * subprocess. When the probe fails the answer stays unknown, which is what the
+ * first push already said.
+ *
+ * @param {{ target?: Object }} [opts]
+ */
+function primeServiceFactsThenPush({ target = socket } = {}) {
+  let pending;
+  try {
+    pending = primeServiceFacts();
+  } catch {
+    return;
+  }
+  Promise.resolve(pending)
+    .then(() => pushServiceState({ target }))
+    .catch(() => { /* unknown stays unknown; nothing more can be said */ });
 }
 
 function stopHeartbeats() {

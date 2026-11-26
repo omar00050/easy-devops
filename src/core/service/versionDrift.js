@@ -37,6 +37,10 @@ import {
   getStartupFolder,
   DEV_MODE_ENV,
 } from '../platform.js';
+// The namespace, for the identity helper added for 1.4.9. A build without it
+// still loads this module: an absent export means "not proven to be the
+// service", which is the conservative answer.
+import * as platform from '../platform.js';
 import { inspect as inspectDaemonLock } from '../daemon/lock.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -443,19 +447,80 @@ export function readServiceVersion({ dataDir = undefined, deps = {} } = {}) {
 }
 
 /**
+ * Whether this process is the background service's own process (the daemon).
+ *
+ * `deps.inDaemon` and `deps.runningUnderServiceManager` pin the answer in a
+ * test; otherwise the platform decides, and a build without the helper answers
+ * `false` — the plain CLI comparison, exactly as before.
+ *
+ * @param {Object} [deps]
+ * @returns {boolean}
+ */
+function insideDaemon(deps = {}) {
+  if (deps.inDaemon !== undefined) return Boolean(deps.inDaemon);
+  const supplied = deps.runningUnderServiceManager;
+  if (typeof supplied === 'boolean') return supplied;
+  const fn = typeof supplied === 'function'
+    ? supplied
+    : (typeof platform?.runningUnderServiceManager === 'function'
+      ? platform.runningUnderServiceManager
+      : null);
+  if (!fn) return false;
+  try {
+    return Boolean(fn());
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Whether the CLI and the service disagree.
  *
  * Personal mode has no second copy, so it can never drift. A null service
  * version is "unknown", never drift.
  *
+ * Inside the daemon the two sides are different questions from the CLI's: the
+ * "CLI" whose update matters is the one INSTALLED on the machine (npm's global
+ * package), not this process's own runtime copy — comparing the copy with
+ * itself was why a drifted service never reported it. When that installed CLI
+ * cannot be read (the service account has no PATH entry for a per-user npm
+ * prefix), the answer is UNKNOWN: `drift: null`, never `false` (1.4.9).
+ *
  * @param {Object} [opts]
  * @param {string} [opts.dataDir]
  * @param {Object} [opts.deps]
- * @returns {{ drift: boolean, cliVersion: string|null, serviceVersion: string|null,
+ * @returns {{ drift: boolean|null, cliVersion: string|null, serviceVersion: string|null,
  *            mode: 'server'|'personal'|'linux', reason: string|null, message: string|null }}
  */
 export function checkDrift({ dataDir = undefined, deps = {} } = {}) {
   const mode = driftMode({ dataDir, deps });
+
+  if (insideDaemon(deps)) {
+    const service = readServiceVersion({ dataDir, deps });
+    // Honours `deps.installedCliVersion` (null included), so a test pins it too.
+    const installed = readInstalledCliVersion({ dataDir, deps });
+    if (!installed) {
+      return {
+        drift: null,
+        cliVersion: null,
+        serviceVersion: service.version,
+        mode,
+        reason: 'the installed CLI version could not be read from the service account, '
+          + 'so version drift is unknown',
+        message: null,
+      };
+    }
+    const drift = Boolean(service.version && compareVersions(installed, service.version) !== 0);
+    return {
+      drift,
+      cliVersion: installed,
+      serviceVersion: service.version,
+      mode,
+      reason: service.reason,
+      message: drift ? driftMessage({ serviceVersion: service.version, cliVersion: installed }) : null,
+    };
+  }
+
   const cli = cliVersion({ deps });
 
   // Windows Personal runs this same package, so there is no second copy to

@@ -54,6 +54,7 @@ import type {
   NotificationChannel,
   PermissionsSetupResult,
   PermissionsSetupStatus,
+  Pm2InstallResult,
   ProcessAction,
   ProcessActionResponse,
   ProcessLogs,
@@ -279,6 +280,21 @@ export const api = {
       request<ProcessActionResponse>(`/processes/${enc(name)}/${action}`, { method: 'POST' }),
     logs: (name: string, lines = 200, signal?: AbortSignal) =>
       request<ProcessLogs>(`/processes/${enc(name)}/logs`, { signal, query: { lines } }),
+  },
+
+  /**
+   * PM2 itself (1.4.9). The install takes no body on purpose: there is nothing
+   * to configure, so the server always runs `npm i -g pm2`. Callers confirm
+   * first; answers are 200, 409 (already_installed / in_progress), 403
+   * (service_account) and 500 (install_failed).
+   */
+  pm2: {
+    // `skipAuthEvents`: a 403 here is `service_account` — an expected refusal
+    // with its own message and fix, not the origin guard, so it must not raise
+    // the app's "Request blocked" banner. The page's own polling still ends the
+    // session if a 401 is what really happened.
+    install: () =>
+      request<Pm2InstallResult>('/pm2/install', { method: 'POST', skipAuthEvents: true }),
   },
 
   deployments: {

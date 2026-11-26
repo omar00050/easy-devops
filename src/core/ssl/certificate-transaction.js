@@ -13,6 +13,7 @@ import path from 'node:path';
 import { getDataDir } from '../platform.js';
 import { validateDomainName } from '../validators.js';
 import { acquireArtifactLock } from './artifact-lock.js';
+import { renameWithRetry, retrySharing } from '../atomicState.js';
 
 const JOURNAL_VERSION = 1;
 const JOURNAL_MAX_BYTES = 64 * 1024;
@@ -64,7 +65,10 @@ function atomicJsonWrite(target, value) {
     fs.closeSync(handle);
     handle = undefined;
     if (process.platform !== 'win32') fs.chmodSync(temporary, 0o600);
-    fs.renameSync(temporary, target);
+    // The next operation reads this journal to recover an interrupted
+    // publication, so it must never observe half a document: the rename retries
+    // a momentary sharing denial through the shared helper.
+    renameWithRetry(temporary, target);
   } finally {
     if (handle !== undefined) fs.closeSync(handle);
     try { fs.unlinkSync(temporary); } catch { /* renamed or never created */ }
@@ -150,17 +154,18 @@ function syncDirectory(directory) {
   }
 }
 
-function renameWithRetry(from, to) {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      fs.renameSync(from, to);
-      return;
-    } catch (error) {
-      const transient = ['EPERM', 'EBUSY', 'EACCES'].includes(error?.code);
-      if (!transient || attempt >= 50) throw error;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-    }
-  }
+/**
+ * The certificate pair keeps its own, longer schedule than a state file: 50
+ * waits of 10 ms (about half a second), because a key and a chain are re-read
+ * by nginx and by the Hub's certificate reader while they are being replaced.
+ * It still runs through the shared retry, so the codes it rides out and its
+ * "give up and rethrow the same error" behaviour cannot drift from every other
+ * writer in the package.
+ */
+const CERTIFICATE_RENAME_DELAYS_MS = Object.freeze(Array.from({ length: 50 }, () => 10));
+
+function renameCertificateFile(from, to) {
+  retrySharing(() => fs.renameSync(from, to), { delays: CERTIFICATE_RENAME_DELAYS_MS });
 }
 
 function safeCleanupFile(target, certDir) {
@@ -193,7 +198,7 @@ function restoreOriginal(entry, certDir) {
   const temporary = path.join(certDir, `.${entry.name}.${crypto.randomUUID()}.rollback`);
   try {
     writeExclusive(temporary, backup.data);
-    renameWithRetry(temporary, target);
+    renameCertificateFile(temporary, target);
     if (process.platform !== 'win32') fs.chmodSync(target, 0o600);
   } finally {
     try { fs.unlinkSync(temporary); } catch { /* renamed or never created */ }
@@ -361,7 +366,7 @@ export async function publishCertificateFiles({
         const target = path.join(certDir, entry.name);
         const moved = deps.renameSync ? deps.renameSync(source, target, entry.name, index) : null;
         if (moved === false) throw new Error(`Certificate rename was refused for ${entry.name}`);
-        if (!deps.renameSync) renameWithRetry(source, target);
+        if (!deps.renameSync) renameCertificateFile(source, target);
         if (process.platform !== 'win32') fs.chmodSync(target, 0o600);
       }
       syncDirectory(certDir);

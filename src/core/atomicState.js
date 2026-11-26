@@ -28,6 +28,16 @@
  * swallows a failure: the temp file is removed and the original error is
  * re-thrown. A caller that cannot write may decide to keep running (a
  * heartbeat), but it has to do so knowingly.
+ *
+ * ── The retry is exported, because the problem is not local ────────────────
+ *
+ * A rename over an open file fails the same way for every writer on Windows,
+ * so `retrySharing`, `renameWithRetry`, `copyFileWithRetry` (and the async
+ * pair) are public here rather than copied into each caller. Five modules had
+ * grown their own version, two of them without EACCES — a file held by a virus
+ * scanner failed in one place and not in another. The dashboard's session
+ * store (dashboard/lib/sessionStore.js) is the first caller added after the
+ * export; it was the one that turned a denial into a 500.
  */
 
 import fs from 'node:fs';
@@ -39,6 +49,20 @@ const pause = new Int32Array(new SharedArrayBuffer(4));
 const sharingErrors = new Set(['EPERM', 'EBUSY', 'EACCES']);
 
 /**
+ * The waits between attempts, in milliseconds.
+ *
+ * Five waits after the first attempt, so at most six attempts and 155 ms of
+ * waiting in total. Small enough to run inside a five-second heartbeat, long
+ * enough to outlast a reader that opened the file while it was being replaced.
+ */
+const RETRY_DELAYS_MS = Object.freeze([5, 10, 20, 40, 80]);
+
+/** True when the error is one Windows reports for a file somebody else has open. */
+function isSharingError(err) {
+  return sharingErrors.has(err?.code);
+}
+
+/**
  * Runs a filesystem operation, retrying briefly while Windows refuses it
  * because another process has the file open.
  *
@@ -46,23 +70,88 @@ const sharingErrors = new Set(['EPERM', 'EBUSY', 'EACCES']);
  * are all written from synchronous code paths, several of which run inside a
  * timer callback. Waits are `Atomics.wait`, so the retry does not spin the CPU.
  *
- * The budget is 5 + 10 + 20 + 40 + 80 = 155 ms. Small enough to run inside a
- * five-second heartbeat, long enough to outlast a reader that opened the file
- * while it was being replaced.
+ * Shared rather than copied: five modules grew their own version of this loop
+ * (the daemon lock, the SSL artifact lock, the certificate transaction, the
+ * service update transaction, the runtime swap), two of them without EACCES, so
+ * a file held open by a virus scanner failed in one place and not in another.
+ * Every new atomic write goes through this one.
  *
  * @template T
  * @param {() => T} operation
+ * @param {{ delays?: readonly number[] }} [options] Override the wait schedule
  * @returns {T}
  */
-function retrySharing(operation) {
-  for (let delay = 5; ; delay *= 2) {
+export function retrySharing(operation, options = {}) {
+  const delays = options.delays ?? RETRY_DELAYS_MS;
+
+  for (let attempt = 0; ; attempt += 1) {
     try {
       return operation();
     } catch (err) {
-      if (!sharingErrors.has(err?.code) || delay > 80) throw err;
-      Atomics.wait(pause, 0, 0, delay);
+      // Any other code is a real failure: ENOENT, ENOSPC, a bad path. Retrying
+      // it would only delay the error message the user needs.
+      if (!isSharingError(err) || attempt >= delays.length) throw err;
+      Atomics.wait(pause, 0, 0, delays[attempt]);
     }
   }
+}
+
+/**
+ * The same retry for an operation that returns a promise.
+ *
+ * Awaited with `setTimeout` rather than a blocking wait, so a caller on the
+ * request path (the session store) does not stall the event loop for 155 ms.
+ *
+ * @template T
+ * @param {() => T | Promise<T>} operation
+ * @param {{ delays?: readonly number[] }} [options]
+ * @returns {Promise<T>}
+ */
+export async function retrySharingAsync(operation, options = {}) {
+  const delays = options.delays ?? RETRY_DELAYS_MS;
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await operation();
+    } catch (err) {
+      if (!isSharingError(err) || attempt >= delays.length) throw err;
+      await new Promise((resolve) => { setTimeout(resolve, delays[attempt]); });
+    }
+  }
+}
+
+/**
+ * Renames a file, riding out a momentary Windows sharing denial.
+ *
+ * @param {string} from
+ * @param {string} to
+ */
+export function renameWithRetry(from, to) {
+  retrySharing(() => fs.renameSync(from, to));
+}
+
+/**
+ * The async form of renameWithRetry().
+ *
+ * @param {string} from
+ * @param {string} to
+ */
+export async function renameWithRetryAsync(from, to) {
+  await retrySharingAsync(() => fs.promises.rename(from, to));
+}
+
+/**
+ * Copies a file, riding out a momentary Windows sharing denial.
+ *
+ * `mode` is `fs.constants.COPYFILE_*`, passed through unchanged; omitting it
+ * keeps `fs.copyFileSync`'s own default.
+ *
+ * @param {string} from
+ * @param {string} to
+ * @param {number} [mode]
+ */
+export function copyFileWithRetry(from, to, mode) {
+  retrySharing(() => (mode === undefined ? fs.copyFileSync(from, to) : fs.copyFileSync(from, to, mode)));
 }
 
 function openExclusive(file) {
@@ -103,7 +192,7 @@ export function createStateFile(file, body) {
  * @param {string} file
  */
 export function moveIntoPlace(temp, file) {
-  retrySharing(() => fs.renameSync(temp, file));
+  renameWithRetry(temp, file);
 }
 
 /**

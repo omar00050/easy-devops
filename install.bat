@@ -11,6 +11,8 @@
 ::   --keep-node           -> -KeepNode
 ::   --service             -> -Service
 ::   --no-service          -> -NoService
+::   --pm2                 -> -Pm2
+::   --no-pm2              -> -NoPm2
 ::   --yes / -y            -> -Yes
 ::   --non-interactive     -> -NonInteractive
 ::
@@ -77,6 +79,16 @@ if /i "%~1"=="--service" (
 )
 if /i "%~1"=="--no-service" (
     set "PS_ARGS=!PS_ARGS! -NoService"
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--pm2" (
+    set "PS_ARGS=!PS_ARGS! -Pm2"
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--no-pm2" (
+    set "PS_ARGS=!PS_ARGS! -NoPm2"
     shift
     goto parse_args
 )

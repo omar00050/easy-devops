@@ -1,5 +1,4 @@
 import { createServer } from 'http';
-import { createRequire } from 'module';
 import express from 'express';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -23,11 +22,9 @@ import { warmProbes } from './controllers/processesController.js';
 import { stopSslController } from './controllers/sslController.js';
 import { initSocket, stopSocket } from './socketManager.js';
 import { requireLocalRequest, isLoopbackAddress } from './lib/localRequest.js';
+import { SessionFileStore } from './lib/sessionStore.js';
 import { startJobs } from '../core/jobs/index.js';
 import { startDaemonBridge, daemonStatus } from './lib/daemonBridge.js';
-
-const require = createRequire(import.meta.url);
-const FileStore = require('session-file-store')(session);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -67,12 +64,14 @@ if (!sessionSecret) {
 }
 
 // Sessions stored on disk so they survive restarts. Same data directory as the
-// database and logs — see getDataDir() in core/platform.js.
+// database and logs — see getDataDir() in core/platform.js. Same folder, file
+// name and JSON shape as session-file-store, so sessions written before this
+// store existed keep loading; only the write goes through core/atomicState.js,
+// which retries the Windows EPERM/EBUSY/EACCES a rename meets here.
 const SESSION_DIR = path.join(getDataDir(), 'sessions');
 
-// Kept in a variable so shutdown() can stop its expired-session reaper, which
-// is an un-unref'd setInterval that would otherwise hold the event loop open.
-const sessionStore = new FileStore({ path: SESSION_DIR, retries: 1, logFn() {} });
+// Kept in a variable so shutdown() can clear its expired-session reaper.
+const sessionStore = new SessionFileStore({ path: SESSION_DIR, retries: 1, logFn() {} });
 
 // Kept in a variable so Socket.io can run the SAME middleware and therefore
 // see the same session. Without it, a socket connection has no session to
@@ -384,13 +383,122 @@ const whenListening = new Promise((resolve, reject) => {
 
 let shutdownPromise = null;
 
+/** How long one step may hold the rest of the teardown up. */
+const SHUTDOWN_SOCKET_MS = 1500;
+const SHUTDOWN_HTTP_MS = 1000;
+const SHUTDOWN_JOBS_MS = 700;
+
+/** Grace for an in-flight request before every connection is dropped. */
+const SHUTDOWN_FORCE_CLOSE_MS = 500;
+
+/** A timer that never keeps the process alive by itself. */
+function delay(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
 /**
- * Releases everything this module started: the HTTP server, the Socket.io
- * server and its log tails, the daemon bridge, the background jobs, and the
+ * Runs one teardown step, giving up on it after `ms`.
+ *
+ * The step is not cancelled — nothing here can cancel socket.io's own close —
+ * but the shutdown moves on, so one wedged client cannot use up the CLI's five
+ * seconds and end the process with "Shutdown timed out".
+ *
+ * @param {() => (void|Promise<void>)} step
+ * @param {number} ms
+ * @param {string} label Named in the log line, so the next report says which step
+ */
+async function timeBox(step, ms, label) {
+  let run;
+  try {
+    // Started NOW, not on a microtask: the caller relies on socket.io being
+    // told to close before anything else touches the listener.
+    run = Promise.resolve(step()).catch(() => { /* already down */ });
+  } catch {
+    run = Promise.resolve();
+  }
+
+  let timer;
+  const limit = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      process.stderr.write(
+        `[shutdown] ${label} did not finish within ${ms} ms; stopping the rest anyway.\n`,
+      );
+      resolve();
+    }, ms);
+    timer.unref?.();
+  });
+
+  try {
+    await Promise.race([run, limit]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Closes the listener and whatever is still connected to it.
+ *
+ * Node's `server.close()` only stops new connections: an idle keep-alive
+ * connection (Node 18, the engines floor) or a request whose body never
+ * arrives keeps it pending forever. `closeIdleConnections()` drops the first at
+ * once; `closeAllConnections()` after a short grace drops the second, so a
+ * stalled upload cannot outlive the operator's patience.
+ *
+ * `listening` is already false when socket.io got here first — its own
+ * `io.close()` closes the listener it was attached to — but the connections
+ * that close is waiting for still have to go, so the connection sweep runs
+ * whether or not the listener is still ours to close.
+ */
+async function closeListener() {
+  const closed = new Promise((resolve) => {
+    if (!httpServer.listening) return resolve();
+    httpServer.close(() => resolve());
+  });
+
+  try { httpServer.closeIdleConnections?.(); } catch { /* not on this Node */ }
+
+  const force = setTimeout(() => {
+    try { httpServer.closeAllConnections?.(); } catch { /* not on this Node */ }
+  }, SHUTDOWN_FORCE_CLOSE_MS);
+  force.unref?.();
+
+  await Promise.race([closed, delay(SHUTDOWN_HTTP_MS)]);
+  clearTimeout(force);
+
+  // The listener may have belonged to socket.io's own close; make certain no
+  // connection is left holding whatever finish callback it is waiting on.
+  try { httpServer.closeAllConnections?.(); } catch { /* not on this Node */ }
+}
+
+/**
+ * Stops the expired-session reaper session-file-store scheduled.
+ *
+ * It is `.unref()`ed in session-file-store 1.5.0, so it never held the event
+ * loop open — the interval is cleared here only so no reap runs against a store
+ * that is being closed. Called first, synchronously: the old place for it was
+ * after the awaited listener close, which is exactly the await that hung, so it
+ * never ran on the shutdown this bug report is about.
+ */
+function stopSessionReaper() {
+  try {
+    const reaper = sessionStore?.options?.reapIntervalObject;
+    if (!reaper) return;
+    clearInterval(reaper);
+    sessionStore.options.reapIntervalObject = null;
+  } catch { /* nothing to clear */ }
+}
+
+/**
+ * Releases everything this module started: the Socket.io server and its log
+ * tails, the HTTP listener, the daemon bridge, the background jobs, and the
  * SQLite handle.
  *
  * Idempotent — concurrent or repeated calls (a second Ctrl+C during shutdown)
- * return the same promise and never double-close.
+ * return the same promise and never double-close. Every await is time-boxed, so
+ * the whole teardown finishes well inside the CLI's five-second force exit.
  *
  * @returns {Promise<void>}
  */
@@ -398,28 +506,29 @@ function shutdown() {
   if (shutdownPromise) return shutdownPromise;
 
   shutdownPromise = (async () => {
-    // Stop accepting connections first so nothing new arrives mid-teardown.
-    await new Promise((resolve) => {
-      if (!httpServer.listening) return resolve();
-      httpServer.close(() => resolve());
-    });
+    stopSessionReaper();
 
-    try { await stopSocket(); } catch { /* already down */ }
+    // Socket.io FIRST. A browser tab holds an UPGRADED socket, and Node's
+    // `server.close()` never closes an upgraded socket: it waits for the
+    // connection to end, which a connected tab has no reason to do. The call
+    // that disconnects those clients (`io.close()`) used to come afterwards, so
+    // this await hung until the CLI's five-second timer printed "Shutdown timed
+    // out — exiting anyway".
+    //
+    // Both halves are needed and must overlap. `io.close()` disconnects every
+    // client and then closes the listener it was attached to, but that listener
+    // close cannot finish while some OTHER connection is still open — a stalled
+    // request, an idle keep-alive on Node 18 — so the connection sweep below
+    // runs while socket.io is still closing, and is what unblocks it.
+    const socketStep = timeBox(stopSocket, SHUTDOWN_SOCKET_MS, 'socket.io');
+    await closeListener();
+    await socketStep;
+
     try { daemonLink.stop(); } catch { /* never connected */ }
     // Stops the monitors, the revision watcher and the hub agent together, and
     // is a no-op when a daemon owns them.
-    try { await jobs.stop(); } catch { /* already stopped */ }
+    await timeBox(() => jobs.stop(), SHUTDOWN_JOBS_MS, 'background jobs');
     try { stopSslController(); } catch { /* nothing pending */ }
-
-    // session-file-store schedules an expired-session reaper with setInterval
-    // and offers no stop API; the handle is exposed on its options.
-    try {
-      const reaper = sessionStore?.options?.reapIntervalObject;
-      if (reaper) {
-        clearInterval(reaper);
-        sessionStore.options.reapIntervalObject = null;
-      }
-    } catch { /* nothing to clear */ }
 
     try { closeDb(); } catch { /* already closed */ }
   })();

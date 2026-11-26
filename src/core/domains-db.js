@@ -8,6 +8,7 @@ import { isWindows, nginxTestCmd, nginxReloadCmd, isNginxTestOk } from './platfo
 import { saveDomainNotifConfig } from './domainNotifier.js';
 import { bumpHubRevision, getHubPermissions } from './hubLink.js';
 import { nginxDomainError } from './nginx-fields.js';
+import { renameWithRetryAsync } from './atomicState.js';
 import {
   missingCertFiles, CERT_MISSING_HINT,
   withCertificateLifecycleLock, deleteCertificateUnderLock,
@@ -333,7 +334,7 @@ export async function handleHubDomainCommand(payload, { runFn = run, recheck = n
 
       if (isEnabled) {
         authorize();
-        try { await fs.rename(enabledPath, disabledPath); } catch (err) {
+        try { await renameWithRetryAsync(enabledPath, disabledPath); } catch (err) {
           return { ok: false, error: `Could not disable: ${err.message}` };
         }
         const domains = getDomains();
@@ -343,12 +344,12 @@ export async function handleHubDomainCommand(payload, { runFn = run, recheck = n
         saveDomains(domains);
       } else {
         authorize();
-        try { await fs.rename(disabledPath, enabledPath); } catch (err) {
+        try { await renameWithRetryAsync(disabledPath, enabledPath); } catch (err) {
           return { ok: false, error: `Could not enable: ${err.message}` };
         }
         const testResult = await runFn(isWindows ? nginxTestCmd(nginxDir) : 'nginx -t', { cwd: nginxDir });
         if (!isNginxTestOk(testResult)) {
-          await fs.rename(enabledPath, disabledPath).catch(() => {});
+          await renameWithRetryAsync(enabledPath, disabledPath).catch(() => {});
           return { ok: false, error: 'nginx rejected the config after enabling' };
         }
         const domains = getDomains();

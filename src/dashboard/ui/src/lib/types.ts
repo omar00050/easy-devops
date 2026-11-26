@@ -323,6 +323,37 @@ export interface Pm2Info {
   path: string | null;
 }
 
+/** The states `pm2State()` reports in the agent's `service:state` (1.4.9). */
+export type Pm2StateName =
+  | 'available'
+  | 'empty'
+  | 'not_running'
+  | 'not_installed'
+  | 'unavailable';
+
+/**
+ * The `pm2` object a `POST /api/deployments` answer carries (1.4.9).
+ *
+ * `offer` is non-null only for `not_installed`; a missing field means an
+ * older server, which never sent this object at all.
+ */
+export interface Pm2OfferState {
+  state: Pm2StateName;
+  reason: string | null;
+  message: string | null;
+  fix: string | null;
+  user: string | null;
+  offer?: { command: string; endpoint: string | null } | null;
+}
+
+/** `POST /api/pm2/install` on success. */
+export interface Pm2InstallResult {
+  ok: true;
+  /** The version read back after the install, or null when it could not be. */
+  version: string | null;
+  output: string;
+}
+
 export interface ProcessApp {
   name: string;
   pmId: number | null;
@@ -964,6 +995,8 @@ export interface DeployKeyInfo {
 export type DeployAppCreated = Omit<DeployApp, 'deployKey'> & {
   deployKey?: DeployKeyInfo | string | null;
   deployKeyError?: string;
+  /** PM2 state at create time, and the install offer when it is missing (1.4.9). */
+  pm2?: Pm2OfferState;
 };
 
 export interface DeployKeyRegenerateResult extends DeployKeyInfo {
@@ -1121,6 +1154,8 @@ export interface ApiErrorPayload {
   /** Service lifecycle failures: elevation_required / not_installed / action_failed. */
   action?: ServiceAction;
   message?: string;
+  /** The next step a refusal carries (POST /api/pm2/install, 1.4.9). */
+  fix?: string;
   command?: string;
   shell?: string;
   backgroundService?: BackgroundServiceEvent;

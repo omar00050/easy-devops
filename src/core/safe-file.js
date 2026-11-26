@@ -10,6 +10,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { renameWithRetry } from './atomicState.js';
 
 const NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
 const DIRECTORY = fs.constants.O_DIRECTORY || 0;
@@ -209,7 +210,10 @@ export function writeFileEventual(file, data, {
         || !directoryStillMatches(parent)) {
       throw new Error(`The destination directory changed before publication: ${parent.path}`);
     }
-    fs.renameSync(
+    // The publication rename rides out a momentary Windows sharing denial with
+    // the shared retry (core/atomicState.js): a reader holding the old
+    // `state.json` open for microseconds must not fail a deploy.
+    renameWithRetry(
       anchored(directoryHandle, parent.path, tempName),
       anchored(directoryHandle, parent.path, path.basename(file)),
     );

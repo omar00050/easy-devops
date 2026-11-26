@@ -12,7 +12,15 @@ import chalk from 'chalk';
 import { getDataDir, isDevDataDir } from '../core/platform.js';
 import { inspect } from '../core/daemon/lock.js';
 
-/** How long a graceful shutdown may take before the process is forced out. */
+/**
+ * How long a graceful shutdown may take before the process is forced out.
+ *
+ * A last resort, not the normal path: dashboard/server.js time-boxes every step
+ * of its own teardown (socket.io, the HTTP listener, the background jobs), so a
+ * healthy shutdown finishes in well under a second. This timer only exists so a
+ * bug in that teardown cannot leave the user with a terminal they cannot get
+ * back.
+ */
 const FORCE_EXIT_MS = 5000;
 
 export async function runDashboard() {
@@ -59,7 +67,8 @@ export async function runDashboard() {
     console.log();
     console.log('  ' + chalk.gray(`Received ${signal}, shutting down…`));
 
-    // Safety net: never leave the user stuck if a socket refuses to close.
+    // Safety net only: shutdown() bounds each step itself, so reaching this
+    // timer means its teardown did not finish despite that.
     const force = setTimeout(() => {
       console.log('  ' + chalk.yellow('Shutdown timed out — exiting anyway.'));
       process.exit(0);

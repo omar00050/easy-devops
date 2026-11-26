@@ -44,6 +44,7 @@ import { hookSettings } from '../../core/deploy/hookServer.js';
 import { hookUrl } from '../../core/deploy/github.js';
 import {
   githubSetupFor, generateKeyForApp, wantsGeneratedKey, regenerateAppDeployKey, addAppDeployKeyToGithub,
+  pm2StateForNewApp,
 } from '../../core/deploy/hubCommands.js';
 import { testDeployKey } from '../../core/deploy/deployKey.js';
 import { applyGithubSetup, parseGithubRepo, validateGithubToken } from '../../core/deploy/githubApi.js';
@@ -76,6 +77,15 @@ function errorBody(result) {
 }
 
 class DeploymentsController {
+  /**
+   * @param {{ pm2State?: Function }} [deps] Injected by tests. The default is
+   *   the shared PM2-state helper, so the dashboard and the Hub answer with the
+   *   same object.
+   */
+  constructor({ pm2State = pm2StateForNewApp } = {}) {
+    this.pm2State = pm2State;
+  }
+
   /** GET /api/deployments */
   async list(req, res, next) {
     try {
@@ -112,8 +122,16 @@ class DeploymentsController {
     }
   }
 
-  /** POST /api/deployments */
-  create(req, res, next) {
+  /**
+   * POST /api/deployments
+   *
+   * Answers with the new app plus `pm2` — its state, and, when PM2 is not
+   * installed, the one command and the route that installs it. Creating the
+   * app never fails because PM2 is missing; the offer is what the UI shows.
+   * The endpoint is this server's own install route, registered in
+   * routes/processes.js (POST /api/pm2/install).
+   */
+  async create(req, res, next) {
     try {
       const body = req.body ?? {};
       const result = createApp(body);
@@ -122,7 +140,10 @@ class DeploymentsController {
       // generated in this same request; a failure still leaves a usable app.
       const extra = wantsGeneratedKey(body) ? generateKeyForApp(result.app.id) : {};
       const app = getApp(result.app.id) ?? result.app;
-      return res.status(201).json({ ...dashboardApp(app), ...extra });
+      // A PM2 probe that throws is reported inside the object, never thrown at
+      // the create: the app exists either way.
+      const pm2 = await this.pm2State({ installEndpoint: 'POST /api/pm2/install' });
+      return res.status(201).json({ ...dashboardApp(app), ...extra, pm2 });
     } catch (error) {
       return next(error);
     }
