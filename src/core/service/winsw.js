@@ -1,4 +1,3 @@
-import { pathToFileURL } from 'node:url';
 /**
  * core/service/winsw.js
  *
@@ -34,6 +33,7 @@ import { createHash } from 'crypto';
 import { pipeline } from 'stream/promises';
 
 import { isDefaultDataDir } from '../platform.js';
+import { daemonNodeArgs, knownNodeVersion } from './runtime.js';
 
 /** The pinned release. Changing any of these three means re-computing the hash. */
 export const WINSW_VERSION = 'v2.12.0';
@@ -253,9 +253,11 @@ export async function downloadWinsw({ dest, log = () => {}, fetchImpl = fetch, v
  * @param {string} opts.dataDir   Passed through the environment
  * @param {string} opts.logDir
  * @param {string} [opts.workingDir]
+ * @param {string|null} [opts.nodeVersion] The pinned runtime's version, so the
+ *   confinement flag matches what that Node supports. Unknown → the loader flag.
  * @returns {string}
  */
-export function buildServiceXml({ nodeExe, entry, dataDir, logDir, workingDir = null }) {
+export function buildServiceXml({ nodeExe, entry, dataDir, logDir, workingDir = null, nodeVersion = null }) {
   const escape = (value) => String(value)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -272,13 +274,23 @@ export function buildServiceXml({ nodeExe, entry, dataDir, logDir, workingDir = 
     ? '  <!-- EASY_DEVOPS_DATA_DIR is not set: this is the default directory. -->'
     : `  <env name="EASY_DEVOPS_DATA_DIR" value="${escape(dataDir)}"/>`;
 
+  // The confinement, exactly as core/service/runtime.js decides it for this
+  // Node: --import + register() where the runtime has it, the loader flag
+  // otherwise (which is what every XML written so far carries). The URLs come
+  // from the package root, the entry's ../..
+  const confinement = daemonNodeArgs({
+    nodeVersion: nodeVersion ?? knownNodeVersion(nodeExe),
+    packageRoot: path.resolve(path.dirname(entry), '..', '..'),
+  });
+  const nodeArguments = [...confinement.map((argument) => `"${escape(argument)}"`), `"${escape(entry)}"`, 'daemon'].join(' ');
+
   return `<service>
   <id>${SERVICE_ID}</id>
   <name>${escape(SERVICE_DISPLAY_NAME)}</name>
   <description>${escape(SERVICE_DESCRIPTION)}</description>
 
   <executable>${escape(nodeExe)}</executable>
-  <arguments>"--experimental-loader=${escape(pathToFileURL(path.resolve(path.dirname(entry), '../core/service/runtime-loader.mjs')).href)}" "${escape(entry)}" daemon</arguments>
+  <arguments>${nodeArguments}</arguments>
   <workingdirectory>${escape(workingDir ?? path.dirname(entry))}</workingdirectory>
 
   <!-- Starts at boot, before anyone logs in. -->

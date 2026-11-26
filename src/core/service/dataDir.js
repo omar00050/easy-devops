@@ -31,6 +31,7 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
@@ -54,6 +55,64 @@ function throwIfStageInterrupted(error, signal) {
 
 /** Top-level folders that contain executable service code, never user data. */
 export const SERVER_CODE_DIR_NAMES = Object.freeze(['runtime', 'runtime.prev', 'bin']);
+
+/** The database file name good.db's SQLite driver creates (core/db.js). */
+const DATABASE_FILE_NAME = 'easy-devops.sqlite';
+
+/** Written by `ezz service install` in Server mode (core/platform.js). */
+const SERVER_MODE_MARKER_NAME = '.server-mode';
+
+/** Case-insensitive path comparison on Windows, exact elsewhere. */
+function samePath(a, b) {
+  if (!a || !b) return false;
+  const norm = (p) => (isWindows ? path.resolve(p).toLowerCase() : path.resolve(p));
+  return norm(a) === norm(b);
+}
+
+/** `lstat` succeeded, so a dangling link also counts as "something is there". */
+function entryExistsSync(fsApi, target) {
+  try {
+    fsApi.lstatSync(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when a test run would inspect a REAL installation folder.
+ *
+ * core/platform.js getDataDir() already refuses to resolve the real directory
+ * under EZ_TEST=1, but the two roots this module inspects are read here
+ * directly. The inspection is read-only, yet a WAL database would still get
+ * its -wal/-shm created and removed beside the user's file, and EZ_TEST means
+ * "this never touches the real installation". A continued inspection needs
+ * either an explicit injected root or a ProgramData/APPDATA that the suite
+ * redirected into the system temp folder.
+ *
+ * @param {string} root
+ * @param {boolean} injected
+ */
+function unsafeToInspectUnderTest(root, injected) {
+  if (injected) return false;
+  if (process.env.EZ_TEST !== '1') return false;
+  const temp = path.resolve(os.tmpdir()).toLowerCase();
+  const resolved = path.resolve(root).toLowerCase();
+  return !(resolved === temp || resolved.startsWith(temp + path.sep));
+}
+
+/** The `db` half of the contract shape when a test must not look. */
+function skippedInspection(why) {
+  return {
+    exists: false,
+    ok: false,
+    keyCount: 0,
+    keys: [],
+    size: 0,
+    mtime: null,
+    error: why,
+  };
+}
 
 /** Per-user directory, computed without the Server-mode marker in the way. */
 export function userDataDir() {
@@ -548,6 +607,51 @@ export function backupPathFor(dir, now = new Date()) {
 }
 
 /**
+ * Withdraws data entries that were placed beside existing service folders and
+ * removes the staging directory.
+ *
+ * Used only to roll back a move into a destination whose other contents are
+ * code folders (bin, runtime, runtime.prev). Those folders, and the user's
+ * original source, are never touched by the rollback.
+ *
+ * @returns {Promise<{ ok: boolean, cleanup: string }>}
+ */
+async function unpublishMergedEntries({
+  staging,
+  to,
+  names,
+  deadline = Infinity,
+  signal,
+  timeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
+  fsApi = fs,
+}) {
+  if (!names.length) return { ok: true, cleanup: '' };
+  let cleanup = '';
+  try {
+    await fsApi.promises.mkdir(staging, { recursive: true, mode: 0o700 });
+    for (const name of names) {
+      remainingStageMs(deadline, 'Rolling back data move', timeoutMs);
+      signal?.throwIfAborted();
+      await fsApi.promises.rename(path.join(to, name), path.join(staging, name));
+    }
+  } catch (error) {
+    throwIfStageInterrupted(error, signal);
+    return {
+      ok: false,
+      cleanup: ` The data placed at ${to} could not be withdrawn: ${error.message}.`,
+    };
+  }
+  try {
+    await removeStagingTree(staging, {
+      deadline, signal, stage: 'Rolling back data move', timeoutMs, fsApi,
+    });
+  } catch (error) {
+    cleanup = ` The withdrawn copy was left at ${staging}: ${error.message}`;
+  }
+  return { ok: true, cleanup };
+}
+
+/**
  * Moves the data directory, keeping a backup of the source.
  *
  * Order: copy → verify → back up the source → remove the source. The backup is
@@ -639,20 +743,44 @@ export async function moveDataDir({
     return { ok: false, reason: `destination is not safe to write: ${unsafeDestination}. Nothing was changed.` };
   }
 
-  // A non-empty destination is never merged with or overwritten by a move.
-  // It may be a previous install, a second machine, or a partial migration.
+  // A destination that holds any content is never merged with or overwritten
+  // by a move. It may be a previous install, a second machine, or a partial
+  // migration.
+  //
+  // ONE exception, and only these three names: bin, runtime and runtime.prev
+  // are executable service code, not user data. An earlier install can leave
+  // them behind (unreadable or not, they are replaced later), and a leftover
+  // Server-mode folder whose database was just set aside has nothing else in
+  // it. The data goes BESIDE them: they are never copied over and never
+  // deleted, and anything else in the folder is still a refusal.
+  let existingEntries = [];
+  let codeOnly = false;
   try {
     const destinationStat = await pathExists(to, fsApi);
     if (destinationStat) {
       if (isLink(destinationStat) || !destinationStat.isDirectory()) {
         return { ok: false, reason: `${to} is not a safe destination directory. Nothing was changed.` };
       }
-      const existing = await fsApi.promises.readdir(to);
-      if (existing.length) {
+      existingEntries = await fsApi.promises.readdir(to);
+      const content = existingEntries.filter((name) => !SERVER_CODE_DIR_NAMES.includes(name));
+      if (content.length) {
         return {
           ok: false,
           reason: `${to} is not empty. Move or remove its contents first; nothing has been changed.`,
         };
+      }
+      codeOnly = existingEntries.length > 0;
+      if (codeOnly) {
+        const sourceEntries = await fsApi.promises.readdir(from);
+        const clash = sourceEntries.find((name) => existingEntries.includes(name)
+          && !isExcluded(path.join(from, name), excluded));
+        if (clash) {
+          return {
+            ok: false,
+            reason: `${to} already has ${clash}, and ${from} holds one too. `
+              + 'Refusing to overwrite an existing entry; nothing was changed.',
+          };
+        }
       }
     }
   } catch (error) {
@@ -673,6 +801,7 @@ export async function moveDataDir({
     `.${path.basename(to)}.migrate-${randomUUID()}`,
   );
   let copied = false;
+  const mergedEntries = [];
   try {
     await fsApi.promises.mkdir(staging, { recursive: false, mode: 0o700 });
     const beforeCopy = await unsafeTreeEntry(from, {
@@ -720,9 +849,46 @@ export async function moveDataDir({
 
     remainingStageMs(deadline, 'Verifying data copy', timeoutMs);
     signal?.throwIfAborted();
-    const destinationNow = await pathExists(to, fsApi);
-    if (destinationNow) await fsApi.promises.rmdir(to);
-    await fsApi.promises.rename(staging, to);
+    if (codeOnly) {
+      // Place the verified data beside the code folders. Each top-level name
+      // is checked again immediately before its rename, and an entry that
+      // exists is never replaced: rename() onto an existing path would
+      // overwrite it on POSIX.
+      const destinationNow = await pathExists(to, fsApi);
+      if (!destinationNow || isLink(destinationNow) || !destinationNow.isDirectory()) {
+        throw new Error(`${to} changed or disappeared while the data was copied; refusing to write into it`);
+      }
+      const staged = await fsApi.promises.readdir(staging);
+      for (const name of staged) {
+        if (existingEntries.includes(name)) {
+          throw new Error(`${path.join(to, name)} already exists; refusing to overwrite it`);
+        }
+      }
+      for (const name of staged) {
+        remainingStageMs(deadline, 'Moving data', timeoutMs);
+        signal?.throwIfAborted();
+        const destination = path.join(to, name);
+        const alreadyThere = await pathExists(destination, fsApi);
+        if (alreadyThere) {
+          throw new Error(`${destination} appeared while the data was copied; refusing to overwrite it`);
+        }
+        await fsApi.promises.rename(path.join(staging, name), destination);
+        mergedEntries.push(name);
+      }
+      log('Data placed beside the existing service folders; they were not changed.');
+    } else {
+      const destinationNow = await pathExists(to, fsApi);
+      if (destinationNow) {
+        // Only an empty directory may be replaced. Content that appeared after
+        // the check above is a refusal, not something to rmdir and delete.
+        const late = await fsApi.promises.readdir(to);
+        if (late.length) {
+          throw new Error(`${to} received content while the data was copied; refusing to overwrite it`);
+        }
+        await fsApi.promises.rmdir(to);
+      }
+      await fsApi.promises.rename(staging, to);
+    }
     copied = true;
     remainingStageMs(deadline, 'Moving data', timeoutMs);
     signal?.throwIfAborted();
@@ -738,27 +904,50 @@ export async function moveDataDir({
       // Leave an unsafe or locked staging directory for the operator to inspect.
       cleanup = ` The partial staging directory was left at ${staging}: ${cleanupError.message}`;
     }
-    // A cancelled rename may have completed after the timer fired. The marker
-    // is still in the source at this point, so removing this verified copy
-    // restores a clean retry state.
-    try {
-      await removeStagingTree(to, {
-        stage: 'Rolling back data move',
-        timeoutMs,
-        fsApi,
+    if (codeOnly) {
+      // The destination also holds service code folders, which must survive a
+      // failed move exactly as they were. Only what this move placed there is
+      // withdrawn from it.
+      const withdrawn = await unpublishMergedEntries({
+        staging, to, names: mergedEntries, deadline, timeoutMs, fsApi,
       });
-    } catch (cleanupError) {
-      cleanup += ` The verified destination could not be removed: ${cleanupError.message}`;
+      cleanup += withdrawn.cleanup;
+    } else {
+      // A cancelled rename may have completed after the timer fired. The marker
+      // is still in the source at this point, so removing this verified copy
+      // restores a clean retry state.
+      try {
+        await removeStagingTree(to, {
+          stage: 'Rolling back data move',
+          timeoutMs,
+          fsApi,
+        });
+      } catch (cleanupError) {
+        cleanup += ` The verified destination could not be removed: ${cleanupError.message}`;
+      }
     }
     throwIfStageInterrupted(err, signal);
     return {
       ok: false,
       reason: `copy failed: ${err.message}. The original was not removed`
-        + (copied ? '' : ` and no live destination was installed.`)
+        + (codeOnly
+          ? ` and ${to} still holds only what it held before.`
+          : (copied ? '' : ' and no live destination was installed.'))
         + cleanup,
     };
   }
   log('Copy verified.');
+
+  if (codeOnly) {
+    // The staging directory is empty once its entries were renamed into the
+    // destination. Remove it so nothing but the data and the code folders is
+    // left; a failure here is cosmetic and never touches either side.
+    try {
+      await fsApi.promises.rmdir(staging);
+    } catch (err) {
+      log(`Left the empty staging folder at ${staging}: ${err.message}`);
+    }
+  }
 
   let backup = backupPathFor(from);
   if (await pathExists(backup, fsApi)) backup = `${backup}-${randomUUID().slice(0, 8)}`;
@@ -795,24 +984,33 @@ export async function moveDataDir({
     }
 
     if (sourceRestored) {
-      try {
-        await removeStagingTree(to, {
-          stage: 'Rolling back data move',
-          timeoutMs,
-          fsApi,
+      if (codeOnly) {
+        const withdrawn = await unpublishMergedEntries({
+          staging, to, names: mergedEntries, deadline, timeoutMs, fsApi,
         });
-        destinationRemoved = true;
-      } catch (cleanupError) {
-        rollbackFailure += ` The verified destination could not be removed: ${cleanupError.message}`;
+        destinationRemoved = withdrawn.ok;
+        rollbackFailure += withdrawn.cleanup;
+      } else {
+        try {
+          await removeStagingTree(to, {
+            stage: 'Rolling back data move',
+            timeoutMs,
+            fsApi,
+          });
+          destinationRemoved = true;
+        } catch (cleanupError) {
+          rollbackFailure += ` The verified destination could not be removed: ${cleanupError.message}`;
+        }
       }
     }
 
     if (err?.code === 'EZ_STAGE_TIMEOUT' || signal?.aborted) {
+      const withdrawnOrRemoved = codeOnly
+        ? ' and the data placed there was withdrawn.'
+        : ' and the uncommitted destination was removed.';
       err.message += sourceRestored
         ? ` The original source was restored at ${from}`
-          + (destinationRemoved
-            ? ' and the uncommitted destination was removed.'
-            : `; the uncommitted destination remains at ${to}.`)
+          + (destinationRemoved ? withdrawnOrRemoved : `; the uncommitted destination remains at ${to}.`)
         : rollbackFailure;
       throw err;
     }
@@ -861,6 +1059,333 @@ export function describeOriginal(result) {
 }
 
 /**
+ * Finds a leftover Server-mode data directory: a real database in
+ * `C:\ProgramData\easy-devops` with no `.server-mode` marker beside it.
+ *
+ * This is the Windows Server state 1.4.7 left behind. The service install was
+ * refused because the folder was "not empty", and the CLI — seeing no marker —
+ * used `%APPDATA%`, where a near-empty database had just been created. The
+ * real data was in ProgramData the whole time.
+ *
+ * Nothing here writes, moves or deletes anything. Both databases are opened
+ * READ-ONLY (core/db.js inspectDatabaseFile) and only KEY NAMES come back, so
+ * the answer can be printed without exposing a domain list, a hub token or a
+ * password hash.
+ *
+ * `recommended` is the side with more keys — a real database holds a dozen or
+ * more, a freshly created one four — with a tie going to `adopt`, because
+ * adopting changes only a marker file while setting aside renames a directory.
+ *
+ * @param {Object} [opts]
+ * @param {string} [opts.programDataDir] Injected for tests; defaults to platform.
+ * @param {string} [opts.userDataDir]    Injected for tests; defaults to platform.
+ * @returns {Promise<{
+ *   leftover: boolean,
+ *   programData: { dir: string, db: Object },
+ *   userData: { dir: string, db: Object },
+ *   recommended: 'adopt'|'keep-aside',
+ *   codeOnly: boolean,
+ * }>}
+ */
+export async function detectLeftoverServerData({
+  programDataDir: programDataOverride,
+  userDataDir: userDataOverride,
+} = {}) {
+  const programRoot = programDataOverride ?? programDataDir();
+  const userRoot = userDataOverride ?? userDataDir();
+
+  // Imported lazily: core/db.js opens the live database while its module body
+  // is evaluated, and core/service/index.js already imports it. dataDir.js
+  // itself must stay loadable by callers that never need an inspection.
+  const { inspectDatabaseFile } = await import('../db.js');
+
+  const programData = {
+    dir: programRoot,
+    db: unsafeToInspectUnderTest(programRoot, programDataOverride !== undefined)
+      ? skippedInspection('not inspected: EZ_TEST=1 never reads the real ProgramData')
+      : inspectDatabaseFile(path.join(programRoot, DATABASE_FILE_NAME)),
+  };
+  const userData = {
+    dir: userRoot,
+    db: unsafeToInspectUnderTest(userRoot, userDataOverride !== undefined)
+      ? skippedInspection('not inspected: EZ_TEST=1 never reads the real %APPDATA%')
+      : inspectDatabaseFile(path.join(userRoot, DATABASE_FILE_NAME)),
+  };
+
+  // Under EZ_TEST the real ProgramData folder is not read at all — not even
+  // for the marker. A read is not a write, but the rule is that a test never
+  // touches the real installation, and that is easier to keep than to audit.
+  const programReadable = !unsafeToInspectUnderTest(programRoot, programDataOverride !== undefined);
+  const markerPresent = programReadable
+    && entryExistsSync(fs, path.join(programRoot, SERVER_MODE_MARKER_NAME));
+  const leftover = Boolean(isWindows && !markerPresent && programData.db.exists);
+
+  let codeOnly = false;
+  if (programReadable && !leftover && isWindows && !markerPresent) {
+    try {
+      const entries = fs.readdirSync(programRoot);
+      codeOnly = entries.length > 0
+        && entries.every((name) => SERVER_CODE_DIR_NAMES.includes(name));
+    } catch {
+      // A missing or unreadable ProgramData folder holds no code folders.
+      codeOnly = false;
+    }
+  }
+
+  return {
+    leftover,
+    programData,
+    userData,
+    recommended: programData.db.keyCount >= userData.db.keyCount ? 'adopt' : 'keep-aside',
+    codeOnly,
+  };
+}
+
+/**
+ * Uses the existing ProgramData database as it is: restores the Server-mode
+ * marker, and leaves `%APPDATA%` completely untouched.
+ *
+ * The marker is written the same way enableServerMode() writes it: same file,
+ * same refusals (link/reparse point, non-regular file, hard link), written to a
+ * temporary name and renamed into place. The database is never opened
+ * read-write and never copied.
+ *
+ * @param {Object} [opts]
+ * @param {(line: string) => void} [opts.log]
+ * @param {string} [opts.programDataDir] Injected for tests.
+ * @param {Object} [opts.fsApi] Injected for tests.
+ * @returns {Promise<{ ok: boolean, reason: string, dataDir: string }>}
+ */
+export async function adoptLeftoverServerData({
+  log = () => {},
+  programDataDir: programDataOverride,
+  fsApi = fs,
+} = {}) {
+  const programRoot = programDataOverride ?? programDataDir();
+  const marker = path.join(programRoot, SERVER_MODE_MARKER_NAME);
+  const database = path.join(programRoot, DATABASE_FILE_NAME);
+
+  if (!isWindows) {
+    return {
+      ok: false,
+      reason: 'Server mode is Windows-only; this machine does not use a ProgramData database. Nothing was changed.',
+      dataDir: programRoot,
+    };
+  }
+  if (unsafeToInspectUnderTest(programRoot, programDataOverride !== undefined)) {
+    return {
+      ok: false,
+      reason: 'EZ_TEST=1 is set, so refusing to write a marker into the real ProgramData. Nothing was changed.',
+      dataDir: programRoot,
+    };
+  }
+
+  let databaseStat;
+  try {
+    databaseStat = fsApi.lstatSync(database);
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `${database} could not be inspected: ${error.message}. Nothing was changed.`,
+      dataDir: programRoot,
+    };
+  }
+  if (databaseStat.isSymbolicLink() || !databaseStat.isFile()) {
+    return {
+      ok: false,
+      reason: `${database} is not a regular database file; refusing to adopt it. Nothing was changed.`,
+      dataDir: programRoot,
+    };
+  }
+
+  let existing = null;
+  try {
+    existing = fsApi.lstatSync(marker);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      return {
+        ok: false,
+        reason: `could not inspect ${marker}: ${error.message}. The database is untouched.`,
+        dataDir: programRoot,
+      };
+    }
+  }
+  if (existing) {
+    if (existing.isSymbolicLink() || !existing.isFile() || existing.nlink !== 1) {
+      return {
+        ok: false,
+        reason: `${marker} is not a regular Server-mode marker; refusing to treat it as one. The database is untouched.`,
+        dataDir: programRoot,
+      };
+    }
+    return {
+      ok: true,
+      reason: `${marker} already exists; Server mode is already in use`,
+      dataDir: programRoot,
+    };
+  }
+
+  const now = new Date().toISOString();
+  const payload = `${JSON.stringify({
+    enabledAt: now,
+    adoptedAt: now,
+    migratedFrom: null,
+    backup: null,
+  })}\n`;
+
+  const marked = await writeMarker(programRoot, marker, payload, { fsApi });
+  if (!marked.ok) {
+    return {
+      ok: false,
+      reason: `the database is intact, but ${marker} could not be written: ${marked.reason}. `
+        + 'Fix the permissions on that folder (an elevated terminal is usually needed) and retry.',
+      dataDir: programRoot,
+    };
+  }
+
+  resetDataDirCache();
+  log(`Using the existing database in ${programRoot}; %APPDATA% was not touched.`);
+  return {
+    ok: true,
+    reason: `Server mode restored: ${programRoot} now holds the live data, and %APPDATA% was left as it was`,
+    dataDir: programRoot,
+  };
+}
+
+/**
+ * Keeps a leftover Server-mode directory out of the way by RENAMING it beside
+ * itself: `easy-devops` → `easy-devops.old-YYYY-MM-DD` (`-2`, `-3`, … when
+ * that name is taken).
+ *
+ * Never a copy-then-delete: both paths are under the same ProgramData folder,
+ * so the rename is atomic on one volume. Before the rename the folder and its
+ * database are checked; after it the database is verified to exist in the new
+ * place with the same size and the old path to be gone. If the rename itself
+ * fails (EBUSY/EPERM: the service or an open handle) nothing has moved, and the
+ * answer says what to stop before retrying.
+ *
+ * @param {Object} [opts]
+ * @param {(line: string) => void} [opts.log]
+ * @param {Date|string} [opts.now] The date used in the name (tests).
+ * @param {string} [opts.programDataDir] Injected for tests.
+ * @param {Object} [opts.fsApi] Injected for tests (must provide renameSync etc).
+ * @returns {Promise<{ ok: boolean, reason: string, movedTo: string|null }>}
+ */
+export async function setAsideLeftoverServerData({
+  log = () => {},
+  now = new Date(),
+  programDataDir: programDataOverride,
+  fsApi = fs,
+} = {}) {
+  const source = programDataOverride ?? programDataDir();
+  const refuse = (reason) => ({ ok: false, reason, movedTo: null });
+
+  if (!isWindows) {
+    return refuse('Server mode is Windows-only; this machine does not use a ProgramData database. Nothing was changed.');
+  }
+  if (unsafeToInspectUnderTest(source, programDataOverride !== undefined)) {
+    return refuse('EZ_TEST=1 is set, so refusing to rename the real ProgramData folder. Nothing was changed.');
+  }
+
+  let sourceStat;
+  try {
+    sourceStat = fsApi.lstatSync(source);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return refuse(`${source} does not exist; there is nothing to set aside.`);
+    }
+    return refuse(`${source} could not be inspected: ${error.message}. Nothing was changed.`);
+  }
+  if (sourceStat.isSymbolicLink() || !sourceStat.isDirectory()) {
+    return refuse(`${source} is a link, reparse point, or not a directory; refusing to rename it. Nothing was changed.`);
+  }
+
+  const database = path.join(source, DATABASE_FILE_NAME);
+  let databaseStat;
+  try {
+    databaseStat = fsApi.lstatSync(database);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return refuse(`${database} is not there, so this folder holds no database to keep aside. Nothing was changed.`);
+    }
+    return refuse(`${database} could not be inspected: ${error.message}. Nothing was changed.`);
+  }
+  if (databaseStat.isSymbolicLink() || !databaseStat.isFile()) {
+    return refuse(`${database} is not a regular database file; refusing to rename the folder. Nothing was changed.`);
+  }
+
+  // This process must not be the one holding the database open: on Windows a
+  // rename of a folder containing an open file fails anyway, but checking
+  // first makes the answer name the cause instead of a bare EPERM.
+  if (samePath(getDataDir(), source)) {
+    return refuse(
+      `this command is using ${database} as its own live database, so it cannot be moved. `
+      + 'Stop the service and close ezz/dashboard, then retry.',
+    );
+  }
+  const inUse = assertNotInUse(source);
+  if (!inUse.ok) return refuse(inUse.reason);
+
+  const parent = path.dirname(source);
+  const date = (now instanceof Date ? now : new Date(now));
+  const stamp = Number.isNaN(date.getTime())
+    ? new Date().toISOString().slice(0, 10)
+    : date.toISOString().slice(0, 10);
+  let movedTo = path.join(parent, `easy-devops.old-${stamp}`);
+  for (let suffix = 2; entryExistsSync(fsApi, movedTo); suffix += 1) {
+    movedTo = path.join(parent, `easy-devops.old-${stamp}-${suffix}`);
+  }
+
+  try {
+    fsApi.renameSync(source, movedTo);
+  } catch (error) {
+    const code = String(error?.code ?? '').trim();
+    return refuse(
+      `could not move ${source} to ${movedTo}: ${code ? `${code}: ` : ''}${error.message}. `
+      + `The database is still in ${source} and nothing was changed. `
+      + 'Stop the service and close ezz/dashboard, then retry.',
+    );
+  }
+
+  let verified = false;
+  let verifyError = '';
+  try {
+    const movedDatabase = fsApi.statSync(path.join(movedTo, DATABASE_FILE_NAME));
+    if (movedDatabase.isFile()
+        && movedDatabase.size === databaseStat.size
+        && !entryExistsSync(fsApi, source)) {
+      verified = true;
+    } else {
+      verifyError = 'the moved database is missing, has a different size, or the original path still exists';
+    }
+  } catch (error) {
+    verifyError = error.message;
+  }
+  if (!verified) {
+    let restored = false;
+    try {
+      fsApi.renameSync(movedTo, source);
+      restored = true;
+    } catch { /* both locations are reported below */ }
+    return {
+      ok: false,
+      reason: restored
+        ? `the move could not be verified (${verifyError}); ${source} was restored unchanged. Nothing was lost.`
+        : `the move could not be verified (${verifyError}); the data is in ${movedTo} and the old path is gone. `
+          + 'Do not delete either folder before checking which one holds the database.',
+      movedTo: restored ? null : movedTo,
+    };
+  }
+
+  log(`${source} was set aside as ${movedTo}; the database was verified there.`);
+  return {
+    ok: true,
+    reason: `${source} was renamed to ${movedTo}; the database was verified there with the same size`,
+    movedTo,
+  };
+}
+
+/**
  * Switches this machine into Server mode: data under ProgramData, marker
  * written, per-user data migrated once.
  *
@@ -880,6 +1405,39 @@ export async function enableServerMode({ log = () => {} } = {}) {
 
   const target = programDataDir();
   const marker = serverModeMarkerPath();
+
+  if (unsafeToInspectUnderTest(target, false)) {
+    return {
+      ok: false,
+      dataDir: target,
+      migrated: false,
+      backup: null,
+      reason: 'EZ_TEST=1 is set, so refusing to switch the real ProgramData into Server mode. Nothing was changed.',
+    };
+  }
+
+  // A leftover database from an earlier Server-mode install is a DECISION, not
+  // an obstacle to move around. Without this check the migration below copies
+  // `%APPDATA%` — which on the real 1.4.7 server held a four-key database that
+  // had just been created — over the fifteen-key database in ProgramData. The
+  // caller asks the user (adopt / keep aside) and calls this again once the
+  // choice is visible on disk.
+  const leftover = await detectLeftoverServerData();
+  if (leftover.leftover) {
+    return {
+      ok: false,
+      code: 'leftover_data',
+      dataDir: target,
+      migrated: false,
+      backup: null,
+      leftover,
+      reason: `${target} holds an Easy DevOps database from an earlier Server-mode install `
+        + `(${leftover.programData.db.keyCount} key(s), ${leftover.programData.db.size} bytes), but its `
+        + '.server-mode marker is missing. Both databases were inspected read-only; no values were read. '
+        + `Choose: adopt the ProgramData database as it is (${leftover.recommended === 'adopt' ? 'recommended' : 'keeps %APPDATA% untouched'}), `
+        + 'or set it aside and migrate %APPDATA%. Nothing was changed.',
+    };
+  }
 
   const safeTarget = await ensureSafeDirectory(target);
   if (!safeTarget.ok) {
@@ -983,6 +1541,16 @@ export async function disableServerMode({
   const target = userDataDir();
   const marker = serverModeMarkerPath();
 
+  if (unsafeToInspectUnderTest(source, false)) {
+    return {
+      ok: false,
+      dataDir: source,
+      moved: false,
+      backup: null,
+      reason: 'EZ_TEST=1 is set, so refusing to move the real ProgramData back. Nothing was changed.',
+    };
+  }
+
   let markerStat;
   try {
     markerStat = await pathExists(marker);
@@ -997,6 +1565,22 @@ export async function disableServerMode({
     };
   }
   if (!markerStat) {
+    // No marker, but a database in ProgramData would mean this is the 1.4.7
+    // leftover state. Moving anything back to %APPDATA% then would be a guess;
+    // the caller asks first (detectLeftoverServerData) and applies the choice.
+    const leftover = await detectLeftoverServerData({ programDataDir: source, userDataDir: target });
+    if (leftover.leftover) {
+      return {
+        ok: false,
+        code: 'leftover_data',
+        dataDir: source,
+        moved: false,
+        backup: null,
+        leftover,
+        reason: `${source} holds a database but no .server-mode marker. `
+          + 'Adopt it, or set it aside before moving data back; nothing was changed.',
+      };
+    }
     return { ok: true, dataDir: target, moved: false, backup: null, reason: 'not in Server mode' };
   }
   if (markerStat.isSymbolicLink() || !markerStat.isFile() || markerStat.nlink !== 1) {

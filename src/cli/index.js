@@ -56,6 +56,9 @@ function parseArgs(argv) {
     // any command module is loaded, and an unknown flag must still be
     // refused rather than silently ignored.
     'purge', 'yes',
+    // With `service install`: what to do with an earlier Server-mode install's
+    // data in C:\ProgramData\easy-devops when the Server-mode marker is gone.
+    'adopt-existing-data', 'set-aside-existing-data',
   ]);
   // Options that take a value, so `--days 30` does not leave `30` looking
   // like a positional argument.
@@ -151,6 +154,15 @@ Options:
                     reclaimable (default 14).
   --yes             Answer the confirmations yes. For scripts;
                     "uninstall --purge" still prints what it will do.
+  --adopt-existing-data
+  --set-aside-existing-data
+                    With "service install", when C:\ProgramData\easy-devops
+                    holds an earlier Server-mode install's data:
+                    --adopt-existing-data keeps that data as it is;
+                    --set-aside-existing-data moves it to
+                    easy-devops.old-<date>, then uses %APPDATA%.
+                    Without either, install asks and changes nothing when it
+                    cannot ask. Never both.
   -h, --help        Show this help
   -v, --version     Show the version
 
@@ -182,12 +194,65 @@ const { flags, options, command, args, unknown } = parseArgs(process.argv.slice(
 if (command === 'daemon') {
   process.env.WS_NO_BUFFER_UTIL = '1';
   process.env.WS_NO_UTF_8_VALIDATE = '1';
+
+  // The CommonJS half of the confinement. Installed unconditionally and
+  // idempotently: the boundary is what refuses a `require` or a native addon
+  // from outside the package, and it must be in place however the daemon was
+  // started.
   require('../core/service/runtime-boundary.cjs').install();
-  const loader = new URL('../core/service/runtime-loader.mjs', import.meta.url);
-  if (!process.execArgv.includes(`--experimental-loader=${loader.href}`)) {
-    const { register } = await import('node:module');
-    if (!register) throw new Error('Run service repair to enable the daemon module loader, or use Node 18.19 or later.');
-    register(loader.href);
+
+  const loaderHref = new URL('../core/service/runtime-loader.mjs', import.meta.url).href;
+  const registerHref = new URL('../core/service/runtime-register.mjs', import.meta.url).href;
+  const LOADER_FLAG = '--experimental-loader';
+
+  /**
+   * Three command lines exist in the field, and each is "already confined":
+   *
+   *  - 1.4.4-1.4.7 units, XML and supervisors pass
+   *    `--experimental-loader=<this package's runtime-loader.mjs>`;
+   *  - 1.4.8 and later pass `--import <this package's runtime-register.mjs>`,
+   *    which installed both halves before this file ran;
+   *  - anything else (1.4.0-1.4.3 units have no flag, and `ezz daemon` run by
+   *    hand has none either) needs register() here.
+   *
+   * The loader flag keeps working - it only prints Node's deprecation warning -
+   * so an old unit is never broken by this; `ezz service repair` rewrites it.
+   */
+  const confinedByLoaderFlag = process.execArgv.some((arg, index) => (
+    (arg === LOADER_FLAG && /runtime-loader\.mjs$/.test(process.execArgv[index + 1] ?? ''))
+    || (arg.startsWith(`${LOADER_FLAG}=`) && /runtime-loader\.mjs$/.test(arg.slice(LOADER_FLAG.length + 1)))
+  ));
+  const confinedByImport = process.execArgv.some((arg, index) => (
+    (arg === '--import' && process.execArgv[index + 1] === registerHref)
+    || arg === `--import=${registerHref}`
+  ));
+
+  if (!confinedByLoaderFlag && !confinedByImport) {
+    try {
+      // On a Node without module.register() this throws, and the message says
+      // to run service repair or use a newer Node.
+      const daemonLoader = await import(registerHref);
+      daemonLoader.install();
+    } catch (error) {
+      // A copy from before 1.4.8 - an old runtime copy, or a tree that was half
+      // refreshed - has the loader but not the register module. Confine it the
+      // way 1.4.7 did and say what to run: a service that will not start is
+      // worse than one running with the older flag, and `ezz service repair`
+      // writes both the file and the command line.
+      const missingRegister = error?.code === 'ERR_MODULE_NOT_FOUND'
+        && /runtime-register\.mjs/.test(String(error?.message ?? ''));
+      if (!missingRegister) throw error;
+
+      const { register } = await import('node:module');
+      if (!register) {
+        throw new Error('Run service repair to enable the daemon module loader, or use Node 18.19 or later.');
+      }
+      register(loaderHref);
+      process.stderr.write(
+        'Warning: this copy is missing src/core/service/runtime-register.mjs, so the daemon was '
+        + 'confined with the older loader. Run `ezz service repair` to bring the copy up to date.\n',
+      );
+    }
   }
 }
 
@@ -205,6 +270,31 @@ if (flags.has('help')) {
 if (flags.has('version')) {
   process.stdout.write(`${version}\n`);
   process.exit(0);
+}
+
+// ─── Leftover-data choice ─────────────────────────────────────────────────────
+// Two flags that each answer the same question, so `--yes` cannot stand in for
+// either: adopting keeps the ProgramData data, setting it aside moves it. A
+// command that got both, or one of them on the wrong command, changes nothing.
+const leftoverChoice = flags.has('adopt-existing-data')
+  ? 'adopt'
+  : flags.has('set-aside-existing-data') ? 'keep-aside' : undefined;
+
+if (flags.has('adopt-existing-data') && flags.has('set-aside-existing-data')) {
+  process.stderr.write(
+    'Choose one: --adopt-existing-data or --set-aside-existing-data, not both. '
+    + 'Adopting keeps the data in C:\\ProgramData\\easy-devops; setting it aside moves that '
+    + 'folder to easy-devops.old-<date> first. Nothing was changed.\n',
+  );
+  process.exit(1);
+}
+
+if (leftoverChoice && !(command === 'service' && args[0] === 'install')) {
+  process.stderr.write(
+    '--adopt-existing-data and --set-aside-existing-data only apply to `ezz service install`. '
+    + 'Nothing was changed.\n',
+  );
+  process.exit(1);
 }
 
 // ─── Dev data mode ────────────────────────────────────────────────────────────
@@ -280,49 +370,46 @@ async function explainDatabaseError(err) {
 }
 
 /**
- * One warning when the CLI package and the service's runtime copy disagree.
+ * One warning when the service this machine should be running needs the CLI's
+ * help: leftover Server-mode data, an install that stopped, or a service whose
+ * copy is an older version (finding A3, and the owner's 1.4.7 server).
  *
- * Windows Server mode gives the service its own copy under ProgramData, so a
- * plain `npm i -g easy-devops` updates only the CLI and the service keeps
- * running the old code with no sign of it (finding A3). Reading it is one
- * `package.json`, so it costs nothing worth measuring on a normal command.
+ * Cheap by construction: the check reads files (a package.json, the daemon's
+ * lock, the install record, and the ProgramData database only when one is
+ * actually there) and never runs `sc.exe`, `icacls`, the registry or
+ * `systemctl` unless one of those file checks already found a problem. It
+ * therefore runs on every ordinary command.
  *
- * Never repairs by itself: the warning names `ezz service repair`, and the
- * existing "Relaunch as administrator?" flow is offered only in an interactive
- * terminal. A pipe, a script or CI gets the warning alone.
+ * Never repairs by itself. Windows: the existing "Relaunch as administrator?"
+ * flow is offered only in an interactive terminal. Linux: the `sudo` command is
+ * printed for the user to run. A pipe, a script or CI gets the warning and the
+ * exact command only.
  *
  * @returns {Promise<void>}
  */
-async function warnOnServiceVersionDrift() {
-  let drift;
+async function reportServiceHealth() {
   try {
-    const { checkDrift } = await import('../core/service/versionDrift.js');
-    drift = checkDrift();
-  } catch {
-    // A drift check must never be why a command fails.
-    return;
-  }
+    const { getDataDir } = await import('../core/platform.js');
+    const { runServiceStartupCheck } = await import('../core/service/versionDrift.js');
 
-  if (!drift?.drift) return;
-
-  process.stderr.write(`\n  Warning: ${drift.message}\n\n`);
-
-  // Only Windows Server has a separate runtime copy, and only a terminal can
-  // answer a UAC prompt. Every other case is warning-only.
-  if (drift.mode !== 'server') return;
-  if (!(process.stdin.isTTY && process.stdout.isTTY)) return;
-
-  try {
-    const { requireElevation } = await import('./elevation.js');
-    const gate = await requireElevation({
-      args: ['service', 'repair'],
-      what: 'Updating the background service',
+    const report = await runServiceStartupCheck({
+      dataDir: getDataDir(),
+      deps: {
+        // core/ must not import the CLI, so the prompt is injected from here.
+        // Imported lazily: chalk and inquirer are only needed on Windows, in a
+        // real terminal, once a problem was found.
+        requireElevation: async (opts) => {
+          const { requireElevation } = await import('./elevation.js');
+          return requireElevation(opts);
+        },
+      },
     });
+
     // Handed off: the elevated window owns the repair, so this one must not
     // also run the command the user asked for. Declining continues normally.
-    if (gate.proceed === false && gate.code === 0) process.exit(0);
+    if (report.handedOff) process.exit(0);
   } catch {
-    // A failed prompt is not a failed command; the warning has been printed.
+    // A health warning must never be why a command fails.
   }
 }
 
@@ -338,14 +425,15 @@ if (command !== 'daemon' && !flags.has('dash')) {
 }
 
 try {
-  // Version drift first, so a user whose service is behind hears it before
-  // the command they typed does its work. Skipped for the commands that are
-  // themselves the fix, and for the long-running processes that report it
-  // through status instead.
-  const skipsDriftWarning = command === 'daemon'
+  // Service health first, so a user whose service is behind or half-installed
+  // hears it before the command they typed does its work. Skipped for the
+  // commands that are themselves the fix, and for the long-running processes
+  // that report it through status instead.
+  const skipsServiceHealth = command === 'daemon'
     || command === '_post-update'
-    || (command === 'service' && (args[0] === 'repair' || args[0] === 'recover'));
-  if (!skipsDriftWarning) await warnOnServiceVersionDrift();
+    || command === 'update'
+    || (command === 'service' && ['install', 'repair', 'recover'].includes(args[0] ?? ''));
+  if (!skipsServiceHealth) await reportServiceHealth();
 
   if (flags.has('dash')) {
     const { runDashboard } = await import('./dash.js');
@@ -375,7 +463,9 @@ try {
       }
     }
     const { serviceCommand } = await import('./menus/service.js');
-    process.exit(await serviceCommand(action));
+    // The leftover-data choice is asked by menus/service.js (lane F3 reads
+    // `options.leftoverChoice`) and applied by core install({ leftoverChoice }).
+    process.exit(await serviceCommand(action, { leftoverChoice }));
   } else if (command === 'runtime') {
     const { runtimeCommand } = await import('./menus/runtime.js');
     process.exit(await runtimeCommand(args[0] ?? 'status', { yes: flags.has('yes') }));

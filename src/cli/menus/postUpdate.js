@@ -43,6 +43,15 @@ export async function postUpdateCommand({
       log: (line) => stdout.write(`${line}\n`),
       deps,
     });
+    if (!result.ok) {
+      // Printed here, not only returned: the updater streams this child's
+      // output, and the operator has to see whether the previous permissions
+      // came back and what to run next.
+      stdout.write(`The post-update step failed${result.step ? ` (${result.step})` : ''}: ${result.reason}\n`);
+      if (result.next && !String(result.reason ?? '').includes('ezz service')) {
+        stdout.write(`Next: ${result.next}\n`);
+      }
+    }
     await emit(stdout, result);
     return result.ok ? 0 : 1;
   } catch (error) {

@@ -263,12 +263,27 @@ function migrateIfNeeded() {
   if (!isDefaultDataDir(DATA_DIR)) return;
 
   try {
-    if (fs.existsSync(OLD_DB_PATH) && !fs.existsSync(DB_PATH)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-      fs.copyFileSync(OLD_DB_PATH, DB_PATH);
-      // Rename old file so migration doesn't run again
-      fs.renameSync(OLD_DB_PATH, OLD_DB_PATH + '.migrated');
+    if (!fs.existsSync(OLD_DB_PATH) || fs.existsSync(DB_PATH)) return;
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+
+    // COPYFILE_EXCL, not copyFileSync's default: if a database appeared between
+    // the check and the copy — another process migrating, or the Windows
+    // Server-mode switch filling this directory — an existing database is
+    // NEVER overwritten. A database that is already there is the live one; the
+    // legacy file is simply left where it is.
+    try {
+      fs.copyFileSync(OLD_DB_PATH, DB_PATH, fs.constants.COPYFILE_EXCL);
+    } catch (error) {
+      if (error?.code === 'EEXIST') return;
+      throw error;
     }
+
+    // Rename old file so migration doesn't run again. A previous `.migrated`
+    // file is another copy of a database, so this must not replace it: a
+    // rename onto an existing name succeeds on Linux and would delete it.
+    let retired = `${OLD_DB_PATH}.migrated`;
+    if (fs.existsSync(retired)) retired = `${retired}-${Date.now()}`;
+    fs.renameSync(OLD_DB_PATH, retired);
   } catch (err) {
     // non-fatal — new install will start fresh
     migrationFailure = describeError(err).text;
@@ -375,6 +390,124 @@ export { db };
 export const dbGet = (key) => db.get(key);
 export const dbSet = (key, value) => db.set(key, value);
 export const dbDelete = (key) => db.delete(key);
+
+/**
+ * Reads the KEY NAMES of a database file that is not this process's live
+ * connection, without opening it through good.db.
+ *
+ * ── Why this is not dbGet()/dbSet() (CLAUDE.md rule 10) ────────────────────
+ *
+ * Rule 10 says every read and write goes through dbGet/dbSet. This is the one
+ * deliberate exception, and it is narrow: it inspects a FOREIGN file — the
+ * leftover `C:\ProgramData\easy-devops\easy-devops.sqlite` from an earlier
+ * Server-mode install (see core/service/dataDir.js). It cannot use good.db:
+ * good.db's constructor runs `CREATE TABLE IF NOT EXISTS gooddb` and opens the
+ * file READ-WRITE, which would (a) modify a file the user has not chosen yet
+ * and (b) fail on exactly the unreadable/permission cases this check exists to
+ * report. So the handle is opened by better-sqlite3 directly, READ-ONLY, with
+ * `fileMustExist`, and the only statement issued is
+ *
+ *     SELECT key FROM gooddb ORDER BY key
+ *
+ * over the table and columns good.db itself creates
+ * (node_modules/good.db/dist/Drivers/SQLite.js:15: `CREATE TABLE IF NOT EXISTS
+ * <table> (key TEXT PRIMARY KEY, value TEXT)`). The `value` column is never
+ * selected, so no user data — domain config, hub tokens, the password hash —
+ * can leave this function.
+ *
+ * @param {string} file
+ * @returns {{ exists: boolean, ok: boolean, keyCount: number, keys: string[],
+ *             size: number, mtime: string|null, error: string|null }}
+ */
+export function inspectDatabaseFile(file) {
+  const result = {
+    exists: false,
+    ok: false,
+    keyCount: 0,
+    keys: [],
+    size: 0,
+    mtime: null,
+    error: null,
+  };
+
+  if (!file || typeof file !== 'string') {
+    return { ...result, error: 'no database file was given' };
+  }
+
+  let stat;
+  try {
+    stat = fs.statSync(file);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return result;
+    return { ...result, error: describeError(error).text };
+  }
+
+  result.exists = true;
+  result.size = stat.size;
+  result.mtime = stat.mtime instanceof Date && !Number.isNaN(stat.mtime.getTime())
+    ? stat.mtime.toISOString()
+    : null;
+
+  if (!stat.isFile()) {
+    return { ...result, error: `${file} exists but is not a regular file` };
+  }
+
+  // WAL sidecars, snapshotted before the open.
+  //
+  // A READ-ONLY SQLite connection to a database whose header says "WAL" but
+  // which has no -wal/-shm beside it (a cleanly closed database, or one copied
+  // off a server) still CREATES an empty `<db>-wal` and a `<db>-shm` wal-index.
+  // That is a write to the user's folder, and this function must not leave one
+  // behind. Measured, not assumed: better-sqlite3 gives -wal 0 bytes and -shm
+  // 32768 bytes, and close() keeps them.
+  //
+  // So: record which sidecars already exist, and afterwards remove only the
+  // ones this call created. A sidecar that was already there belongs to
+  // someone else's connection and is never touched. On Windows an open sidecar
+  // cannot be unlinked at all (EBUSY), so a concurrent reader is protected
+  // twice; callers stop the service and close ezz/dashboard before inspecting
+  // ProgramData (see core/service/dataDir.js setAsideLeftoverServerData).
+  const sidecarsBefore = new Map();
+  for (const sidecar of [`${file}-wal`, `${file}-shm`]) {
+    try {
+      sidecarsBefore.set(sidecar, fs.lstatSync(sidecar));
+    } catch {
+      sidecarsBefore.set(sidecar, null);
+    }
+  }
+
+  let handle = null;
+  try {
+    const Database = require('better-sqlite3');
+    // readonly: never writes. fileMustExist: never creates the file or its
+    // -wal/-shm siblings for a path that is not there.
+    handle = new Database(file, { readonly: true, fileMustExist: true });
+    const rows = handle.prepare('SELECT key FROM gooddb ORDER BY key').all();
+    result.keys = rows.map((row) => String(row.key));
+    result.keyCount = result.keys.length;
+    result.ok = true;
+  } catch (error) {
+    result.error = describeError(error).text;
+  } finally {
+    if (handle) {
+      try { handle.close(); } catch { /* the handle is already unusable */ }
+    }
+    for (const [sidecar, before] of sidecarsBefore) {
+      if (before) continue;
+      try {
+        const created = fs.lstatSync(sidecar);
+        if (!created.isFile() || created.nlink !== 1) continue;
+        // The wal-index is rebuildable and the -wal this call made is empty.
+        if (sidecar.endsWith('-wal') && created.size !== 0) continue;
+        fs.unlinkSync(sidecar);
+      } catch {
+        // Not created by this call, or already gone / held open. Leave it.
+      }
+    }
+  }
+
+  return result;
+}
 
 /**
  * Closes the underlying SQLite connection.

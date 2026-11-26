@@ -83,8 +83,18 @@ const results = fs.readdirSync(resultDir)
 
 assert.equal(results.length, 10);
 assert.equal(results.some((entry) => entry.overlap), false);
+const unreleased = results.filter((entry) => entry.released !== true);
+assert.equal(
+  unreleased.length,
+  0,
+  `contenders that held the lock but could not release their own record: `
+  + `${unreleased.map((entry) => entry.contender).join(', ') || 'none'}`,
+);
 assert.equal(fs.existsSync(path.join(resultDir, 'active')), false);
 assert.equal(fs.existsSync(lockPath), false);
 assert.equal(fs.existsSync(recoveryPath), false);
+// Not just the recovery marker: no claim, candidate or released copy survives.
+const leftovers = fs.readdirSync(dataDir);
+assert.deepEqual(leftovers, [], `lock files left behind in ${dataDir}: ${leftovers.join(', ')}`);
 
 process.stdout.write('PASS  stale lock recovery remains exclusive across independent processes\n');

@@ -26,6 +26,7 @@
 
 import fs from 'fs';
 import { randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
 import path from 'path';
 
 import { run as shellRun, runFile as shellRunFile } from '../shell.js';
@@ -42,17 +43,17 @@ import {
   verifyWinsw,
 } from './winsw.js';
 import {
-  requiredGrants, applyGrants, revokeGrants, compareGrants, systemTool,
+  ACCESS, requiredGrants, applyGrants, revokeGrants, readPathAccess, systemTool,
   aclEntryAllowsReadExecute, parseIcaclsListing,
 } from './acl.js';
-import { runtimeDir, copyRuntime, verifyNativeModules } from './runtime.js';
+import { runtimeDir, runtimeNodePath, copyRuntime, verifyNativeModules } from './runtime.js';
 import {
-  protectServiceFiles,
+  protectCodeRoot,
+  removeCodeTree,
   grantOperator,
   grantServiceControl,
   ensureServiceDefaults,
   verifyServiceCodeRoot,
-  removeUnapprovedCodeRootAces,
   revokeOperator,
   revokeServiceControl,
   restoreServiceControl,
@@ -62,6 +63,8 @@ import {
   operatorAceState,
   prepareProtectedDir,
 } from './operator.js';
+import { replaceStateFile } from '../atomicState.js';
+import { probe } from '../probeCache.js';
 import {
   completeLogLines,
   readBoundedTailSync,
@@ -106,6 +109,212 @@ export function outLogPath() {
 }
 export function errLogPath() {
   return path.join(logDir(), `${SERVICE_ID}.err.log`);
+}
+
+const require = createRequire(import.meta.url);
+
+/**
+ * This package's version, for the install progress record.
+ *
+ * The package root is THREE levels up from `src/core/service/`, not two: two
+ * levels lands on `src/package.json`, which does not exist, and the version
+ * silently read as null — so a record left by another version was reused. A
+ * missing or unreadable file still returns null, never a throw.
+ */
+function packageVersion() {
+  try {
+    return String(require('../../../package.json').version);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A timeout a timer can actually hold.
+ *
+ * `setTimeout(…, Infinity)` is not "wait for ever": Node warns
+ * (`TimeoutOverflowWarning`), then fires on the next tick, and the command it
+ * was guarding is killed immediately. That is how a recovery step inherited an
+ * `Infinity` from a missing deadline (`remainingStageMs(undefined)` returns
+ * Infinity by design) and turned into a timeout on the real server. Every wait
+ * and every child-process timeout in this file goes through here, so nothing
+ * infinite can reach a timer.
+ *
+ * @param {unknown} value
+ * @param {number} fallback
+ * @returns {number}
+ */
+function finiteMs(value, fallback) {
+  const ms = Number(value);
+  return Number.isFinite(ms) && ms > 0 ? ms : fallback;
+}
+
+// ─── Install progress ────────────────────────────────────────────────────────
+//
+// Install is a long sequence of elevated steps: copy an 11,000-file runtime,
+// write ACLs on it, register a service, grant three trees. On a real Windows
+// Server it stopped at the runtime step, and the only way forward was to start
+// again from the beginning — re-copying everything and re-protecting trees that
+// had already passed.
+//
+// So each step boundary is written to `install-progress.json` in the DATA
+// directory (atomic: core/atomicState.js), and the next `ezz service install`
+// reads it back. A step recorded 'done' is skipped only when its result can be
+// checked cheaply; the step that failed and every later step run again. The
+// file is removed once an install completes, and the removal is safe: it is
+// ours, it holds no user data, and a missing file simply means "start from the
+// first step".
+//
+// A record written by a DIFFERENT version is never reused: the runtime copy it
+// calls "done" is that version's code, and keeping it under a new CLI is the
+// exact drift this release is fixing.
+
+/** The progress file's name, in the data directory. */
+export const INSTALL_PROGRESS_FILE = 'install-progress.json';
+
+/** The install steps, in order. A later step never starts before an earlier one. */
+export const INSTALL_STEPS = Object.freeze([
+  'dataDir', 'runtime', 'bin', 'register', 'grants', 'operator', 'start',
+]);
+
+/** Human wording for a step, for "install not finished: …" messages. */
+export const INSTALL_STEP_LABELS = Object.freeze({
+  dataDir: 'protecting the data directory',
+  runtime: 'copying and protecting the runtime',
+  bin: 'installing the service wrapper',
+  register: 'registering the service',
+  grants: 'granting the service account access',
+  operator: 'allowing your account to start and stop the service',
+  start: 'starting the service',
+});
+
+/** Where the record lives. */
+export function installProgressPath(dataDir) {
+  return path.join(dataDir, INSTALL_PROGRESS_FILE);
+}
+
+/**
+ * The install in progress, or null when there is none.
+ *
+ * Never throws and never writes. A half-written or unreadable file reads as
+ * "no record", which only costs a re-run of steps that are idempotent anyway.
+ *
+ * @param {string} dataDir
+ * @returns {{ version: string|null, startedAt: string|null, updatedAt: string|null,
+ *             steps: Object<string, 'done'|'failed'>, failedStep: string|null,
+ *             error: string|null }|null}
+ */
+export function readInstallProgress(dataDir) {
+  if (typeof dataDir !== 'string' || dataDir === '') return null;
+  let text;
+  try {
+    text = fs.readFileSync(installProgressPath(dataDir), 'utf8');
+  } catch {
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  if (!parsed.steps || typeof parsed.steps !== 'object' || Array.isArray(parsed.steps)) return null;
+
+  const steps = {};
+  for (const name of INSTALL_STEPS) {
+    const value = parsed.steps[name];
+    if (value === 'done' || value === 'failed') steps[name] = value;
+  }
+  return {
+    version: typeof parsed.version === 'string' ? parsed.version : null,
+    startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : null,
+    updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : null,
+    steps,
+    failedStep: typeof parsed.failedStep === 'string' ? parsed.failedStep : null,
+    error: typeof parsed.error === 'string' ? parsed.error : null,
+  };
+}
+
+/**
+ * Removes the record. Called when an install completes.
+ *
+ * Only this one file, and only by name: it is Easy DevOps's own scratch state,
+ * never user data.
+ *
+ * @param {string} dataDir
+ * @returns {boolean} Whether the file is gone afterwards
+ */
+export function clearInstallProgress(dataDir) {
+  try {
+    fs.rmSync(installProgressPath(dataDir), { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Writes the record at each step boundary.
+ *
+ * A failed write is a warning, never a failed install: the record only saves
+ * time on the next run, and losing that is not a reason to leave a server
+ * without its service.
+ */
+function createInstallTracker({ dataDir, log = () => {} }) {
+  const version = packageVersion();
+  const previous = readInstallProgress(dataDir);
+  const resuming = Boolean(previous && previous.version === version);
+  if (previous && !resuming) {
+    log(`The recorded install step belongs to version ${previous.version ?? 'unknown'}; `
+      + `this is ${version ?? 'a different version'}, so every step runs again.`);
+  }
+
+  const now = () => new Date().toISOString();
+  const state = {
+    version,
+    startedAt: resuming ? previous.startedAt ?? now() : now(),
+    updatedAt: now(),
+    steps: resuming ? { ...previous.steps } : {},
+    failedStep: resuming ? previous.failedStep ?? null : null,
+    error: resuming ? previous.error ?? null : null,
+  };
+
+  const write = () => {
+    state.updatedAt = now();
+    try {
+      replaceStateFile(installProgressPath(dataDir), `${JSON.stringify(state, null, 2)}\n`);
+    } catch (error) {
+      log(`  warning: could not record the install step (${error?.code ?? error?.message ?? error}); `
+        + 'the install continues, but a re-run cannot resume from here.');
+    }
+  };
+
+  // Not written here: the first step boundary writes it. A run that refuses in
+  // a preflight ("the service is not registered", "not elevated") changed
+  // nothing, and must not leave a record that makes `status` say an install is
+  // unfinished.
+  return {
+    resuming,
+    previous,
+    steps: state.steps,
+    failedStep: () => state.failedStep,
+    isDone: (name) => state.steps[name] === 'done',
+    done(name) {
+      state.steps[name] = 'done';
+      if (state.failedStep === name) {
+        state.failedStep = null;
+        state.error = null;
+      }
+      write();
+    },
+    failed(name, error) {
+      state.steps[name] = 'failed';
+      state.failedStep = name;
+      state.error = typeof error === 'string' ? error : error?.message ?? String(error);
+      write();
+    },
+  };
 }
 
 /**
@@ -306,6 +515,9 @@ export async function unregister({
   deletePollMs = 500,
 } = {}) {
   const sc = scExecutor({ run, runFile });
+  // Finite whatever the caller passed: these become a timer and a deadline.
+  const pollMs = finiteMs(deletePollMs, 500);
+  const removeWaitMs = finiteMs(deleteWaitMs, 30_000);
 
   const still = await isRegistered({ run, runFile });
   if (still === null) {
@@ -323,7 +535,7 @@ export async function unregister({
   const output = outputOf(deleted);
 
   const waitForRemoval = async () => {
-    const deadline = Date.now() + deleteWaitMs;
+    const deadline = Date.now() + removeWaitMs;
     let lastState = true;
     let lastError = null;
     do {
@@ -333,7 +545,7 @@ export async function unregister({
         ? `SCM did not return a usable state for ${SERVICE_ID}`
         : null;
       if (Date.now() >= deadline) break;
-      await new Promise(resolve => setTimeout(resolve, deletePollMs));
+      await new Promise(resolve => setTimeout(resolve, pollMs));
     } while (true);
     return {
       ok: false,
@@ -381,6 +593,9 @@ async function removeServiceDirectory(target, {
   stage = 'Removing obsolete service files',
   timeoutMs = UNINSTALL_STAGE_TIMEOUT_MS,
 } = {}) {
+  // This budget only feeds the stage checks (and the message a timeout
+  // produces), so an unusable one must not become "no limit" anywhere.
+  const stageBudgetMs = finiteMs(timeoutMs, UNINSTALL_STAGE_TIMEOUT_MS);
   let root;
   try {
     root = await fs.promises.lstat(target);
@@ -396,13 +611,13 @@ async function removeServiceDirectory(target, {
   const directories = [];
   const files = [];
   while (pending.length) {
-    remainingStageMs(deadline, stage, timeoutMs);
+    remainingStageMs(deadline, stage, stageBudgetMs);
     signal?.throwIfAborted();
     const directory = pending.pop();
     directories.push(directory);
     const entries = await fs.promises.readdir(directory, { withFileTypes: true });
     for (const entry of entries) {
-      remainingStageMs(deadline, stage, timeoutMs);
+      remainingStageMs(deadline, stage, stageBudgetMs);
       signal?.throwIfAborted();
       const entryPath = path.join(directory, entry.name);
       const stat = await fs.promises.lstat(entryPath);
@@ -420,12 +635,12 @@ async function removeServiceDirectory(target, {
   }
 
   for (const file of files) {
-    remainingStageMs(deadline, stage, timeoutMs);
+    remainingStageMs(deadline, stage, stageBudgetMs);
     signal?.throwIfAborted();
     await fs.promises.unlink(file);
   }
   for (const directory of directories.reverse()) {
-    remainingStageMs(deadline, stage, timeoutMs);
+    remainingStageMs(deadline, stage, stageBudgetMs);
     signal?.throwIfAborted();
     await fs.promises.rmdir(directory);
   }
@@ -458,17 +673,25 @@ async function removeObsoleteServiceFiles({
  * Installs the service.
  *
  * Order matters and is deliberate:
- *   1. the runtime copy, so there is something to run
- *   2. verify native modules load with the copied node.exe — before a service
+ *   1. the data directory, protected in place
+ *   2. the runtime copy, in a folder protected while it was still empty, then
+ *      verified once — folder ACL, the files the service executes, and one
+ *      streamed scan of the tree
+ *   3. verify native modules load with the copied node.exe — before a service
  *      is registered against a runtime that cannot start
- *   3. WinSW, verified against its pinned hash
- *   4. the XML
- *   5. ACLs, so the service account can reach what it needs
- *   6. register, then start
+ *   4. WinSW, verified against its pinned hash, then the XML
+ *   5. register, so the virtual account exists
+ *   6. ACLs, so the service account can reach what it needs
+ *   7. the installing user's own start/stop and data access, then start
  *
- * Steps 2 and 3 are refusals, not warnings. Registering a service that cannot
+ * Steps 3 and 4 are refusals, not warnings. Registering a service that cannot
  * run, or installing an unverified binary with service privileges, are both
  * worse than stopping with an explanation.
+ *
+ * Each step boundary is recorded in `install-progress.json`, and a later run
+ * resumes from the failed one. Every protection call goes through the one
+ * routine in operator.js (`protectCodeRoot`, via `prepareProtectedDir`), so
+ * install, repair and recover cannot drift apart.
  *
  * @param {Object} opts
  * @param {string} opts.dataDir
@@ -477,10 +700,12 @@ async function removeObsoleteServiceFiles({
  * @param {(line: string) => void} [opts.log]
  * @param {Function} [opts.run]
  * @param {Function} [opts.fetchImpl]
- * @param {Object} [opts.deps]  Injected for tests: canWrite, isWindows, copyRuntime, verifyNativeModules,
- *                              verifyWinsw
+ * @param {Object} [opts.deps]  Injected for tests: canWrite, isWindows, isElevated, copyRuntime,
+ *                              verifyNativeModules, verifyWinsw, prepareProtectedDir,
+ *                              verifyServiceCodeRoot, grantOperator
  * @returns {Promise<{ ok: boolean, reason?: string, granted?: string[], runtime?: Object,
- *                     registrationFailed?: boolean }>}
+ *                     registrationFailed?: boolean, failedStep?: string,
+ *                     installProgress?: Object|null }>}
  */
 export async function install({
   dataDir,
@@ -501,10 +726,44 @@ export async function install({
     return { ok: false, reason: elevationMessage(), needsElevation: true };
   }
 
-  // A service left by an earlier attempt must be stopped and unregistered
-  // before runtime/bin can be replaced. Deleting a running wrapper is refused
-  // by Windows, and leaving either executable directory for a merge would let
+  // Every step boundary below is written to `install-progress.json`, and an
+  // interrupted install resumes from the failed step. See the section above
+  // `readInstallProgress` for why, and for the version rule.
+  const tracker = createInstallTracker({ dataDir, log });
+  if (tracker.resuming) {
+    const at = tracker.failedStep();
+    log(`Resuming the install: it stopped at ${INSTALL_STEP_LABELS[at] ?? at ?? 'the last recorded step'}. `
+      + 'Steps that already passed are kept and re-checked rather than redone.');
+  }
+
+  // Records the failure and answers the caller. Every reason ends with what to
+  // do next, and the recorded step is what the next `install` resumes from.
+  // `registered` is reported whenever the service really is registered, so the
+  // caller records it and `status` does not say "not installed".
+  let registrationInPlace = false;
+  const fail = (step, reason, extra = {}) => {
+    tracker.failed(step, reason);
+    return {
+      ok: false,
+      failedStep: step,
+      installProgress: readInstallProgress(dataDir),
+      ...(registrationInPlace ? { registered: true } : {}),
+      ...extra,
+      reason,
+    };
+  };
+
+  // A service left by an earlier attempt is normally stopped and unregistered
+  // before runtime/bin are replaced: deleting a running wrapper is refused by
+  // Windows, and leaving either executable directory for a merge would let
   // content written by another account survive into the service runtime.
+  //
+  // A RESUMED install keeps the registration its own record calls done. It is
+  // this service, registered by the run that stopped later; tearing it down
+  // would renumber the virtual account and make the record pointless. If a code
+  // folder still has to be replaced, it is stopped first (Windows locks the
+  // running image) and the registration stays.
+  const keepRegistration = tracker.isDone('register');
   const existing = await isRegistered({ run, runFile });
   if (existing === null) {
     return {
@@ -515,7 +774,10 @@ export async function install({
         + 'Administrator PowerShell to inspect the service manager, then retry.',
     };
   }
-  if (existing) {
+  if (existing && keepRegistration) {
+    log(`Install progress: the ${SERVICE_ID} service is already registered; keeping the registration.`);
+    registrationInPlace = true;
+  } else if (existing) {
     log(`A ${SERVICE_ID} service is already registered; removing it before registering again…`);
     const cleared = await unregister({ run, runFile, log });
     if (!cleared.ok) {
@@ -529,54 +791,197 @@ export async function install({
     }
   }
 
-  // ── 0. The folders the service runs code from, protected while empty ──────
+  /** Before replacing a code folder while our own registration stays in place. */
+  const stopForReplacement = async () => {
+    if (!(existing && keepRegistration)) return { ok: true };
+    log('Stopping the service so its files can be replaced…');
+    const stopped = await stop({ run, runFile, stopWaitMs: 60_000 });
+    if (stopped.ok) return stopped;
+    // Already gone is fine: there is nothing holding the files.
+    return /not installed|nothing to stop/i.test(stopped.reason ?? '') ? { ok: true } : stopped;
+  };
+
+  // ── Step dataDir: the data folder, protected in place ────────────────────
   //
-  // An earlier install may have left the installing user a grant on the data
-  // directory, which a new folder would inherit. Runtime and bin are replaced
-  // outright, while the data directory is protected in place.
-  for (const dir of [dataDir, runtimeDir(dataDir), binDir()]) {
+  // Not a fresh folder: the user's database, logs and sessions live here, so it
+  // is protected in place and never reset recursively. An earlier install may
+  // have left the installing user a grant that a new folder would inherit.
+  if (tracker.isDone('dataDir')) {
+    log('Install progress: the data directory is already protected; keeping it.');
+  } else {
     const prepared = await (deps.prepareProtectedDir ?? prepareProtectedDir)({
-      dir,
+      dir: dataDir,
       sid: operator?.sid ?? null,
       serviceAccount: false,
-      fresh: dir !== dataDir,
+      fresh: false,
       runFile,
       log,
+      mode: 'install',
     });
-    if (!prepared.ok) return { ok: false, reason: `${prepared.reason}. Nothing was registered.` };
+    if (!prepared.ok) {
+      return fail('dataDir', `${prepared.reason}. Nothing was registered.\n`
+        + `${prepared.next ?? 'Fix the cause above, then run ezz service install again in an Administrator PowerShell.'}`);
+    }
+    tracker.done('dataDir');
   }
 
-  // ── 1. The pinned runtime ────────────────────────────────────────────────
-  log('Copying the runtime…');
-  const runtime = (deps.copyRuntime ?? copyRuntime)({ dataDir, appRoot, log });
-  if (!runtime.ok) return { ok: false, reason: runtime.reason };
+  // ── Step runtime: the pinned runtime, copied and verified ────────────────
+  let runtime = null;
+  let native = null;
 
-  // ── 2. Prove it can actually run ─────────────────────────────────────────
-  log('Checking that native modules load with the copied node.exe…');
-  const native = await (deps.verifyNativeModules ?? verifyNativeModules)({
-    nodeExe: runtime.nodeExe,
-    appDir: path.join(runtime.dir, 'app'),
-  });
-  if (!native.ok) {
-    return {
-      ok: false,
-      reason: `${native.reason}\n\n${native.fix ?? ''}`.trim(),
-    };
+  if (tracker.isDone('runtime')) {
+    // Cheap re-check, not a re-copy: read the folder ACL and the required files
+    // back (one streamed scan, never a /T listing parsed out of a bounded
+    // capture), then prove the copy still runs.
+    const check = await (deps.verifyServiceCodeRoot ?? verifyServiceCodeRoot)({
+      dir: runtimeDir(dataDir),
+      serviceAccount: false,
+      runFile,
+      log,
+      requireFiles: true,
+    });
+    if (check.ok) {
+      const candidate = {
+        dir: runtimeDir(dataDir),
+        nodeExe: runtimeNodePath(dataDir),
+        entry: path.join(runtimeDir(dataDir), 'app', 'src', 'cli', 'index.js'),
+      };
+      const proven = await (deps.verifyNativeModules ?? verifyNativeModules)({
+        nodeExe: candidate.nodeExe,
+        appDir: path.join(candidate.dir, 'app'),
+      });
+      if (proven.ok) {
+        runtime = candidate;
+        native = proven;
+        log('Install progress: the runtime copy is present and verified; not copying it again.');
+      } else {
+        log(`Install progress: the recorded runtime copy cannot run (${`${proven.reason ?? ''}`.split('\n')[0]}); `
+          + 'copying it again.');
+      }
+    } else {
+      log(`Install progress: the recorded runtime copy does not verify (${check.reason}); copying it again.`);
+    }
   }
-  log(`  ok — Node ${native.version}, ABI ${native.abi}`);
 
-  // ── 3. WinSW, hash-verified, stored as EasyDevOps.exe ────────────────────
+  if (!runtime) {
+    const released = await stopForReplacement();
+    if (!released.ok) {
+      return fail('runtime', `the service could not be stopped before its runtime was replaced: ${released.reason}\n`
+        + 'Stop it with ezz service stop (or restart Windows), then run ezz service install again.');
+    }
+    const prepared = await (deps.prepareProtectedDir ?? prepareProtectedDir)({
+      dir: runtimeDir(dataDir),
+      sid: operator?.sid ?? null,
+      serviceAccount: false,
+      fresh: true,
+      runFile,
+      log,
+      mode: 'install',
+    });
+    if (!prepared.ok) {
+      return fail('runtime', `${prepared.reason}. Nothing was registered.\n`
+        + `${prepared.next ?? 'Fix the cause above, then run ezz service install again.'}`);
+    }
+
+    log('Copying the runtime…');
+    runtime = (deps.copyRuntime ?? copyRuntime)({ dataDir, appRoot, log });
+    if (!runtime.ok) {
+      return fail('runtime', `${runtime.reason}\n`
+        + 'Free the file or folder above and run ezz service install again; it resumes from this step.');
+    }
+
+    log('Checking that native modules load with the copied node.exe…');
+    native = await (deps.verifyNativeModules ?? verifyNativeModules)({
+      nodeExe: runtime.nodeExe,
+      appDir: path.join(runtime.dir, 'app'),
+    });
+    if (!native.ok) {
+      return fail('runtime', `${native.reason}\n\n${native.fix ?? ''}\n`
+        + 'Fix the cause above, then run ezz service install again; it resumes from this step.');
+    }
+    log(`  ok — Node ${native.version}, ABI ${native.abi}`);
+
+    // The ONE verification of the runtime, and it runs AFTER the copy: the
+    // folder was protected while empty, so every copied file must already
+    // inherit, and the files the service actually executes must be readable.
+    const verified = await (deps.verifyServiceCodeRoot ?? verifyServiceCodeRoot)({
+      dir: runtime.dir,
+      serviceAccount: false,
+      runFile,
+      log,
+      requireFiles: true,
+    });
+    if (!verified.ok) {
+      return fail('runtime', `the runtime copy could not be verified: ${verified.reason}\n`
+        + 'Run ezz service install again in an Administrator PowerShell to copy and protect it again; '
+        + 'if the same file keeps failing, run ezz service recover.');
+    }
+    tracker.done('runtime');
+  }
+
+  // ── Step bin: the wrapper, hash-verified, and its definition ────────────
+  let binPrepared = false;
+  if (tracker.isDone('bin') && fs.existsSync(winswPath()) && fs.existsSync(serviceXmlPath())) {
+    const check = await (deps.verifyServiceCodeRoot ?? verifyServiceCodeRoot)({
+      dir: binDir(),
+      serviceAccount: false,
+      runFile,
+      log,
+      requireFiles: true,
+    });
+    if (check.ok) {
+      binPrepared = true;
+      log('Install progress: the service wrapper folder is present and protected; keeping it.');
+    } else {
+      log(`Install progress: the wrapper folder does not verify (${check.reason}); installing it again.`);
+    }
+  }
+
+  if (!binPrepared) {
+    const released = await stopForReplacement();
+    if (!released.ok) {
+      return fail('bin', `the service could not be stopped before its wrapper was replaced: ${released.reason}\n`
+        + 'Stop it with ezz service stop (or restart Windows), then run ezz service install again.');
+    }
+    const prepared = await (deps.prepareProtectedDir ?? prepareProtectedDir)({
+      dir: binDir(),
+      sid: operator?.sid ?? null,
+      serviceAccount: false,
+      fresh: true,
+      runFile,
+      log,
+      mode: 'install',
+    });
+    if (!prepared.ok) {
+      return fail('bin', `${prepared.reason}. Nothing was registered.\n`
+        + `${prepared.next ?? 'Fix the cause above, then run ezz service install again.'}`);
+    }
+  }
+
+  // WinSW is verified against its pinned hash on EVERY run: skipping the
+  // download is a time saving, never a shortcut on trust.
   const winsw = await downloadWinsw({ dest: winswPath(), log, fetchImpl, verify: deps.verifyWinsw });
-  if (!winsw.ok) return { ok: false, reason: winsw.reason };
+  if (!winsw.ok) {
+    return fail('bin', `${winsw.reason}\n`
+      + 'Check the network and the file above, then run ezz service install again; it resumes from this step.');
+  }
   removeLegacyWinsw(log);
 
-  // ── 4. The service definition ────────────────────────────────────────────
+  // The service definition. No path argument to the wrapper: WinSW v2 ignores
+  // it and reads `EasyDevOps.xml` beside `EasyDevOps.exe`.
+  //
+  // `nodeVersion` is the version of the COPIED node.exe, which the native-module
+  // proof just reported. Without it the XML falls back to the loader flag
+  // (`--experimental-loader`), because the copied binary is not the process that
+  // wrote the file and cannot be asked cheaply here — and every daemon start
+  // then prints ExperimentalWarning.
   const xml = buildServiceXml({
     nodeExe: runtime.nodeExe,
     entry: runtime.entry,
     dataDir,
     logDir: logDir(),
     workingDir: path.join(runtime.dir, 'app'),
+    nodeVersion: native?.version ?? null,
   });
 
   try {
@@ -584,111 +989,234 @@ export async function install({
     fs.writeFileSync(serviceXmlPath(), xml, 'utf8');
     log(`Wrote ${serviceXmlPath()}`);
   } catch (err) {
-    return { ok: false, reason: `could not write the service definition: ${err.message}` };
+    return fail('bin', `could not write the service definition: ${err.message}\n`
+      + 'Free the file above, then run ezz service install again in an Administrator PowerShell.');
   }
 
-  // ── 5. Register, so the virtual account exists ───────────────────────────
+  if (!binPrepared) {
+    // One verification of the wrapper folder, now that the wrapper and its
+    // definition are in it.
+    const verified = await (deps.verifyServiceCodeRoot ?? verifyServiceCodeRoot)({
+      dir: binDir(),
+      serviceAccount: false,
+      runFile,
+      log,
+      requireFiles: true,
+    });
+    if (!verified.ok) {
+      return fail('bin', `the service wrapper folder could not be verified: ${verified.reason}\n`
+        + 'Run ezz service install again in an Administrator PowerShell; '
+        + 'if the same file keeps failing, run ezz service recover.');
+    }
+  }
+  tracker.done('bin');
+
+  // ── Step register, so the virtual account exists ─────────────────────────
   //
   // The ACL grants have to come AFTER this: `NT SERVICE\EasyDevOps` does not
   // exist as a security principal until a service of that name is registered,
   // and icacls refuses an unknown account.
-  //
-  // No path argument: WinSW v2 ignores it and reads `EasyDevOps.xml` beside
-  // `EasyDevOps.exe`. Passing it suggested otherwise, which is how the name
-  // mismatch went unnoticed.
-  log('Registering the service…');
-  // Elevation is confirmed in the normal case, so no prompt appears. When it
-  // could not be confirmed, say what a prompt would be before it shows up.
-  if (elevated !== true) log(UAC_NOTE);
-  const registered = await runFile(winswPath(), ['install'], { timeout: 120_000 });
-  if (!registered.success) {
-    const output = outputOf(registered);
+  let isRegisteredNow = tracker.isDone('register')
+    ? (await isRegistered({ run, runFile })) === true
+    : false;
+  if (isRegisteredNow) {
+    log('Install progress: the service is already registered; keeping the registration.');
+  } else {
+    log('Registering the service…');
+    // Elevation is confirmed in the normal case, so no prompt appears. When it
+    // could not be confirmed, say what a prompt would be before it shows up.
+    if (elevated !== true) log(UAC_NOTE);
+    const registration = await runFile(winswPath(), ['install'], { timeout: 120_000 });
+    if (!registration.success) {
+      const output = outputOf(registration);
 
-    // WinSW can fail after the Service Control Manager accepted the name, so
-    // a failed register is followed by a clean-up: nothing half-registered is
-    // left for the next attempt to trip over.
-    // SCM can report MISSING even after WinSW created and then lost part of a
-    // registration. Force the delete on this failure path so a partial name is
-    // not left to block the next install. Deleting a missing service is 1060,
-    // which unregister treats as already clean.
-    const cleanup = await unregister({ run, runFile, log, force: true });
-    const leftover = cleanup.ok
-      ? 'Nothing was left registered.'
-      : `A partial registration could not be removed (${cleanup.reason}); `
-        + `remove it with: sc.exe delete ${SERVICE_ID}`;
+      // WinSW can fail after the Service Control Manager accepted the name, so
+      // a failed register is followed by a clean-up: nothing half-registered is
+      // left for the next attempt to trip over.
+      // SCM can report MISSING even after WinSW created and then lost part of a
+      // registration. Force the delete on this failure path so a partial name is
+      // not left to block the next install. Deleting a missing service is 1060,
+      // which unregister treats as already clean.
+      const cleanup = await unregister({ run, runFile, log, force: true });
+      const leftover = cleanup.ok
+        ? 'Nothing was left registered.'
+        : `A partial registration could not be removed (${cleanup.reason}); `
+          + `remove it with: sc.exe delete ${SERVICE_ID}`;
 
-    return {
-      ok: false,
-      registrationFailed: true,
-      reason: `WinSW could not register the service:\n${output.slice(0, 600)}\n\n`
+      return fail('register', `WinSW could not register the service:\n${output.slice(0, 600)}\n\n`
         + `Hint: ${WINSW_EXE_NAME} and ${WINSW_XML_NAME} must sit side by side in ${binDir()}; `
         + `fix the cause above and run ezz service install again in an Administrator PowerShell. ${leftover}`,
-    };
+      { registrationFailed: true });
+    }
+    isRegisteredNow = true;
+    registrationInPlace = true;
+    tracker.done('register');
   }
 
-  // ── 6. ACLs, from the live Settings — never a hardcoded path ─────────────
-  log('Granting the service account access…');
+  // ── Step grants: from the live Settings — never a hardcoded path ─────────
   const grants = requiredGrants({
     dataDir,
     nginxDir: config.nginxDir ?? null,
     sslDir: config.sslDir ?? null,
   });
-  const acl = await applyGrants({ grants, runFile, log });
-
-  if (!acl.ok) {
-    // Not fatal: the service is registered and the data directory grant is the
-    // one that must work. A missing nginxDir grant degrades specific features
-    // and is reported rather than rolled back, because rolling back a working
-    // install over a directory that does not exist yet would be worse.
-    for (const failure of acl.failed) {
-      log(`  warning: ${failure.path} — ${failure.reason}`);
-    }
+  let acl = { applied: [], failed: [] };
+  let grantedPaths = [];
+  let grantsStillInPlace = false;
+  if (tracker.isDone('grants')) {
+    // One non-recursive icacls per granted directory: cheap, and it answers the
+    // question the recorded list only used to guess at.
+    const live = await liveGrantState({
+      dataDir,
+      nginxDir: config.nginxDir ?? null,
+      sslDir: config.sslDir ?? null,
+      runFile,
+    });
+    grantsStillInPlace = live.checked && live.missing.length === 0 && (live.errors ?? []).length === 0;
+    log(grantsStillInPlace
+      ? 'Install progress: the service-account grants are still in place; keeping them.'
+      : 'Install progress: a service-account grant is missing; granting them again.');
   }
 
-  // ── 6b. The installing user: start/stop, and the data directory ─────────
+  if (grantsStillInPlace) {
+    // Verified live, so the caller may record them as in place.
+    grantedPaths = grants.map((grant) => grant.path);
+  } else {
+    log('Granting the service account access…');
+    acl = await applyGrants({ grants, runFile, log });
+
+    if (!acl.ok) {
+      // Not fatal: the service is registered and the data directory grant is the
+      // one that must work. A missing nginxDir grant degrades specific features
+      // and is reported rather than rolled back, because rolling back a working
+      // install over a directory that does not exist yet would be worse.
+      for (const failure of acl.failed) {
+        log(`  warning: ${failure.path} — ${failure.reason}`);
+        log('  next: set the folder in Settings (or create it), then run ezz service repair.');
+      }
+    }
+    // What is recorded must be what is TRUE, not what was attempted: a failed
+    // grants step used to record `[]`, which made `status` report missing
+    // permissions for directories that were fine.
+    const live = await liveGrantState({
+      dataDir,
+      nginxDir: config.nginxDir ?? null,
+      sslDir: config.sslDir ?? null,
+      runFile,
+    });
+    grantedPaths = live.checked
+      ? grants.map((grant) => grant.path)
+        .filter((dir) => !live.missing.some((entry) => entry.path === dir))
+      : [];
+    tracker.done('grants');
+  }
+
+  // ── Step operator: start/stop without elevation, and the data directory ──
   //
   // Before the first start, so the service never runs from a runtime folder
   // that is not yet administrator-only. See operator.js.
-  log('Allowing your account to start and stop the service without elevation…');
-  const operatorGrant = await (deps.grantOperator ?? grantOperator)({
-    operator,
-    dataDir,
-    protectedDirs: [binDir(), runtimeDir(dataDir)],
-    run,
-    runFile,
-    log,
-  });
-  for (const note of operatorGrant.notes) log(`  note: ${note}`);
-
-  if (operatorGrant.protection?.ok === false) {
-    return { ok: false, registered: true, operator: operatorGrant.record, reason: 'The service files could not be protected. Run service repair before starting.' };
+  let operatorGrant;
+  let operatorStillInPlace = false;
+  if (tracker.isDone('operator') && operator?.sid) {
+    // icacls prints the account name when Windows can resolve it and the SID
+    // when it cannot, so both forms are asked about.
+    const operatorTrustees = [`*${operator.sid}`, operator.name].filter(Boolean);
+    const [sddl, access] = await Promise.all([
+      readServiceSddl({ run, runFile }).catch(() => null),
+      readPathAccess(dataDir, { runFile, trustees: operatorTrustees }).catch(() => null),
+    ]);
+    const control = sddl ? operatorAceState(sddl, operator.sid) : null;
+    operatorStillInPlace = Boolean(control?.granted && !control?.excessive && access?.modify === true);
+    log(operatorStillInPlace
+      ? 'Install progress: your account already has start/stop and the data directory; keeping it.'
+      : 'Install progress: your account\'s access is not in place; granting it again.');
   }
 
-  // ── 7. Start ─────────────────────────────────────────────────────────────
-  log('Starting the service…');
-  const started = await runFile(winswPath(), ['start'], { timeout: 60_000 });
-  if (!started.success) {
-    const output = `${started.stdout ?? ''}\n${started.stderr ?? ''}`.trim();
-    return {
-      ok: false,
-      reason: `the service was registered but would not start:\n${output.slice(0, 400)}\n\n`
-        + `Logs: ${errLogPath()} — more at ${TROUBLESHOOTING_URL}#logs`,
-      registered: true,
-      // Registration and the grants did succeed, and the caller records them:
-      // status must not report a registered service as "not installed".
-      granted: acl.applied.map((g) => g.path),
-      aclFailures: acl.failed,
-      operator: operatorGrant.record,
-      runtime: { nodeExe: runtime.nodeExe, entry: runtime.entry, version: native.version, abi: native.abi },
+  if (operatorStillInPlace) {
+    // Nothing to write, but the caller still records what is true.
+    operatorGrant = {
+      record: {
+        sid: operator.sid,
+        name: operator.name ?? null,
+        serviceControl: true,
+        dataDir: true,
+        grantedAt: new Date().toISOString(),
+      },
+      protection: { ok: true, protected: [], failed: [] },
+      notes: [],
     };
+  } else {
+    log('Allowing your account to start and stop the service without elevation…');
+    operatorGrant = await (deps.grantOperator ?? grantOperator)({
+      operator,
+      dataDir,
+      // The earlier passes ran with `serviceAccount: false`, because a service
+      // account cannot be named before the service is registered (`icacls`
+      // refuses an unknown account). So this step ADDS the virtual account's
+      // read & execute ACE instead of re-protecting: `add-service-read` writes
+      // one folder-only `/grant "NT SERVICE\EasyDevOps:(OI)(CI)RX"` per root,
+      // which its files inherit, and reads the folder and the required files
+      // back — the service can read its own files without a second /T scan of
+      // an 11,000-file runtime.
+      protectedDirs: [binDir(), runtimeDir(dataDir)],
+      codeRootsProtected: 'add-service-read',
+      run,
+      runFile,
+      log,
+    });
+    for (const note of operatorGrant.notes ?? []) log(`  note: ${note}`);
+
+    if (operatorGrant.protection?.ok === false) {
+      const detail = (operatorGrant.protection.failed ?? [])
+        .map((failure) => `${failure.path}: ${failure.reason}`).join('; ');
+      return fail('operator', `The service files could not be protected${detail ? ` (${detail})` : ''}. `
+        + 'The service is registered but not started.\n'
+        + 'Run ezz service recover from an Administrator PowerShell, then ezz service install again.',
+      { registered: true, operator: operatorGrant.record });
+    }
+    tracker.done('operator');
   }
+
+  // ── Step start ───────────────────────────────────────────────────────────
+  let alreadyRunning = false;
+  if (tracker.isDone('start')) {
+    const state = await queryState({ run, runFile });
+    if (state === 'RUNNING' || state === 'START_PENDING') {
+      alreadyRunning = true;
+      log('Install progress: the service is already running; not starting it again.');
+    }
+  }
+
+  if (!alreadyRunning) {
+    log('Starting the service…');
+    const started = await runFile(winswPath(), ['start'], { timeout: 60_000 });
+    if (!started.success) {
+      const output = `${started.stdout ?? ''}\n${started.stderr ?? ''}`.trim();
+      return fail('start', `the service was registered but would not start:\n${output.slice(0, 400)}\n\n`
+        + `Run ezz service install again to resume (it does not repeat the passed steps). `
+        + `Logs: ${errLogPath()} — more at ${TROUBLESHOOTING_URL}#logs`,
+      {
+        registered: true,
+        // Registration and the grants did succeed, and the caller records them:
+        // status must not report a registered service as "not installed".
+        granted: grantedPaths,
+        aclFailures: acl.failed,
+        operator: operatorGrant.record,
+        runtime: { nodeExe: runtime.nodeExe, entry: runtime.entry, version: native.version, abi: native.abi },
+      });
+    }
+    tracker.done('start');
+  }
+
+  // A completed install needs no resume record. Removing it is safe: it is
+  // Easy DevOps's own scratch file and holds no user data.
+  clearInstallProgress(dataDir);
 
   return {
     ok: true,
-    granted: acl.applied.map((g) => g.path),
+    granted: grantedPaths,
     aclFailures: acl.failed,
     operator: operatorGrant.record,
-    operatorNotes: operatorGrant.notes,
+    operatorNotes: operatorGrant.notes ?? [],
     runtime: { nodeExe: runtime.nodeExe, entry: runtime.entry, version: native.version, abi: native.abi },
   };
 }
@@ -1050,12 +1578,16 @@ export async function waitForState({
   timeoutMs = 30_000,
   intervalMs = 500,
 } = {}) {
-  const deadline = Date.now() + timeoutMs;
+  // `setTimeout(…, Infinity)` warns and then fires at once, so an unusable
+  // budget must become a real one rather than "no limit".
+  const waitMs = finiteMs(timeoutMs, 30_000);
+  const pollMs = finiteMs(intervalMs, 500);
+  const deadline = Date.now() + waitMs;
   let state = null;
   while (Date.now() < deadline) {
     state = await queryState({ run, runFile });
     if (state === wanted || (wanted === 'STOPPED' && state === 'MISSING')) return { reached: true, state };
-    await new Promise((r) => setTimeout(r, intervalMs));
+    await new Promise((r) => setTimeout(r, pollMs));
   }
   return { reached: false, state };
 }
@@ -1089,6 +1621,7 @@ export async function stop({
   stopWaitMs = 30_000,
 } = {}) {
   const sc = scExecutor({ run, runFile });
+  const waitMs = finiteMs(stopWaitMs, 30_000);
   // Windows is asked, not the files: a registration whose wrapper is gone can
   // still be stopped, and files without a registration cannot.
   if ((await isRegistered({ run, runFile })) === false) {
@@ -1119,13 +1652,13 @@ export async function stop({
     wanted: 'STOPPED',
     run,
     runFile,
-    timeoutMs: stopWaitMs,
+    timeoutMs: waitMs,
   });
   if (!settled.reached) {
     return {
       ok: false,
       reason: `the stop was accepted but the service was still ${settled.state ?? 'not reporting'} after `
-        + `${Math.round(stopWaitMs / 1000)}s. Check the wrapper log: ${wrapperLogPath()}`,
+        + `${Math.round(waitMs / 1000)}s. Check the wrapper log: ${wrapperLogPath()}`,
     };
   }
   return { ok: true };
@@ -1157,64 +1690,37 @@ function recoveryAsSystem({ dataDir, roots }) {
 }
 
 /**
- * The owner's manual recovery for one executable root: reset the files first
- * (taking ownership for Administrators when that is refused), make the folder
- * administrator-only, remove any unapproved explicit ACE, then reset the files
- * once more so they inherit the FINAL folder list, and verify every entry.
+ * Protects one executable root by calling the ONE routine install and repair
+ * use — `protectCodeRoot` in operator.js.
+ *
+ * It used to be a local sequence of its own: reset the files, take ownership,
+ * grant, remove inheritance, remove stray ACEs, reset the files AGAIN, verify.
+ * Four to five whole-tree icacls passes per root, every recovery, even on a
+ * healthy server (cause C2), and no saved ACL to put back when a step failed
+ * (cause C3), which is why recover could only say "the permissions were not
+ * changed back". Now the routine saves the tree, does at most one child reset,
+ * restores the saved ACL on any failure, and on a healthy tree does one scan
+ * and no reset at all — so `ezz service recover` is safe to run anywhere.
+ *
+ * @returns {Promise<{ ok: boolean, reason?: string, restored?: boolean, next?: string|null }>}
  */
 async function recoverCodeRoot({ dir, serviceAccount, runFile, log }) {
-  const icacls = systemTool('icacls.exe');
-  const children = path.win32.join(dir, '*');
-  const scope = ['/L', '/Q'];
-  const resetChildren = () => runFile(icacls, [children, '/reset', '/T', '/C', ...scope], { timeout: 600_000 });
-
-  log(`  ${dir}: resetting its files so they inherit from the folder`);
-  let reset = await resetChildren();
-  if (!reset.success && /access is denied/i.test(outputOf(reset))) {
-    log(`  ${dir}: access denied; taking ownership for Administrators first`);
-    const owner = await runFile(icacls, [children, '/setowner', '*S-1-5-32-544', '/T', '/C', ...scope],
-      { timeout: 600_000 });
-    if (!owner.success) {
-      return { ok: false, step: 'taking ownership of the files', detail: outputOf(owner).slice(0, 200) };
-    }
-    reset = await resetChildren();
-  }
-  if (!reset.success) {
-    return { ok: false, step: 'resetting the files', detail: outputOf(reset).slice(0, 200) };
-  }
-
-  log(`  ${dir}: granting SYSTEM, Administrators, Users and the service account`);
-  const grants = ['*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX'];
-  if (serviceAccount) grants.push(`${SERVICE_ACCOUNT}:(OI)(CI)RX`);
-  const grant = await runFile(icacls, [dir, '/grant:r', ...grants, ...scope], { timeout: 120_000 });
-  if (!grant.success) return { ok: false, step: 'granting access to the folder', detail: outputOf(grant).slice(0, 200) };
-  const inherit = await runFile(icacls, [dir, '/inheritance:r', ...scope], { timeout: 120_000 });
-  if (!inherit.success) {
-    return { ok: false, step: 'removing inheritance from the folder', detail: outputOf(inherit).slice(0, 200) };
-  }
-
-  log(`  ${dir}: removing any explicit permission that is not SYSTEM, Administrators, Users or the service`);
-  const cleaned = await removeUnapprovedCodeRootAces({ dir, runFile });
-  if (!cleaned.ok) return { ok: false, step: 'removing unapproved permissions', detail: cleaned.reason };
-
-  // The final folder list must be what the files inherit.
-  log(`  ${dir}: resetting its files onto the final folder permissions`);
-  const finalReset = await resetChildren();
-  if (!finalReset.success) {
-    return { ok: false, step: 'resetting the files onto the final folder permissions', detail: outputOf(finalReset).slice(0, 200) };
-  }
-
-  log(`  ${dir}: verifying SYSTEM, Administrators and the service account can read it`);
-  const verified = await verifyServiceCodeRoot({ dir, serviceAccount, runFile });
-  return verified.ok ? { ok: true } : { ok: false, step: 'verifying the new permissions', detail: verified.reason };
+  return protectCodeRoot(dir, { serviceAccount, runFile, log, mode: 'recover' });
 }
 
 /**
- * `ezz service recover`, Windows. Runs the owner's manual recovery with direct
- * icacls/sc argv, read back at every step. It never resets or recurses on the
- * data root: only an additive grant there, so no user data is touched.
+ * `ezz service recover`, Windows. The escalation path: the same protection
+ * routine install and repair use, applied to every executable root that exists,
+ * with direct icacls/sc argv and a read-back at every step. It never resets or
+ * recurses on the data root: only an additive grant there, so no user data is
+ * ever touched.
  *
- * @returns {Promise<{ ok: boolean, needsElevation?: boolean, reason?: string }>}
+ * Safe on a healthy server: on a healthy tree the routine does one scan and no
+ * reset, so `recover` is a cheap check there rather than four whole-tree
+ * rewrites, which is what it used to be.
+ *
+ * @returns {Promise<{ ok: boolean, needsElevation?: boolean, reason?: string,
+ *                     restored?: boolean, next?: string|null }>}
  */
 export async function recoverCodePermissions({
   run = shellRun,
@@ -1253,24 +1759,45 @@ export async function recoverCodePermissions({
     return {
       ok: false,
       reason: `${dataDir}: could not restore SYSTEM and Administrators access: `
-        + `${outputOf(rootGrant).slice(0, 300)}\n\n${help()}`,
+        + `${outputOf(rootGrant).slice(0, 300)}\n\n` + help(),
     };
   }
 
-  // 2 and 3. Each executable root, then the read-back of every entry.
+  // 2. Each executable root, through the one protection routine. A failure has
+  //    already put the previous ACL back, so the message says so (like install)
+  //    and names the next step, instead of the old "the permissions were not
+  //    changed back automatically" — which was true then and is not now.
   for (const dir of roots) {
-    const recovered = await recoverCodeRoot({ dir, serviceAccount: registered !== false, runFile, log });
+    const recovered = await recoverCodeRoot({
+      dir,
+      serviceAccount: registered !== false,
+      runFile,
+      log,
+    });
     if (!recovered.ok) {
+      // protectCodeRoot's reason already says which step failed, whether the
+      // previous permissions came back, and what to run next; the SYSTEM
+      // commands below are recover's own last resort.
+      const reason = String(recovered.reason ?? `${dir}: the permissions could not be established`);
+      const lines = [reason];
+      if (recovered.next && !reason.includes(recovered.next)) lines.push(recovered.next);
+      lines.push('', help());
       return {
         ok: false,
-        reason: `${dir}: ${recovered.step} failed: ${recovered.detail}. `
-          + 'The permissions were not changed back automatically.\n\n' + help(),
+        restored: recovered.restored === true,
+        next: recovered.next ?? null,
+        reason: lines.join('\n'),
       };
     }
-    log(`  ${dir}: every file keeps SYSTEM and Administrators full control`);
+    const verified = registered !== false
+      ? 'SYSTEM, Administrators and the service account'
+      : 'SYSTEM and Administrators';
+    log(`  ${dir}: ${verified} verified`
+      + `${recovered.resetChildren ? ' (the files were reset onto the folder permissions)' : ''}`
+      + `${recovered.count ? `, ${recovered.count} entries scanned` : ''}`);
   }
 
-  // 4. The service security descriptor: the Windows defaults plus the
+  // 3. The service security descriptor: the Windows defaults plus the
   //    installing account's additive start/stop grant, verified.
   log(`  ${SERVICE_ID}: checking the service security descriptor`);
   const who = operator === undefined ? await resolveOperator({ run }) : operator;
@@ -1280,6 +1807,7 @@ export async function recoverCodePermissions({
   if (!descriptor.ok) {
     return {
       ok: false,
+      next: 'Run ezz service recover again from an Administrator PowerShell once the service is registered.',
       reason: `the ${SERVICE_ID} service descriptor could not be restored: ${descriptor.reason}\n\n${help()}`,
     };
   }
@@ -1287,7 +1815,7 @@ export async function recoverCodePermissions({
     ? `  ${SERVICE_ID}: SYSTEM and Administrators full control verified; ${who.name ?? who.sid} may start and stop it`
     : `  ${SERVICE_ID}: SYSTEM and Administrators full control verified`);
 
-  return { ok: true };
+  return { ok: true, restored: false, next: null };
 }
 
 /** `sc.exe start`. */
@@ -1434,18 +1962,6 @@ export function countRecentRestarts({
 }
 
 /**
- * The roots that hold service code; their grants are required, not stale.
- */
-function codeRootDirs(dataDir) {
-  return [path.join(dataDir, 'bin'), runtimeDir(dataDir), path.join(dataDir, 'runtime.prev')];
-}
-
-function isInsideCodeRoot(dataDir, dir) {
-  return codeRootDirs(dataDir).some((root) =>
-    path.relative(path.resolve(root), path.resolve(dir)) === '');
-}
-
-/**
  * The service account must keep read & execute on bin and runtime: it runs its
  * own binary from there. This reads the folders back when a real icacls channel
  * is available (a string run stub has none) and warns when that is missing.
@@ -1477,9 +1993,88 @@ async function codeRootAccessWarnings({ dataDir, run, runFile, fsImpl }) {
 }
 
 /**
+ * What the service account can ACTUALLY do with each directory it needs, read
+ * from the live permissions.
+ *
+ * This replaces the old comparison of the install record against the live
+ * Settings (cause C6). On the real server the record said `granted: []` because
+ * the install had failed, so `status` reported "the service has no access to
+ * C:\ProgramData\easy-devops, C:\nginx, C:\easy-devops\ssl" while every one of
+ * those ACLs was correct — and told the user to run the repair that hit the same
+ * bug. The filesystem is the only authority here.
+ *
+ * One `icacls <path>` per granted directory (no `/T`, no recursion), all in
+ * parallel: three spawns, not three tree walks.
+ *
+ * @param {Object} opts
+ * @param {string} opts.dataDir
+ * @param {string} [opts.nginxDir] From Settings — never a default
+ * @param {string} [opts.sslDir]   From Settings — never a default
+ * @param {Function} [opts.runFile]
+ * @param {string} [opts.serviceSid] Already-known SID of the service account,
+ *                                   for a machine that prints SIDs, not names
+ * @returns {Promise<{ checked: boolean, missing: Array<{ path: string, need: 'modify'|'read' }>,
+ *                     errors: Array<{ path: string, error: string }> }>}
+ */
+export async function liveGrantState({
+  dataDir,
+  nginxDir = null,
+  sslDir = null,
+  runFile = shellRunFile,
+  serviceSid = null,
+} = {}) {
+  const required = requiredGrants({ dataDir, nginxDir, sslDir });
+  // acl.js compares trustees by name, upper-cased and without its leading `*`.
+  // The SID form is passed too when it is already known: a localized Windows
+  // can print `*S-1-5-80-…` where it cannot resolve the account name.
+  const trustees = [SERVICE_ACCOUNT];
+  if (typeof serviceSid === 'string' && /^S-1-5-80-\d+-\d+-\d+-\d+-\d+$/.test(serviceSid)) {
+    trustees.push(`*${serviceSid}`);
+  }
+
+  const readings = await Promise.all(required.map(async (grant) => {
+    try {
+      return { grant, access: await readPathAccess(grant.path, { runFile, trustees }) };
+    } catch (error) {
+      return { grant, error };
+    }
+  }));
+
+  const missing = [];
+  const errors = [];
+  for (const { grant, access, error } of readings) {
+    if (error) {
+      errors.push({ path: grant.path, error: error?.message ?? String(error) });
+      continue;
+    }
+    if (!access || access.ok === false) {
+      errors.push({ path: grant.path, error: access?.error ?? 'the permissions could not be read' });
+      continue;
+    }
+    // A directory that does not exist needs no grant: Settings may name one that
+    // has not been created yet, and that is not an access failure.
+    if (access.exists === false) continue;
+    const need = grant.access === ACCESS.MODIFY ? 'modify' : 'read';
+    const granted = need === 'modify'
+      ? access.modify === true
+      : (access.readable === true || access.full === true);
+    if (!granted) missing.push({ path: grant.path, need });
+  }
+
+  return { checked: true, missing, errors };
+}
+
+/**
  * The service's state.
  *
+ * Two halves, kept apart as before: this reads the service manager (a few
+ * spawns) and, when it can, the live permissions of the directories the service
+ * needs (one non-recursive icacls each). The dashboard passes `cache: true` so
+ * those come from core/probeCache.js and a refresh runs behind the answer; the
+ * CLI leaves it false so a freshly typed `ezz service status` measures afresh.
+ *
  * @param {Object} [opts]
+ * @param {boolean} [opts.cache]  Serve the live ACL read from the probe cache
  * @returns {Promise<Object>}
  */
 export async function status({
@@ -1487,8 +2082,15 @@ export async function status({
   config = {},
   run = shellRun,
   runFile = shellRunFile,
+  // Kept for callers that still pass the install record. The record is NOT used
+  // for any decision: a failed install recorded `granted: []` and produced the
+  // three false warnings on the real server.
   granted = [],
   operatorSid = null,
+  // The service account's SID, when the caller already knows it: a localized
+  // Windows can print SIDs where it cannot resolve `NT SERVICE\EasyDevOps`.
+  serviceSid = null,
+  cache = false,
   deps = {},
 } = {}) {
   const fsImpl = deps.fs ?? fs;
@@ -1496,6 +2098,7 @@ export async function status({
   const xmlFile = inspectPath(fsImpl, serviceXmlPath());
   const filesPresent = wrapperFile.exists && xmlFile.exists;
   const fileInspectionError = wrapperFile.error ?? xmlFile.error;
+  const installProgress = readInstallProgress(dataDir);
 
   // Windows is the authority on whether the service exists — not the files.
   // 1.4.0 said "Installed: yes" from the files alone while `sc query` answered
@@ -1520,6 +2123,9 @@ export async function status({
       crashRestarts: 0,
       crashLooping: false,
       fileInspectionError,
+      // An install that stopped part way through: the caller can say "install
+      // not finished: run ezz service install to resume" instead of guessing.
+      installProgress,
       warnings: fileInspectionError
         ? [`Could not inspect the service files in ${binDir()}: ${fileInspectionError}`]
         : [],
@@ -1548,6 +2154,7 @@ export async function status({
       crashRestarts: 0,
       crashLooping: false,
       fileInspectionError,
+      installProgress,
       warnings: [
         scWarning,
         ...(fileInspectionError
@@ -1561,8 +2168,25 @@ export async function status({
     };
   }
 
+  // One icacls per granted directory, and never a real one from a stubbed
+  // channel: a string `run` stub with the production `runFile` has no icacls
+  // channel at all, so nothing is measured and nothing is guessed.
+  const liveChannel = run === shellRun || runFile !== shellRunFile;
+  const readLive = async () => {
+    const read = () => liveGrantState({
+      dataDir,
+      nginxDir: config.nginxDir ?? null,
+      sslDir: config.sslDir ?? null,
+      runFile,
+      serviceSid,
+    });
+    if (!cache) return read();
+    const probed = await probe('service:acl-live', read, { ttlMs: 30_000 });
+    return probed.value ?? null;
+  };
+
   const sc = scExecutor({ run, runFile });
-  const [config2, sddl] = await Promise.all([
+  const [config2, sddl, codeWarnings, live] = await Promise.all([
     sc(['qc', SERVICE_ID], { timeout: 20_000 }).catch((error) => ({
       success: false,
       stdout: '',
@@ -1572,35 +2196,65 @@ export async function status({
     operatorSid
       ? readServiceSddl({ run, runFile }).catch(() => null)
       : Promise.resolve(null),
+    codeRootAccessWarnings({ dataDir, run, runFile, fsImpl }),
+    liveChannel ? readLive() : Promise.resolve(null),
   ]);
   const startType = `${config2.stdout ?? ''}`.match(/START_TYPE\s*:\s*\d+\s+([\w_]+)/i)?.[1] ?? null;
 
   const loop = countRecentRestarts();
-  const codeWarnings = await codeRootAccessWarnings({ dataDir, run, runFile, fsImpl });
 
-  const aclCheck = compareGrants({
-    // bin/runtime/runtime.prev are required to hold the service account's RX
-    // grant; they are not stale data grants, so they never produce the "no
-    // longer needs" warning. Missing access is warned about separately.
-    granted: granted.filter((dir) => !isInsideCodeRoot(dataDir, dir)),
-    required: requiredGrants({
-      dataDir,
-      nginxDir: config.nginxDir ?? null,
-      sslDir: config.sslDir ?? null,
-    }),
-  });
+  // The live answer, shaped like the old recorded-grant comparison so existing
+  // readers (`service.acl.ok`, `.missing`, `.reason`) keep working. `ok` is null
+  // while nothing has been measured — never a guess in either direction.
+  const acl = liveChannel
+    ? (live === null
+      ? {
+        checked: false,
+        pending: true,
+        ok: null,
+        missing: [],
+        stale: [],
+        errors: [],
+        reason: null,
+      }
+      : (() => {
+        const missing = live.missing ?? [];
+        const errors = live.errors ?? [];
+        const parts = [];
+        if (missing.length) {
+          parts.push(`the service account has no ${missing.map((entry) => entry.need).join('/')} `
+            + `access to ${missing.map((entry) => entry.path).join(', ')} (read from the live permissions)`);
+        }
+        if (errors.length) {
+          parts.push(errors.map((entry) => `could not read the permissions of ${entry.path}: ${entry.error}`).join('; '));
+        }
+        return {
+          checked: true,
+          pending: false,
+          ok: missing.length === 0 && errors.length === 0,
+          missing,
+          stale: [],
+          errors,
+          reason: parts.length
+            ? `${parts.join('; ')}. Run \`ezz service repair\` in an Administrator PowerShell to fix it.`
+            : null,
+        };
+      })())
+    : null;
 
   return {
     installed: true,
     registered,
     filesPresent,
     fileInspectionError,
+    installProgress,
     warnings: [
       ...(scWarning ? [scWarning] : []),
       ...(fileInspectionError
         ? [`Could not inspect the service files in ${binDir()}: ${fileInspectionError}`]
         : []),
       ...codeWarnings,
+      ...(acl?.reason ? [acl.reason] : []),
     ],
     // Registered, but the wrapper or its definition is missing: the service
     // cannot start. A reinstall puts them back.
@@ -1618,7 +2272,9 @@ export async function status({
     crashRestarts: loop.crashRestarts,
     crashLooping: loop.crashLooping,
     crashLoopSince: loop.since,
-    acl: aclCheck,
+    // The live permissions of the data directory, nginx directory and SSL
+    // directory. null: no real icacls channel to measure with.
+    acl,
     // Whether the recorded installing user may still start and stop it — read
     // from the service's DACL, not from the record. null: nobody recorded, or
     // the DACL could not be read.
@@ -1664,6 +2320,11 @@ export function readLogs({
  * The two things that drift: the ACL grants, when a path changes in Settings,
  * and the runtime copy, when the application is upgraded under it. Both are
  * re-done; the service is then restarted so it picks them up.
+ *
+ * The order is the one that worked on the real server and is kept: stop, keep
+ * the current copy aside as `runtime.prev`, protect the new folder while it is
+ * empty, copy, prove the copy runs, verify it ONCE, then grants, then start.
+ * Any failure after the stop puts the previous copy back and starts it again.
  */
 export async function repair({
   dataDir,
@@ -1696,7 +2357,8 @@ export async function repair({
     if (wrapperFile.error) {
       return {
         ok: false,
-        reason: `Could not determine whether the service is installed. The service manager query failed, and ${winswPath()} could not be inspected: ${wrapperFile.error}. Nothing was stopped or changed.`,
+        reason: `Could not determine whether the service is installed. The service manager query failed, and ${winswPath()} could not be inspected: ${wrapperFile.error}. Nothing was stopped or changed.\n`
+          + `Run sc.exe query ${SERVICE_ID} in an Administrator PowerShell, then run ezz service repair again.`,
       };
     }
     if (!wrapperFile.exists) {
@@ -1736,8 +2398,9 @@ export async function repair({
     const back = await startAgain();
     return {
       ok: false,
-      reason: `Could not read the service definition: ${error.message}`
-        + (back.ok ? ' The service was started again.' : ` The service did not start again: ${back.reason}`),
+      reason: `Could not read the service definition: ${error.message}. `
+        + (back.ok ? 'The service was started again.' : `The service did not start again: ${back.reason}`)
+        + '\nRun ezz service install to write a fresh service definition.',
       restarted: back.ok,
     };
   }
@@ -1753,7 +2416,8 @@ export async function repair({
     return {
       ok: false,
       reason: `could not verify the installed service wrapper: ${error.message}. `
-        + (back.ok ? 'The service was started again.' : `The service did not start again: ${back.reason}`),
+        + (back.ok ? 'The service was started again.' : `The service did not start again: ${back.reason}`)
+        + '\nRun ezz service install in an Administrator PowerShell to replace the wrapper.',
       restarted: back.ok,
     };
   }
@@ -1762,7 +2426,8 @@ export async function repair({
     return {
       ok: false,
       reason: `${wrapper.reason}. The service wrapper was not replaced. `
-        + (back.ok ? 'The service was started again.' : `The service did not start again: ${back.reason}`),
+        + (back.ok ? 'The service was started again.' : `The service did not start again: ${back.reason}`)
+        + '\nDelete the file named above and run ezz service install in an Administrator PowerShell.',
       restarted: back.ok,
     };
   }
@@ -1774,7 +2439,8 @@ export async function repair({
       return {
         ok: false,
         reason: `${again.reason}. `
-          + (back.ok ? 'The service was started again.' : `The service did not start again: ${back.reason}`),
+          + (back.ok ? 'The service was started again.' : `The service did not start again: ${back.reason}`)
+          + '\nCheck the network, then run ezz service repair again.',
         restarted: back.ok,
       };
     }
@@ -1787,7 +2453,14 @@ export async function repair({
     let restored = false;
     try {
       if (fs.existsSync(prev)) {
-        fs.rmSync(dir, { recursive: true, force: true });
+        // Removing a code tree needs the ACL-aware path, never a plain
+        // `rmSync`: a runtime left by 1.4.4-1.4.6 can have empty DACLs, and
+        // Windows refuses to read (or delete) those files until ownership is
+        // taken. Unreadable code is replaced, never a reason to give up.
+        if (fs.existsSync(dir)) {
+          const removed = await removeCodeTree({ dir, runFile, log });
+          if (removed?.ok === false) throw new Error(removed.reason ?? `could not remove ${dir}`);
+        }
         fs.renameSync(prev, dir);
         fs.writeFileSync(serviceXmlPath(), previousXml);
         restored = true;
@@ -1801,6 +2474,7 @@ export async function repair({
       reason: `${why}. `
         + (restored ? 'The previous runtime copy was restored' : 'The previous runtime copy could not be restored')
         + (back.ok ? ' and the service is running on it again.' : `, and the service did not start again: ${back.reason}.`)
+        + '\nFix the cause above, then run ezz service repair again.'
         + `\nLogs: ${errLogPath()} — more at ${TROUBLESHOOTING_URL}#repair-while-running`,
       restored,
       restarted: back.ok,
@@ -1808,21 +2482,27 @@ export async function repair({
   };
 
   try {
-    fs.rmSync(prev, { recursive: true, force: true });
+    if (fs.existsSync(prev)) {
+      // The previous attempt's copy, possibly with empty DACLs. Only this code
+      // folder, never anything else: removeCodeTree refuses any other path.
+      const discarded = await removeCodeTree({ dir: prev, runFile, log });
+      if (discarded?.ok === false) throw new Error(discarded.reason ?? `could not remove ${prev}`);
+    }
     if (fs.existsSync(dir)) fs.renameSync(dir, prev);
   } catch (err) {
     const back = await startAgain();
     return {
       ok: false,
       reason: `could not set the current runtime copy aside (${err.code ?? err.message}), so nothing was changed`
-        + (back.ok ? '; the service is running again.' : `; the service did not start again: ${back.reason}`),
+        + (back.ok ? '; the service is running again.' : `; the service did not start again: ${back.reason}`)
+        + '\nClose any program holding the runtime folder open, then run ezz service repair again.',
     };
   }
 
   // The new folder is protected while it is still empty, before anything the
   // service will run is copied into it.
   const prepared = await (deps.prepareProtectedDir ?? prepareProtectedDir)({
-    dir, sid: operator?.sid ?? null, runFile, log,
+    dir, sid: operator?.sid ?? null, runFile, log, mode: 'repair',
   });
   if (!prepared.ok) return restorePrevious(`the new runtime folder could not be protected: ${prepared.reason}`);
 
@@ -1838,6 +2518,24 @@ export async function repair({
     return restorePrevious(`the new runtime cannot load its native modules: ${`${native.reason} ${native.fix ?? ''}`.trim()}`);
   }
 
+  // The ONE verification of the new copy, and it runs after the copy: the
+  // folder was protected while it was still empty, so every copied file must
+  // already inherit, and the files the service executes must be readable by it.
+  // It reads the folder ACL, each required file on its own, then one streamed
+  // scan — never a `/T` listing parsed out of a bounded capture, which is what
+  // failed on the real server: the whole runtime was scanned, the capture kept
+  // only its newest 64 KiB, and `runtime\node.exe` never appeared in it.
+  const verifiedCopy = await (deps.verifyServiceCodeRoot ?? verifyServiceCodeRoot)({
+    dir: runtime.dir,
+    serviceAccount: true,
+    runFile,
+    log,
+    requireFiles: true,
+  });
+  if (!verifiedCopy.ok) {
+    return restorePrevious(`the new runtime copy could not be verified: ${verifiedCopy.reason}`);
+  }
+
   log('Re-applying the service account grants…');
   const grants = requiredGrants({
     dataDir,
@@ -1845,45 +2543,73 @@ export async function repair({
     sslDir: config.sslDir ?? null,
   });
   const acl = await applyGrants({ grants, runFile, log });
+  if (!acl.ok) {
+    for (const failure of acl.failed) {
+      log(`  warning: ${failure.path} — ${failure.reason}`);
+    }
+  }
 
-  // The fresh runtime folder inherits again, so it is protected again before
-  // the service starts on it; then the installing user's rights are renewed.
+  // The runtime folder was protected while empty and verified after the copy;
+  // this pass renews the installing user's rights and the service's own
+  // start/stop, which cannot be granted before the account exists.
   log('Allowing your account to start and stop the service without elevation…');
   const operatorGrant = await (deps.grantOperator ?? grantOperator)({
     operator,
     dataDir,
+    // The wrapper was verified above and the new runtime folder was protected
+    // while empty and verified after the copy, so neither needs a second pass.
     protectedDirs: [binDir(), dir],
+    codeRootsProtected: true,
     run,
     runFile,
     log,
   });
-  for (const note of operatorGrant.notes) log(`  note: ${note}`);
+  for (const note of operatorGrant.notes ?? []) log(`  note: ${note}`);
 
-  if (operatorGrant.protection?.ok === false) return restorePrevious('the new runtime permissions could not be secured');
-  try { refreshServiceDefinition({ dataDir, runtime }); } catch (error) {
+  if (operatorGrant.protection?.ok === false) {
+    const detail = (operatorGrant.protection.failed ?? [])
+      .map((failure) => `${failure.path}: ${failure.reason}`).join('; ');
+    return restorePrevious(`the new runtime permissions could not be secured${detail ? ` (${detail})` : ''}`);
+  }
+  try { refreshServiceDefinition({ dataDir, runtime, nodeVersion: native.version ?? null }); } catch (error) {
     return restorePrevious(`could not refresh the service definition: ${error.message}`);
   }
   log('Starting the service…');
   const started = await startAgain();
   if (!started.ok) return restorePrevious(`the service did not come up on the new copy: ${started.reason}`);
 
-  try { fs.rmSync(prev, { recursive: true, force: true }); } catch { /* `ezz cleanup` offers it later */ }
+  // Best effort: the old copy is dead weight, not a failure. `ezz cleanup`
+  // offers it later if the ACL-aware removal cannot take it.
+  try {
+    if (fs.existsSync(prev)) await removeCodeTree({ dir: prev, runFile, log });
+  } catch { /* `ezz cleanup` offers it later */ }
 
   return {
     ok: true,
     granted: acl.applied.map((g) => g.path),
     aclFailures: acl.failed,
     operator: operatorGrant.record,
-    operatorNotes: operatorGrant.notes,
+    operatorNotes: operatorGrant.notes ?? [],
     runtime: { version: native.version, abi: native.abi },
   };
 }
 
-export function refreshServiceDefinition({ dataDir, runtime }) {
+/**
+ * Writes the service definition from a runtime copy.
+ *
+ * `nodeVersion` is optional so existing callers keep working, and is taken from
+ * the caller, the runtime record, or `runtime.version`. It is what decides
+ * between `--import` and the `--experimental-loader` flag in the XML: without
+ * it the copied node.exe cannot be asked here (this is synchronous, and every
+ * subprocess goes through core/shell.js), so the older flag would be written
+ * and every daemon start would print ExperimentalWarning.
+ */
+export function refreshServiceDefinition({ dataDir, runtime, nodeVersion = null }) {
   const target = serviceXmlPath();
   const temp = path.join(path.dirname(target), `.service-${randomUUID()}.xml`);
   const xml = buildServiceXml({ nodeExe: runtime.nodeExe, entry: runtime.entry,
-    dataDir, logDir: logDir(), workingDir: path.join(runtime.dir, 'app') });
+    dataDir, logDir: logDir(), workingDir: path.join(runtime.dir, 'app'),
+    nodeVersion: nodeVersion ?? runtime?.version ?? runtime?.nodeVersion ?? null });
   fs.writeFileSync(temp, xml, { flag: 'wx', mode: 0o600 });
   try { fs.renameSync(temp, target); } finally { fs.rmSync(temp, { force: true }); }
 }

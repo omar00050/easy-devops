@@ -91,6 +91,32 @@ export const POST_UPDATE_RESULT_PREFIX = '__EASY_DEVOPS_POST_UPDATE__';
  */
 export const POST_UPDATE_SINCE = '1.4.7';
 
+/**
+ * The one line a Windows Server edition with no registered service gets.
+ *
+ * There is nothing to stop, prepare or start, and the Personal Startup
+ * launcher is never an answer on a Server edition (1.4.7 finding C4). The
+ * package update itself still proceeds.
+ */
+export const NOT_INSTALLED_SERVER_LINE = 'The Easy DevOps service is not installed on this Windows Server; '
+  + 'run `ezz service install` from an Administrator PowerShell.';
+
+/**
+ * Per-stream cap for the post-update child's output.
+ *
+ * The marker is the LAST line the child prints, and a runtime copy can log
+ * thousands of progress lines before it. The old 64 KiB tail is what made a
+ * marker printed early in a long output unfindable; 8 MiB is the same generous
+ * default core/shell.js uses for `output: 'full'`.
+ */
+export const POST_UPDATE_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+
+/** A positive, finite millisecond timeout, or the default when it is not. */
+function finiteMs(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
 /** The command that shows this machine's service state, by mechanism. */
 export function serviceCheckCommand(mechanism) {
   if (mechanism === 'systemd') return 'sudo systemctl status easy-devops';
@@ -102,10 +128,10 @@ export function serviceCheckCommand(mechanism) {
  * The lines a failed update ends with: the step, the error, the state of the
  * service, and the exact command to run next.
  */
-function failureLines({ step, reason, mechanism, untouched, attemptedStop, restored, reinstallFailed }) {
+function failureLines({ step, reason, mechanism, untouched, attemptedStop, restored, reinstallFailed, check = null }) {
   const lines = [`Failed at: ${step}`];
   for (const line of String(reason ?? '').split('\n')) lines.push(line);
-  const check = serviceCheckCommand(mechanism);
+  const checkCommand = check ?? serviceCheckCommand(mechanism);
   if (untouched) {
     lines.push('Nothing was changed.');
     if (attemptedStop) {
@@ -121,20 +147,20 @@ function failureLines({ step, reason, mechanism, untouched, attemptedStop, resto
     } else {
       lines.push('The service was left as it was.');
     }
-    lines.push(`To check it: ${check}`);
+    lines.push(`To check it: ${checkCommand}`);
   } else if (reinstallFailed === true) {
     lines.push(restored
       ? 'The service is running again, but the previous package could not be reinstalled, so the files on disk'
         + ' and the running service are not the same version.'
       : 'The previous package could not be reinstalled and the service is NOT confirmed running.');
-    lines.push(`To check it: ${check}`);
+    lines.push(`To check it: ${checkCommand}`);
     lines.push('To repair it: ezz service recover');
   } else if (restored === true) {
     lines.push('The service is running the previous version again.');
-    lines.push(`To check it: ${check}`);
+    lines.push(`To check it: ${checkCommand}`);
   } else {
     lines.push('The background service is NOT confirmed running.');
-    lines.push(`To check it: ${check}`);
+    lines.push(`To check it: ${checkCommand}`);
     lines.push('To repair it: ezz service recover');
   }
   return lines;
@@ -259,10 +285,17 @@ export async function performUpdate({
   const source = (deps.detectInstallSource ?? detectInstallSource)();
   const from = deps.currentVersion ? deps.currentVersion() : currentVersion();
   const exec = deps.runFile ?? runFile;
+  // Every wait here is bounded. `Infinity`, a zero or a value derived from an
+  // undefined deadline becomes the default rather than a setTimeout overflow
+  // (1.4.7 finding C7).
+  const verifyMs = finiteMs(deps.verifyMs, VERIFY_MS);
 
   let installed = null;
   let mechanism = null;
   let recorded = {};
+  // A Windows Server edition with no registered service: the package update
+  // proceeds, the service steps are skipped, and this is never a failure.
+  let serverNotRegistered = false;
 
   /**
    * Every failure leaves through here, so none of them can be silent: the
@@ -274,6 +307,11 @@ export async function performUpdate({
     const alive = fields.restored === true;
     const confirmed = alive && fields.rollbackVersionConfirmed !== false;
     let next = fields.next;
+    if (!next && serverNotRegistered) {
+      // No service exists here, so neither "start" nor "recover" applies; the
+      // package itself is what still needs attention.
+      next = 'ezz service status';
+    }
     if (!next) {
       if (untouched) {
         next = fields.attemptedStop && fields.restored !== true && fields.rollbackVersionConfirmed !== true
@@ -301,6 +339,7 @@ export async function performUpdate({
         attemptedStop: fields.attemptedStop === true,
         restored: confirmed,
         reinstallFailed: fields.reinstallFailed === true,
+        check: serverNotRegistered ? 'ezz service status' : null,
       }),
     };
   };
@@ -344,12 +383,35 @@ export async function performUpdate({
   mechanism = installed?.mechanism ?? (serverMode ? 'winsw' : null);
   try { recorded = service.recordedState?.() ?? {}; } catch { /* optional metadata */ }
 
+  // 2a. Windows Server edition with no service registered.
+  //
+  // 1.4.7's repair fell back to the Personal Startup launcher here; an update
+  // must never do that. The edition is what makes the difference, and it is
+  // read once from the service module (or an injected probe in tests) rather
+  // than guessed from a status shape that may belong to the previous release.
+  if (isWindows) {
+    let state = null;
+    try {
+      if (deps.serviceInstallState) {
+        state = await deps.serviceInstallState({});
+      } else if (!serviceInstalled || serverMode) {
+        const probe = typeof service.serviceInstallState === 'function'
+          ? () => service.serviceInstallState()
+          : null;
+        state = probe ? await probe() : null;
+      }
+    } catch { /* an unreadable state does not change the package update */ }
+    serverNotRegistered = state?.registered === false && state?.edition === 'server';
+  }
+  // What is left for the service steps. A stale status that still says
+  // "installed" does not override the edition probe.
+  let serviceSteps = serviceInstalled && !serverNotRegistered;
 
   // 2b. Windows Server mode: the service runs from a copy under ProgramData
   // that only administrators may replace, and that is deliberate (replacing
   // node.exe would run code as the service account). Asked of Windows before
   // anything is stopped, so a normal terminal changes nothing at all.
-  if (isWindows && serverMode) {
+  if (isWindows && serverMode && serviceSteps) {
     const elevated = await (deps.isElevated ?? isElevated)({});
     if (elevated === false) {
       return fail({
@@ -366,7 +428,7 @@ export async function performUpdate({
 
   // 3. Stop the service. Its files are the ones npm is about to replace, and
   // on Windows an open handle makes the install fail rather than wait.
-  if (serviceInstalled) {
+  if (serviceSteps) {
     log('Stopping the background service...');
     let stopped;
     try {
@@ -374,13 +436,19 @@ export async function performUpdate({
     } catch (error) {
       stopped = { ok: false, reason: error.message };
     }
-    if (!stopped.ok && !stopped.alreadyStopped) {
+    if (!stopped.ok && stopped.code === 'not_installed') {
+      // The status was stale: on this Windows Server there is no service to
+      // stop. That is not an error, and it is never a rollback.
+      serviceSteps = false;
+      serverNotRegistered = true;
+      log(NOT_INSTALLED_SERVER_LINE);
+    } else if (!stopped.ok && !stopped.alreadyStopped) {
       // A stop that fails may still have stopped it. Put it back either way,
       // so a failed update never leaves the service down.
       const back = await restoreStoppedService({
         service,
         dataDir,
-        verifyMs: deps.verifyMs,
+        verifyMs,
         inspectLockFn: deps.inspectLock,
         from,
         log,
@@ -396,6 +464,8 @@ export async function performUpdate({
         rollbackVersionConfirmed: back.versionConfirmed,
       });
     }
+  } else if (serverNotRegistered) {
+    log(NOT_INSTALLED_SERVER_LINE);
   } else {
     log('No background service is installed; updating the package only.');
   }
@@ -404,7 +474,7 @@ export async function performUpdate({
   // runtime copy are not. Put a restorable copy aside after the service has
   // stopped, before npm or the new post-update command can change them.
   let transaction = { ok: true, root: null };
-  if (serviceInstalled) {
+  if (serviceSteps) {
     try {
       transaction = await (deps.captureUpdateState ?? captureUpdateState)({
         dataDir,
@@ -418,7 +488,7 @@ export async function performUpdate({
       const back = await restoreStoppedService({
         service,
         dataDir,
-        verifyMs: deps.verifyMs,
+        verifyMs,
         inspectLockFn: deps.inspectLock,
         restoreUpdateStateFn: deps.restoreUpdateState,
         from,
@@ -454,17 +524,17 @@ export async function performUpdate({
       version: from,
       service,
       exec,
-      serviceInstalled,
+      serviceInstalled: serviceSteps,
       transaction,
       dataDir,
-      verifyMs: deps.verifyMs,
+      verifyMs,
       inspectLockFn: deps.inspectLock,
       restoreUpdateStateFn: deps.restoreUpdateState,
       log,
     });
     return fail({
       step: 'install',
-      serviceInstalled,
+      serviceInstalled: serviceSteps,
       reason: [
         dbError
           ? `the package was installed but its database could not be reopened: ${dbError.message}`
@@ -480,9 +550,43 @@ export async function performUpdate({
     });
   }
 
+  /**
+   * The package changed and there is no service to prepare or start. Not a
+   * failure: on a machine with no registered service this IS the update, and
+   * on a Windows Server edition it prints the command that installs one.
+   * Anything captured for a status that turned out to be stale is committed,
+   * so no journal is left behind for the next run to "recover".
+   */
+  const finishWithoutService = async () => {
+    const warnings = [];
+    if (transaction?.ok && (transaction.root || transaction.runtimeBackup || transaction.journal)) {
+      try {
+        const committed = await (deps.commitUpdateState ?? commitUpdateState)(transaction, { log });
+        warnings.push(...(committed?.warnings ?? []));
+      } catch (error) {
+        warnings.push(`could not remove the update snapshot: ${error.message}`);
+        log(`warning: ${warnings[warnings.length - 1]}`);
+      }
+    }
+    return {
+      ok: true,
+      from,
+      to: version,
+      serviceInstalled: false,
+      serviceNotInstalled: serverNotRegistered,
+      ...(serverNotRegistered ? {
+        notInstalledLine: NOT_INSTALLED_SERVER_LINE,
+        lines: [NOT_INSTALLED_SERVER_LINE],
+      } : {}),
+      refreshedCopy: installed?.mode === MODES.SERVER || installed?.mechanism === 'winsw',
+      cleanupWarnings: warnings,
+      source,
+    };
+  };
+
   // 5. No service means there is nothing for post-update to prepare.
-  if (!serviceInstalled) {
-    return { ok: true, from, to: version, serviceInstalled: false, source };
+  if (!serviceSteps) {
+    return finishWithoutService();
   }
 
   // 6. The updater that is running is the OLD package. Start a fresh process
@@ -498,6 +602,9 @@ export async function performUpdate({
       mechanism,
       nodeExe: transaction.runtimeNodeExe || recorded.nodeExe || process.execPath,
       runFile: exec,
+      // The child's own progress lines (a 10,700-file runtime takes a while)
+      // reach the operator through this log instead of being swallowed.
+      log,
     });
   } catch (error) {
     postUpdate = { ok: false, step: 'post-update', reason: error.message };
@@ -520,6 +627,13 @@ export async function performUpdate({
       repaired = { ok: false, reason: error.message };
     }
     if (!repaired?.ok) {
+      // A Windows Server with no registered service has nothing to repair.
+      // That is not a failed update, and it is never a reason to roll back.
+      if (repaired?.code === 'not_installed') {
+        serverNotRegistered = true;
+        log(NOT_INSTALLED_SERVER_LINE);
+        return finishWithoutService();
+      }
       postUpdate = {
         ok: false,
         step: 'repair',
@@ -529,22 +643,28 @@ export async function performUpdate({
     }
   }
 
+  if (!postUpdate.ok && postUpdate.code === 'not_installed') {
+    serverNotRegistered = true;
+    log(NOT_INSTALLED_SERVER_LINE);
+    return finishWithoutService();
+  }
+
   if (!postUpdate.ok) {
     const rolled = await rollback({
       version: from,
       service,
       exec,
-      serviceInstalled,
+      serviceInstalled: serviceSteps,
       transaction,
       dataDir,
-      verifyMs: deps.verifyMs,
+      verifyMs,
       inspectLockFn: deps.inspectLock,
       restoreUpdateStateFn: deps.restoreUpdateState,
       log,
     });
     return fail({
       step: postUpdate.step || 'post-update',
-      serviceInstalled,
+      serviceInstalled: serviceSteps,
       reason: [
         postUpdate.reason || 'the newly installed post-update step failed',
         rolled.reason,
@@ -567,10 +687,18 @@ export async function performUpdate({
   } catch (error) {
     started = { ok: false, reason: error.message };
   }
+  if (!started.ok && started.code === 'not_installed') {
+    // Between the status read and here the service turned out not to exist on
+    // this Windows Server. The package is installed; say which command adds
+    // the service, and never roll back for it.
+    serverNotRegistered = true;
+    log(NOT_INSTALLED_SERVER_LINE);
+    return finishWithoutService();
+  }
   let alive;
   try {
     alive = started.ok
-      ? await service.waitForDaemon({ dataDir, timeoutMs: deps.verifyMs ?? VERIFY_MS })
+      ? await service.waitForDaemon({ dataDir, timeoutMs: verifyMs })
       : { alive: false, waitedMs: 0 };
   } catch (error) {
     alive = { alive: false, waitedMs: 0, reason: error.message };
@@ -610,7 +738,7 @@ export async function performUpdate({
   const why = started.ok
     ? alive.alive
       ? `the daemon reported v${running ?? 'an unknown version'}, not v${version}`
-      : `it started but the daemon did not report in within ${Math.round((deps.verifyMs ?? VERIFY_MS) / 1000)}s`
+      : `it started but the daemon did not report in within ${Math.round(verifyMs / 1000)}s`
     : `the service could not be started: ${started.reason}`;
 
   log(`The new version did not come up (${why}). Rolling back to v${from}...`);
@@ -618,10 +746,10 @@ export async function performUpdate({
     version: from,
     service,
     exec,
-    serviceInstalled,
+    serviceInstalled: serviceSteps,
     transaction,
     dataDir,
-    verifyMs: deps.verifyMs,
+    verifyMs,
     inspectLockFn: deps.inspectLock,
     restoreUpdateStateFn: deps.restoreUpdateState,
     log,
@@ -629,7 +757,7 @@ export async function performUpdate({
 
   return fail({
     step: 'verify',
-    serviceInstalled,
+    serviceInstalled: serviceSteps,
     reason: [why, rolled.reason].filter(Boolean).join(' '),
     rolledBack: rolled.ok,
     reinstallFailed: rolled.reinstallFailed === true,
@@ -681,7 +809,21 @@ export function postUpdateSupport(sourceRoot) {
 /**
  * Starts the newly installed package's post-update code in a new process.
  * Direct argv avoids shell quoting. `stdin: inherit` keeps sudo's password
- * prompt on the operator's terminal while stdout remains capturable.
+ * prompt on the operator's terminal.
+ *
+ * The marker is the LAST line the child prints, after thousands of progress
+ * lines from the runtime copy. 1.4.7 read the child's captured stdout, whose
+ * tail is 64 KiB (core/shell.js): everything the child printed before that was
+ * gone, so a marker printed early — or simply more than 64 KiB before the end —
+ * was never found and a successful post-update was reported as a failure.
+ *
+ * So the child's output is read with `output: 'full'` (a generous cap, never a
+ * silent cut) AND scanned line by line as it arrives, so the marker is found
+ * wherever it is printed. Progress lines are passed to `log`.
+ *
+ * @param {Object} opts
+ * @param {(line: string) => void} [opts.log]
+ * @param {number} [opts.maxOutputBytes] Per-stream capture cap (default 8 MiB)
  */
 export async function runPostUpdateHandoff({
   sourceRoot,
@@ -691,17 +833,45 @@ export async function runPostUpdateHandoff({
   mechanism,
   nodeExe,
   runFile: exec = runFile,
+  log = () => {},
+  maxOutputBytes = POST_UPDATE_MAX_OUTPUT_BYTES,
 }) {
   const support = postUpdateSupport(sourceRoot);
   if (!support.supported) {
     return { ok: true, fallback: true, step: 'post-update-missing', reason: support.reason };
   }
 
+  // The streamed scan: complete lines only, so a marker split across chunks is
+  // still recognised, and nothing is kept beyond one line at a time.
+  let markerLine = null;
+  let pending = '';
+  const scan = (text, stream) => {
+    pending += text;
+    let newline;
+    while ((newline = pending.indexOf('\n')) !== -1) {
+      const line = pending.slice(0, newline).replace(/\r$/, '');
+      pending = pending.slice(newline + 1);
+      if (!markerLine && line.startsWith(POST_UPDATE_RESULT_PREFIX)) {
+        markerLine = line;
+        continue;
+      }
+      if (stream !== 'stdout') continue;
+      // Progress from the new package, one line at a time.
+      if (line.trim()) log(line);
+    }
+    // A progress line can be enormous; the marker is one short line, so only
+    // the start of an unfinished line is worth keeping.
+    if (pending.length > 1_000_000) pending = pending.slice(0, 1_000_000);
+  };
+
   const entry = path.join(sourceRoot, 'src', 'cli', 'index.js');
   const result = await exec(process.execPath, [entry, '_post-update'], {
     cwd: sourceRoot,
     timeout: 1_800_000,
     stdin: 'inherit',
+    output: 'full',
+    maxBytes: maxOutputBytes,
+    onData: scan,
     env: {
       EASY_DEVOPS_DATA_DIR: dataDir,
       EZ_UPDATE_TARGET: version,
@@ -711,8 +881,9 @@ export async function runPostUpdateHandoff({
     },
   });
 
-  const marker = String(result?.stdout ?? '').split(/\r?\n/)
+  const capturedMarker = String(result?.stdout ?? '').split(/\r?\n/)
     .find((line) => line.startsWith(POST_UPDATE_RESULT_PREFIX));
+  const marker = markerLine ?? capturedMarker ?? null;
   let parsed = null;
   if (marker) {
     try {
@@ -720,12 +891,17 @@ export async function runPostUpdateHandoff({
     } catch { /* reported below */ }
   }
   if (!result?.success || !parsed?.ok) {
+    const dropped = (Number(result?.truncated?.stdout) || 0) + (Number(result?.truncated?.stderr) || 0);
+    const droppedNote = dropped > 0
+      ? ` (${dropped} byte(s) of its output were dropped because it exceeded the capture cap)`
+      : '';
     return {
       ok: false,
       step: parsed?.step ?? 'post-update',
-      reason: parsed?.reason
+      reason: (parsed?.reason
         || String(result?.stderr ?? '').trim()
-        || 'the newly installed post-update command exited without a result',
+        || result?.error
+        || 'the newly installed post-update command exited without a result') + droppedNote,
     };
   }
   if (!sameVersion(parsed.version, version)) {
@@ -751,7 +927,7 @@ async function startAndVerify({ service, dataDir, verifyMs, inspectLockFn, expec
   let alive;
   if (started?.ok) {
     try {
-      alive = await service.waitForDaemon({ dataDir, timeoutMs: verifyMs ?? VERIFY_MS });
+      alive = await service.waitForDaemon({ dataDir, timeoutMs: finiteMs(verifyMs, VERIFY_MS) });
     } catch (error) {
       alive = { alive: false, reason: error.message };
     }
@@ -916,8 +1092,28 @@ async function rollback({
   return restored;
 }
 
+/**
+ * The end of a command's output, for an error message.
+ *
+ * 1.4.7 kept the FIRST 500 characters, which for npm is the banner and the
+ * first progress lines — never the error, which is printed last. This keeps
+ * the newest 500 and says when that is what it is. Output core/shell.js dropped
+ * is reported too, so a cut capture is never mistaken for the whole story.
+ */
 function trim(result = {}) {
-  return `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim().slice(0, 500);
+  const text = `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim();
+  const dropped = (Number(result.truncated?.stdout) || 0) + (Number(result.truncated?.stderr) || 0);
+  // Count characters, not UTF-16 units: the slice is the last 500 characters,
+  // and a surrogate pair at the boundary must not be split.
+  const characters = [...text];
+  const cut = characters.length > 500;
+  const excerpt = cut ? characters.slice(-500).join('') : text;
+  const notes = [];
+  if (cut) notes.push('(last 500 characters)');
+  if (dropped > 0) {
+    notes.push(`(${dropped} earlier byte(s) were dropped because the captured output was capped)`);
+  }
+  return [notes.join(' '), excerpt].filter(Boolean).join('\n');
 }
 
 /**

@@ -146,6 +146,14 @@ async function testShellBounds() {
   check('run retains the newest stderr and drops the old prefix',
     streamed.stderr.includes('NEW-ERR-END') && !streamed.stderr.includes('OLD-ERR-START'));
 
+  // The tail is explicit now: the result says how much it could not keep.
+  // (The exact byte count is asserted over a direct spawn in
+  // e2e/shell-output.test.mjs; a configured shell may translate line endings.)
+  check('run reports that the tail dropped stdout bytes',
+    streamed.truncated?.stdout > 0, String(streamed.truncated?.stdout));
+  check('run reports that the tail dropped stderr bytes',
+    streamed.truncated?.stderr > 0, String(streamed.truncated?.stderr));
+
   const boundarySource = `
     const limit = ${limit};
     const prefix = Buffer.alloc(limit - 1, 65);
@@ -178,6 +186,9 @@ async function testShellBounds() {
     stdinResult.stdout.includes('NEW-OUT-END') && !stdinResult.stdout.includes('OLD-OUT-START'));
   check('runWithStdin retains the newest stderr and drops the old prefix',
     stdinResult.stderr.includes('NEW-ERR-END') && !stdinResult.stderr.includes('OLD-ERR-START'));
+  check('runWithStdin reports the bytes its tail dropped',
+    stdinResult.truncated?.stdout > 0 && stdinResult.truncated?.stderr > 0,
+    `${stdinResult.truncated?.stdout}/${stdinResult.truncated?.stderr}`);
 
   const onDataSource = `
     (async () => {

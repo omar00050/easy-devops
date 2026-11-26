@@ -22,7 +22,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { run as defaultRun } from './shell.js';
+import { run as defaultRun, SHELL_CAPTURE_TAIL_BYTES } from './shell.js';
 import { quoteExe, pm2StartupCmd, pm2UnstartupCmd, isWindows } from './platform.js';
 
 /** PM2 can be slow to answer while the daemon is starting up. */
@@ -138,11 +138,25 @@ export async function install({ run = defaultRun } = {}) {
  * notices there, so the JSON array has to be extracted rather than parsed
  * from the whole buffer.
  *
+ * The list is read with `output: 'full'`: a machine with enough PM2 apps
+ * produces more than the 64 KiB tail, and a tail drops the leading `[{`, so
+ * every consumer would see "no list". If even the full cap is exceeded the
+ * answer is a clear error naming that cause — never a quietly cut capture.
+ *
  * @param {{ run?: Function, pm2Path?: string }} [deps]
  * @returns {Promise<{ ok: boolean, apps: Array<Object>, error: string|null }>}
  */
 export async function list({ run = defaultRun, pm2Path = 'pm2' } = {}) {
-  const r = await run(`${quoteExe(pm2Path)} jlist`, { timeout: PM2_TIMEOUT_MS });
+  const r = await run(`${quoteExe(pm2Path)} jlist`, { timeout: PM2_TIMEOUT_MS, output: 'full' });
+
+  const dropped = (r?.truncated?.stdout ?? 0) + (r?.truncated?.stderr ?? 0);
+  if (dropped > 0) {
+    return {
+      ok: false,
+      apps: [],
+      error: `PM2 returned more process-list output than Easy DevOps reads in full (${r?.error ?? `${dropped} bytes over the limit`}). Nothing was parsed — run \`pm2 jlist\` in a terminal, or reduce the number of apps PM2 manages, then try again.`,
+    };
+  }
 
   const raw = extractJsonArray(r.stdout);
   if (raw === null) {
@@ -476,8 +490,21 @@ async function simple(verb, name, run, pm2Path) {
   return { ok: r.success, output: combine(r) };
 }
 
+/**
+ * The text shown to the user for one command: stdout then stderr.
+ *
+ * These call sites (install, start, reload, del, logs, save, startup) keep the
+ * default `tail` capture, because they show output rather than parse it. When
+ * the tail dropped bytes the text says so, so a user never reads a cut
+ * transcript as the whole one.
+ */
 function combine(r) {
-  return [r?.stdout, r?.stderr].filter(Boolean).join('\n').trim();
+  const text = [r?.stdout, r?.stderr].filter(Boolean).join('\n').trim();
+  const dropped = (r?.truncated?.stdout ?? 0) + (r?.truncated?.stderr ?? 0);
+  if (dropped <= 0) return text;
+
+  const notice = `(showing the last ${Math.round(SHELL_CAPTURE_TAIL_BYTES / 1024)} KiB)`;
+  return text ? `${notice}\n${text}` : notice;
 }
 
 /**

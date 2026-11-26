@@ -1514,6 +1514,356 @@ async function testWhyCliOnly() {
     String(updater.whyCliOnly().length));
 }
 
+// ─── 8. A Windows Server edition with no service registered ─────────────────
+
+async function testServerEditionNoService() {
+  setGroup('8. a Windows Server with no service is updated without one');
+
+  const updater = await import(srcUrl('core/updater.js'));
+  const dataDir = scratch('upd-server-none');
+  const logs = [];
+  const calls = [];
+  const npm = recordingRun({ 'npm install': 'installed' });
+  const service = {
+    async status() { calls.push('status'); return { service: { installed: false }, mode: 'server' }; },
+    async stop() { calls.push('stop'); return { ok: true }; },
+    async start() { calls.push('start'); return { ok: true }; },
+    async waitForDaemon() { calls.push('wait'); return { alive: true, lock: { version: '1.4.8' } }; },
+    async repair() { calls.push('repair'); return { ok: true }; },
+    recordedState() { return {}; },
+  };
+
+  const result = await updater.performUpdate({
+    version: '1.4.8',
+    dataDir,
+    log: (line) => logs.push(line),
+    deps: {
+      runFile: npm,
+      service,
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.4.6',
+      // A non-elevated terminal: with no service to replace, elevation is not
+      // needed, so this must not stop the update.
+      isElevated: async () => false,
+      serviceInstallState: async () => ({
+        registered: false,
+        edition: 'server',
+        personalLauncher: { present: false, files: [] },
+      }),
+      runPostUpdate: async () => { calls.push('post-update'); return { ok: true }; },
+      runRepair: async () => { calls.push('repair'); return { ok: true }; },
+    },
+  });
+
+  check('the update succeeds', result.ok === true, result.reason ?? '');
+  check('the package itself was replaced',
+    npm.commands.includes('npm install -g easy-devops@1.4.8'), npm.commands.join(' | '));
+  check('the not-installed line is printed exactly once',
+    logs.filter((line) => line === updater.NOT_INSTALLED_SERVER_LINE).length === 1,
+    logs.join(' | '));
+  check('it says the command and shell that install the service',
+    /ezz service install/.test(result.notInstalledLine)
+      && /Administrator PowerShell/.test(result.notInstalledLine),
+    result.notInstalledLine);
+  check('nothing is stopped, prepared or started', calls.join(',') === 'status', calls.join(' -> '));
+  check('no Personal launcher or repair is used', !calls.includes('repair')
+    && !/startup-supervisor|Startup-folder/i.test(logs.join('\n')), calls.join(' -> '));
+  check('the elevation gate does not fire for a Server edition that has no service',
+    result.step !== 'elevation' && result.ok === true);
+  check('it is reported as a package update, not as a failure',
+    result.serviceInstalled === false && result.rolledBack === undefined, JSON.stringify(result).slice(0, 180));
+  check('the result carries the line for a dashboard caller',
+    result.notInstalledLine === updater.NOT_INSTALLED_SERVER_LINE
+      && result.lines?.includes(updater.NOT_INSTALLED_SERVER_LINE));
+
+  // A status shape from the previous release still says "installed", and the
+  // start is what discovers the truth. That is not a rollback either. No
+  // install-state probe is supplied here, so nothing knows in advance.
+  const staleCalls = [];
+  const stale = serviceStub({ installed: true, mode: 'server', version: '1.4.6' });
+  stale.start = async () => {
+    stale.calls.push('start');
+    return { ok: false, code: 'not_installed', message: 'no service registered' };
+  };
+  const waitCalls = [];
+  stale.waitForDaemon = async () => {
+    waitCalls.push('wait');
+    return { alive: false, waitedMs: 0, lock: null };
+  };
+  const staleNpm = recordingRun({ 'npm install': 'installed' });
+  const staleLogs = [];
+  const staleResult = await updater.performUpdate({
+    version: '1.4.8',
+    dataDir: scratch('upd-server-none-stale'),
+    log: (line) => staleLogs.push(line),
+    deps: {
+      runFile: staleNpm,
+      service: stale,
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.4.6',
+      isElevated: async () => true,
+      ...transactionDeps(staleCalls),
+    },
+  });
+  check('a service start that reports not_installed ends as a package-only success',
+    staleResult.ok === true && staleResult.serviceInstalled === false,
+    staleResult.reason ?? '');
+  check('the not-installed line is printed in that case too',
+    staleLogs.includes(updater.NOT_INSTALLED_SERVER_LINE), staleLogs.join(' | '));
+  check('there is no heartbeat wait for a service that does not exist',
+    waitCalls.length === 0, waitCalls.join(' -> '));
+  check('and it never rolls back to the previous package',
+    !staleNpm.commands.includes('npm install -g easy-devops@1.4.6'), staleNpm.commands.join(' | '));
+  check('the update snapshot is still committed, so no journal is left',
+    staleCalls.includes('commit'), staleCalls.join(' -> '));
+
+  // A deadline that is not a number cannot become setTimeout(Infinity).
+  const timeouts = [];
+  const waiting = serviceStub({ installed: true, mode: 'personal' });
+  waiting.waitForDaemon = async ({ timeoutMs }) => {
+    timeouts.push(timeoutMs);
+    return { alive: true, waitedMs: 10, lock: { version: '1.4.8' } };
+  };
+  const timed = await updater.performUpdate({
+    version: '1.4.8',
+    dataDir: scratch('upd-server-none-deadline'),
+    verifyMs: Infinity,
+    deps: {
+      runFile: recordingRun({ 'npm install': 'installed' }),
+      service: waiting,
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.4.6',
+      ...transactionDeps([]),
+    },
+  });
+  check('a non-finite verify deadline becomes a finite one',
+    timed.ok === true && timeouts.length === 1 && Number.isFinite(timeouts[0]) && timeouts[0] > 0,
+    String(timeouts[0]));
+}
+
+// ─── 9. A failed post-update protection pass ────────────────────────────────
+
+async function testPostUpdateProtectionFailure() {
+  setGroup('9. a failed post-update protection says what happened and what to run');
+
+  const { applyPostUpdate, permissionsFailureReason } = await import(srcUrl('core/service/postUpdate.js'));
+  const { postUpdateCommand } = await import(srcUrl('cli/menus/postUpdate.js'));
+  const dataDir = scratch('upd-protect-fail');
+  const runtimeDir = path.join(dataDir, 'runtime');
+  const failure = {
+    path: runtimeDir,
+    reason: 'verifying the new permissions failed: runtime\\node.exe is missing from the read-back',
+    restored: true,
+    next: 'Run `ezz service repair` from an Administrator PowerShell',
+  };
+
+  let protectMode = null;
+  const dataDirDeps = {
+    installedPackageVersion: () => '1.4.8',
+    recoverInterruptedUpdate: async () => ({ ok: true, recovered: false }),
+    copyRuntime: (opts) => ({ ok: true, dir: runtimeDir, nodeExe: opts.nodeExe }),
+    verifyNativeModules: async () => ({ ok: true, version: 'v22.11.0', abi: '127' }),
+    protectServiceFiles: async (opts) => {
+      protectMode = opts.mode;
+      return { ok: false, protected: [], failed: [failure] };
+    },
+  };
+
+  const failed = await applyPostUpdate({
+    dataDir,
+    mode: 'server',
+    mechanism: 'winsw',
+    targetVersion: '1.4.8',
+    deps: dataDirDeps,
+  });
+  check('the failure is reported at the permissions step',
+    failed.ok === false && failed.step === 'permissions', failed.step);
+  check('every protection call passes the post-update mode', protectMode === 'post-update', String(protectMode));
+  check('the reason says the previous permissions were restored', /restored/i.test(failed.reason), failed.reason);
+  check('and names the repair command from an Administrator PowerShell',
+    /ezz service repair/.test(failed.reason) && /Administrator PowerShell/.test(failed.reason),
+    failed.reason);
+  check('the result carries the next step for the updater',
+    /ezz service repair/.test(String(failed.next)), String(failed.next));
+  check('the per-entry state is what makes the wording true',
+    failed.restored === true
+      && /restored/i.test(permissionsFailureReason([failure]))
+      && /NOT restored/i.test(permissionsFailureReason([{ ...failure, restored: false }])));
+
+  // The hidden command is what the updater streams, so the operator sees this.
+  let printed = '';
+  const code = await postUpdateCommand({
+    env: {
+      EASY_DEVOPS_DATA_DIR: dataDir,
+      EZ_UPDATE_MODE: 'server',
+      EZ_UPDATE_MECHANISM: 'winsw',
+      EZ_UPDATE_TARGET: '1.4.8',
+    },
+    stdout: {
+      write: (chunk, callback) => {
+        printed += chunk;
+        callback?.();
+        return true;
+      },
+    },
+    deps: dataDirDeps,
+  });
+  check('the hidden command exits non-zero', code === 1, String(code));
+  check('it prints the reason, the restore state and the next step',
+    /The post-update step failed \(permissions\)/.test(printed)
+      && /restored/i.test(printed)
+      && /ezz service repair/.test(printed),
+    printed.split('\n').filter(Boolean).slice(-2).join(' | '));
+
+  // And a stop request left over from an earlier stop is cleared first.
+  const stopDataDir = scratch('upd-protect-fail-stop');
+  const stopFile = path.join(stopDataDir, 'daemon.stop');
+  fs.writeFileSync(stopFile, JSON.stringify({ at: new Date().toISOString(), reason: 'ezz service stop' }));
+  const stopLogs = [];
+  const stopResult = await applyPostUpdate({
+    dataDir: stopDataDir,
+    mode: 'server',
+    mechanism: 'winsw',
+    targetVersion: '1.4.8',
+    log: (line) => stopLogs.push(line),
+    deps: {
+      ...dataDirDeps,
+      protectServiceFiles: async () => ({ ok: true, protected: [], failed: [] }),
+      refreshServiceDefinition: () => {},
+    },
+  });
+  check('a stale stop request is cleared before the runtime copy',
+    stopResult.ok === true && !fs.existsSync(stopFile)
+      && stopLogs.some((line) => /stop request/i.test(line)),
+    stopLogs.join(' | '));
+}
+
+// ─── 10. The npm failure excerpt is the end of the output ───────────────────
+
+async function testNpmFailureExcerpt() {
+  setGroup('10. a failing npm install is quoted by its last 500 characters');
+
+  const updater = await import(srcUrl('core/updater.js'));
+  const early = 'EARLY-BANNER-THAT-NOBODY-NEEDS';
+  const late = 'npm ERR! the real reason, printed last';
+  const stdout = `${early}\n${'x'.repeat(200 * 1024)}\n${late}`;
+  const npm = async (file, args) => {
+    const command = npmCommand(file, args);
+    if (command.includes('@1.4.8')) {
+      return {
+        success: false,
+        stdout,
+        stderr: '',
+        exitCode: 1,
+        command,
+        // What core/shell.js reports when it had to cap the capture.
+        truncated: { stdout: 123_456, stderr: 0 },
+      };
+    }
+    return { success: true, stdout: 'installed', stderr: '', exitCode: 0, command };
+  };
+
+  const result = await updater.performUpdate({
+    version: '1.4.8',
+    dataDir: scratch('upd-excerpt'),
+    deps: {
+      runFile: npm,
+      service: serviceStub({ installed: true, mode: 'personal', version: '1.4.7' }),
+      detectInstallSource: () => SOURCES.npm,
+      currentVersion: () => '1.4.7',
+      ...transactionDeps([]),
+    },
+  });
+
+  check('the update fails at the install step',
+    result.ok === false && result.step === 'install', result.step);
+  check('the quoted output is the END of npm output',
+    /the real reason, printed last/.test(result.reason), result.reason.slice(0, 300));
+  check('the first 500 characters are not what is quoted',
+    !result.reason.includes(early), result.reason.slice(0, 200));
+  check('the excerpt says it is the last 500 characters',
+    /\(last 500 characters\)/.test(result.reason), result.reason.slice(0, 200));
+  check('dropped bytes are reported rather than hidden',
+    /123456 earlier byte\(s\) were dropped/.test(result.reason), result.reason.slice(0, 300));
+}
+
+// ─── 11. The post-update marker, however much the child prints ──────────────
+
+async function testPostUpdateMarkerIsFound() {
+  setGroup('11. the post-update marker is found in a long output');
+
+  const updater = await import(srcUrl('core/updater.js'));
+  const dataDir = scratch('upd-long-marker');
+  const sourceRoot = scratch('upd-long-marker-package');
+  const marker = `${updater.POST_UPDATE_RESULT_PREFIX}${JSON.stringify({
+    ok: true,
+    step: 'definition',
+    version: '1.4.8',
+  })}`;
+  const noise = 'runtime progress line\n'.repeat(10_000); // ~230 KB
+
+  // (a) The marker is printed first and the output carries on for 200 KB.
+  let invocation = null;
+  const exec = async (file, args, options) => {
+    invocation = { file, args, options };
+    return {
+      success: true,
+      stdout: `${marker}\n${noise}`,
+      stderr: '',
+      exitCode: 0,
+      truncated: { stdout: 0, stderr: 0 },
+    };
+  };
+  const found = await updater.runPostUpdateHandoff({
+    sourceRoot, version: '1.4.8', dataDir, runFile: exec,
+  });
+  check('a marker printed before 200 KB of progress is still found',
+    found.ok === true && found.version === '1.4.8', JSON.stringify(found).slice(0, 200));
+  check('the child output is read whole, not as a 64 KiB tail',
+    invocation.options.output === 'full'
+      && invocation.options.maxBytes >= 8 * 1024 * 1024,
+    JSON.stringify({ output: invocation.options.output, maxBytes: invocation.options.maxBytes }));
+  check('the hand-off keeps a finite timeout',
+    Number.isFinite(invocation.options.timeout) && invocation.options.timeout > 0,
+    String(invocation.options.timeout));
+
+  // (b) The marker arrives in the stream, split across two chunks, with more
+  // output after it and nothing in the captured result.
+  const lines = [];
+  const streamExec = async (file, args, options) => {
+    options.onData(`${noise}${marker.slice(0, 9)}`, 'stdout');
+    options.onData(`${marker.slice(9)}\n${noise}`, 'stdout');
+    return { success: true, stdout: '', stderr: '', exitCode: 0, truncated: { stdout: 0, stderr: 0 } };
+  };
+  const streamed = await updater.runPostUpdateHandoff({
+    sourceRoot,
+    version: '1.4.8',
+    dataDir,
+    runFile: streamExec,
+    log: (line) => lines.push(line),
+  });
+  check('a marker split across streamed chunks is found',
+    streamed.ok === true && streamed.version === '1.4.8', JSON.stringify(streamed).slice(0, 200));
+  check('the marker line itself is not reprinted as progress',
+    !lines.some((line) => line.includes(updater.POST_UPDATE_RESULT_PREFIX)),
+    lines.slice(-2).join(' | '));
+  check('progress lines from the new package reach the operator',
+    lines.some((line) => /runtime progress line/.test(line)), String(lines.length));
+
+  // (c) No marker and a capped capture: say that output was dropped.
+  const missing = await updater.runPostUpdateHandoff({
+    sourceRoot,
+    version: '1.4.8',
+    dataDir,
+    runFile: async () => ({
+      success: false, stdout: '', stderr: '', exitCode: 1, truncated: { stdout: 999, stderr: 0 },
+    }),
+  });
+  check('a failure with no marker reports the dropped output',
+    missing.ok === false && /999 byte\(s\) of its output were dropped/.test(missing.reason),
+    missing.reason);
+}
+
 // ─── main ────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -1534,6 +1884,10 @@ async function main() {
   await testPostUpdateFallback();
   await testPostUpdateIdempotent();
   await testNoService();
+  await testServerEditionNoService();
+  await testPostUpdateProtectionFailure();
+  await testNpmFailureExcerpt();
+  await testPostUpdateMarkerIsFound();
   await testCheck();
   await testWhyCliOnly();
 

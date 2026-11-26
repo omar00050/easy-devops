@@ -7,25 +7,45 @@
  *
  * Exported functions:
  * - getShell() — Returns OS-resolved shell descriptor { shell, flag }
- * - run(cmd, options) — Executes a command and captures output; never throws
+ * - run(cmd, options) — Executes a command and captures output; command failures never throw
  * - runLive(cmd, options) — Executes a command, streaming output to the terminal; never throws
  * - runInteractive(cmd, options) — Executes a command with full stdio inheritance, for commands that prompt; never throws
- * - runWithStdin(cmd, argsArray, stdinData) — Spawns a process with stdin piping; never throws
- * - runCommandLine(cmd, options) — Runs a command line a USER wrote, in the platform's default shell; never throws
+ * - runWithStdin(cmd, argsArray, stdinData, options) — Spawns a process with stdin piping; command failures never throw
+ * - runCommandLine(cmd, options) — Runs a command line a USER wrote, in the platform's default shell; command failures never throw
+ *
+ * An unknown `output` mode, an invalid `maxBytes`, or `output: 'stream'`
+ * without `onData` throws a TypeError before anything is spawned.
  *
  * CommandResult shape (returned by run()):
- * { success: boolean, stdout: string, stderr: string, exitCode: number|null, command: string }
+ * { success: boolean, stdout: string, stderr: string, exitCode: number|null,
+ *   command: string, truncated: { stdout: number, stderr: number }, error?: string }
  *
- * stdout and stderr contain at most SHELL_CAPTURE_TAIL_BYTES each. They are
- * the newest bytes, so a noisy command cannot grow the caller's memory without
- * bound. `onData`, when supplied, still receives every chunk.
+ * `truncated.stdout` / `truncated.stderr` are the bytes DROPPED from each
+ * stream, so a caller can never mistake a cut capture for a complete one. In
+ * `tail` mode that is what the ring evicted; in `full` mode it is 0 unless the
+ * byte cap was hit; in `stream` mode it is always 0 because nothing is kept.
  *
- * CommandOptions (accepted by run() and runLive()):
- * { timeout?: number, cwd?: string }
- * Defaults: timeout = 30 000 ms, cwd = process.cwd()
+ * Output modes (`options.output`), exported as SHELL_OUTPUT_MODES:
+ *   'tail'   (default) — stdout and stderr each keep only the newest
+ *                        SHELL_CAPTURE_TAIL_BYTES bytes. A noisy command
+ *                        cannot grow the caller's memory without bound.
+ *                        `onData`, when supplied, still receives every chunk.
+ *   'full'   — stdout and stderr each keep everything up to `maxBytes`
+ *                        (default SHELL_CAPTURE_FULL_MAX_BYTES, 8 MiB). Over
+ *                        the cap the child is KILLED and the result is
+ *                        { success: false, exitCode: null, error: 'output
+ *                        exceeded <N> bytes' } — never a silent cut.
+ *   'stream' — nothing is buffered; stdout and stderr stay ''. Every chunk
+ *                        reaches `onData`, which is required (a missing
+ *                        callback is a programming error and throws).
  *
- * run() additionally accepts `env` (merged over process.env) and `onData`
- * (called with each chunk of output as it arrives).
+ * CommandOptions (accepted by run(), runFile(), runCommandLine() and
+ * runWithStdin()'s options argument):
+ * { timeout?: number, cwd?: string, output?: 'tail'|'full'|'stream',
+ *   maxBytes?: number, onData?: Function }
+ * Defaults: timeout = 30 000 ms, cwd = process.cwd(), output = 'tail'
+ *
+ * run() additionally accepts `env` (merged over process.env).
  */
 
 import { spawn } from 'child_process';
@@ -35,10 +55,61 @@ import { StringDecoder } from 'node:string_decoder';
 // ─── internal helpers ─────────────────────────────────────────────────────────
 
 /**
- * Maximum bytes retained for each captured stream. Callers receive only the
- * newest bytes, while `onData` still sees every chunk as it arrives.
+ * Maximum bytes retained for each captured stream in `tail` mode. Callers
+ * receive only the newest bytes, while `onData` still sees every chunk as it
+ * arrives. What was dropped is reported in `result.truncated`.
  */
 export const SHELL_CAPTURE_TAIL_BYTES = 64 * 1024;
+
+/**
+ * Default per-stream byte cap for `output: 'full'`. Generous enough for a
+ * PM2 process list or a remote branch list, small enough that a runaway
+ * command cannot exhaust memory. A per-call `maxBytes` overrides it.
+ */
+export const SHELL_CAPTURE_FULL_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The accepted values of `options.output`. Frozen so a typo is a clear
+ * programming error, not a silently ignored option.
+ */
+export const SHELL_OUTPUT_MODES = Object.freeze(['tail', 'full', 'stream']);
+
+/**
+ * Validates the output options and returns the normalised mode and byte cap.
+ *
+ * @param {{ output?: string, maxBytes?: number, onData?: Function|null }} options
+ * @returns {{ mode: 'tail'|'full'|'stream', maxBytes: number }}
+ * @throws {TypeError} An unknown mode, an invalid cap, or `stream` without
+ *   `onData` — each would otherwise silently lose output.
+ */
+function resolveOutputOptions({ output = 'tail', maxBytes, onData = null } = {}) {
+  const mode = output ?? 'tail';
+  if (!SHELL_OUTPUT_MODES.includes(mode)) {
+    throw new TypeError(
+      `Unknown shell output mode ${JSON.stringify(mode)}. Use one of: ${SHELL_OUTPUT_MODES.join(', ')}.`,
+    );
+  }
+  if (mode === 'stream' && typeof onData !== 'function') {
+    throw new TypeError(
+      "output: 'stream' requires an onData callback: stream mode keeps no captured output, so onData is the only way to receive it.",
+    );
+  }
+
+  let cap = SHELL_CAPTURE_FULL_MAX_BYTES;
+  if (maxBytes !== undefined && maxBytes !== null) {
+    cap = Number(maxBytes);
+    if (!Number.isFinite(cap) || cap <= 0) {
+      throw new TypeError(`maxBytes must be a positive number of bytes; got ${String(maxBytes)}.`);
+    }
+  }
+
+  return { mode, maxBytes: Math.floor(cap) };
+}
+
+/** Empty truncation report for results that never captured anything. */
+function noTruncation() {
+  return { stdout: 0, stderr: 0 };
+}
 
 function stripAnsi(str) {
   return str.replace(/\x1B\[[0-9;]*[mGKHFJ]/g, '');
@@ -66,11 +137,12 @@ function validUtf8Tail(buffer) {
   return start === 0 ? buffer : buffer.subarray(start);
 }
 
-/** Keeps the newest bytes in a fixed circular buffer. */
+/** Keeps the newest bytes in a fixed circular buffer and counts what it drops. */
 function createBoundedTail(limit = SHELL_CAPTURE_TAIL_BYTES) {
   const ring = Buffer.allocUnsafe(limit);
   let start = 0;
   let bytes = 0;
+  let dropped = 0;
 
   return {
     append(chunk) {
@@ -78,6 +150,8 @@ function createBoundedTail(limit = SHELL_CAPTURE_TAIL_BYTES) {
       if (incoming.length === 0) return;
 
       if (incoming.length >= limit) {
+        // Everything already buffered is older than this chunk's own tail.
+        dropped += bytes + (incoming.length - limit);
         incoming.copy(ring, 0, incoming.length - limit);
         start = 0;
         bytes = limit;
@@ -86,6 +160,7 @@ function createBoundedTail(limit = SHELL_CAPTURE_TAIL_BYTES) {
 
       const overflow = Math.max(0, bytes + incoming.length - limit);
       if (overflow > 0) {
+        dropped += overflow;
         start = (start + overflow) % limit;
         bytes -= overflow;
       }
@@ -95,6 +170,11 @@ function createBoundedTail(limit = SHELL_CAPTURE_TAIL_BYTES) {
       incoming.copy(ring, writeAt, 0, first);
       if (first < incoming.length) incoming.copy(ring, 0, first);
       bytes += incoming.length;
+    },
+
+    /** Bytes evicted so far — the exact size of the gap the caller cannot see. */
+    get dropped() {
+      return dropped;
     },
 
     toString() {
@@ -117,31 +197,88 @@ function capturedText(tail) {
 }
 
 /**
- * Decode one byte stream incrementally.
+ * Decode one byte stream incrementally and keep what the mode asks for.
  *
  * A UTF-8 character may be split across pipe chunks. Decoding each Buffer on
  * its own replaces both halves before redaction can see the secret. The
  * StringDecoder preserves the partial character until the next chunk, and
- * finish() flushes it before the captured tail is returned.
+ * finish() flushes it before the captured text is returned.
+ *
+ * Modes:
+ *   - tail: a fixed ring of the newest bytes, counting what it evicts;
+ *   - full: every byte up to `limit` per stream, then `onOverflow` (the caller
+ *     kills the child) — the extra bytes are counted, never silently cut;
+ *   - stream: nothing buffered; `onText` receives every decoded chunk.
+ *
+ * @param {{ mode?: 'tail'|'full'|'stream', limit?: number,
+ *   onText?: Function|null, onOverflow?: Function|null }} options
  */
-function createTextCapture(limit, onText) {
+function createTextCapture({ mode = 'tail', limit = SHELL_CAPTURE_TAIL_BYTES, onText = null, onOverflow = null } = {}) {
   const decoder = new StringDecoder('utf8');
-  const tail = createBoundedTail(limit);
+  const tail = mode === 'tail' ? createBoundedTail(limit) : null;
+  const chunks = mode === 'full' ? [] : null;
+  let size = 0;
+  let dropped = 0;
+  let overflowed = false;
+  let finished = null;
 
-  const appendText = (text) => {
+  const consumeText = (text) => {
     if (!text) return;
-    tail.append(Buffer.from(text, 'utf8'));
-    if (!onText) return;
-    try { onText(text); } catch { /* a listener cannot change the command result */ }
+
+    if (onText) {
+      try { onText(text); } catch { /* a listener cannot change the command result */ }
+    }
+    if (mode === 'stream') return;
+
+    const bytes = Buffer.from(text, 'utf8');
+
+    if (mode === 'tail') {
+      tail.append(bytes);
+      dropped = tail.dropped;
+      return;
+    }
+
+    // full mode: keep what fits, count the rest, and let the caller abort.
+    if (overflowed) {
+      dropped += bytes.length;
+      return;
+    }
+
+    const room = limit - size;
+    if (bytes.length <= room) {
+      chunks.push(bytes);
+      size += bytes.length;
+      return;
+    }
+
+    if (room > 0) {
+      chunks.push(bytes.subarray(0, room));
+      size += room;
+    }
+    dropped += bytes.length - Math.max(0, room);
+    overflowed = true;
+    if (onOverflow) {
+      try { onOverflow(dropped); } catch { /* the capture still resolves */ }
+    }
   };
 
   return {
     append(chunk) {
-      appendText(decoder.write(asBuffer(chunk)));
+      consumeText(decoder.write(asBuffer(chunk)));
     },
+    /** The captured text for this mode. Stream mode captures nothing. */
     finish() {
-      appendText(decoder.end());
-      return capturedText(tail);
+      if (finished === null) {
+        consumeText(decoder.end());
+        if (mode === 'tail') finished = capturedText(tail);
+        else if (mode === 'full') finished = stripAnsi(Buffer.concat(chunks).toString('utf8')).trim();
+        else finished = '';
+      }
+      return finished;
+    },
+    /** Bytes dropped so far, valid after finish(). */
+    get dropped() {
+      return dropped;
     },
   };
 }
@@ -226,7 +363,25 @@ export function getShell() {
   return { shell: 'bash', flag: '-c' };
 }
 
-/** Execute a native executable with literal arguments and no command interpreter. */
+/**
+ * Execute a native executable with literal arguments and no command
+ * interpreter.
+ *
+ * Accepts the same `output`/`maxBytes`/`onData` options as run():
+ * `'tail'` (default) keeps the newest 64 KiB of each stream, `'full'` keeps
+ * everything up to `maxBytes` and kills the child over the cap, and
+ * `'stream'` keeps nothing but requires `onData`. Every result carries
+ * `truncated: { stdout, stderr }`, the bytes dropped from each stream.
+ *
+ * @param {string} file
+ * @param {string[]} args
+ * @param {{ timeout?: number, cwd?: string, env?: Object|null,
+ *   onData?: Function|null, replaceEnv?: boolean, stdin?: string|null,
+ *   output?: 'tail'|'full'|'stream', maxBytes?: number }} [options]
+ * @returns {Promise<{ success: boolean, stdout: string, stderr: string,
+ *   exitCode: number|null, command: string,
+ *   truncated: { stdout: number, stderr: number }, error?: string }>}
+ */
 export function runFile(file, args, options = {}) {
   const {
     timeout = 30000,
@@ -235,9 +390,11 @@ export function runFile(file, args, options = {}) {
     onData = null,
     replaceEnv = false,
     stdin = null,
+    output = 'tail',
+    maxBytes,
   } = options;
   return capture((spawnOptions) => spawn(file, args, { ...spawnOptions, shell: false }), {
-    cmd: file, timeout, cwd, env, onData, replaceEnv, stdin,
+    cmd: file, timeout, cwd, env, onData, replaceEnv, stdin, output, maxBytes,
   });
 }
 
@@ -246,40 +403,84 @@ export function runFile(file, args, options = {}) {
 /**
  * Executes a shell command and captures its stdout and stderr.
  *
- * Never throws. ANSI escape codes are stripped from all captured output.
- * When the timeout expires the child process is killed and exitCode is null.
+ * Command failures never throw. ANSI escape codes are stripped from all
+ * captured output. When the timeout expires the child process is killed and
+ * exitCode is null.
  *
  * @param {string} cmd - The command string to execute.
- * @param {{ timeout?: number, cwd?: string }} [options]
+ * @param {{ timeout?: number, cwd?: string, output?: 'tail'|'full'|'stream', maxBytes?: number }} [options]
  * @param {number} [options.timeout=30000] - Milliseconds before the process is killed.
  * @param {string} [options.cwd=process.cwd()] - Working directory for the child process.
  * @param {Object} [options.env] - Extra environment variables, merged over process.env.
  * @param {(chunk: string, stream: 'stdout'|'stderr') => void} [options.onData] - Receives output as it arrives.
- * @returns {Promise<{ success: boolean, stdout: string, stderr: string, exitCode: number|null, command: string }>}
+ * @param {'tail'|'full'|'stream'} [options.output='tail'] - What to keep: the
+ *   newest 64 KiB of each stream, everything up to `maxBytes` (the child is
+ *   killed over the cap), or nothing at all (requires `onData`).
+ * @param {number} [options.maxBytes] - Per-stream cap for `output: 'full'`
+ *   (default 8 MiB).
+ * @returns {Promise<{ success: boolean, stdout: string, stderr: string, exitCode: number|null, command: string, truncated: { stdout: number, stderr: number }, error?: string }>}
  */
 export function run(cmd, options = {}) {
-  const { timeout = 30000, cwd = process.cwd(), env = null, onData = null, replaceEnv = false } = options;
+  const {
+    timeout = 30000,
+    cwd = process.cwd(),
+    env = null,
+    onData = null,
+    replaceEnv = false,
+    output = 'tail',
+    maxBytes,
+  } = options;
   const { shell, flag } = getShell();
 
   return capture(
     (spawnOptions) => spawn(shell, [flag, cmd], spawnOptions),
-    { cmd, timeout, cwd, env, onData, replaceEnv },
+    { cmd, timeout, cwd, env, onData, replaceEnv, output, maxBytes },
   );
 }
 
 /**
- * Shared body of run() and runCommandLine(): spawn, collect output, enforce
- * the timeout, and always resolve with a CommandResult.
+ * Shared body of run(), runFile() and runCommandLine(): spawn, collect output,
+ * enforce the timeout and the `full` byte cap, and always resolve with a
+ * CommandResult.
+ *
+ * `output: 'stream'` without `onData`, an unknown mode or an invalid cap throws
+ * a TypeError synchronously — before anything is spawned — because each of
+ * those would silently lose output.
  *
  * @param {(spawnOptions: Object) => import('child_process').ChildProcess} spawnChild
- * @param {{ cmd: string, timeout: number, cwd: string, env: Object|null, onData: Function|null }} opts
+ * @param {{ cmd: string, timeout: number, cwd: string, env: Object|null,
+ *   onData: Function|null, replaceEnv?: boolean, stdin?: string|null,
+ *   output?: 'tail'|'full'|'stream', maxBytes?: number }} opts
  */
-function capture(spawnChild, { cmd, timeout, cwd, env, onData, replaceEnv = false, stdin = null }) {
+function capture(spawnChild, opts) {
+  const {
+    cmd,
+    timeout,
+    cwd,
+    env,
+    onData,
+    replaceEnv = false,
+    stdin = null,
+    output = 'tail',
+    maxBytes,
+  } = opts;
+  const { mode, maxBytes: capBytes } = resolveOutputOptions({ output, maxBytes, onData });
+
   return new Promise((resolve) => {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeout);
 
     let child;
+    let capError = null;
+    let settled = false;
+
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
     try {
       child = spawnChild({
         cwd,
@@ -290,63 +491,103 @@ function capture(spawnChild, { cmd, timeout, cwd, env, onData, replaceEnv = fals
         ...(env ? { env: replaceEnv ? { ...env } : { ...process.env, ...env } } : {}),
       });
     } catch (err) {
-      clearTimeout(timer);
-      resolve({
+      settle({
         success: false,
         stdout: '',
         stderr: err.message,
         exitCode: null,
         command: cmd,
+        truncated: noTruncation(),
       });
       return;
     }
 
-    const stdoutCapture = createTextCapture(
-      SHELL_CAPTURE_TAIL_BYTES,
-      onData ? (text) => onData(stripAnsi(text), 'stdout') : null,
-    );
-    const stderrCapture = createTextCapture(
-      SHELL_CAPTURE_TAIL_BYTES,
-      onData ? (text) => onData(stripAnsi(text), 'stderr') : null,
-    );
+    const overflow = () => {
+      if (capError) return;
+      capError = `output exceeded ${capBytes} bytes`;
+      // Full mode must never return a quietly cut capture: stop the producer.
+      try { child?.kill('SIGKILL'); } catch { /* it may have exited already */ }
+    };
+
+    const stdoutCapture = createTextCapture({
+      mode,
+      limit: mode === 'full' ? capBytes : SHELL_CAPTURE_TAIL_BYTES,
+      onText: onData ? (text) => onData(stripAnsi(text), 'stdout') : null,
+      onOverflow: overflow,
+    });
+    const stderrCapture = createTextCapture({
+      mode,
+      limit: mode === 'full' ? capBytes : SHELL_CAPTURE_TAIL_BYTES,
+      onText: onData ? (text) => onData(stripAnsi(text), 'stderr') : null,
+      onOverflow: overflow,
+    });
+
+    /** Finish both captures once, whatever path settles the promise. */
+    const snapshot = () => {
+      const stdout = stdoutCapture.finish();
+      const stderr = stderrCapture.finish();
+      return {
+        stdout,
+        stderr,
+        truncated: { stdout: stdoutCapture.dropped, stderr: stderrCapture.dropped },
+      };
+    };
 
     child.stdout.on('data', (chunk) => {
+      if (settled) return;
       stdoutCapture.append(chunk);
     });
     child.stderr.on('data', (chunk) => {
+      if (settled) return;
       stderrCapture.append(chunk);
     });
 
     child.on('close', (exitCode) => {
-      clearTimeout(timer);
-      resolve({
+      const captured = snapshot();
+      if (capError) {
+        settle({
+          success: false,
+          stdout: captured.stdout,
+          stderr: captured.stderr,
+          exitCode: null,
+          command: cmd,
+          truncated: captured.truncated,
+          error: capError,
+        });
+        return;
+      }
+      settle({
         success: exitCode === 0,
-        stdout: stdoutCapture.finish(),
-        stderr: stderrCapture.finish(),
+        stdout: captured.stdout,
+        stderr: captured.stderr,
         exitCode,
         command: cmd,
+        truncated: captured.truncated,
       });
     });
 
     child.on('error', (err) => {
-      clearTimeout(timer);
-      if (err.name === 'AbortError') {
-        resolve({
+      const captured = snapshot();
+      if (capError) {
+        settle({
           success: false,
-          stdout: stdoutCapture.finish(),
-          stderr: `Timeout after ${timeout}ms`,
+          stdout: captured.stdout,
+          stderr: captured.stderr,
           exitCode: null,
           command: cmd,
+          truncated: captured.truncated,
+          error: capError,
         });
-      } else {
-        resolve({
-          success: false,
-          stdout: stdoutCapture.finish(),
-          stderr: err.message,
-          exitCode: null,
-          command: cmd,
-        });
+        return;
       }
+      settle({
+        success: false,
+        stdout: captured.stdout,
+        stderr: err.name === 'AbortError' ? `Timeout after ${timeout}ms` : err.message,
+        exitCode: null,
+        command: cmd,
+        truncated: captured.truncated,
+      });
     });
   });
 }
@@ -363,7 +604,11 @@ function capture(spawnChild, { cmd, timeout, cwd, env, onData, replaceEnv = fals
  * `cmd.exe /d /s /c` on Windows, which is the shell npm scripts themselves run
  * in — so a command that works in `package.json` works here unchanged.
  *
- * Never throws. Same CommandResult as run(). On a timeout the shell is killed;
+ * Command failures never throw. Same CommandResult and same `output` modes as run():
+ * `'tail'` (default) keeps the newest 64 KiB of each stream, `'full'` keeps
+ * everything up to `maxBytes` and kills the shell over the cap, and `'stream'`
+ * keeps nothing but requires `onData`. Every result carries
+ * `truncated: { stdout, stderr }`. On a timeout the shell is killed;
  * a grandchild it started may outlive it, which is why the default is long
  * rather than tight.
  *
@@ -373,7 +618,9 @@ function capture(spawnChild, { cmd, timeout, cwd, env, onData, replaceEnv = fals
  * @param {string} [options.cwd=process.cwd()]
  * @param {Object} [options.env] - Extra environment variables, merged over process.env.
  * @param {(chunk: string, stream: 'stdout'|'stderr') => void} [options.onData]
- * @returns {Promise<{ success: boolean, stdout: string, stderr: string, exitCode: number|null, command: string }>}
+ * @param {'tail'|'full'|'stream'} [options.output='tail'] - What to keep.
+ * @param {number} [options.maxBytes] - Per-stream cap for `output: 'full'` (default 8 MiB).
+ * @returns {Promise<{ success: boolean, stdout: string, stderr: string, exitCode: number|null, command: string, truncated: { stdout: number, stderr: number }, error?: string }>}
  */
 export function runCommandLine(cmd, options = {}) {
   const {
@@ -382,10 +629,12 @@ export function runCommandLine(cmd, options = {}) {
     env = null,
     onData = null,
     replaceEnv = false,
+    output = 'tail',
+    maxBytes,
   } = options;
   return capture(
     (spawnOptions) => spawn(cmd, [], { ...spawnOptions, shell: true }),
-    { cmd, timeout, cwd, env, onData, replaceEnv },
+    { cmd, timeout, cwd, env, onData, replaceEnv, output, maxBytes },
   );
 }
 
@@ -396,6 +645,10 @@ export function runCommandLine(cmd, options = {}) {
  *
  * Never throws. Returns the process exit code, or null if the process was killed
  * (e.g. timeout) or an error occurred.
+ *
+ * This streams straight to the terminal and captures nothing, so the `output`
+ * modes and `truncated` report do not apply; use run() when a caller needs the
+ * text.
  *
  * @param {string} cmd - The command string to execute.
  * @param {{ timeout?: number, cwd?: string }} [options]
@@ -495,59 +748,128 @@ export function runInteractiveFile(file, args, { cwd = process.cwd() } = {}) {
  * Spawns a process directly (no shell wrapper) and pipes data to its stdin.
  * Intended for commands like `sudo -S` that read input from stdin.
  *
- * Never throws. The returned Promise always resolves with a CommandResult.
- * Captured stdout and stderr each contain only the newest bounded byte tail.
+ * Never throws for command failures. The returned Promise always resolves with
+ * a CommandResult. Captured stdout and stderr follow the same `output` modes
+ * as run():
+ *   - `'tail'` (default): each keeps only the newest bounded byte tail;
+ *   - `'full'`: everything up to `maxBytes` (default 8 MiB) per stream; over
+ *     the cap the child is killed and the result carries
+ *     `success: false, exitCode: null, error: 'output exceeded <N> bytes'`;
+ *   - `'stream'`: nothing is captured (stdout/stderr stay ''), every chunk
+ *     goes to `onData`, which is required.
+ * Every result carries `truncated: { stdout, stderr }` — the bytes dropped.
  *
  * @param {string} cmd - The executable to spawn (e.g. 'sudo').
  * @param {string[]} argsArray - Arguments passed directly to the executable.
  * @param {string} [stdinData=''] - String to pipe to the process stdin.
- * @returns {Promise<{ success: boolean, stdout: string, stderr: string, exitCode: number|null, command: string }>}
+ * @param {{ output?: 'tail'|'full'|'stream', maxBytes?: number,
+ *   onData?: ((chunk: string, stream: 'stdout'|'stderr') => void)|null }} [options]
+ * @returns {Promise<{ success: boolean, stdout: string, stderr: string, exitCode: number|null, command: string, truncated: { stdout: number, stderr: number }, error?: string }>}
  */
-export function runWithStdin(cmd, argsArray, stdinData = '') {
+export function runWithStdin(cmd, argsArray, stdinData = '', options = {}) {
+  const { output = 'tail', maxBytes, onData = null } = options;
+  const { mode, maxBytes: capBytes } = resolveOutputOptions({ output, maxBytes, onData });
+
   return new Promise((resolve) => {
     let child;
+    let capError = null;
+    let settled = false;
+
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
     try {
       child = spawn(cmd, argsArray, {
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
       });
     } catch (err) {
-      resolve({
+      settle({
         success: false,
         stdout: '',
         stderr: err.message,
         exitCode: null,
         command: cmd,
+        truncated: noTruncation(),
       });
       return;
     }
 
-    const stdoutCapture = createTextCapture(SHELL_CAPTURE_TAIL_BYTES);
-    const stderrCapture = createTextCapture(SHELL_CAPTURE_TAIL_BYTES);
+    const overflow = () => {
+      if (capError) return;
+      capError = `output exceeded ${capBytes} bytes`;
+      try { child?.kill('SIGKILL'); } catch { /* it may have exited already */ }
+    };
 
-    child.stdout.on('data', (chunk) => stdoutCapture.append(chunk));
-    child.stderr.on('data', (chunk) => stderrCapture.append(chunk));
+    const stdoutCapture = createTextCapture({
+      mode,
+      limit: mode === 'full' ? capBytes : SHELL_CAPTURE_TAIL_BYTES,
+      onText: onData ? (text) => onData(stripAnsi(text), 'stdout') : null,
+      onOverflow: overflow,
+    });
+    const stderrCapture = createTextCapture({
+      mode,
+      limit: mode === 'full' ? capBytes : SHELL_CAPTURE_TAIL_BYTES,
+      onText: onData ? (text) => onData(stripAnsi(text), 'stderr') : null,
+      onOverflow: overflow,
+    });
 
+    const snapshot = () => ({
+      stdout: stdoutCapture.finish(),
+      stderr: stderrCapture.finish(),
+      truncated: { stdout: stdoutCapture.dropped, stderr: stderrCapture.dropped },
+    });
+
+    child.stdout.on('data', (chunk) => {
+      if (settled) return;
+      stdoutCapture.append(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      if (settled) return;
+      stderrCapture.append(chunk);
+    });
+
+    child.stdin.on('error', () => { /* the child may exit before reading stdin */ });
     child.stdin.write(stdinData);
     child.stdin.end();
 
     child.on('close', (exitCode) => {
-      resolve({
+      const captured = snapshot();
+      if (capError) {
+        settle({
+          success: false,
+          stdout: captured.stdout,
+          stderr: captured.stderr,
+          exitCode: null,
+          command: cmd,
+          truncated: captured.truncated,
+          error: capError,
+        });
+        return;
+      }
+      settle({
         success: exitCode === 0,
-        stdout: stdoutCapture.finish(),
-        stderr: stderrCapture.finish(),
+        stdout: captured.stdout,
+        stderr: captured.stderr,
         exitCode,
         command: cmd,
+        truncated: captured.truncated,
       });
     });
 
     child.on('error', (err) => {
-      resolve({
+      const captured = snapshot();
+      settle({
         success: false,
-        stdout: stdoutCapture.finish(),
-        stderr: err.message,
+        stdout: captured.stdout,
+        stderr: capError ?? err.message,
         exitCode: null,
         command: cmd,
+        truncated: captured.truncated,
+        ...(capError ? { error: capError } : {}),
       });
     });
   });

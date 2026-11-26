@@ -31,13 +31,13 @@
 
 import './lib/guard.mjs';
 import { withFileStub } from './lib/windows-file-stub.mjs';
+import { killProcessTree } from './lib/kill-tree.mjs';
 import { TEST_DATA_DIR, assertInsideTestDataDir } from './lib/guard.mjs';
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
-import { once } from 'events';
 import { createRequire } from 'module';
 import { fileURLToPath, pathToFileURL } from 'url';
 
@@ -54,6 +54,81 @@ function check(label, passed, detail = '') {
 }
 
 const srcUrl = (rel) => pathToFileURL(path.join(ROOT, 'src', rel)).href;
+
+/**
+ * Waits for a child with a hard limit.
+ *
+ * A Personal-mode supervisor restarts its daemon for ever, so a suite that
+ * waits for it without a limit can hang the whole run — which is exactly what
+ * happened when the supervisor's command line changed and the fixture no longer
+ * carried the module it imports. After `timeoutMs` the whole TREE is killed and
+ * the step is told it timed out instead of blocking.
+ *
+ * Resolves with `{ code, signal, timedOut, error }` and never rejects.
+ */
+function waitExit(child, { timeoutMs = 60_000, label = 'the child process' } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(async () => {
+      const killed = await killProcessTree(child.pid, { waitMs: 10_000 }).catch(() => null);
+      const survivors = killed?.survivors ?? [];
+      finish({
+        code: null,
+        signal: 'timeout',
+        timedOut: true,
+        error: new Error(`${label} did not finish within ${Math.round(timeoutMs / 1000)}s and was killed`
+          + `${survivors.length ? ` (still visible: ${survivors.join(', ')})` : ''}`),
+      });
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    child.once('close', (code, signal) => finish({ code, signal, timedOut: false }));
+    child.once('error', (error) => finish({ code: null, signal: null, timedOut: false, error }));
+  });
+}
+
+/**
+ * `withFileStub` plus streamed output.
+ *
+ * `streamIcaclsTree` asks `runFile` for `{ output: 'stream', onData }` and keeps
+ * no captured stdout at all, because a real `icacls <dir>\* /T` on an 11,000-file
+ * runtime is several megabytes and shell.js keeps only the newest 64 KiB. The
+ * suites' `run` stubs answer with `stdout`, so the delivery has to be explicit
+ * here: the same text goes to `onData` as it would from icacls's pipe.
+ */
+function stubFiles(options) {
+  const base = withFileStub(options);
+  return {
+    ...base,
+    runFile: async (file, args, extra = {}) => {
+      const result = await base.runFile(file, args);
+      if (typeof extra?.onData === 'function' && result?.stdout) extra.onData(result.stdout, 'stdout');
+      return result;
+    },
+  };
+}
+
+/**
+ * What a real runtime copy leaves in the folder.
+ *
+ * install and repair read the folder and these three files back after copying
+ * (`REQUIRED_CODE_FILES`), so a `copyRuntime` stub that returns a path without
+ * writing them is not a copy: it fails the very verification a real install
+ * runs. The bytes are irrelevant; their presence and their DACLs are not.
+ */
+function writeRuntimeFixture(dir) {
+  fs.mkdirSync(path.join(dir, 'app', 'src', 'cli'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'node.exe'), 'fixture node.exe\n');
+  fs.writeFileSync(path.join(dir, 'app', 'package.json'), '{"name":"easy-devops"}\n');
+  fs.writeFileSync(path.join(dir, 'app', 'src', 'cli', 'index.js'), '// fixture entry\n');
+  return dir;
+}
 
 /** The user's real Startup folder. Read, never written. */
 const REAL_STARTUP = process.env.APPDATA
@@ -713,18 +788,18 @@ async function testAcls() {
   // Applying: driven by a stub, so no real ACL is ever changed.
   const dir = scratch('acl-target');
   const run = stubRun([[/icacls/, { success: true, stdout: 'Successfully processed 1 files' }]]);
-  const applied = await acl.applyGrants(withFileStub({ approvedDirs: [dir], grants: [{ path: dir, access: 'M', why: 'test' }], run }));
+  const applied = await acl.applyGrants(stubFiles({ approvedDirs: [dir], grants: [{ path: dir, access: 'M', why: 'test' }], run }));
   check('a grant is applied through icacls', applied.ok === true && run.matching(/icacls/).length === 1);
   check('the applied command names the real directory', run.calls[0].includes(dir));
 
-  const denied = await acl.applyGrants(withFileStub({
+  const denied = await acl.applyGrants(stubFiles({
     approvedDirs: [dir], grants: [{ path: dir, access: 'M', why: 'test' }],
     run: stubRun([[/icacls/, { success: false, stderr: 'Access is denied.' }]]),
   }));
   check('an Access denied result is reported as needing elevation',
     denied.ok === false && denied.needsElevation === true);
 
-  const absent = await acl.applyGrants(withFileStub({
+  const absent = await acl.applyGrants(stubFiles({
     approvedDirs: [path.join(dir, 'does-not-exist')], grants: [{ path: path.join(dir, 'does-not-exist'), access: 'M', why: 'test' }],
     run: stubRun([[/icacls/, { success: true }]]),
   }));
@@ -1091,7 +1166,7 @@ async function testGuardRefusesProgramData() {
   // temp root. Machine data under ProgramData is therefore probed by its fixed
   // lexical path: changing the environment must never move that boundary.
   const childTemp = scratch('guard-temp');
-  const probe = (dataDir) => new Promise((resolve) => {
+  const probe = async (dataDir) => {
     const child = spawn(process.execPath, [
       '-e',
       'import("./src/core/platform.js").then(m=>{try{m.getDataDir();'
@@ -1107,8 +1182,9 @@ async function testGuardRefusesProgramData() {
     });
     let out = '';
     child.stdout.on('data', (d) => { out += d; });
-    child.on('exit', () => resolve(out));
-  });
+    const result = await waitExit(child, { timeoutMs: 60_000, label: `the guard probe for ${dataDir}` });
+    return result.timedOut ? `TIMEOUT:${out}` : out;
+  };
 
   const programData = 'C:\\ProgramData';
   const ezProgramData = path.win32.join(programData, 'easy-devops');
@@ -1169,7 +1245,12 @@ async function testPersonalLauncher() {
   fs.mkdirSync(path.dirname(entry), { recursive: true });
   const serviceDir = path.join(runDir, 'src/core/service');
   fs.mkdirSync(serviceDir, { recursive: true });
-  for (const file of ['runtime-loader.mjs', 'runtime-boundary.cjs']) {
+  // Every module the supervisor's command line reaches: runtime-register.mjs is
+  // what `--import` runs, and it loads the other two itself. The fixture used to
+  // copy only the loader and the boundary, so a supervisor written for the
+  // `--import` form (Node 18.19 / 20.6 and later) restarted a daemon that could
+  // never start, for ever.
+  for (const file of ['runtime-register.mjs', 'runtime-loader.mjs', 'runtime-boundary.cjs']) {
     fs.copyFileSync(path.join(ROOT, 'src/core/service', file), path.join(serviceDir, file));
   }
   fs.writeFileSync(entry, [
@@ -1192,9 +1273,11 @@ async function testPersonalLauncher() {
   fs.writeFileSync(launcher, runnable.replace(/\n/g, '\r\n'));
 
   const child = spawn('cmd.exe', ['/c', launcher], { stdio: 'ignore', windowsHide: true });
-  const [code] = await once(child, 'exit');
+  const launcherExit = await waitExit(child, { timeoutMs: 60_000, label: 'the generated supervisor' });
 
-  check('the generated batch script runs and exits cleanly', code === 0, `exit ${code}`);
+  check('the generated batch script runs and exits cleanly',
+    launcherExit.code === 0 && launcherExit.timedOut === false,
+    launcherExit.timedOut ? launcherExit.error.message : `exit ${launcherExit.code}`);
 
   const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : '';
   check('it started the daemon', /starting daemon/.test(log));
@@ -1811,7 +1894,7 @@ async function testNotDevMode() {
   const defaultProbeDir = platform.isWindows
     ? path.join(profile, 'easy-devops') : path.join(profile, '.config', 'easy-devops');
   fs.mkdirSync(defaultProbeDir, { recursive: true });
-  const probe = (env) => new Promise((resolve) => {
+  const probe = async (env) => {
     const child = spawn(process.execPath, [
       '-e',
       'Promise.all([import("./src/core/platform.js"), import("./src/core/ssl-issuer.js")])'
@@ -1829,10 +1912,10 @@ async function testNotDevMode() {
     let err = '';
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { err += d; });
-    child.on('exit', () => {
-      try { resolve(JSON.parse(out)); } catch { resolve({ error: err.slice(-200) || out }); }
-    });
-  });
+    const result = await waitExit(child, { timeoutMs: 60_000, label: 'the launcher-profile probe' });
+    if (result.timedOut) return { error: result.error.message };
+    try { return JSON.parse(out); } catch { return { error: err.slice(-200) || out }; }
+  };
 
   const asLauncher = await probe({ EASY_DEVOPS_DATA_DIR: defaultProbeDir });
   check('a daemon started by the launcher is NOT in dev mode',
@@ -2220,21 +2303,23 @@ async function testStoppedByYou() {
 
 // ─── 22b. Database diagnostics before core/db.js opens ──────────────────────
 
-function runCaptured(file, args, env) {
-  return new Promise((resolve) => {
-    const child = spawn(file, args, {
-      cwd: ROOT,
-      env,
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += chunk; });
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
-    child.on('error', (error) => resolve({ code: null, stdout, stderr: `${stderr}${error.stack ?? error}` }));
-    child.on('close', (code) => resolve({ code, stdout, stderr }));
+async function runCaptured(file, args, env) {
+  const child = spawn(file, args, {
+    cwd: ROOT,
+    env,
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const result = await waitExit(child, { timeoutMs: 60_000, label: `${path.basename(file)} ${args.join(' ')}` });
+  if (result.error && result.code === null) {
+    return { code: null, stdout, stderr: `${stderr}${result.error.stack ?? result.error}` };
+  }
+  if (result.timedOut) return { code: null, stdout, stderr: `${stderr}${result.error.message}` };
+  return { code: result.code, stdout, stderr };
 }
 
 async function testDatabaseStatusPreflight() {
@@ -2600,7 +2685,7 @@ async function testWinswLeftoverUpgrade() {
     const run = serviceRun({ registered: false });
 
     let fetched = false;
-    const installed = await ws.install(withFileStub({
+    const installed = await ws.install(stubFiles({
       dataDir,
       appRoot: path.join(root, 'app'),
       config: {},
@@ -2614,7 +2699,7 @@ async function testWinswLeftoverUpgrade() {
         isWindows: true,
         copyRuntime: () => ({
           ok: true,
-          dir: path.join(dataDir, 'runtime'),
+          dir: writeRuntimeFixture(path.join(dataDir, 'runtime')),
           nodeExe: 'NODE',
           entry: 'ENTRY',
         }),
@@ -2679,7 +2764,7 @@ async function testWinswReregisters() {
     // this stub, so only `sc delete` does. That is the awkward real case.
     const run = serviceRun({ registered: true });
 
-    const installed = await ws.install(withFileStub({
+    const installed = await ws.install(stubFiles({
       dataDir,
       appRoot: path.join(root, 'app'),
       config: {},
@@ -2690,7 +2775,7 @@ async function testWinswReregisters() {
         isWindows: true,
         copyRuntime: () => ({
           ok: true,
-          dir: path.join(dataDir, 'runtime'),
+          dir: writeRuntimeFixture(path.join(dataDir, 'runtime')),
           nodeExe: 'NODE',
           entry: 'ENTRY',
         }),
@@ -2901,7 +2986,7 @@ async function testWinswRegistrationFailure() {
       registerResult: { success: false, stdout: '', stderr: output },
     });
 
-    const failed = await ws.install(withFileStub({
+    const failed = await ws.install(stubFiles({
       dataDir,
       appRoot: path.join(root, 'app'),
       config: {},
@@ -2912,7 +2997,7 @@ async function testWinswRegistrationFailure() {
         isWindows: true,
         copyRuntime: () => ({
           ok: true,
-          dir: path.join(dataDir, 'runtime'),
+          dir: writeRuntimeFixture(path.join(dataDir, 'runtime')),
           nodeExe: 'NODE',
           entry: 'ENTRY',
         }),
@@ -3358,7 +3443,7 @@ async function testWindowsUninstallStages() {
     }
 
     const logs = [];
-    const result = await ws.uninstall(withFileStub({
+    const result = await ws.uninstall(stubFiles({
       dataDir,
       config: {},
       operator: { sid: SID, name: 'DOMAIN\\installer', dataDir: true, serviceControl: true },
@@ -3460,7 +3545,7 @@ async function testWindowsUninstallAclTimeout() {
     const dataDir = platform.programDataDir();
     fs.mkdirSync(dataDir, { recursive: true });
     fs.writeFileSync(path.join(dataDir, 'easy-devops.sqlite'), 'KEEP');
-    const stubbed = withFileStub({
+    const stubbed = stubFiles({
       dataDir,
       config: {},
       operator: { sid: SID, name: 'DOMAIN\\installer', dataDir: true, serviceControl: true },
@@ -3535,7 +3620,7 @@ async function testWindowsUninstallRetryAfterRegistrationRemoved() {
     fs.writeFileSync(path.join(dataDir, '.server-mode'), '{}\n');
     fs.writeFileSync(path.join(dataDir, 'easy-devops.sqlite'), 'KEEP');
 
-    const result = await ws.uninstall(withFileStub({
+    const result = await ws.uninstall(stubFiles({
       dataDir,
       config: {},
       operator: {
@@ -3628,7 +3713,7 @@ async function testScExeEverywhere() {
       canWrite: () => true,
       copyRuntime: () => ({
         ok: true,
-        dir: runtime,
+        dir: writeRuntimeFixture(runtime),
         nodeExe: path.join(runtime, 'node.exe'),
         entry: path.join(runtime, 'app', 'src', 'cli', 'index.js'),
       }),
@@ -3637,7 +3722,7 @@ async function testScExeEverywhere() {
     };
     const log = () => {};
 
-    await ws.install(withFileStub({
+    await ws.install(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -3646,7 +3731,7 @@ async function testScExeEverywhere() {
       fetchImpl: async () => winswResponse(),
       deps,
     }));
-    await ws.uninstall(withFileStub({ dataDir, config: {}, run, log }));
+    await ws.uninstall(stubFiles({ dataDir, config: {}, run, log }));
     scState = 'RUNNING';
     await ws.stop({ run, stopWaitMs: 2_000 });
     await ws.start({ run });
@@ -3655,7 +3740,7 @@ async function testScExeEverywhere() {
     scState = 'RUNNING';
     fs.mkdirSync(runtime, { recursive: true });
     fs.writeFileSync(path.join(runtime, 'marker'), 'OLD');
-    await ws.repair(withFileStub({
+    await ws.repair(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -3728,7 +3813,7 @@ async function testElevation() {
   check('and specifically for Administrator', /Administrator/.test(command));
 
   let copied = 0;
-  const refused = await ws.install(withFileStub({
+  const refused = await ws.install(stubFiles({
     dataDir: scratch('elevation-nocopy'),
     appRoot: scratch('elevation-app'),
     run: stubRun(),
@@ -3780,7 +3865,7 @@ async function testElevation() {
       return base(cmd);
     };
 
-    const installed = await ws.install(withFileStub({
+    const installed = await ws.install(stubFiles({
       dataDir,
       appRoot: path.join(root, 'app'),
       config: {},
@@ -3793,7 +3878,7 @@ async function testElevation() {
         canWrite: () => true,
         copyRuntime: () => ({
           ok: true,
-          dir: path.join(dataDir, 'runtime'),
+          dir: writeRuntimeFixture(path.join(dataDir, 'runtime')),
           nodeExe: 'NODE',
           entry: 'ENTRY',
         }),
@@ -4209,6 +4294,7 @@ async function testRepairWhileRunning() {
       events.push('COPY');
       events.push(`COPY_STATE:${run.state.sc}`);
       fs.mkdirSync(dir, { recursive: true });
+      writeRuntimeFixture(dir);
       fs.writeFileSync(path.join(dir, 'marker'), 'NEW');
       return {
         ok: true,
@@ -4234,7 +4320,7 @@ async function testRepairWhileRunning() {
 
     const successEvents = [];
     const successRun = makeRun(successEvents);
-    const success = await ws.repair(withFileStub({
+    const success = await ws.repair(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -4263,7 +4349,7 @@ async function testRepairWhileRunning() {
     fs.writeFileSync(path.join(dir, 'marker'), 'OLD');
     const unreadableEvents = [];
     const unreadableRun = makeRun(unreadableEvents);
-    const unreadable = await ws.repair(withFileStub({
+    const unreadable = await ws.repair(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -4297,7 +4383,7 @@ async function testRepairWhileRunning() {
     let startCalls = 0;
     let atSecondStart = null;
 
-    const rollback = await ws.repair(withFileStub({
+    const rollback = await ws.repair(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -4328,7 +4414,7 @@ async function testRepairWhileRunning() {
 
     const noElevationEvents = [];
     const noElevationRun = makeRun(noElevationEvents);
-    const refused = await ws.repair(withFileStub({
+    const refused = await ws.repair(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -4342,7 +4428,7 @@ async function testRepairWhileRunning() {
 
     const unknownElevationEvents = [];
     const unknownElevationRun = makeRun(unknownElevationEvents);
-    const unknown = await ws.repair(withFileStub({
+    const unknown = await ws.repair(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -4356,7 +4442,7 @@ async function testRepairWhileRunning() {
 
     const aclHiddenEvents = [];
     const aclHiddenRun = makeRun(aclHiddenEvents);
-    const aclHidden = await ws.repair(withFileStub({
+    const aclHidden = await ws.repair(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -4383,7 +4469,7 @@ async function testRepairWhileRunning() {
       aclHiddenEvents.join(' | '));
 
     const unknownProbeEvents = [];
-    const unknownProbe = await ws.repair(withFileStub({
+    const unknownProbe = await ws.repair(stubFiles({
       dataDir,
       appRoot,
       config: {},

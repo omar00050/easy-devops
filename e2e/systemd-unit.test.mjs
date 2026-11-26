@@ -768,10 +768,192 @@ async function testRecoverService() {
     (blocked.reason ?? '').includes(path.join(blockedData, 'daemon.stop')), blocked.next ?? '');
 }
 
-// ─── 5. systemd's own parser, when it exists here ───────────────────────────
+// ─── 5. One rule for every privileged command: root runs it, others sudo ────
+
+/**
+ * The owner's Linux server is a root install. 1.4.7 ran `sudo systemctl …` and
+ * `sudo install …` unconditionally, so on a root server without sudo installed
+ * `ezz update` stopped and started nothing at all — while `recover` already
+ * dropped the wrapper. Every privileged command in systemd.js now goes through
+ * one decision, and this group pins both halves of it with an injected uid:
+ * root → the argv starts with `systemctl` / `install` / `rm`, a normal user →
+ * it starts with `sudo`.
+ */
+async function testPrivilegeRule() {
+  setGroup('5. as root every privileged command runs directly; otherwise sudo asks');
+
+  const sd = await import(srcUrl('core/service/systemd.js'));
+
+  const dir = scratch('privilege');
+  const unitPath = path.join(dir, 'easy-devops.service');
+  fs.writeFileSync(unitPath, BROKEN_146_UNIT);
+  const tty = { isTTY: true };
+
+  /** A runner that records every argv and succeeds, so nothing real is run. */
+  const recorder = () => {
+    const calls = [];
+    const fileRunner = async (file, args) => {
+      calls.push([file, ...args]);
+      return { success: true, exitCode: 0, stdout: '', stderr: '' };
+    };
+    const interactive = async (command) => {
+      calls.push([String(command)]);
+      return { success: true, exitCode: 0, stdout: '', stderr: '' };
+    };
+    return { calls, fileRunner, interactive, joined: () => calls.map((call) => call.join(' ')) };
+  };
+
+  for (const [label, isRoot] of [['as root', true], ['as a normal user', false]]) {
+    const { calls, fileRunner, joined } = recorder();
+    const restarted = await sd.restart({ fileRunner, isRoot });
+    const stopped = await sd.stop({ fileRunner, isRoot, unitPath, stdin: tty });
+    const started = await sd.start({ fileRunner, isRoot, unitPath, stdin: tty });
+
+    check(`${label}: restart, stop and start succeed`,
+      restarted.ok && stopped.ok && started.ok,
+      restarted.reason ?? stopped.reason ?? started.reason ?? '');
+
+    const expected = isRoot
+      ? [['systemctl', 'restart', sd.UNIT_NAME], ['systemctl', 'stop', sd.UNIT_NAME], ['systemctl', 'start', sd.UNIT_NAME]]
+      : [['sudo', 'systemctl', 'restart', sd.UNIT_NAME], ['sudo', 'systemctl', 'stop', sd.UNIT_NAME], ['sudo', 'systemctl', 'start', sd.UNIT_NAME]];
+    check(`${label}: restart, stop and start are ${isRoot ? 'systemctl argv with no sudo' : 'sudo systemctl argv'}`,
+      JSON.stringify(calls) === JSON.stringify(expected), joined().join(' | '));
+  }
+
+  // Root has nothing to answer, so it must not demand a terminal; a normal user
+  // must still have one, because sudo asks there and nowhere else.
+  const rootNoTty = recorder();
+  const rootStop = await sd.stop({ fileRunner: rootNoTty.fileRunner, isRoot: true, unitPath, stdin: { isTTY: false } });
+  check('as root, stop needs no terminal (there is no password to ask for)',
+    rootStop.ok === true && rootNoTty.calls.length === 1, rootStop.reason ?? '');
+  const userNoTty = recorder();
+  const userStop = await sd.stop({ fileRunner: userNoTty.fileRunner, isRoot: false, unitPath, stdin: { isTTY: false } });
+  check('as a normal user, stop still refuses without a terminal, because sudo must ask',
+    userStop.ok === false && /terminal/i.test(userStop.reason ?? '') && userNoTty.calls.length === 0,
+    userStop.reason ?? '');
+
+  // ── install: the file copy, enable and restart ───────────────────────────
+  for (const [label, isRoot] of [['as root', true], ['as a normal user', false]]) {
+    const { calls, fileRunner, interactive, joined } = recorder();
+    const installed = await sd.install({
+      nodeExe: path.join(dir, 'runtime', 'node'),
+      entry: path.join(dir, 'src', 'cli', 'index.js'),
+      dataDir: dir,
+      user: 'deploy',
+      fileRunner,
+      interactive,
+      unitPath: path.join(dir, `install-${isRoot ? 'root' : 'user'}.service`),
+      stdin: tty,
+      isRoot,
+      runner: async () => ({ success: true, exitCode: 0, stdout: '', stderr: '' }),
+    });
+
+    check(`${label}: install succeeds`, installed.ok === true, installed.reason ?? '');
+    check(`${label}: the unit copy is ${isRoot ? 'install' : 'sudo install'}, and reload, enable and restart follow the same rule`,
+      calls[0]?.[0] === (isRoot ? 'install' : 'sudo')
+        && calls[0]?.join(' ').includes('-m 0644')
+        && calls.slice(1).map((call) => call.join(' ')).join(' | ') === (isRoot
+          ? 'systemctl daemon-reload | systemctl enable easy-devops.service | systemctl restart easy-devops.service'
+          : 'sudo systemctl daemon-reload | sudo systemctl enable easy-devops.service | sudo systemctl restart easy-devops.service'),
+      joined().join(' | '));
+  }
+
+  // A root install needs no terminal at all: nobody has to answer sudo, and a
+  // server being set up by a script has none.
+  const scripted = recorder();
+  const scriptedInstall = await sd.install({
+    nodeExe: path.join(dir, 'runtime', 'node'),
+    entry: path.join(dir, 'src', 'cli', 'index.js'),
+    dataDir: dir,
+    user: 'deploy',
+    fileRunner: scripted.fileRunner,
+    interactive: scripted.interactive,
+    unitPath: path.join(dir, 'install-scripted.service'),
+    stdin: { isTTY: false },
+    isRoot: true,
+    runner: async () => ({ success: true, exitCode: 0, stdout: '', stderr: '' }),
+  });
+  check('as root, install does not demand a terminal it has no use for',
+    scriptedInstall.ok === true, scriptedInstall.reason ?? '');
+  const scriptedUser = recorder();
+  const scriptedRefused = await sd.install({
+    nodeExe: path.join(dir, 'runtime', 'node'),
+    entry: path.join(dir, 'src', 'cli', 'index.js'),
+    dataDir: dir,
+    fileRunner: scriptedUser.fileRunner,
+    interactive: scriptedUser.interactive,
+    unitPath: path.join(dir, 'install-refused.service'),
+    stdin: { isTTY: false },
+    isRoot: false,
+  });
+  check('as a normal user, install still refuses without a terminal',
+    scriptedRefused.ok === false && /terminal/i.test(scriptedRefused.reason ?? ''),
+    scriptedRefused.reason ?? '');
+
+  // ── daemon-reload, through a unit rewrite ────────────────────────────────
+  for (const [label, isRoot] of [['as root', true], ['as a normal user', false]]) {
+    const { calls, fileRunner, interactive, joined } = recorder();
+    const refreshPath = path.join(dir, `refresh-${isRoot ? 'root' : 'user'}.service`);
+    fs.writeFileSync(refreshPath, OLD_143_UNIT);
+    const refreshed = await sd.refreshUnit({
+      entry: '/opt/easy-devops/src/cli/index.js',
+      dataDir: dir,
+      unitPath: refreshPath,
+      fileRunner,
+      interactive,
+      isRoot,
+    });
+
+    const reloadLine = calls.map((call) => call.join(' ')).find((line) => line.includes('daemon-reload')) ?? '';
+    check(`${label}: rewriting the unit copies it with ${isRoot ? 'install' : 'sudo install'} and reloads with ${isRoot ? 'systemctl' : 'sudo systemctl'}`,
+      refreshed.ok === true
+        && calls[0]?.[0] === (isRoot ? 'install' : 'sudo')
+        && reloadLine === (isRoot ? 'systemctl daemon-reload' : 'sudo systemctl daemon-reload'),
+      joined().join(' | '));
+  }
+
+  // ── uninstall: stop, disable, rm, reload, reset-failed ──────────────────
+  for (const [label, isRoot] of [['as root', true], ['as a normal user', false]]) {
+    const { calls, fileRunner, interactive, joined } = recorder();
+    const removePath = path.join(dir, `remove-${isRoot ? 'root' : 'user'}.service`);
+    const removed = await sd.uninstall({ fileRunner, interactive, unitPath: removePath, stdin: tty, isRoot });
+
+    const lines = joined();
+    check(`${label}: uninstall succeeds`, removed.ok === true, removed.reason ?? '');
+    check(`${label}: uninstall ${isRoot ? 'never wraps a step in sudo' : 'wraps every step in sudo'}`,
+      isRoot
+        ? lines.every((line) => !line.startsWith('sudo ') && line.split(' ')[1] !== 'sudo')
+        : lines.every((line) => line.startsWith('sudo ')),
+      lines.join(' | '));
+    check(`${label}: stop, disable, rm, daemon-reload and reset-failed all ran`,
+      ['systemctl stop', 'systemctl disable', 'rm -f --', 'systemctl daemon-reload', 'systemctl reset-failed']
+        .every((part) => lines.join(' ').includes(part)), lines.join(' | '));
+  }
+
+  // ── status: readable state never elevates, for anyone ────────────────────
+  const statusCalls = [];
+  const statusRunner = async (command) => {
+    statusCalls.push(String(command));
+    return {
+      success: true,
+      exitCode: 0,
+      stdout: 'ActiveState=active\nSubState=running\nNRestarts=0\nUnitFileState=enabled\n',
+      stderr: '',
+    };
+  };
+  const statusRoot = await sd.status({ runner: statusRunner, unitPath, isRoot: true });
+  const statusUser = await sd.status({ runner: statusRunner, unitPath, isRoot: false });
+  check('status reads the same for root and a normal user, and never adds sudo',
+    statusRoot.running === true && statusUser.running === true
+      && statusCalls.length === 2
+      && statusCalls.every((command) => command.startsWith('systemctl show ') && !command.includes('sudo')),
+    statusCalls.join(' | '));
+}
+
+// ─── 6. systemd's own parser, when it exists here ───────────────────────────
 
 async function testSystemdAnalyze() {
-  setGroup('5. systemd-analyze verify accepts the generated unit');
+  setGroup('6. systemd-analyze verify accepts the generated unit');
 
   const shell = await import(srcUrl('core/shell.js'));
   const sd = await import(srcUrl('core/service/systemd.js'));
@@ -815,6 +997,7 @@ async function main() {
   await testBrokenUnitRepair();
   await testOldUnitRepair();
   await testRecoverService();
+  await testPrivilegeRule();
   await testSystemdAnalyze();
 
   const failed = results.filter((result) => !result.passed);

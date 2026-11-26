@@ -252,6 +252,9 @@ export function explainLsRemoteFailure(stderr, timedOut) {
   if (timedOut) {
     return 'GitHub did not answer within 12 seconds. Check that this server can reach github.com on port 22 (a firewall may block outgoing SSH), then test again.';
   }
+  if (/output exceeded \d+ bytes/i.test(text)) {
+    return `git printed more than Easy DevOps reads in full (${text.match(/output exceeded \d+ bytes/i)[0]}). The repository has an unusually large branch list; check the repository URL and the branch name, then test again.`;
+  }
   if (/REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|host key .* (?:mismatch|differs)/i.test(text)) {
     return 'The server answering as github.com did not present GitHub\'s published host key, so the connection was refused. Something between this server and GitHub may be intercepting SSH; do not deploy until this is explained.';
   }
@@ -309,14 +312,21 @@ export async function testDeployKey(id, { run = shellRun } = {}) {
   const result = await run(`git ls-remote --heads "${app.repoUrl}"`, {
     timeout: LS_REMOTE_TIMEOUT_MS,
     env: { GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: sshCmd },
+    // A repository with thousands of branches exceeds the default 64 KiB
+    // tail. A tail drops the first lines, so an existing branch reported
+    // "missing" — the very branch might be in the part that was cut.
+    output: 'full',
   });
   const fingerprint = describeDeployKey(app).fingerprint;
 
   if (!result.success) {
+    // Over the full-mode cap, run() reports the cause in `error` and leaves
+    // stderr possibly empty; pass both so the user is told what happened.
+    const detail = [result.stderr, result.error].filter(Boolean).join('\n');
     return {
       ok: false,
       status: 200,
-      error: explainLsRemoteFailure(result.stderr, result.exitCode === null),
+      error: explainLsRemoteFailure(detail, result.exitCode === null),
       fingerprint,
     };
   }

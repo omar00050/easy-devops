@@ -7,7 +7,204 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [1.4.8] — 2026-11-26
+
+**A stability release.** 1.4.7 was published, then failed on a real Windows
+Server at the runtime permission step. 1.4.8 fixes that failure and the
+conditions that led a 1.4.7 server into it, and makes one command enough to
+bring a server in any 1.4.0–1.4.7 state — broken or healthy — to a running,
+protected service with its data intact.
+
+### Fixed
+
+- **The permission check no longer reads a cut-off listing.** It checked the
+  whole `runtime` tree with one `icacls … /T` and looked for
+  `runtime\node.exe` in the captured output, which keeps only the last 64 KiB —
+  and `node.exe` is listed near the top of a 10,700-file tree, so a file that
+  was there, with correct permissions, was reported as missing.
+- **A healthy runtime is measured in one pass, not several.** The folder ACL is
+  read and granted once; the tree is scanned once, streamed, with no size
+  limit, only to find a child whose access list is empty or does not inherit;
+  `icacls /reset /T` and `/setowner` run only when that scan finds a real
+  problem, and a step that takes more than a few seconds says so while it runs.
+- **The previous permissions are put back, and the output says so, in install,
+  repair, recover and after an update.** 1.4.7 put them back in install and in
+  repair — repair goes through the same routine, and it also put the previous
+  runtime copy back. `recover` returned without restoring them and said so,
+  "The permissions were not changed back automatically", and the post-update
+  step returned the failure without restoring them. All four now save the
+  code-tree permissions before changing them, restore them when a check fails,
+  say whether the restore worked, and print the next command.
+- **Windows Server editions never get the Startup launcher.** With no service
+  registered, `repair`, `start`, `update` and every fallback now say the service
+  is not installed and name `ezz service install` instead of setting up a
+  supervisor that only runs while someone is signed in. If the two launcher
+  files are already there on a Server edition, install and repair copy them to
+  `<data>\backup\personal-launcher-<stamp>`, verify the copy, then remove only
+  those two files. A Personal install on a desktop is unchanged.
+- **Leftover Server-mode data is detected instead of refused.** When
+  `C:\ProgramData\easy-devops` holds an Easy DevOps database and the
+  `.server-mode` marker is missing, install shows both databases — key count,
+  size, modified time and the key names, never a value — and asks which to use:
+  adopt ProgramData as it is (restore the marker, leave `%APPDATA%` untouched),
+  or set it aside as `easy-devops.old-<date>` and then migrate `%APPDATA%`. The
+  default is the database with more keys, and neither database is ever
+  overwritten or deleted. Without a terminal it refuses and prints
+  `ezz service install --adopt-existing-data` and
+  `ezz service install --set-aside-existing-data`.
+- **An interrupted install resumes.** Install records its steps in
+  `install-progress.json`. Running `ezz service install` again re-checks the
+  finished steps cheaply and continues from the one that stopped. Status then
+  says the install is not finished, names the step, and tells you to run
+  `ezz service install` to resume, instead of claiming the permissions are
+  missing.
+- **Status warnings come from a live read.** The three "run repair" warnings
+  that 1.4.7 printed on a server whose permissions were correct came from the
+  failed install's record. Access is now read from the access lists themselves
+  — the service account on the data, nginx and SSL folders, the operator entry
+  on the service descriptor — so the lines cannot contradict each other, and
+  an unfinished install says only "resume install". `Service version` is
+  printed only when a service is registered, and then it is the version the
+  daemon reported or the runtime copy's `package.json`, never the CLI's own;
+  with no service it says the service is not installed.
+- **The `TimeoutOverflowWarning: Infinity does not fit into a 32-bit signed
+  integer` is gone.** A permission cleanup after a failed check ran without a
+  deadline, so a timeout of `Infinity` reached `setTimeout`. Every permission
+  step now has a finite deadline.
+- **The daemon no longer prints `--experimental-loader may be removed`.** On
+  Node 18.19+, 20.6+ and every later major the service command line now uses
+  `--import` with `module.register()`, with the same module confinement and no
+  experimental warning; Node before 18.19 and the 19.x line keep the loader
+  flag, which is what they support. Units and WinSW XML written by older
+  versions keep working as they are until `ezz service repair` rewrites them.
+- **The first `ezz` command after `npm i -g` offers the fix.** A plain
+  `npm i -g easy-devops@1.4.8` updates the CLI while the service keeps running
+  its own copy. The first command after that detects a service on an older
+  version, an unfinished install, or leftover Server data — it no longer needs
+  the Server-mode marker to notice — and offers the fix: "Relaunch as
+  administrator?" on Windows in a real terminal, the exact `sudo` command on
+  Linux, and the command alone in a script, a pipe or CI. Nothing repairs
+  itself.
+- **Command output is never cut silently any more.** `core/shell.js` now takes
+  an explicit `output: 'tail' | 'full' | 'stream'` and reports how many bytes it
+  dropped, so a caller cannot mistake a cut capture for a complete one. The
+  callers that parse more than 64 KiB say so: PM2's process list (`pm2 jlist`)
+  is read in full and refuses with an explanation rather than parsing a partial
+  list, and a git branch list over 64 KiB (`git ls-remote --heads`) is read in
+  full; the ACL tree scan streams instead of buffering.
+- **The test runner reports what it actually ran.** Each suite prints
+  `name: PASS|FAIL passed/total, skipped n`, the summary adds the skipped total
+  and names every suite with skips, and a suite that hangs or stops printing is
+  killed and failed with its name and the step it had reached, instead of
+  hanging the whole run. `node e2e/run.mjs --windows-only` runs the groups that
+  need a real Windows machine.
+- **Two background daemons can no longer run at once under heavy file
+  contention.** On Windows a read, rename or delete of the lock file can be
+  refused for a moment while another process has it open. 1.4.7 treated a
+  refused read as "no lock at all", so a live holder's own heartbeat could stop
+  seeing its lock and a competitor could take it, leaving two daemons running
+  the jobs. Those operations are now retried, a lock that cannot be read is
+  treated as held rather than free, a crashed holder's lock is recovered under a
+  guard that is deleted and never restored, and a release removes only a lock
+  that carries this process's own token. With 128 competing processes the old
+  code produced up to five overlaps of two live holders in three runs; the new
+  code produced none.
+- **A refused rename no longer crashes a certificate operation, or stalls the
+  next one for 30 seconds.** The SSL artifact lock had the same Windows
+  behaviour: a rename refused because another process held the file was thrown
+  uncaught, and its recovery path could put a released guard back, so other
+  processes saw "another process is recovering the lock" until the guard aged
+  out (30 seconds). Every path change is now retried, a retired guard is
+  deleted and never restored, and a dead owner's guard is cleared at once.
+  Taking the lock is still an exclusive create, so there is still only ever one
+  holder.
+- **A certificate issue that hangs now fails instead of exiting quietly.** If
+  an ACME call never answered, the timeout that should have stopped it was
+  unref'd, so an `ezz` run with nothing else waiting could exit with code 0 and
+  print neither a certificate nor an error. The timeout now rejects with "The
+  certificate operation timed out after Ns while <stage>", so the command says
+  what happened.
+- **Linux: `ezz update` works on a root install with no `sudo` installed.**
+  Stop and start always ran `sudo systemctl`, even as root, so an update on a
+  minimal root install failed at the stop. As root the command now runs
+  `systemctl` directly; for everyone else `sudo` is unchanged.
+
+### Updating from any 1.4.x
+
+The background service runs its own copy of the package, under
+`C:\ProgramData\easy-devops\runtime` on Windows Server, as the service account.
+It cannot replace those files itself — that needs an administrator — so one
+command must be run once, by a person. That one command is enough for every
+state below.
+
+**A server whose `ezz` runs (any 1.4.0–1.4.7).** The update is automatic; the
+new version's post-update step runs before the service starts, and on Windows
+the update relaunches itself elevated through the existing prompt when it needs
+to:
+
+```powershell
+# Windows, Administrator PowerShell
+ezz update
+```
+
+```bash
+# Linux: the account that installed the package, with no sudo prefix
+ezz update
+```
+
+On Linux the command is the same for root and for every other account:
+`ezz update`. The privileged steps are the same either way — it runs
+`sudo systemctl stop easy-devops` and `sudo systemctl start easy-devops`
+itself (`core/service/systemd.js`), so it needs a real terminal, where sudo
+can ask; as root, sudo has nothing to ask for. Do not put `sudo` in front of
+the whole command: the data directory is under the home directory of whoever
+runs it, so root would read root's own `~/.config/easy-devops` and not find
+the service. The `npm install -g` step runs as the account running the
+command, as it did when the package was first installed.
+
+**A server where `npm i -g` already replaced the CLI:**
+
+```powershell
+# Windows
+npm i -g easy-devops@1.4.8
+ezz service status        # offers "Relaunch as administrator?"; Y runs the repair
+ezz service repair        # or run this instead, from an Administrator PowerShell
+```
+
+```bash
+# Linux
+sudo npm i -g easy-devops@1.4.8
+sudo ezz service repair
+```
+
+If nothing is registered as a service on Windows, the first `ezz` command tells
+you so and names `ezz service install`; repair and start do the same instead of
+setting up the Personal launcher on a Server edition. Install once — see the
+state below — and the service ends registered, protected and running on 1.4.8.
+
+**A server in the state from the 1.4.7 report** — no service registered, while
+`C:\ProgramData\easy-devops` still holds the earlier Server-mode data — from an
+Administrator PowerShell:
+
+```powershell
+ezz service install
+ezz service status
+```
+
+`ezz service install` shows both databases with their key counts and key names
+and asks which to use. Choose **adopt** to keep the ProgramData data as it is,
+or **set aside** to rename it to `easy-devops.old-<date>` first. Without a
+terminal, pass `--adopt-existing-data` or `--set-aside-existing-data`. Nothing
+is overwritten, and the folder with more keys is the default.
+
+If `ezz` cannot start at all on Windows, read
+[Troubleshooting](https://easy-devops.devxor.team/docs/troubleshooting#service-stopped-after-update-1-4-4)
+and restore access to `bin` and `runtime` first; then install 1.4.8 and run
+`ezz service repair` once.
+
 ## [1.4.7] — 2026-11-25
+
+**Windows Server install can stop at the runtime permission step; fixed in 1.4.8.**
 
 **Security and availability.** Every security fix from 1.4.4, 1.4.5 and 1.4.6 is
 still here. 1.4.7 repairs the upgrade failures those releases caused: an
@@ -136,6 +333,21 @@ older version without saying so. If this server updated to 1.4.4, 1.4.5 or
   interrupted update back before reading or replacing those files. Only the
   service's own folder, the snapshot and the journal are ever removed — never
   user data.
+
+### Known issues
+
+- **Windows Server: install or recover can stop at the runtime permission
+  check** with `node.exe is missing from the read-back`. It is a bug in the
+  check, not a lock-out — see
+  [Troubleshooting](https://easy-devops.devxor.team/docs/troubleshooting#runtime-read-back-1-4-7).
+- **Windows Server: install refuses `C:\ProgramData\easy-devops is not empty`**
+  when an earlier Server-mode install left its data there and the Server-mode
+  marker is missing. Do not remove the folder — see
+  [Troubleshooting](https://easy-devops.devxor.team/docs/troubleshooting#programdata-not-empty).
+- **Windows Server: `ezz service repair` with no service registered installs the
+  Personal Startup launcher** instead of saying the service is not installed.
+  The two files and how to remove them — see
+  [Troubleshooting](https://easy-devops.devxor.team/docs/troubleshooting#personal-launcher-on-server).
 
 ### If you updated to 1.4.4, 1.4.5 or 1.4.6
 

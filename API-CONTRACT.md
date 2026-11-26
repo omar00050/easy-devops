@@ -958,14 +958,20 @@ parallel, which took it from about 7.5 s to about 2 s.
 | `startsAt` | `logon` (Windows Personal) or `boot` |
 | `jobsRunningHere` | This process is the one running the jobs. Exactly one process does, enforced by a marker — see §3.5 |
 | `stoppedByUser` | Stopped deliberately, not crashed. `stoppedAt` is an ISO timestamp when known |
-| `warnings` | Human-readable problems from the service status: a crash loop, a broken runtime pin, ACL paths that changed, a missing recorded permission check |
+| `warnings` | Human-readable problems from the service status: a crash loop, a broken runtime pin, an unfinished install, missing live access for the service account, or a service/CLI version drift. Since 1.4.8 the access warnings come from the ACLs as they are now, never from the install record |
 | `runtime` | The service's pinned Node next to the system's, so a version-manager break is visible |
-| `serviceVersion` | The version of the package the service actually runs. Windows Server has its own copy under `C:\ProgramData\easy-devops\runtime\app`; Linux and Personal run the CLI package, so the two are equal. `null` when it cannot be read |
+| `serviceVersion` | The version of the package the service actually runs. Windows Server has its own copy under `C:\ProgramData\easy-devops\runtime\app`; Linux and Personal run the CLI package, so the two are equal. `null` when no service is registered, or when it cannot be read. 1.4.7 printed the CLI's own version here even with no service installed, so the field looked installed when nothing was |
 | `cliVersion` | The version of the package this dashboard/CLI is running |
-| `versionDrift` | `true` when `serviceVersion` and `cliVersion` differ. A file read, not a probe, so it is never stale. No automatic repair: the client names `ezz service repair` |
+| `versionDrift` | `true` when `serviceVersion` and `cliVersion` differ, and only while a service is registered, so it is always `false` when `serviceVersion` is `null`. A file read, not a probe, so it is never stale. No automatic repair: the client names `ezz service repair` |
 
 `enabledOnBoot` is `true`, `false`, or **`null` for unknown** (a non-systemd
 Linux, where the boot hook cannot be read).
+
+`core/service/index.js` `status()` also computes `serviceInstalled`,
+`installProgress` (with `installUnfinished`) and `liveGrants` for the CLI and its
+status lines. `GET /api/service` and `service:changed` do not publish them, so
+the `backgroundService` shape above is unchanged and a dashboard cannot read
+install progress over HTTP.
 
 **Version drift is reported, never repaired automatically.** On Windows Server
 the service runs its own copy of the package, so a plain `npm i -g easy-devops`

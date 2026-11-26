@@ -463,13 +463,33 @@ async function main() {
       await args.challengeCreateFn({}, { token: 'tok' }, 'tok.keyauth');
       return new Promise(() => {});
     });
-    const result = await issuer.issueCertificate('slow.example.com', {
-      email: 'ops@example.com',
-      mode: 'proxy',
-      timeoutMs: 40,
-      deps: successDeps(acme),
-      run: fakeRun,
+    // The operation must SETTLE. 1.4.7 unref'd this bound's timer, so a CLI run
+    // with nothing else on the event loop exited 0 mid-operation and the suite
+    // stopped after group 5. This dead-man timer (not unref'd) keeps the loop
+    // alive and fails loudly if the timeout rejection never arrives.
+    let deadman;
+    const deadline = new Promise((_, reject) => {
+      deadman = setTimeout(
+        () => reject(new Error('the certificate operation never settled: its timeout did not fire')),
+        5000,
+      );
     });
+    const result = await Promise.race([
+      issuer.issueCertificate('slow.example.com', {
+        email: 'ops@example.com',
+        mode: 'proxy',
+        timeoutMs: 40,
+        deps: successDeps(acme),
+        run: fakeRun,
+      }),
+      deadline,
+    ]);
+    clearTimeout(deadman);
+    check('the timeout rejection arrived, naming the stage it interrupted',
+      result?.success === false && result.error?.step === 'timeout'
+      && /timed out/i.test(result.error?.cause ?? '')
+      && /waiting for validation/.test(result.error?.cause ?? ''),
+      result?.error?.cause);
     check('the overall time is bounded', result.success === false && result.error?.step === 'timeout');
     check('the timeout names the stage that was running',
       /timed out/i.test(result.error?.cause ?? '') && /waiting for validation/.test(result.error?.cause ?? ''),

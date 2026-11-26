@@ -1,4 +1,3 @@
-import { pathToFileURL } from 'node:url';
 /**
  * core/service/windowsPersonal.js
  *
@@ -50,6 +49,7 @@ import { getStartupFolder, isWindows, isDefaultDataDir } from '../platform.js';
 import { dbGet, dbSet } from '../db.js';
 import { run as shellRun } from '../shell.js';
 import { stopRequestPath } from '../daemon/stopRequest.js';
+import { daemonNodeArgs, knownNodeVersion } from './runtime.js';
 import {
   completeLogLines,
   readBoundedTailSync,
@@ -150,9 +150,11 @@ exit /b 0
  * @param {string} opts.dataDir
  * @param {string} opts.logFile
  * @param {string} opts.stopFile
+ * @param {string|null} [opts.nodeVersion] The pinned Node's version, when known.
+ *   Unknown means the loader flag, which every version understands.
  * @returns {string}
  */
-export function buildSupervisor({ nodeExe, entry, dataDir, logFile, stopFile }) {
+export function buildSupervisor({ nodeExe, entry, dataDir, logFile, stopFile, nodeVersion = null }) {
   // Only set when it is NOT the default directory. Passing it needlessly is
   // what put the daemon into dev mode -- issuing staging certificates on real
   // domains -- back when dev mode was inferred from the variable's presence.
@@ -160,6 +162,17 @@ export function buildSupervisor({ nodeExe, entry, dataDir, logFile, stopFile }) 
   const dataDirLine = isDefaultDataDir(dataDir)
     ? 'rem EASY_DEVOPS_DATA_DIR is not set: this is the default directory.'
     : `set "EASY_DEVOPS_DATA_DIR=${dataDir}"`;
+
+  // The confinement flags, from the same decision the unit and the XML use.
+  // Batch reads `%` in a command line as a variable reference, so a percent
+  // sign in a URL has to be doubled here (it already did when the loader flag
+  // was the only form).
+  const confinement = daemonNodeArgs({
+    nodeVersion: nodeVersion ?? knownNodeVersion(nodeExe),
+    packageRoot: path.resolve(path.dirname(entry), '..', '..'),
+  })
+    .map((argument) => `"${argument.replaceAll('%', '%%')}"`)
+    .join(' ');
 
   // Batch has no arrays and awkward arithmetic, so the backoff is a short
   // explicit ladder rather than a computed sequence. Clearer to read in a file
@@ -211,7 +224,7 @@ if exist "!STOPFILE!" (
 
 echo [%DATE% %TIME%] starting daemon>>"!LOGFILE!"
 
-"!NODEEXE!" "--experimental-loader=${pathToFileURL(path.resolve(path.dirname(entry), '../core/service/runtime-loader.mjs')).href.replaceAll('%', '%%')}" "!ENTRY!" daemon>>"!LOGFILE!" 2>&1
+"!NODEEXE!" ${confinement} "!ENTRY!" daemon>>"!LOGFILE!" 2>&1
 
 set "CODE=!ERRORLEVEL!"
 echo [%DATE% %TIME%] daemon exited with code !CODE!>>"!LOGFILE!"

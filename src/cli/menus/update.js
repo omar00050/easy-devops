@@ -22,11 +22,13 @@
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import ora from 'ora';
+import fs from 'node:fs';
 import { dbGet, dbSet } from '../../core/db.js';
 import { loadConfig } from '../../core/config.js';
 import { getDashboardStatus, startDashboard, stopDashboard } from '../../core/dashboardProcess.js';
 import { page, pause } from '../ui/page.js';
 import { isWindows, isServerMode } from '../../core/platform.js';
+import { serviceXmlPath } from '../../core/service/windowsService.js';
 import { requireElevation } from '../elevation.js';
 
 
@@ -144,6 +146,26 @@ async function warnStaleDaemon(targetVersion) {
 // ─── `ezz update` ─────────────────────────────────────────────────────────────
 
 /**
+ * Whether a Windows Server service may be registered even though the
+ * Server-mode marker is missing.
+ *
+ * The marker is what selects `%ProgramData%` for the data directory, and 1.4.7
+ * could leave the service registered without it (the CLI then read
+ * `%APPDATA%`). The WinSW XML under ProgramData is written only by a
+ * Server-mode install, so its presence is the file-based proof. A file check,
+ * not `sc.exe`: nothing is spawned before the decision, and the updater asks
+ * the service manager itself once elevation is settled.
+ */
+function serverServiceLooksRegistered() {
+  if (!isWindows) return false;
+  try {
+    return fs.existsSync(serviceXmlPath());
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Non-interactive update.
  *
  * Shares `core/updater.js` with the menu above, so there is one implementation
@@ -225,7 +247,10 @@ async function runUpdate({ yes = false, heading = true } = {}) {
   // Server mode replaces the service's administrator-only runtime copy. Asked
   // before the confirmation and before the dashboard is stopped, so a normal
   // terminal changes nothing; the elevated window asks the question itself.
-  if (isWindows && isServerMode()) {
+  // A missing marker does not mean "no service": a 1.4.7 install could leave
+  // the service registered in ProgramData without it, and that runtime copy
+  // needs the same elevation.
+  if (isWindows && (isServerMode() || serverServiceLooksRegistered())) {
     const gate = await requireElevation({ args: ['update', ...(yes ? ['--yes'] : [])], what: 'Updating Easy DevOps' });
     if (!gate.proceed) return gate.code;
   }
@@ -263,7 +288,12 @@ async function runUpdate({ yes = false, heading = true } = {}) {
 
   if (result.ok) {
     console.log('  ' + chalk.green(`Updated v${result.from} -> v${result.to}.`));
-    if (result.serviceInstalled) {
+    if (result.notInstalledLine) {
+      // A Windows Server with no registered service: nothing was stopped,
+      // prepared or verified, so the summary must not claim otherwise. The
+      // command that installs the service is the whole next step.
+      console.log('  ' + chalk.yellow(result.notInstalledLine));
+    } else if (result.serviceInstalled) {
       console.log('  ' + chalk.gray(
         result.versionConfirmed
           ? `The service is running v${result.runningVersion} (reported by the daemon itself).`

@@ -144,38 +144,371 @@ function parseIcaclsAce(line) {
   };
 }
 
+/** The summary `icacls` prints after a recursive pass. */
+const ICACLS_SUMMARY = /Successfully processed\s+([\d,]+)\s+files?(?:;?\s*Failed processing\s+([\d,]+)\s+files?)?/i;
+
+/** The messages `icacls` prints for one object it could not process. */
+const ICACLS_FAILURE = /^(?:Access is denied|The system cannot find|The filename, directory name, or volume label syntax is incorrect|No mapping between account names and security IDs was done|Invalid parameter|The parameter is incorrect)\b/i;
+
 /**
- * Parses `icacls <path>` and `icacls <path>\* /T /C` output.
+ * The failure text of one printed line, or null.
  *
- * The first line of an entry carries the path, followed by its first ACE;
- * further ACEs are indented. A path with no ACE line is an EMPTY DACL, which
- * is exactly the broken state this read-back must catch, so it is kept.
+ * `icacls` prefixes a per-file error with the path and a colon
+ * (`C:\dir\file.txt: Access is denied.`), so the text after the last colon is
+ * checked as well as the whole line. Windows cannot put a colon inside a path
+ * beyond the drive letter, so this cannot mistake a path for an error.
+ */
+function icaclsFailureOf(line) {
+  const text = String(line ?? '').trim();
+  const colon = text.lastIndexOf(':');
+  const tail = colon > 1 ? text.slice(colon + 1).trim() : text;
+  return ICACLS_FAILURE.test(tail) || ICACLS_FAILURE.test(text) ? text : null;
+}
+
+/**
+ * Classifies one line of `icacls` output.
+ *
+ * One parser for both readers, so a listing read from captured output and a
+ * listing streamed while it is produced can never disagree about what an ACE
+ * line is, or about what an empty DACL looks like.
+ *
+ * @param {string} raw
+ * @returns {{ kind: 'blank'|'summary'|'error'|'path'|'ace', path?: string,
+ *   ace?: { trustee: string, permissions: string[] }, text?: string,
+ *   succeeded?: number|null, failed?: number }}
+ */
+function classifyIcaclsLine(raw) {
+  const line = String(raw ?? '').replace(/\s+$/, '');
+  if (!line.trim()) return { kind: 'blank' };
+  if (/\b(?:Successfully processed|Failed processing)\b/i.test(line)) {
+    const summary = ICACLS_SUMMARY.exec(line);
+    return {
+      kind: 'summary',
+      succeeded: summary ? Number(summary[1].replace(/,/g, '')) : null,
+      // A summary without the second half reported no failures.
+      failed: summary?.[2] ? Number(summary[2].replace(/,/g, '')) : 0,
+    };
+  }
+  const failure = icaclsFailureOf(line);
+  if (failure) return { kind: 'error', text: failure };
+  const ace = parseIcaclsAce(line);
+  if (!ace) return { kind: 'path', path: line.trim(), ace: null };
+  const parsed = { trustee: ace.trustee, permissions: ace.permissions };
+  // Continuation lines are indented to the path width, so they carry no path.
+  return ace.prefix
+    ? { kind: 'path', path: ace.prefix, ace: parsed }
+    : { kind: 'ace', ace: parsed };
+}
+
+/**
+ * The entry state machine behind both readers.
+ *
+ * A path line opens an entry; the ACE on that same line is its first, and the
+ * indented lines that follow belong to it. A path line with no ACE at all is an
+ * EMPTY DACL and is kept as an entry with no ACEs — that is the broken state
+ * this read-back exists to catch. An entry is closed by the next path line or
+ * by the end of the output.
+ *
+ * @param {(entry: { path: string, aces: Array<{ trustee: string, permissions: string[] }> }) => void} [onEntry]
+ * @param {{ retain?: boolean }} [options] `retain: false` keeps no history, for a streamed tree.
+ */
+function createIcaclsEntryBuilder(onEntry, { retain = true } = {}) {
+  const entries = [];
+  let current = null;
+  const close = () => {
+    if (!current) return null;
+    const entry = current;
+    current = null;
+    if (retain) entries.push(entry);
+    if (typeof onEntry === 'function') onEntry(entry);
+    return entry;
+  };
+  return {
+    feed(rawLine) {
+      const parsed = classifyIcaclsLine(rawLine);
+      if (parsed.kind === 'path') {
+        close();
+        current = { path: parsed.path, aces: parsed.ace ? [parsed.ace] : [] };
+      } else if (parsed.kind === 'ace' && current) {
+        current.aces.push(parsed.ace);
+      }
+      return parsed;
+    },
+    end() {
+      close();
+      return entries;
+    },
+  };
+}
+
+/**
+ * Parses `icacls <path>` and `icacls <path>\* /T /C` output that was already
+ * captured.
+ *
+ * Kept for a single object (`icacls <folder>`), where the output is one short
+ * listing. A whole tree is never parsed this way: see streamIcaclsTree.
  *
  * @param {string} output
  * @returns {Array<{ path: string, aces: Array<{ trustee: string, permissions: string[] }> }>}
  */
 export function parseIcaclsListing(output) {
-  const entries = [];
-  let current = null;
-  for (const raw of String(output ?? '').split(/\r?\n/)) {
-    const line = raw.replace(/\s+$/, '');
-    if (!line.trim()) continue;
-    if (/^\s*(?:Successfully processed|Failed processing)\b/i.test(line)) continue;
-    if (/^\s*(?:The system cannot find|Access is denied|No mapping between)\b/i.test(line)) continue;
-    const ace = parseIcaclsAce(line);
-    if (!ace) {
-      current = { path: line.trim(), aces: [] };
-      entries.push(current);
-      continue;
+  const builder = createIcaclsEntryBuilder(null);
+  for (const line of String(output ?? '').split(/\r?\n/)) builder.feed(line);
+  return builder.end();
+}
+
+/** A whole-tree listing may legitimately take minutes on a slow disk. */
+export const ICACLS_TREE_TIMEOUT_MS = 10 * 60_000;
+
+/** How often a streamed scan offers a progress update. */
+const STREAM_PROGRESS_INTERVAL_MS = 2_000;
+
+/**
+ * Reads a whole tree's DACLs without ever depending on captured output.
+ *
+ * `shell.js` is asked for `output: 'stream'`, which keeps NOTHING of stdout or
+ * stderr, and every chunk is split into lines as it arrives: no size cap, no
+ * buffer that can drop the beginning, and no captured text that could be
+ * mistaken for the whole listing. (The old capture kept only the newest 64 KiB;
+ * `icacls` lists a folder's own entries first, so a large tree lost exactly the
+ * entries at the front and a real server reported `runtime\node.exe is missing
+ * from the read-back` while the ACL was correct.)
+ *
+ * A read that streams nothing is a FAILURE ("icacls produced no output"), never
+ * a pass: the one exception is a code root with no children yet, where icacls
+ * has nothing to report and there is nothing to verify.
+ *
+ * @param {string} root  The folder to scan; its children are read, not the folder itself.
+ * @param {Object} [opts]
+ * @param {Function} [opts.runFile]
+ * @param {(entry: { path: string, aces: Array }) => void} [opts.onEntry]
+ * @param {(progress: { count: number, elapsedMs: number }) => void} [opts.onProgress]
+ * @param {number} [opts.timeout]
+ * @returns {Promise<{ ok: boolean, count: number, error: string|null,
+ *   failed: string[] }>}
+ */
+export async function streamIcaclsTree(root, {
+  runFile = shellRunFile,
+  onEntry = null,
+  onProgress = null,
+  timeout = ICACLS_TREE_TIMEOUT_MS,
+  progressIntervalMs = STREAM_PROGRESS_INTERVAL_MS,
+} = {}) {
+  const target = path.win32.join(String(root), '*');
+  const limit = Number.isFinite(timeout) && timeout > 0 ? timeout : ICACLS_TREE_TIMEOUT_MS;
+  const interval = Number.isFinite(progressIntervalMs) && progressIntervalMs > 0
+    ? progressIntervalMs
+    : STREAM_PROGRESS_INTERVAL_MS;
+  const started = Date.now();
+  const failures = [];
+  let count = 0;
+  let summaryFailed = 0;
+  let sawStdout = false;
+  let sawStderr = false;
+  let lastProgress = 0;
+
+  /**
+   * The failing lines the owner needs, first five only: a tree with thousands
+   * of unreadable files must not print thousands of lines. The count of
+   * failures comes from icacls's own summary.
+   */
+  const noteFailure = (text) => {
+    const line = String(text ?? '').trim();
+    if (!line || failures.length >= 5) return;
+    failures.push(line);
+  };
+
+  const reportProgress = () => {
+    if (typeof onProgress !== 'function') return;
+    const elapsedMs = Date.now() - started;
+    if (elapsedMs - lastProgress < interval) return;
+    lastProgress = elapsedMs;
+    try {
+      onProgress({ count, elapsedMs });
+    } catch { /* a progress listener cannot fail the scan */ }
+  };
+
+  const builder = createIcaclsEntryBuilder((entry) => {
+    count += 1;
+    if (typeof onEntry === 'function') {
+      try {
+        onEntry(entry);
+      } catch { /* an entry listener cannot fail the scan */ }
     }
-    if (ace.prefix) {
-      current = { path: ace.prefix, aces: [{ trustee: ace.trustee, permissions: ace.permissions }] };
-      entries.push(current);
-    } else if (current) {
-      current.aces.push({ trustee: ace.trustee, permissions: ace.permissions });
+  }, { retain: false });
+
+  /**
+   * A chunk can end in the middle of a line, and a CRLF can be split across
+   * two chunks. Complete lines are handed over as soon as their newline
+   * arrives; the remainder waits for the next chunk.
+   */
+  const splitLines = (state, text) => {
+    if (!text) return '';
+    const pending = state.pending + String(text);
+    const lines = pending.split('\n');
+    state.pending = lines.pop() ?? '';
+    for (const line of lines) {
+      handleLine(line.endsWith('\r') ? line.slice(0, -1) : line);
     }
+    return state.pending;
+  };
+
+  const stdout = { pending: '' };
+  const stderr = { pending: '' };
+
+  const handleLine = (line) => {
+    const parsed = builder.feed(line);
+    if (parsed.kind === 'error') noteFailure(parsed.text);
+    if (parsed.kind === 'summary' && parsed.failed) {
+      summaryFailed = Math.max(summaryFailed, parsed.failed);
+    }
+    if (parsed.kind !== 'blank') reportProgress();
+  };
+
+  // stderr never carries entries; its complete lines are failures.
+  const splitFailures = (state, text) => {
+    if (!text) return;
+    const pending = state.pending + String(text);
+    const lines = pending.split('\n');
+    state.pending = lines.pop() ?? '';
+    for (const line of lines) noteFailure(line.replace(/\r$/, ''));
+  };
+
+  let result;
+  try {
+    result = await runFile(systemTool('icacls.exe'), [target, '/T', '/C', '/Q'], {
+      timeout: limit,
+      // `stream`: shell.js keeps NOTHING of stdout or stderr. Every chunk comes
+      // through onData, so a listing larger than any buffer cannot be cut, and
+      // no captured text can be mistaken for the whole listing.
+      output: 'stream',
+      onData: (text, stream = 'stdout') => {
+        if (stream === 'stderr') {
+          sawStderr = true;
+          splitFailures(stderr, text);
+          return;
+        }
+        sawStdout = true;
+        splitLines(stdout, text);
+      },
+    });
+  } catch (error) {
+    return { ok: false, count, error: error?.message ?? String(error), failed: failures.slice(0, 5) };
   }
-  return entries;
+
+  // Close the last line, then the last entry.
+  if (stdout.pending) handleLine(stdout.pending.replace(/\r$/, ''));
+  if (stderr.pending) noteFailure(stderr.pending.replace(/\r$/, ''));
+  builder.end();
+
+  const problems = [];
+  if (!result?.success) {
+    const output = `${result?.stdout ?? ''} ${result?.stderr ?? ''}`.trim();
+    problems.push(output.slice(0, 300) || 'icacls failed');
+  }
+  if (!sawStdout && !sawStderr) {
+    // Nothing was streamed at all. `output: 'stream'` keeps no capture to fall
+    // back to, and a listing that never arrived must never read as "every file
+    // is fine". The one real case is a code root with no children yet - a
+    // folder protected before its first copy - where icacls has nothing to
+    // report and there is nothing to verify.
+    if (!treeIsEmpty(root)) problems.push('icacls produced no output');
+  }
+  if (summaryFailed > 0) problems.push(`${summaryFailed} file${summaryFailed === 1 ? '' : 's'} could not be processed`);
+  if (failures.length) problems.push(failures.slice(0, 5).join('; '));
+
+  return {
+    ok: problems.length === 0,
+    count,
+    error: problems.length ? [...new Set(problems)].join(' — ') : null,
+    failed: failures.slice(0, 5),
+  };
+}
+
+/** Whether a folder really has no children, used only when icacls said nothing. */
+function treeIsEmpty(root) {
+  try {
+    return fs.readdirSync(String(root ?? '')).length === 0;
+  } catch {
+    // Unreadable is not empty: that must fail, not pass silently.
+    return false;
+  }
+}
+
+/** Matches a trustee name or SID the way `normalizeTrustee` does below. */
+function aclPathKey(value) {
+  return path.win32.normalize(String(value ?? '')).toLowerCase();
+}
+
+/** Whether one entry gives any of `trustees` write access (Modify or more). */
+function entryAllowsModify(entry, trustees) {
+  return entryAllows(entry, trustees, /^(?:F|M|GA)$/i);
+}
+
+/**
+ * Reads ONE path's ACL for a status answer — never a tree.
+ *
+ * One `icacls <target>` spawn, no `/T`: the answer is about that object alone.
+ * The captured output is fine here because a single listing is a few lines.
+ *
+ * @param {string} target
+ * @param {Object} [opts]
+ * @param {Function} [opts.runFile]
+ * @param {string[]} [opts.trustees]  Accounts to report on; the service account by default.
+ * @returns {Promise<{ exists: boolean, ok: boolean, readable: boolean|null,
+ *   modify: boolean|null, full: boolean|null, aces: Array, error: string|null }>}
+ */
+export async function readPathAccess(target, {
+  runFile = shellRunFile,
+  trustees = [SERVICE_ACCOUNT],
+  timeout = 60_000,
+} = {}) {
+  const requested = String(target ?? '');
+  const limit = Number.isFinite(timeout) && timeout > 0 ? timeout : 60_000;
+  const empty = { exists: false, ok: true, readable: null, modify: null, full: null, aces: [], error: null };
+  if (!requested) return { ...empty, ok: false, error: 'no path was given' };
+
+  let result;
+  try {
+    result = await runFile(systemTool('icacls.exe'), [requested], { timeout: limit });
+  } catch (error) {
+    return { ...empty, exists: true, ok: false, error: error?.message ?? String(error) };
+  }
+  const output = `${result?.stdout ?? ''}\n${result?.stderr ?? ''}`.trim();
+  if (/The system cannot find|The filename, directory name, or volume label syntax is incorrect|could not find the path/i.test(output)) {
+    return empty;
+  }
+  if (!result?.success) {
+    return {
+      ...empty,
+      exists: true,
+      ok: false,
+      error: output.slice(0, 300) || 'icacls failed',
+    };
+  }
+  const entries = parseIcaclsListing(result?.stdout ?? '');
+  const entry = entries.find((candidate) => aclPathKey(candidate.path) === aclPathKey(requested))
+    ?? entries[0];
+  if (!entry) {
+    return {
+      ...empty,
+      exists: true,
+      ok: false,
+      error: `the read-back of ${requested} contained no entry`
+      + (/Successfully processed/i.test(output) ? ' (the DACL is empty)' : ''),
+      aces: [],
+    };
+  }
+  const accounts = (trustees ?? []).filter(Boolean);
+  return {
+    exists: true,
+    ok: true,
+    readable: accounts.length ? aclEntryAllowsReadExecute(entry, accounts) : null,
+    modify: accounts.length ? entryAllowsModify(entry, accounts) : null,
+    full: accounts.length ? aclEntryAllowsFullControl(entry, accounts) : null,
+    aces: entry.aces,
+    error: null,
+  };
 }
 
 function normalizeTrustee(value) {
@@ -335,16 +668,22 @@ export async function checkedAclDirectory(dir, runFile, recursive = false, {
   // anything below the root. Hard-linked files are checked in walkAclTree only
   // after their parent DACL has been locked, which avoids a JavaScript tree
   // walk following a reparse tag that lstat did not classify as a symlink.
-  const timeout = deadline === Infinity
-    ? 120_000
-    : remainingStageMs(deadline, stage, timeoutMs);
+  const timeout = Number.isFinite(deadline)
+    ? remainingStageMs(deadline, stage, timeoutMs)
+    : 120_000;
   const result = await runFile(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', CHECK_ATTRIBUTES], {
     env: { EZ_ACL_TARGET: target, EZ_ACL_TREE: recursive ? '1' : '0' },
     timeout,
   });
   remainingStageMs(deadline, stage, timeoutMs);
   signal?.throwIfAborted();
-  if (!result.success) throw new Error('could not verify directory attributes or found a reparse point');
+  if (!result.success) {
+    // Keep what the native check said: an "Access is denied." here is the
+    // difference between a folder whose DACL denies the walk (recoverable by
+    // taking ownership) and a real reparse point (never touched).
+    const detail = `${result.stdout ?? ''} ${result.stderr ?? ''}`.trim().slice(0, 300);
+    throw new Error(`could not verify directory attributes: ${detail || 'found a reparse point or an unreadable folder'}`);
+  }
   return target;
 }
 
@@ -581,9 +920,9 @@ export async function revokeGrants({
       if (['runtime', 'runtime.prev', 'bin'].some(name => inside(canonical, path.join(machine, name)))) {
         throw new Error('Service code directories cannot receive a data revoke');
       }
-      const timeout = deadline === Infinity
-        ? 120_000
-        : remainingStageMs(deadline, 'Removing service-account permissions', timeoutMs);
+      const timeout = Number.isFinite(deadline)
+        ? remainingStageMs(deadline, 'Removing service-account permissions', timeoutMs)
+        : 120_000;
       signal?.throwIfAborted();
       const result = await runFile(systemTool('icacls.exe'), [
         canonical, '/remove:g', trustee, '/T', '/L', '/Q',

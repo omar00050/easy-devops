@@ -45,6 +45,7 @@
 import fs from 'fs';
 import { randomUUID } from 'node:crypto';
 import path from 'path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { runFile } from '../shell.js';
 import { isWindows, programDataDir } from '../platform.js';
@@ -111,6 +112,150 @@ export function detectMixedWindowsInstalls(nodePath = process.execPath) {
     msiPath: msiPresent ? msi : null,
     managed: manager,
   };
+}
+
+// ─── The daemon's confinement, as command-line arguments ─────────────────────
+
+/** The register module: the `--import` entry that installs both guards. */
+const REGISTER_MODULE = ['src', 'core', 'service', 'runtime-register.mjs'];
+/** The ESM loader, for the `--experimental-loader` flag older Nodes need. */
+const LOADER_MODULE = ['src', 'core', 'service', 'runtime-loader.mjs'];
+
+/**
+ * The package root this module belongs to (the folder holding package.json).
+ *
+ * @returns {string}
+ */
+export function packageRoot() {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+}
+
+/**
+ * "v22.11.0", "22.11.0" or a `node --version` line → [major, minor, patch].
+ *
+ * @param {string|null|undefined} value
+ * @returns {[number, number, number]|null}
+ */
+export function parseNodeVersion(value) {
+  const match = /(\d+)\.(\d+)\.(\d+)/.exec(String(value ?? ''));
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/**
+ * Whether a Node version can confine the daemon with `--import` + register().
+ *
+ * The facts this rests on, from Node's own documentation:
+ *
+ *  - `module.register()` was added in 20.6.0 and backported to 18.19.0. It was
+ *    never added to 19.x, which is why 19 gets the loader flag: 19 is a short
+ *    release almost nobody runs a service on, and guessing wrong there would
+ *    mean a daemon that does not start.
+ *  - `--import` was added in 20.6.0 and 18.18.0, so 18.19 (the register
+ *    minimum) always has it.
+ *  - Every later major has both.
+ *
+ * An unknown or unparsable version gets the loader flag, which works on every
+ * Node this package supports. A warning is better than a service that fails to
+ * start.
+ *
+ * @param {string|null|undefined} nodeVersion
+ * @returns {boolean}
+ */
+export function supportsRegisterLoader(nodeVersion) {
+  const parsed = parseNodeVersion(nodeVersion);
+  if (!parsed) return false;
+  const [major, minor] = parsed;
+
+  if (major < 18) return false;
+  if (major === 18) return minor >= 19;
+  if (major === 19) return false;
+  if (major === 20) return minor >= 6;
+  return true;
+}
+
+/**
+ * The node flags a service (or a daemon command line) must carry.
+ *
+ * @param {Object} [opts]
+ * @param {string|null} [opts.nodeVersion] The version of the binary being
+ *   invoked, e.g. "v22.11.0" or "22.11.0". Unknown → the loader flag.
+ * @param {string|null} [opts.packageRoot] The installed package root; defaults
+ *   to the package this module is part of.
+ * @returns {string[]} `['--import', <register URL>]` or
+ *   `['--experimental-loader=<loader URL>']`
+ */
+export function daemonNodeArgs({ nodeVersion = null, packageRoot: root = null } = {}) {
+  const base = root ? path.resolve(root) : packageRoot();
+  const registerPath = path.join(base, ...REGISTER_MODULE);
+  const loaderPath = path.join(base, ...LOADER_MODULE);
+
+  // The register module has to be there: a package that does not carry it - a
+  // runtime copy written by an older version, or a half-refreshed tree - would
+  // otherwise get a command line Node refuses to start, and the service would
+  // fail with "Cannot find module" instead of running confined. The loader
+  // flag confines it just as well, with the warning it has always printed.
+  if (supportsRegisterLoader(nodeVersion) && fs.existsSync(registerPath)) {
+    // Two arguments: `--import` takes the module URL as its value, and the
+    // space-separated form is what a service file and WinSW's <arguments>
+    // both carry without a quoting rule of their own.
+    return ['--import', pathToFileURL(registerPath).href];
+  }
+
+  // One argument, the same shape every unit and XML written since 1.4.4 has,
+  // so an operator comparing files sees only the flag that changed.
+  return [`--experimental-loader=${pathToFileURL(loaderPath).href}`];
+}
+
+/**
+ * The version of a Node binary we already have in hand.
+ *
+ * Exact only when the path resolves to the very binary this process is running:
+ * install copies `process.execPath` into the runtime copy and links the Linux
+ * runtime at it, so that covers most installs and repairs without a subprocess.
+ * A different binary - a stale copy, another version - is genuinely unknown
+ * here, and the caller falls back to the loader flag.
+ *
+ * @param {string|null|undefined} nodeExe
+ * @returns {string|null}
+ */
+export function knownNodeVersion(nodeExe) {
+  if (!nodeExe) return null;
+  try {
+    const real = fs.realpathSync.native(path.resolve(String(nodeExe)));
+    const self = fs.realpathSync.native(process.execPath);
+    const same = isWindows ? real.toLowerCase() === self.toLowerCase() : real === self;
+    return same ? process.version : null;
+  } catch {
+    // A binary that is not there yet cannot be asked, and is not this one.
+    return null;
+  }
+}
+
+/**
+ * Asks the pinned Node for its version, so the command line it gets matches it.
+ *
+ * Never throws and never guesses: an unreadable answer means the loader flag,
+ * which every supported version understands. This is one cheap subprocess, and
+ * only where the answer is not already known (see knownNodeVersion).
+ *
+ * @param {Object} opts
+ * @param {string} opts.nodeExe
+ * @param {Function} [opts.runner] argv runner (core/shell.js runFile)
+ * @param {number} [opts.timeout]
+ * @returns {Promise<string|null>}
+ */
+export async function readNodeVersion({ nodeExe, runner = runFile, timeout = 10_000 } = {}) {
+  const known = knownNodeVersion(nodeExe);
+  if (known) return known;
+
+  try {
+    const probe = await runner(nodeExe, ['--version'], { timeout });
+    if (!probe?.success) return null;
+    return parseNodeVersion(probe.stdout) ? String(probe.stdout).trim() : null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Linux: the symlink ───────────────────────────────────────────────────────
@@ -399,9 +544,11 @@ export function copyRuntime({ dataDir, appRoot, nodeExe = process.execPath, log 
  * @param {Object} opts
  * @param {string} opts.nodeExe
  * @param {string} opts.appDir  Directory whose node_modules should be used
+ * @param {string|null} [opts.nodeVersion] The binary's version, when the caller
+ *   already knows it. Unknown means the loader flag, which every version runs.
  * @returns {Promise<{ ok: boolean, abi?: string, version?: string, reason?: string, fix?: string }>}
  */
-export async function verifyNativeModules({ nodeExe, appDir } = {}) {
+export async function verifyNativeModules({ nodeExe, appDir, nodeVersion = null } = {}) {
   // better-sqlite3 is reached through good.db. Opening an in-memory database
   // and closing it exercises the addon's load path and its entry points
   // without touching any file.
@@ -415,9 +562,18 @@ export async function verifyNativeModules({ nodeExe, appDir } = {}) {
     'process.stdout.write(JSON.stringify({ abi: process.versions.modules, version: process.version }));',
   ].join('\n');
 
+  // The daemon's own confinement flags, so the probe proves the command line
+  // that actually runs the service can load this module. --import is used only
+  // where this binary supports it; an unknown version keeps the loader flag,
+  // exactly as the unit would.
+  const confinement = daemonNodeArgs({
+    nodeVersion: nodeVersion ?? knownNodeVersion(nodeExe),
+    packageRoot: appDir,
+  });
+
   let result;
   try {
-    result = await runFile(nodeExe, ['-e', probe], { cwd: appDir, timeout: 30_000, env: { NODE_PATH: '', NODE_OPTIONS: '' } });
+    result = await runFile(nodeExe, [...confinement, '-e', probe], { cwd: appDir, timeout: 30_000, env: { NODE_PATH: '', NODE_OPTIONS: '' } });
   } catch (err) {
     return { ok: false, reason: `could not run the runtime probe: ${err.message}` };
   }

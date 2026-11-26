@@ -15,9 +15,39 @@ import crypto from 'node:crypto';
 
 export const ARTIFACT_LOCK_STALE_MS = 120_000;
 export const SSL_ARTIFACT_LIFECYCLE_LOCK = 'ssl-artifact-lifecycle';
+
+/**
+ * How long a recovery guard whose owner still looks alive may block others.
+ *
+ * The guard covers one short synchronous replacement of the lock, and it is
+ * deliberately not heartbeated: there is no await inside that replacement for a
+ * heartbeat to run in. A guard this old therefore cannot belong to a worker
+ * making progress — it is a wedged one — and treating it as live forever would
+ * block waiters for their whole acquisition timeout.
+ */
+export const ARTIFACT_LOCK_RECOVERY_GUARD_STALE_MS = 30_000;
+
 const EMPTY_LOCK_GRACE_MS = 2_000;
-const RECOVERY_GUARD_STALE_MS = 30_000;
 const RETRY_MS = 25;
+
+/**
+ * Windows contention, not damage.
+ *
+ * Measured on this project's machine: ten processes creating, renaming and
+ * deleting one path produced 1,898 EPERM renames out of 3,009 attempts, and
+ * every one succeeded on a later attempt. MoveFileEx returns ACCESS_DENIED
+ * while the same name is being created or deleted by someone else, so every
+ * mutation below retries these codes instead of failing its caller.
+ */
+const CONTENTION_CODES = new Set(['EPERM', 'EBUSY']);
+
+/** One retry step for a contended path, and how many of them a mutation gets. */
+const CONTENTION_RETRY_MS = 5;
+const CONTENTION_ATTEMPTS = 200;
+
+function isContention(error) {
+  return CONTENTION_CODES.has(error?.code);
+}
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -32,7 +62,7 @@ function delay(ms) {
 
 function statIfPresent(target) {
   try { return fs.lstatSync(target); } catch (error) {
-    if (error?.code === 'ENOENT') return null;
+    if (error?.code === 'ENOENT' || isContention(error)) return null;
     throw error;
   }
 }
@@ -111,45 +141,89 @@ function createExclusive(file, owner) {
     if (process.platform !== 'win32') fs.chmodSync(file, 0o600);
     return { ok: true };
   } catch (error) {
-    return { ok: false, code: error?.code ?? 'UNKNOWN', message: error?.message ?? String(error) };
+    return {
+      ok: false,
+      code: error?.code ?? 'UNKNOWN',
+      message: error?.message ?? String(error),
+      contention: isContention(error),
+    };
   }
+}
+
+/** Removes a path, retrying Windows contention. Best effort by design. */
+function removeWithRetry(file, attempts = CONTENTION_ATTEMPTS) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try { fs.unlinkSync(file); return true; } catch (error) {
+      if (error?.code === 'ENOENT') return true;
+      if (!isContention(error)) return false;
+      sleepSync(CONTENTION_RETRY_MS);
+    }
+  }
+  return false;
 }
 
 function abandonedRecovery(guard, now) {
   const stat = statIfPresent(guard);
   if (!stat) return null;
+  const age = Math.max(0, now - stat.mtimeMs);
   const record = readOwner(guard);
   if (!record) {
-    return now - stat.mtimeMs > EMPTY_LOCK_GRACE_MS
+    return age > EMPTY_LOCK_GRACE_MS
       ? { stat, owner: null }
       : null;
   }
-  return !ownerIsRunning(record, now)
-    && now - record.stat.mtimeMs > RECOVERY_GUARD_STALE_MS
+  // A dead owner cannot still be replacing the lock, so its guard is abandoned
+  // at once. This is the common case: a worker crashed between creating the
+  // guard and releasing it, and the next waiter must not spend its whole
+  // timeout treating that marker as a live recovery.
+  if (!ownerIsRunning(record, now)) return { stat, owner: record.owner };
+  // Alive, so normally still inside the replacement. One replacement is a few
+  // synchronous file operations; a guard this old is a wedged worker.
+  return age > ARTIFACT_LOCK_RECOVERY_GUARD_STALE_MS
     ? { stat, owner: record.owner }
     : null;
 }
 
+/** True while the guard path still holds exactly the record we inspected. */
+function stillTheSameGuard(guard, abandoned) {
+  const stat = statIfPresent(guard);
+  if (!stat || !abandoned.stat) return false;
+  if (stat.dev !== abandoned.stat.dev || stat.ino !== abandoned.stat.ino) return false;
+  return (readOwner(guard)?.owner.token ?? null) === (abandoned.owner?.token ?? null);
+}
+
 /**
- * Move one inspected stale recovery guard aside before retiring it.
+ * Retire one inspected stale recovery guard.
  *
- * Rechecking the inode after the rename prevents an unconditional unlink from
- * deleting a fresh guard created by a competing recovery worker. The caller
- * still verifies its own new guard immediately before and after replacing the
- * protected lock, so a worker whose guard was displaced can never proceed.
+ * The pathname is moved aside, checked against the inspection, and then
+ * DELETED — never put back. If a competing worker replaced the guard between
+ * the inspection and the rename, that worker fails its own ownership checks
+ * and retries; restoring the copy could instead revive a marker after its
+ * owner had already released it, which used to leave every other waiter
+ * staring at "another process is recovering the lock" until the marker aged
+ * out. Deleting the copy cannot create a second holder: only the token visible
+ * at the guard path may replace the lock, and it is re-checked before and
+ * after.
  */
 function retireStaleRecoveryGuard(guard, abandoned) {
+  if (!stillTheSameGuard(guard, abandoned)) return false;
+
   const claim = `${guard}.stale-${process.pid}-${crypto.randomUUID()}`;
-  try {
-    fs.renameSync(guard, claim);
-  } catch (error) {
-    if (error?.code === 'ENOENT') return false;
-    throw error;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(guard, claim);
+      break;
+    } catch (error) {
+      if (error?.code === 'ENOENT') return false;
+      if (!isContention(error)) throw error;
+      if (attempt >= CONTENTION_ATTEMPTS) return false;
+      sleepSync(CONTENTION_RETRY_MS);
+    }
   }
 
   const moved = statIfPresent(claim);
   const movedOwner = readOwner(claim)?.owner ?? null;
-  const sameFile = Boolean(
+  const retiredInspectedGuard = Boolean(
     moved
     && !moved.isSymbolicLink()
     && moved.isFile()
@@ -159,17 +233,8 @@ function retireStaleRecoveryGuard(guard, abandoned) {
     && (movedOwner?.token ?? null) === (abandoned.owner?.token ?? null),
   );
 
-  if (!sameFile) {
-    // A competing worker replaced this pathname between inspection and rename.
-    // Put its guard back when possible and never act on the lock as this worker.
-    try {
-      if (!fs.existsSync(guard)) fs.renameSync(claim, guard);
-    } catch { /* the displaced worker will fail its own guard check */ }
-    return false;
-  }
-
-  try { fs.unlinkSync(claim); } catch { /* stale claim is harmless */ }
-  return true;
+  removeWithRetry(claim);
+  return retiredInspectedGuard;
 }
 
 function ownsRecoveryGuard(names, token) {
@@ -193,7 +258,7 @@ function acquireRecoveryGuard(names, key, now) {
 function releaseRecoveryGuard(names, token) {
   const record = readOwner(names.recovery);
   if (record?.owner.token !== token) return;
-  try { fs.unlinkSync(names.recovery); } catch { /* already released */ }
+  removeWithRetry(names.recovery);
 }
 
 function replaceStale(names, key, now) {
@@ -223,13 +288,13 @@ function replaceStale(names, key, now) {
       if (!ownsRecoveryGuard(names, guard.owner.token)) {
         try {
           const installed = readOwner(names.lock);
-          if (installed?.owner.token === owner.token) fs.unlinkSync(names.lock);
+          if (installed?.owner.token === owner.token) removeWithRetry(names.lock);
         } catch { /* the next owner must inspect and recover it */ }
         return { ok: false, reason: 'the recovery guard changed during lock replacement' };
       }
       return { ok: true, owner };
     } finally {
-      try { fs.unlinkSync(candidate); } catch { /* renamed or never created */ }
+      removeWithRetry(candidate);
     }
   } catch (error) {
     return { ok: false, reason: error?.message ?? String(error) };
@@ -280,7 +345,13 @@ function tryTake(dataDir, key, now) {
   const owner = newOwner(key, now);
   const created = createExclusive(names.lock, owner);
   if (created.ok) return { ok: true, owner, ...names };
-  if (created.code !== 'EEXIST') return { ok: false, reason: created.message };
+  if (created.code !== 'EEXIST') {
+    // Contention is a retry; anything else is a real problem with the path and
+    // must be reported now rather than as a timeout.
+    if (created.contention) return { ok: false, reason: created.message };
+    throw new Error(`Cannot create the ${key} lock at ${names.lock}: ${created.message}. `
+      + 'Check that the data directory is writable by this account.');
+  }
 
   const state = inspectLock(names, now);
   if (!state.stale) return { ok: false, reason: state.reason };
@@ -297,36 +368,51 @@ function makeHandle(result, key, heartbeatMs) {
     return record?.owner.token === result.owner.token;
   };
   const releaseOwned = () => {
-    let handle;
-    try {
-      handle = fs.openSync(
-        result.lock,
-        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0),
-      );
-      const before = fs.fstatSync(handle);
-      if (!before.isFile() || before.nlink !== 1) return false;
-      const owner = JSON.parse(fs.readFileSync(handle, 'utf8'));
-      if (owner?.token !== result.owner.token) return false;
+    const detached = `${result.lock}.released-${process.pid}-${crypto.randomUUID()}`;
+    for (let attempt = 0; ; attempt += 1) {
+      let handle;
+      try {
+        handle = fs.openSync(
+          result.lock,
+          fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0),
+        );
+        const before = fs.fstatSync(handle);
+        if (!before.isFile() || before.nlink !== 1) return false;
+        const owner = JSON.parse(fs.readFileSync(handle, 'utf8'));
+        if (owner?.token !== result.owner.token) return false;
 
-      const detached = `${result.lock}.released-${process.pid}-${crypto.randomUUID()}`;
-      fs.renameSync(result.lock, detached);
-      const moved = fs.lstatSync(detached);
-      if (!moved.isFile()
-          || moved.isSymbolicLink()
-          || moved.dev !== before.dev
-          || moved.ino !== before.ino) {
         try {
-          if (!fs.existsSync(result.lock)) fs.renameSync(detached, result.lock);
-        } catch { /* ownership mismatch remains the safe result */ }
+          fs.renameSync(result.lock, detached);
+        } catch (error) {
+          // On Windows another contender reading the lock makes the rename
+          // fail with EPERM for a moment. Giving up here would leave a live
+          // lock behind after a successful operation, and every later waiter
+          // would sit out the whole stale window.
+          if (error?.code === 'ENOENT') return false;
+          if (!isContention(error) || attempt >= CONTENTION_ATTEMPTS) return false;
+          sleepSync(CONTENTION_RETRY_MS);
+          continue;
+        }
+
+        const moved = fs.lstatSync(detached);
+        if (!moved.isFile()
+            || moved.isSymbolicLink()
+            || moved.dev !== before.dev
+            || moved.ino !== before.ino) {
+          try {
+            if (!fs.existsSync(result.lock)) fs.renameSync(detached, result.lock);
+          } catch { /* ownership mismatch remains the safe result */ }
+          return false;
+        }
+        // The lock is off its path now, so it is released whatever this does.
+        removeWithRetry(detached);
+        return true;
+      } catch {
         return false;
-      }
-      fs.unlinkSync(detached);
-      return true;
-    } catch {
-      return false;
-    } finally {
-      if (handle !== undefined) {
-        try { fs.closeSync(handle); } catch { /* already closed */ }
+      } finally {
+        if (handle !== undefined) {
+          try { fs.closeSync(handle); } catch { /* already closed */ }
+        }
       }
     }
   };

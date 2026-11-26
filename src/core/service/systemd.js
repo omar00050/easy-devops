@@ -32,22 +32,28 @@
  *
  * ── Why sudo is asked for by sudo ──────────────────────────────────────────
  *
- * Writing to `/etc/systemd/system` needs root. The command is run with
- * `runInteractive` (or, for file copies, `sudo install` with argv), so sudo
- * prompts on the user's own terminal and the password never passes through
- * this process. Nothing here ever reads, stores, or asks for a password
- * itself.
+ * Writing to `/etc/systemd/system` needs root. A normal user's command goes out
+ * as `sudo install …` / `sudo systemctl …` with argv (never a shell string for
+ * the privileged part), so sudo prompts on the user's own terminal and the
+ * password never passes through this process. Nothing here ever reads, stores,
+ * or asks for a password itself.
+ *
+ * **A root install is not wrapped at all.** uid 0 already has the privilege,
+ * and a minimal server may have no sudo installed — `sudo systemctl` there
+ * fails with ENOENT and `ezz update` could never stop or start the service.
+ * Every privileged call goes through `serviceAccess()`, which is the one place
+ * that decides: root runs it directly, everyone else through sudo.
  */
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { fileURLToPath } from 'url';
 
 import { run, runFile, runInteractive } from '../shell.js';
 import { getDataDir, isDefaultDataDir } from '../platform.js';
 import { clearStopRequest, readStopRequest, stopRequestPath } from '../daemon/stopRequest.js';
-import { linkRuntime, runtimeNodePath } from './runtime.js';
+import { daemonNodeArgs, linkRuntime, readNodeVersion, runtimeNodePath } from './runtime.js';
 
 /** Unit name and path. One unit, one name, no per-user variants. */
 export const UNIT_NAME = 'easy-devops.service';
@@ -108,7 +114,8 @@ export async function hasSystemd({ runner = run } = {}) {
   // which is exactly the case that must not be treated as supported.
   if (!fs.existsSync('/run/systemd/system')) return false;
 
-  const probe = await runner('systemctl --version', { timeout: 10_000 });
+  // A version query asks the manager nothing privileged, so it never elevates.
+  const probe = await serviceAccess({ runner }).read('systemctl --version', { timeout: 10_000 });
   return probe.success;
 }
 
@@ -244,16 +251,23 @@ function tuningFromUnit(text, log = () => {}) {
  * @param {string} opts.dataDir
  * @param {string} [opts.workingDir]
  * @param {Array<[string, string]>} [opts.tuning] Operator settings carried over, in order
+ * @param {string|null} [opts.nodeVersion] The pinned runtime's version, so the
+ *   confinement flag matches what that Node supports. Unknown → the loader flag.
  * @returns {Array<{ name: string, items: Array<string|string[]> }>}
  */
-export function unitSections({ nodeExe, entry, user, dataDir, workingDir = null, tuning = [] }) {
+export function unitSections({ nodeExe, entry, user, dataDir, workingDir = null, tuning = [], nodeVersion = null }) {
   if (!nodeExe) throw new Error('the unit needs the path of the pinned runtime (nodeExe)');
   if (!entry) throw new Error('the unit needs the entry script path (entry)');
   if (!user) throw new Error('the unit needs the user the daemon runs as');
 
-  const loader = `--experimental-loader=${pathToFileURL(
-    path.resolve(path.dirname(entry), '../core/service/runtime-loader.mjs'),
-  ).href}`;
+  // The confinement, exactly as core/service/runtime.js decides it for this
+  // Node: --import + register() where the runtime has it, the loader flag
+  // otherwise. The URLs are built from the package root (the entry's ../..),
+  // which is also the unit's WorkingDirectory.
+  const confinement = daemonNodeArgs({
+    nodeVersion,
+    packageRoot: path.resolve(path.dirname(entry), '..', '..'),
+  });
 
   // Only passed when it is NOT the default. A unit that sets it to the very
   // directory the code already resolves on its own adds nothing, and the one
@@ -305,9 +319,9 @@ export function unitSections({ nodeExe, entry, user, dataDir, workingDir = null,
         '',
         '# The pinned runtime, not whatever "node" resolves to in a shell. A version',
         '# manager can change that at any time; this path is ours. The daemon also',
-        '# starts through the runtime boundary loader, which confines it to its own',
-        '# package.',
-        ['ExecStart', `${unitArg(nodeExe)} ${unitArg(loader)} ${unitArg(entry)} daemon`],
+        '# starts confined to its own package: --import on Node 18.19/20.6 and later,',
+        '# the older loader flag before that.',
+        ['ExecStart', [unitArg(nodeExe), ...confinement.map(unitArg), unitArg(entry), 'daemon'].join(' ')],
         '',
         '# Ambient Node settings and the optional ws accelerators are switched off,',
         '# so a daemon started from an unusual environment cannot behave differently.',
@@ -410,8 +424,8 @@ export function serializeUnit(sections) {
  * @param {Object} opts See unitSections()
  * @returns {string}
  */
-export function buildUnit({ nodeExe, entry, user, dataDir, workingDir = null, tuning = [] }) {
-  return serializeUnit(unitSections({ nodeExe, entry, user, dataDir, workingDir, tuning }));
+export function buildUnit({ nodeExe, entry, user, dataDir, workingDir = null, tuning = [], nodeVersion = null }) {
+  return serializeUnit(unitSections({ nodeExe, entry, user, dataDir, workingDir, tuning, nodeVersion }));
 }
 
 /** What to print when systemd is absent. */
@@ -439,10 +453,10 @@ export function manualInstructions({ nodeExe, entry, dataDir }) {
 /**
  * Installs and starts the unit.
  *
- * sudo asks for the
- * password, on the user's terminal, in its own words. This process never sees
- * it. That also means a real TTY is required, which is checked first rather
- * than discovered as a hang.
+ * As a normal user sudo asks for the password, on the user's terminal, in its
+ * own words. This process never sees it. That also means a real TTY is
+ * required, which is checked first rather than discovered as a hang. As root
+ * nothing is wrapped: the copy, the enable and the restart run directly.
  *
  * @param {Object} opts
  * @param {string} opts.nodeExe
@@ -453,6 +467,7 @@ export function manualInstructions({ nodeExe, entry, dataDir }) {
  * @param {Function} [opts.runner]
  * @param {Function} [opts.interactive]
  * @param {string} [opts.unitPath]
+ * @param {boolean|null} [opts.isRoot] Injected by tests; otherwise the account
  * @returns {Promise<{ ok: boolean, reason?: string, unitPath?: string }>}
  */
 export async function install({
@@ -466,8 +481,14 @@ export async function install({
   fileRunner = runFile,
   unitPath = UNIT_PATH,
   stdin = process.stdin,
+  isRoot = null,
 } = {}) {
-  if (!stdin?.isTTY) {
+  const access = serviceAccess({ isRoot, interactive, fileRunner, runner });
+
+  // Someone has to answer sudo's prompt, so a normal user needs a terminal.
+  // Root has nothing to answer: refusing a root install for want of a TTY would
+  // block the automated setup of a server that needs no password at all.
+  if (!access.root && !stdin?.isTTY) {
     return {
       ok: false,
       reason: 'installing the service needs a real terminal, because sudo has to ask for your password. '
@@ -475,14 +496,25 @@ export async function install({
     };
   }
 
-  const unit = buildUnit({ nodeExe, entry, user, dataDir });
+  // Root runs every privileged step directly, and may have no sudo at all.
+  if (access.root) log('Running as root: privileged commands go out directly, without sudo.');
 
-  const written = await writeUnit(unit, { fileRunner, interactive, unitPath, log });
+  const nodeVersion = await readNodeVersion({ nodeExe });
+  const unit = buildUnit({ nodeExe, entry, user, dataDir, nodeVersion });
+
+  const written = await writeUnit(unit, {
+    fileRunner: fileRunnerFor(access),
+    interactive: access.shell,
+    unitPath,
+    log,
+    root: access.root,
+  });
   if (!written.ok) return written;
-  const enable = await interactive(`sudo systemctl enable ${UNIT_NAME}`);
+
+  const enable = await access.run(['sudo', 'systemctl', 'enable', UNIT_NAME], { timeout: 300_000 });
   if (!enable.success) return { ok: false, reason: `systemctl enable ${UNIT_NAME} failed` };
 
-  const start = await interactive(`sudo systemctl restart ${UNIT_NAME}`);
+  const start = await access.run(['sudo', 'systemctl', 'restart', UNIT_NAME], { timeout: 300_000 });
   if (!start.success) {
     const recent = await journal({ lines: 20, runner });
     return {
@@ -526,6 +558,7 @@ async function backupUnit(previous, {
   stagingDir = null,
   fileRunner = runFile,
   stdin = 'inherit',
+  root = false,
 } = {}) {
   const backupPath = `${unitPath}.prev`;
   if (typeof previous !== 'string' || previous === '') return { ok: true, path: backupPath, skipped: true };
@@ -556,7 +589,7 @@ async function backupUnit(previous, {
   });
   return copied.success
     ? { ok: true, path: backupPath }
-    : { ok: false, path: backupPath, reason: copied.stderr || 'sudo install failed' };
+    : { ok: false, path: backupPath, reason: copied.stderr || `${root ? 'install' : 'sudo install'} failed` };
 }
 
 /**
@@ -575,6 +608,7 @@ async function backupUnit(previous, {
  * @param {boolean}  [opts.reload]  run daemon-reload here (default true)
  * @param {string|null} [opts.previousUnit] already-read previous text
  * @param {string}   [opts.stdin]   stdio for the sudo child, so it can prompt
+ * @param {boolean}  [opts.root]    this process is root: no sudo, so say so
  * @returns {Promise<{ ok: boolean, reason?: string, backup?: string, warning?: string }>}
  */
 async function writeUnit(unit, {
@@ -585,6 +619,7 @@ async function writeUnit(unit, {
   reload = true,
   previousUnit = undefined,
   stdin = 'inherit',
+  root = false,
 } = {}) {
   let stagingDir;
   try {
@@ -599,7 +634,7 @@ async function writeUnit(unit, {
     }
 
     const previous = previousUnit === undefined ? readTextFile(unitPath) : previousUnit;
-    const backup = await backupUnit(previous, { unitPath, stagingDir, fileRunner, stdin });
+    const backup = await backupUnit(previous, { unitPath, stagingDir, fileRunner, stdin, root });
     // A backup that cannot be written must not block the repair: without it
     // the update transaction's snapshot is still the rollback path, and a
     // refused repair would leave the service broken. Say so instead of
@@ -608,11 +643,17 @@ async function writeUnit(unit, {
     if (warning) log(`warning: ${warning}`);
     else if (!backup.skipped) log(`Previous unit kept as ${backup.path}`);
 
-    log(`Installing ${unitPath} (sudo will ask for your password)`);
-    // sudo reads passwords directly from its controlling terminal.
+    log(root
+      ? `Installing ${unitPath}`
+      : `Installing ${unitPath} (sudo will ask for your password)`);
+    // sudo reads passwords directly from its controlling terminal; as root
+    // there is nothing to ask, so `install` runs directly.
     const copy = await fileRunner('sudo', ['install', '-m', '0644', '--', staged, unitPath], { timeout: 300_000, stdin });
     if (!copy.success) {
-      return { ok: false, reason: `could not write ${unitPath}. sudo exited ${copy.exitCode ?? 'non-zero'}.` };
+      return {
+        ok: false,
+        reason: `could not write ${unitPath}. ${root ? 'install' : 'sudo'} exited ${copy.exitCode ?? 'non-zero'}.`,
+      };
     }
 
     if (reload) {
@@ -695,19 +736,41 @@ export async function refreshUnit({
   unitPath = UNIT_PATH,
   user = null,
   log = () => {},
+  isRoot = null,
   ...options
 } = {}) {
   const previous = readTextFile(unitPath);
   const owner = user ?? installedUser(previous) ?? os.userInfo().username;
   const tuning = tuningFromUnit(previous, log);
 
-  const unit = buildUnit({ nodeExe: runtimeNodePath(dataDir), entry, dataDir, user: owner, tuning });
+  const nodeExe = runtimeNodePath(dataDir);
+  // Read from the pinned binary, not from the CLI's own Node: a unit must run
+  // on the Node it names. Unknown means the loader flag, which every version
+  // understands.
+  const nodeVersion = await readNodeVersion({ nodeExe });
+  const unit = buildUnit({ nodeExe, entry, dataDir, user: owner, tuning, nodeVersion });
   if (previous === unit) {
     log(`${unitPath} is already up to date`);
     return { ok: true, unitPath, unchanged: true };
   }
 
-  return writeUnit(unit, { ...options, unitPath, log, previousUnit: previous });
+  // The file copy and the daemon-reload go through the same rule as every other
+  // privileged step: root writes directly, everyone else through sudo.
+  const access = serviceAccess({
+    isRoot,
+    interactive: options.interactive ?? runInteractive,
+    fileRunner: options.fileRunner ?? runFile,
+  });
+
+  return writeUnit(unit, {
+    ...options,
+    fileRunner: fileRunnerFor(access),
+    interactive: access.shell,
+    unitPath,
+    log,
+    previousUnit: previous,
+    root: access.root,
+  });
 }
 
 /**
@@ -727,6 +790,81 @@ function isRootUser() {
   } catch {
     return false;
   }
+}
+
+/**
+ * The one place that decides how a privileged command is invoked.
+ *
+ * Two rules, and no third:
+ *
+ *  - **uid 0** already has what sudo would ask for, and a minimal server may
+ *    not even have sudo installed. Every privileged command goes out directly:
+ *    `systemctl restart …`, `install -m 0644 …`, `rm -f …`.
+ *  - **anyone else** goes through sudo exactly as before. sudo asks on the
+ *    user's own terminal, in its own words. This process never sees, stores or
+ *    forwards a password, and never passes `-n` (which would fail instead of
+ *    asking) or `-S` (which would take one from us).
+ *
+ * Reading the service's state is not privileged — `systemctl show` is readable
+ * by any user — so `read()` never elevates. A status command that prompted for
+ * a password would be a status command nobody could put in a script.
+ *
+ * @param {Object} [opts]
+ * @param {boolean|null} [opts.isRoot] Injected by tests; otherwise the account
+ * @param {Function} [opts.interactive] string runner that can prompt
+ * @param {Function} [opts.fileRunner] argv runner
+ * @param {Function} [opts.runner] read-only string runner
+ * @returns {{
+ *   root: boolean,
+ *   run: (argv: string[], options?: Object) => Promise<Object>,
+ *   shell: (command: string, options?: Object) => Promise<Object>,
+ *   read: (command: string, options?: Object) => Promise<Object>,
+ * }}
+ */
+export function serviceAccess({
+  isRoot = null,
+  interactive = runInteractive,
+  fileRunner = runFile,
+  runner = run,
+} = {}) {
+  const root = (isRoot ?? isRootUser()) === true;
+
+  return {
+    root,
+
+    /**
+     * Runs a fixed argument list. A leading `sudo` element is what marks a
+     * command as privileged, and it is dropped when this process is root.
+     */
+    run(argv, options = {}) {
+      const [first, ...rest] = argv;
+      if (root && first === 'sudo') return fileRunner(rest[0], rest.slice(1), options);
+      return fileRunner(first, rest, options);
+    },
+
+    /** Runs a command line that needs a shell (a `|| true`, a redirect). */
+    shell(command, options = {}) {
+      const text = String(command);
+      return interactive(root ? text.replace(/^sudo\s+/, '') : text, options);
+    },
+
+    /** Runs a command that reads state only. Never elevated. */
+    read(command, options = {}) {
+      return runner(command, options);
+    },
+  };
+}
+
+/**
+ * Adapts serviceAccess().run() to the `(file, args, options)` shape that the
+ * unit writers expect, so a file copy is elevated by the same rule as a
+ * systemctl call.
+ *
+ * @param {ReturnType<typeof serviceAccess>} access
+ * @returns {(file: string, args: string[], options?: Object) => Promise<Object>}
+ */
+function fileRunnerFor(access) {
+  return (file, args, options = {}) => access.run([file, ...(Array.isArray(args) ? args : [])], options);
 }
 
 /**
@@ -788,14 +926,9 @@ export async function recoverService({
 
   // Root already has the privilege sudo would ask for — and a minimal server
   // may not even have sudo. Every privileged call below goes through this one
-  // function, so dropping the wrapper is the whole difference.
-  const asRoot = (deps.isRoot ?? isRootUser)() === true;
-  if (asRoot) log('Running as root: privileged commands go out directly, without sudo.');
-  const privileged = asRoot
-    ? (file, args, options = {}) => (file === 'sudo'
-      ? fileRunner(args[0], args.slice(1), options)
-      : fileRunner(file, args, options))
-    : fileRunner;
+  // rule (see serviceAccess), so dropping the wrapper is the whole difference.
+  const access = serviceAccess({ isRoot: (deps.isRoot ?? isRootUser)(), fileRunner });
+  if (access.root) log('Running as root: privileged commands go out directly, without sudo.');
 
   // ── 1. The pinned runtime ────────────────────────────────────────────────
   log('Re-pointing the pinned Node runtime…');
@@ -811,7 +944,9 @@ export async function recoverService({
   log(`Regenerating ${unitPath}…`);
   let refreshed;
   try {
-    refreshed = await refreshUnit({ entry, dataDir, unitPath, log, fileRunner: privileged, reload: false, stdin });
+    refreshed = await refreshUnit({
+      entry, dataDir, unitPath, log, fileRunner: fileRunnerFor(access), isRoot: access.root, reload: false, stdin,
+    });
   } catch (error) {
     return fail(
       'unit',
@@ -830,7 +965,7 @@ export async function recoverService({
 
   // ── 3. daemon-reload ─────────────────────────────────────────────────────
   log('Reloading systemd…');
-  const reloaded = await privileged('sudo', ['systemctl', 'daemon-reload'], { timeout: 300_000, stdin });
+  const reloaded = await access.run(['sudo', 'systemctl', 'daemon-reload'], { timeout: 300_000, stdin });
   if (!reloaded?.success) {
     return fail(
       'reload',
@@ -853,7 +988,7 @@ export async function recoverService({
 
   // ── 5. Restart ───────────────────────────────────────────────────────────
   log(`Restarting ${UNIT_NAME}…`);
-  const restarted = await privileged('sudo', ['systemctl', 'restart', UNIT_NAME], { timeout: 300_000, stdin });
+  const restarted = await access.run(['sudo', 'systemctl', 'restart', UNIT_NAME], { timeout: 300_000, stdin });
   if (!restarted?.success) {
     return fail(
       'restart',
@@ -902,6 +1037,9 @@ export async function recoverService({
  * Every step tolerates "already gone": uninstall must succeed on a machine
  * where the user removed the unit by hand, or they are left unable to clean up
  * through the tool at all.
+ *
+ * @param {Object} [opts]
+ * @param {boolean|null} [opts.isRoot] Injected by tests; otherwise the account
  */
 export async function uninstall({
   log = () => {},
@@ -909,66 +1047,96 @@ export async function uninstall({
   fileRunner = runFile,
   unitPath = UNIT_PATH,
   stdin = process.stdin,
+  isRoot = null,
 } = {}) {
-  if (!stdin?.isTTY) {
+  // Root does the same steps without a sudo wrapper - and a minimal server may
+  // have no sudo at all, so no terminal is needed either.
+  const access = serviceAccess({ isRoot, interactive, fileRunner });
+
+  if (!access.root && !stdin?.isTTY) {
     return {
       ok: false,
       reason: 'removing the service needs a real terminal, because sudo has to ask for your password.',
     };
   }
 
-  log(`Removing ${unitPath} (sudo will ask for your password)`);
+  log(access.root
+    ? `Removing ${unitPath}`
+    : `Removing ${unitPath} (sudo will ask for your password)`);
 
-  await interactive(`sudo systemctl stop ${UNIT_NAME} || true`);
-  await interactive(`sudo systemctl disable ${UNIT_NAME} || true`);
-  const remove = await fileRunner('sudo', ['rm', '-f', '--', unitPath], { timeout: 300_000 });
+  await access.shell(`sudo systemctl stop ${UNIT_NAME} || true`);
+  await access.shell(`sudo systemctl disable ${UNIT_NAME} || true`);
+  const remove = await access.run(['sudo', 'rm', '-f', '--', unitPath], { timeout: 300_000 });
   if (!remove.success) return { ok: false, reason: `could not remove ${unitPath}` };
 
-  const reload = await interactive('sudo systemctl daemon-reload');
+  const reload = await access.shell('sudo systemctl daemon-reload');
   if (!reload.success) return { ok: false, reason: 'systemctl daemon-reload failed' };
-  await interactive(`sudo systemctl reset-failed ${UNIT_NAME} || true`);
+  await access.shell(`sudo systemctl reset-failed ${UNIT_NAME} || true`);
 
   return { ok: true };
 }
 
-/** `systemctl restart`, which needs no password beyond sudo's own prompt. */
-export async function restart({ interactive = runInteractive } = {}) {
-  const result = await interactive(`sudo systemctl restart ${UNIT_NAME}`);
+/**
+ * `systemctl restart`, which needs no password beyond sudo's own prompt.
+ *
+ * @param {Object} [opts]
+ * @param {boolean|null} [opts.isRoot] Injected by tests; otherwise the account
+ */
+export async function restart({ fileRunner = runFile, isRoot = null, stdin = 'inherit' } = {}) {
+  const access = serviceAccess({ isRoot, fileRunner });
+  const result = await access.run(['sudo', 'systemctl', 'restart', UNIT_NAME], { timeout: 300_000, stdin });
   return { ok: result.success, reason: result.success ? null : `systemctl restart ${UNIT_NAME} failed` };
 }
 
 /**
  * `systemctl stop` — temporary. The unit stays enabled, so the daemon comes
  * back at the next boot. Removing it permanently is `ezz service uninstall`.
+ *
+ * @param {Object} [opts]
+ * @param {boolean|null} [opts.isRoot] Injected by tests; otherwise the account
  */
-export async function stop({ interactive = runInteractive } = {}) {
-  if (!fs.existsSync(UNIT_PATH)) {
+export async function stop({
+  fileRunner = runFile, isRoot = null, stdin = process.stdin, unitPath = UNIT_PATH,
+} = {}) {
+  if (!fs.existsSync(unitPath)) {
     return { ok: false, reason: 'the service is not installed, so there is nothing to stop' };
   }
-  if (!process.stdin.isTTY) {
+
+  const access = serviceAccess({ isRoot, fileRunner });
+  if (!access.root && !stdin?.isTTY) {
     return {
       ok: false,
       reason: 'stopping the service needs a terminal, because sudo has to ask for your password.',
     };
   }
 
-  const result = await interactive(`sudo systemctl stop ${UNIT_NAME}`);
+  const result = await access.run(['sudo', 'systemctl', 'stop', UNIT_NAME], { timeout: 300_000, stdin: 'inherit' });
   return { ok: result.success, reason: result.success ? null : `systemctl stop ${UNIT_NAME} failed` };
 }
 
-/** `systemctl start`. */
-export async function start({ interactive = runInteractive } = {}) {
-  if (!fs.existsSync(UNIT_PATH)) {
+/**
+ * `systemctl start`, through the same rule as stop: root directly, everyone
+ * else with sudo asking on their own terminal.
+ *
+ * @param {Object} [opts]
+ * @param {boolean|null} [opts.isRoot] Injected by tests; otherwise the account
+ */
+export async function start({
+  fileRunner = runFile, isRoot = null, stdin = process.stdin, unitPath = UNIT_PATH,
+} = {}) {
+  if (!fs.existsSync(unitPath)) {
     return { ok: false, reason: 'the service is not installed; run `ezz service install` first' };
   }
-  if (!process.stdin.isTTY) {
+
+  const access = serviceAccess({ isRoot, fileRunner });
+  if (!access.root && !stdin?.isTTY) {
     return {
       ok: false,
       reason: 'starting the service needs a terminal, because sudo has to ask for your password.',
     };
   }
 
-  const result = await interactive(`sudo systemctl start ${UNIT_NAME}`);
+  const result = await access.run(['sudo', 'systemctl', 'start', UNIT_NAME], { timeout: 300_000, stdin: 'inherit' });
   return { ok: result.success, reason: result.success ? null : `systemctl start ${UNIT_NAME} failed` };
 }
 
@@ -1007,10 +1175,12 @@ export async function journal({ lines = 50, runner = run } = {}) {
  * it, so it is read explicitly and reported.
  *
  * @param {Object} [opts]
+ * @param {boolean|null} [opts.isRoot] Injected by tests; otherwise the account
+ * @param {string} [opts.unitPath] Injected by tests
  * @returns {Promise<Object>}
  */
-export async function status({ runner = run } = {}) {
-  const installed = fs.existsSync(UNIT_PATH);
+export async function status({ runner = run, isRoot = null, unitPath = UNIT_PATH } = {}) {
+  const installed = fs.existsSync(unitPath);
 
   if (!installed) {
     return {
@@ -1020,13 +1190,19 @@ export async function status({ runner = run } = {}) {
       state: 'not installed',
       restarts: 0,
       crashLooping: false,
-      unitPath: UNIT_PATH,
+      unitPath,
     };
   }
 
+  // Reading the state is not privileged (`systemctl show` is world-readable
+  // for system units), so the same rule applies to everyone and never adds
+  // sudo: a status check that prompted for a password would be useless in a
+  // script. serviceAccess().read() is the one place that says so.
+  const access = serviceAccess({ isRoot, runner });
+
   // One call for several properties: cheaper than four systemctl invocations,
   // and consistent — four calls can straddle a state change.
-  const props = await runner(
+  const props = await access.read(
     `systemctl show ${UNIT_NAME} --property=ActiveState --property=SubState --property=NRestarts `
     + '--property=UnitFileState --property=ExecMainStartTimestamp --property=Result --no-pager',
     { timeout: 15_000 },
@@ -1057,7 +1233,7 @@ export async function status({ runner = run } = {}) {
     crashLooping,
     result: parsed.Result || null,
     startedAt: parsed.ExecMainStartTimestamp || null,
-    unitPath: UNIT_PATH,
+    unitPath,
   };
 }
 
@@ -1069,16 +1245,21 @@ export async function status({ runner = run } = {}) {
  * link is enough — the unit itself refers to the link, not to a Node version,
  * which is the entire reason it is a link.
  */
-export async function repair({ dataDir, entry, nodeExe = process.execPath, log = () => {}, interactive = runInteractive } = {}) {
+export async function repair({
+  dataDir, entry, nodeExe = process.execPath, log = () => {}, interactive = runInteractive,
+  fileRunner = runFile, isRoot = null,
+} = {}) {
   const linked = linkRuntime({ dataDir, nodeExe });
   if (!linked.ok) return { ok: false, reason: linked.reason };
   log(`Runtime link → ${linked.target}`);
+
+  const access = serviceAccess({ isRoot, interactive, fileRunner });
 
   if (!fs.existsSync(UNIT_PATH)) {
     return { ok: true, relinked: true, reason: 'the runtime link was fixed; no unit is installed' };
   }
 
-  if (!process.stdin.isTTY) {
+  if (!access.root && !process.stdin.isTTY) {
     return {
       ok: false,
       reason: 'the runtime link was fixed, but restarting the unit needs a terminal for sudo.',
@@ -1086,10 +1267,12 @@ export async function repair({ dataDir, entry, nodeExe = process.execPath, log =
   }
 
   if (entry) {
-    const result = await refreshUnit({ dataDir, entry, interactive, log });
+    const result = await refreshUnit({
+      dataDir, entry, interactive: access.shell, isRoot: access.root, log,
+    });
     if (!result.ok) return { ...result, relinked: true };
   }
-  const result = await interactive(`sudo systemctl restart ${UNIT_NAME}`);
+  const result = await access.run(['sudo', 'systemctl', 'restart', UNIT_NAME], { timeout: 300_000 });
   return result.success
     ? { ok: true, relinked: true, target: linked.target }
     : { ok: false, reason: `the link was fixed but \`systemctl restart ${UNIT_NAME}\` failed` };

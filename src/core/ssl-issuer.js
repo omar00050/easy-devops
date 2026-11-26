@@ -306,6 +306,13 @@ function timeoutError(ms, stage) {
 /**
  * Rejects if `promise` does not settle in time. The stage may be a function so
  * the message names the stage that was actually running when the clock ran out.
+ *
+ * The timer is deliberately NOT unref'd: this bound is the only thing an
+ * awaited, never-settling ACME/validation promise depends on. Unref'd in 1.4.7,
+ * a CLI run with nothing else on the event loop exited 0 mid-issuance instead
+ * of rejecting with the timeout error, so the operator saw neither result nor
+ * error. It is cleared when the promise settles, so it never outlives the
+ * operation it bounds.
  */
 function withTimeout(promise, ms, stage) {
   if (!Number.isFinite(ms) || ms <= 0) return promise;
@@ -317,7 +324,6 @@ function withTimeout(promise, ms, stage) {
       settled = true;
       reject(timeoutError(ms, stageName()));
     }, ms);
-    if (timer && typeof timer.unref === 'function') timer.unref();
 
     Promise.resolve(promise).then(
       (value) => {

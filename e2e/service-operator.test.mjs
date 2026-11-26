@@ -72,6 +72,28 @@ function stubRun(rules = []) {
   return run;
 }
 
+/**
+ * `withFileStub` plus streamed output.
+ *
+ * `streamIcaclsTree` calls `runFile` with `{ output: 'stream', onData }` and
+ * keeps no captured stdout at all: a real `icacls <dir>\* /T` over a 10,700-file
+ * runtime is several megabytes and `core/shell.js` keeps only the newest 64 KiB,
+ * which is exactly the 1.4.7 truncation bug. A `run` stub answers with `stdout`,
+ * so this wrapper delivers the same text through `onData`, as icacls's pipe
+ * would, and keeps returning it so non-streaming callers are unchanged.
+ */
+function stubFiles(options) {
+  const base = withFileStub(options);
+  return {
+    ...base,
+    runFile: async (file, args, extra = {}) => {
+      const result = await base.runFile(file, args);
+      if (typeof extra?.onData === 'function' && result?.stdout) extra.onData(result.stdout, 'stdout');
+      return result;
+    },
+  };
+}
+
 const SID = 'S-1-5-21-1111111111-2222222222-3333333333-1001';
 const ENTRA_SID = 'S-1-12-1-1111111111-2222222222-3333333333-1001';
 const OTHER_SID = 'S-1-5-21-4444444444-5555555555-6666666666-1002';
@@ -492,7 +514,7 @@ async function testDataDirCommands() {
   try {
     await acl.walkAclTree(hardLinkRoot, async (target, kind) => {
       hardLinkVisits.push({ target, kind });
-    }, { runFile: withFileStub({ run: hardLinkRun }).runFile });
+    }, { runFile: stubFiles({ run: hardLinkRun }).runFile });
   } catch (error) {
     hardLinkError = error;
   }
@@ -562,7 +584,7 @@ async function testProtectServiceFiles() {
 
   const run = stubRun([[/icacls /, { success: true, stdout: 'Successfully processed 1 files' }]]);
   const logs = [];
-  const done = await op.protectServiceFiles(withFileStub({
+  const done = await op.protectServiceFiles(stubFiles({
     dirs: [bin, runtime], sid: SID, run, log: (line) => logs.push(line),
   }));
 
@@ -615,13 +637,13 @@ async function testProtectServiceFiles() {
 
   const missing = path.join(root, 'not-created');
   const skipRun = stubRun([[/icacls /, { success: true }]]);
-  const skipped = await op.protectServiceFiles(withFileStub({ dirs: [missing], sid: SID, run: skipRun }));
+  const skipped = await op.protectServiceFiles(stubFiles({ dirs: [missing], sid: SID, run: skipRun }));
   check('a directory that does not exist yet is skipped, not created',
     skipped.ok === false && skipped.protected.length === 0 && !fs.existsSync(missing));
   check('and nothing was run for it', skipRun.calls.length === 0);
 
   const deniedRun = stubRun([[/icacls /, { success: false, stderr: 'Access is denied.' }]]);
-  const denied = await op.protectServiceFiles(withFileStub({
+  const denied = await op.protectServiceFiles(stubFiles({
     dirs: [bin, runtime],
     sid: SID,
     run: deniedRun,
@@ -650,7 +672,7 @@ async function testGrantServiceControl() {
     [/^sc\.exe sdset /, () => { state.gave = true; return { success: true, stdout: '[SC] ChangeServiceConfig2 SUCCESS' }; }],
   ]);
 
-  const granted = await op.grantServiceControl(withFileStub({ sid: SID, run }));
+  const granted = await op.grantServiceControl(stubFiles({ sid: SID, run }));
   check('the grant succeeds', granted.ok === true, granted.reason ?? '');
   check('the sequence is sdshow, sdset, sdshow',
     run.calls.map((c) => c.split(' ')[1]).join(',') === 'sdshow,sdset,sdshow',
@@ -661,12 +683,12 @@ async function testGrantServiceControl() {
     !FORBIDDEN_TRUSTEES.some((sid) => run.calls[1].includes(sid)), run.calls[1]);
 
   const noSid = stubRun();
-  const refusedNoSid = await op.grantServiceControl(withFileStub({ sid: 'S-1-5-32-545', run: noSid }));
+  const refusedNoSid = await op.grantServiceControl(stubFiles({ sid: 'S-1-5-32-545', run: noSid }));
   check('no account SID means no grant, and no command at all',
     refusedNoSid.ok === false && noSid.calls.length === 0, refusedNoSid.reason);
 
   const unreadable = stubRun([[/^sc\.exe sdshow /, { success: false, stderr: 'Access is denied.' }]]);
-  const refusedRead = await op.grantServiceControl(withFileStub({ sid: SID, run: unreadable }));
+  const refusedRead = await op.grantServiceControl(stubFiles({ sid: SID, run: unreadable }));
   check('an unreadable DACL is refused, not guessed at', refusedRead.ok === false);
   check('and it names the service permissions',
     /service permissions/.test(refusedRead.reason ?? ''), refusedRead.reason);
@@ -674,7 +696,7 @@ async function testGrantServiceControl() {
 
   // A DACL that is not plain SDDL must never reach a shell.
   const odd = stubRun([[/^sc\.exe sdshow /, { stdout: 'D:(A;;CC;;;SY) & calc' }]]);
-  const refusedOdd = await op.grantServiceControl(withFileStub({ sid: SID, run: odd }));
+  const refusedOdd = await op.grantServiceControl(stubFiles({ sid: SID, run: odd }));
   check('a DACL with characters outside [A-Za-z0-9:;()-] is REFUSED', refusedOdd.ok === false);
   check('and the message says nothing was changed',
     /nothing was changed/.test(refusedOdd.reason ?? ''), refusedOdd.reason);
@@ -684,7 +706,7 @@ async function testGrantServiceControl() {
     [/^sc\.exe sdshow /, { stdout: SERVICE_SDDL }],
     [/^sc\.exe sdset /, { success: false, stderr: 'Access is denied.' }],
   ]);
-  const refusedSet = await op.grantServiceControl(withFileStub({ sid: SID, run: failedSet }));
+  const refusedSet = await op.grantServiceControl(stubFiles({ sid: SID, run: failedSet }));
   check('a refused sdset is reported with its output',
     refusedSet.ok === false && /Access is denied/.test(refusedSet.reason ?? ''), refusedSet.reason);
   check('and it is not read back', failedSet.calls.length === 2);
@@ -694,7 +716,7 @@ async function testGrantServiceControl() {
     [/^sc\.exe sdshow /, { stdout: SERVICE_SDDL }],
     [/^sc\.exe sdset /, { success: true }],
   ]);
-  const refusedReadBack = await op.grantServiceControl(withFileStub({ sid: SID, run: neverLands }));
+  const refusedReadBack = await op.grantServiceControl(stubFiles({ sid: SID, run: neverLands }));
   check('a grant that does not read back is a failure',
     refusedReadBack.ok === false && /does not read back/.test(refusedReadBack.reason ?? ''),
     refusedReadBack.reason);
@@ -709,7 +731,7 @@ async function testGrantServiceControl() {
       return { success: true };
     }],
   ]);
-  const missingAdmin = await op.grantServiceControl(withFileStub({ sid: SID, run: incompleteRun }));
+  const missingAdmin = await op.grantServiceControl(stubFiles({ sid: SID, run: incompleteRun }));
   check('a descriptor missing administrator control gains the Windows default instead of refusing',
     missingAdmin.ok === true, missingAdmin.reason ?? '');
   check('and the written descriptor carries both Windows defaults',
@@ -741,7 +763,7 @@ async function testGrantServiceControl() {
     if (/^sc\.exe sdset /.test(cmd)) writtenDescriptors.push(/"([^"]+)"\s*$/.exec(cmd)?.[1] ?? '');
     return descriptorRun(cmd);
   }, { calls: [] });
-  await op.grantServiceControl(withFileStub({ sid: SID, run: trackingRun }));
+  await op.grantServiceControl(stubFiles({ sid: SID, run: trackingRun }));
   check('every descriptor this code writes grants the Windows defaults',
     writtenDescriptors.length > 0
       && writtenDescriptors.every((sddl) => op.missingServiceDefaults(sddl).length === 0),
@@ -775,7 +797,7 @@ async function testGrantOperator() {
     [/icacls /, { success: true, stdout: 'Successfully processed 1 files' }],
   ]);
 
-  const result = await op.grantOperator(withFileStub({
+  const result = await op.grantOperator(stubFiles({
     operator: { sid: SID, name: 'DOMAIN\\me' },
     dataDir,
     protectedDirs: [bin, runtime],
@@ -834,7 +856,7 @@ async function testGrantOperator() {
     [/inheritance:r/, { success: false, stderr: 'Access is denied.' }],
     [/icacls /, { success: true }],
   ]);
-  const notShared = await op.grantOperator(withFileStub({
+  const notShared = await op.grantOperator(stubFiles({
     operator: { sid: SID, name: 'DOMAIN\\me' },
     dataDir,
     protectedDirs: [bin, runtime],
@@ -862,7 +884,7 @@ async function testGrantOperator() {
     failedRun.calls.some((c) => /^sc\.exe sdset /.test(c)));
 
   // ── Data grant failed after protection ──────────────────────────────────
-  const deniedData = await op.grantOperator(withFileStub({
+  const deniedData = await op.grantOperator(stubFiles({
     operator: { sid: SID, name: null },
     dataDir,
     protectedDirs: [bin],
@@ -880,7 +902,7 @@ async function testGrantOperator() {
     deniedData.notes.join(' | '));
 
   // ── Nobody identified ───────────────────────────────────────────────────
-  const noOperator = await op.grantOperator(withFileStub({
+  const noOperator = await op.grantOperator(stubFiles({
     operator: null,
     dataDir,
     protectedDirs: [bin],
@@ -893,7 +915,7 @@ async function testGrantOperator() {
   check('and the note says why nobody was granted',
     noOperator.notes.some((n) => /could not tell which account/.test(n)), noOperator.notes.join(' | '));
 
-  const groupOperator = await op.grantOperator(withFileStub({
+  const groupOperator = await op.grantOperator(stubFiles({
     operator: { sid: 'S-1-5-32-545', name: 'Users' },
     dataDir,
     protectedDirs: [bin],
@@ -904,7 +926,7 @@ async function testGrantOperator() {
 
   // ── Revocation ──────────────────────────────────────────────────────────
   const revokeRun = stubRun([[/icacls /, { success: true }]]);
-  const revoked = await op.revokeOperator(withFileStub({ operator: { sid: SID }, dataDir, run: revokeRun, log: () => {} }));
+  const revoked = await op.revokeOperator(stubFiles({ operator: { sid: SID }, dataDir, run: revokeRun, log: () => {} }));
   check('revocation succeeds', revoked.ok === true);
   check('and runs a direct-argument removal for that SID on every object',
     revokeRun.calls.length >= 1
@@ -919,7 +941,7 @@ async function testGrantOperator() {
     revokeRun.calls.join(' | '));
 
   const restoreRun = stubRun([[/icacls /, { success: true }]]);
-  const restored = await op.restoreOperatorDataAccess(withFileStub({
+  const restored = await op.restoreOperatorDataAccess(stubFiles({
     operator: { sid: SID, name: 'DOMAIN\\me' },
     dataDir,
     run: restoreRun,
@@ -933,14 +955,14 @@ async function testGrantOperator() {
 
   const nothingToRevoke = stubRun();
   check('no operator is a no-op',
-    (await op.revokeOperator(withFileStub({ operator: null, dataDir, run: nothingToRevoke }))).ok === true
+    (await op.revokeOperator(stubFiles({ operator: null, dataDir, run: nothingToRevoke }))).ok === true
     && nothingToRevoke.calls.length === 0);
   check('a directory that does not exist is a no-op',
-    (await op.revokeOperator(withFileStub({
+    (await op.revokeOperator(stubFiles({
       operator: { sid: SID }, dataDir: path.join(root, 'gone'), run: nothingToRevoke,
     }))).ok === true && nothingToRevoke.calls.length === 0);
 
-  const revokeDenied = await op.revokeOperator(withFileStub({
+  const revokeDenied = await op.revokeOperator(stubFiles({
     operator: { sid: SID }, dataDir, run: stubRun([[/icacls /, { success: false, stderr: 'Access is denied.' }]]),
     log: () => {},
   }));
@@ -953,7 +975,7 @@ async function testGrantOperator() {
   let grantThrew = null;
   let oddGrant = null;
   try {
-    oddGrant = await op.grantOperator(withFileStub({
+    oddGrant = await op.grantOperator(stubFiles({
       operator: { sid: SID, name: 'DOMAIN\\me' },
       dataDir: oddData,
       protectedDirs: [],
@@ -972,7 +994,7 @@ async function testGrantOperator() {
   let oddRevoke = null;
   const oddRun = stubRun([[/icacls /, { success: true }]]);
   try {
-    oddRevoke = await op.revokeOperator(withFileStub({ operator: { sid: SID }, dataDir: oddData, run: oddRun, log: () => {} }));
+    oddRevoke = await op.revokeOperator(stubFiles({ operator: { sid: SID }, dataDir: oddData, run: oddRun, log: () => {} }));
   } catch (err) { revokeThrew = err; }
   check('revocation handles the same literal path without throwing', revokeThrew === null, revokeThrew?.message);
   check('and succeeds without shell evaluation', oddRevoke?.ok === true, oddRevoke?.reason);
@@ -1557,35 +1579,76 @@ async function testWindowsStatusOperator() {
   check('an operator absent from the DACL is reported as not granted',
     revoked.operatorControl?.granted === false, JSON.stringify(revoked.operatorControl));
 
-  // bin/runtime/runtime.prev are where the service RUNS from: their grant is
-  // required, so a recorded one must never be called "no longer needed".
+  // ── The live ACLs are the only evidence (item 7) ─────────────────────────
+  //
+  // 1.4.7 compared the RECORDED grant list with the live Settings. A failed
+  // install recorded `granted: []`, so status printed three false warnings on a
+  // server whose ACLs were correct. `status` now reads the live permissions; a
+  // recorded list is passed here on purpose and must change nothing.
   const rt = await import(srcUrl('core/service/runtime.js'));
   const codeRoots = [path.join(dataDir, 'bin'), rt.runtimeDir(dataDir), path.join(dataDir, 'runtime.prev')];
-  const staleGrant = await ws.status({
+
+  /** One folder listing, in icacls's format, with or without the service ACE. */
+  const aclFolder = (target, access) => [
+    `${target} NT AUTHORITY\\SYSTEM:(OI)(CI)(F)`,
+    `    BUILTIN\\Administrators:(OI)(CI)(F)`,
+    `    BUILTIN\\Users:(OI)(CI)(RX)`,
+    ...(access ? [`    NT SERVICE\\EasyDevOps:(OI)(CI)(${access})`] : []),
+  ].join('\r\n');
+
+  /** `runFile` answering only the live one-path icacls reads status makes. */
+  const liveAclRunFile = ({ dataAccess = 'M', binAccess = 'RX' } = {}) => async (file, args) => {
+    if (!/icacls\.exe$/i.test(file)) {
+      return { success: false, stdout: '', stderr: `unexpected ${path.basename(file)}` };
+    }
+    const target = args[0];
+    if (!fs.existsSync(target)) {
+      return { success: false, stdout: '', stderr: 'The system cannot find the path specified.' };
+    }
+    const access = path.resolve(target) === path.resolve(dataDir) ? dataAccess : binAccess;
+    return { success: true, stdout: aclFolder(target, access) };
+  };
+
+  fs.mkdirSync(path.join(dataDir, 'bin'), { recursive: true });
+  const grantedLive = await ws.status({
     dataDir,
     config: {},
     run: statusRun('D:(A;;CC;;;SY)'),
+    runFile: liveAclRunFile(),
     granted: [...codeRoots, dataDir],
   });
+  check('status reads the live permissions, not the recorded grant list',
+    grantedLive.acl?.checked === true && grantedLive.acl.ok === true,
+    JSON.stringify(grantedLive.acl));
+  check('a service SID on the data directory is no access warning',
+    !grantedLive.warnings.some((warning) => /no (modify|read) access|cannot read/i.test(warning)),
+    grantedLive.warnings.join(' | '));
   check('a code-root grant is never called "no longer needed"',
-    !staleGrant.warnings.some((warning) => /no longer needs/.test(warning))
-      && staleGrant.acl?.ok === true,
-    staleGrant.warnings.join(' | '));
+    !grantedLive.warnings.some((warning) => /no longer needs/.test(warning)),
+    grantedLive.warnings.join(' | '));
 
-  fs.mkdirSync(path.join(dataDir, 'bin'), { recursive: true });
+  const missingDataAce = await ws.status({
+    dataDir,
+    config: {},
+    run: statusRun('D:(A;;CC;;;SY)'),
+    runFile: liveAclRunFile({ dataAccess: null }),
+    granted: [...codeRoots, dataDir],
+  });
+  check('a missing service SID on the data directory warns, from the live read',
+    missingDataAce.acl?.ok === false
+      && missingDataAce.warnings.some((warning) => /no modify access/.test(warning)
+        && /read from the live permissions/.test(warning)),
+    missingDataAce.warnings.join(' | '));
+  check('and the warning still names the repair command',
+    missingDataAce.warnings.some((warning) => /ezz service repair/.test(warning)),
+    missingDataAce.warnings.join(' | '));
+
   const missingRx = await ws.status({
     dataDir,
     config: {},
-    runFile: async (file, args) => {
-      if (/sc\.exe$/i.test(file)) {
-        if (args[0] === 'query') return { success: true, stdout: 'STATE : 4 RUNNING' };
-        if (args[0] === 'qc') return { success: true, stdout: 'START_TYPE : 2 AUTO_START' };
-      }
-      if (/icacls\.exe$/i.test(file)) {
-        return { success: true, stdout: `${args[0]} BUILTIN\\Users:(OI)(CI)(RX)` };
-      }
-      return { success: false, stdout: '', stderr: 'unmatched' };
-    },
+    run: statusRun('D:(A;;CC;;;SY)'),
+    runFile: liveAclRunFile({ binAccess: null }),
+    granted: [],
   });
   check('a code root without the service account\'s RX warns and names the recovery',
     missingRx.warnings.some((warning) => /cannot read/.test(warning) && /ezz service recover/.test(warning)),
@@ -1638,7 +1701,15 @@ async function testWindowsServiceOperatorWiring() {
 
     const events = [];
     const ledger = scmRun({ initial: 'MISSING' });
-    const run = async (cmd) => { events.push(cmd); return ledger(cmd); };
+    // The class's `run` stub is also the icacls channel (withFileStub maps
+    // icacls.exe onto it), and install now READS the runtime and wrapper ACLs
+    // back after copying them. Those read-backs list the real files in the
+    // redirected ProgramData tree, including the ones the copy must leave.
+    const run = async (cmd) => {
+      events.push(cmd);
+      if (/^icacls /.test(cmd)) return aclReadback(cmd);
+      return ledger(cmd);
+    };
 
     const prepared = [];
     const installDeps = {
@@ -1660,6 +1731,7 @@ async function testWindowsServiceOperatorWiring() {
       copyRuntime: () => {
         events.push('COPY');
         fs.mkdirSync(runtime, { recursive: true });
+        writeRuntimeFixture(runtime);
         return { ok: true, dir: runtime, nodeExe: path.join(runtime, 'node.exe'), entry: 'ENTRY' };
       },
       verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
@@ -1672,7 +1744,7 @@ async function testWindowsServiceOperatorWiring() {
       },
     };
 
-    const installed = await ws.install(withFileStub({
+    const installed = await ws.install(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -1715,8 +1787,10 @@ async function testWindowsServiceOperatorWiring() {
       events.indexOf(`PREPARE:${ws.binDir()}`) < events.indexOf('VERIFY_WINSW')
       && events.indexOf(`PREPARE:${ws.binDir()}`) < events.indexOf('FETCH')
       && events.includes('VERIFY_WINSW'), events.join(' -> '));
-    check('the wrapper folder is prepared before any icacls grant on it',
-      events.indexOf(`PREPARE:${ws.binDir()}`) < events.findIndex((e) => /^icacls /.test(e)),
+    check('the wrapper folder is prepared before any icacls read-back or grant on it',
+      events.indexOf(`PREPARE:${ws.binDir()}`) !== -1
+      && events.indexOf(`PREPARE:${ws.binDir()}`)
+        < events.findIndex((e) => /^icacls /.test(e) && e.includes(ws.binDir())),
       events.join(' -> '));
 
     const grantAt = events.indexOf('GRANT_OPERATOR');
@@ -1729,7 +1803,7 @@ async function testWindowsServiceOperatorWiring() {
 
     // ── A folder that cannot be protected stops the install, before it registers
     const blockedLedger = scmRun({ initial: 'MISSING' });
-    const blocked = await ws.install(withFileStub({
+    const blocked = await ws.install(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -1754,12 +1828,16 @@ async function testWindowsServiceOperatorWiring() {
     // ── Repair re-grants, because a fresh runtime copy inherits again ──────
     const repairEvents = [];
     const repairLedger = scmRun();
-    const repairRun = async (cmd) => { repairEvents.push(cmd); return repairLedger(cmd); };
+    const repairRun = async (cmd) => {
+      repairEvents.push(cmd);
+      if (/^icacls /.test(cmd)) return aclReadback(cmd);
+      return repairLedger(cmd);
+    };
     let repairedOperator = null;
     let repairedDirs = null;
     let prevExistedAtPrepare = null;
 
-    const repaired = await ws.repair(withFileStub({
+    const repaired = await ws.repair(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -1781,7 +1859,7 @@ async function testWindowsServiceOperatorWiring() {
         copyRuntime: () => {
           repairEvents.push('COPY');
           fs.mkdirSync(runtime, { recursive: true });
-          fs.writeFileSync(path.join(runtime, 'node.exe'), 'dummy node');
+          writeRuntimeFixture(runtime);
           return { ok: true, dir: runtime, nodeExe: path.join(runtime, 'node.exe'), entry: 'ENTRY' };
         },
         verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
@@ -1818,9 +1896,11 @@ async function testWindowsServiceOperatorWiring() {
       `grant ${repairGrantAt}, start ${repairStartAt}`);
 
     // ── A failed preparation restores the previous runtime and starts on it ─
+    const previousNode = 'the copy the service was running\n';
+    fs.writeFileSync(path.join(runtime, 'node.exe'), previousNode);
     const restoreLedger = scmRun();
     let restoreCopied = false;
-    const restored = await ws.repair(withFileStub({
+    const restored = await ws.repair(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -1841,21 +1921,34 @@ async function testWindowsServiceOperatorWiring() {
     check('a fresh runtime folder that cannot be protected fails the repair',
       restored.ok === false && /could not be protected/.test(restored.reason ?? ''), restored.reason);
     check('the previous copy is put back, not left behind', restored.restored === true
-      && fs.readFileSync(path.join(runtime, 'node.exe'), 'utf8') === 'dummy node',
+      && fs.readFileSync(path.join(runtime, 'node.exe'), 'utf8') === previousNode,
       JSON.stringify({ restored: restored.restored, exists: fs.existsSync(runtime) }));
     check('the service runs on it again', restored.restarted === true);
     check('and nothing was ever copied into the unprotected folder', restoreCopied === false);
 
     // ── A failed protection withholds the data grant ───────────────────────
-    const withheldRun = stubRun([
+    //
+    // The data root is protected by the ordinary per-directory sequence, so a
+    // refused `/inheritance:r` there is a failed protection. Every read-back an
+    // install makes on the way (the runtime copy, the wrapper) still has to
+    // answer, which is what `aclReadback` does over the real temp tree.
+    const withheldCalls = [];
+    const withheldLedger = stubRun([
       [/^sc\.exe query /, { success: false, stdout: '', stderr: 'The specified service does not exist (1060)' }],
       [/^sc\.exe qc /, { success: true, stdout: 'START_TYPE : 2  AUTO_START' }],
       [/^sc\.exe sdshow /, { stdout: SERVICE_SDDL }],
       [/^sc\.exe sdset /, { success: true }],
-      [/inheritance:r/, { success: false, stderr: 'Access is denied.' }],
       [/EasyDevOps\.exe" (install|start)$/, { success: true }],
     ]);
-    const withheld = await ws.install(withFileStub({
+    const withheldRun = async (cmd) => {
+      withheldCalls.push(cmd);
+      if (/^icacls /.test(cmd)) {
+        if (/\/inheritance:r\b/.test(cmd)) return { success: false, stdout: '', stderr: 'Access is denied.' };
+        return aclReadback(cmd);
+      }
+      return withheldLedger(cmd);
+    };
+    const withheld = await ws.install(stubFiles({
       dataDir,
       appRoot,
       config: {},
@@ -1866,16 +1959,16 @@ async function testWindowsServiceOperatorWiring() {
       deps: { ...installDeps, grantOperator: undefined },
     }));
     check('failed protection leaves the service registered and stopped',
-      withheld.ok === false && withheld.registered === true && !withheldRun.calls.some(c => /EasyDevOps\.exe" start$/.test(c)), withheld.reason ?? '');
+      withheld.ok === false && withheld.registered === true && !withheldCalls.some(c => /EasyDevOps\.exe" start$/.test(c)), withheld.reason ?? '');
     check('the recorded operator has no data directory access',
       withheld.operator?.dataDir === false, JSON.stringify(withheld.operator));
     check('and no data-directory grant command was run',
-      !withheldRun.calls.some((c) => c.includes(`/grant "*${SID}:(OI)(CI)M"`)),
-      withheldRun.calls.filter((c) => /\/grant/.test(c)).join(' | '));
+      !withheldCalls.some((c) => c.includes(`/grant "*${SID}:(OI)(CI)M"`)),
+      withheldCalls.filter((c) => /\/grant/.test(c)).join(' | '));
     check('while an earlier data-directory grant is revoked',
-      withheldRun.calls.some((c) => c === `icacls "${dataDir}" /remove:g "*${SID}" /L /Q`)
-        && !withheldRun.calls.some((c) => /\/remove:g/.test(c) && /\/T\b/.test(c)),
-      withheldRun.calls.join(' | '));
+      withheldCalls.some((c) => c === `icacls "${dataDir}" /remove:g "*${SID}" /L /Q`)
+        && !withheldCalls.some((c) => /\/remove:g/.test(c) && /\/T\b/.test(c)),
+      withheldCalls.join(' | '));
   });
 }
 
@@ -1892,7 +1985,7 @@ async function testPrepareProtectedDir() {
   fs.mkdirSync(path.dirname(dir));
 
   const run = stubRun([[/icacls /, { success: true }]]);
-  const prepared = await op.prepareProtectedDir(withFileStub({
+  const prepared = await op.prepareProtectedDir(stubFiles({
     dir, sid: SID, serviceAccount: false, run, log: () => {},
   }));
 
@@ -1908,13 +2001,13 @@ async function testPrepareProtectedDir() {
   check('and the operator\'s own SID is removed, not granted', run.calls[3]?.includes(`/remove:g "*${SID}"`),
     run.calls[3]);
 
-  const again = await op.prepareProtectedDir(withFileStub({
+  const again = await op.prepareProtectedDir(stubFiles({
     dir, sid: SID, run: stubRun([[/icacls /, { success: true }]]), log: () => {},
   }));
   check('preparing a folder that already exists is not an error', again.ok === true);
 
   const deniedDir = path.join(root, 'denied');
-  const denied = await op.prepareProtectedDir(withFileStub({
+  const denied = await op.prepareProtectedDir(stubFiles({
     dir: deniedDir, sid: SID, run: stubRun([[/icacls /, { success: false, stderr: 'Access is denied.' }]]),
     log: () => {},
   }));
@@ -1927,7 +2020,7 @@ async function testPrepareProtectedDir() {
   const hidden = await op.prepareProtectedDir({
     dir: path.join(root, 'acl-hidden'),
     sid: SID,
-    runFile: withFileStub({ run: hiddenRun }).runFile,
+    runFile: stubFiles({ run: hiddenRun }).runFile,
     fsApi: {
       lstatSync: () => {
         const error = new Error('EPERM: operation not permitted, lstat runtime');
@@ -1943,7 +2036,7 @@ async function testPrepareProtectedDir() {
 
   const oddDir = path.join(root, 'odd$dir');
   const oddRun = stubRun([[/icacls /, { success: true }]]);
-  const odd = await op.prepareProtectedDir(withFileStub({
+  const odd = await op.prepareProtectedDir(stubFiles({
     dir: oddDir, sid: SID, run: oddRun, log: () => {},
   }));
   check('a newly created directory containing a dollar sign is protected',
@@ -1958,7 +2051,7 @@ async function testPrepareProtectedDir() {
   fs.writeFileSync(staleStub, 'require("child_process").exec("malicious");\n');
   fs.writeFileSync(path.join(stale, 'marker'), 'old runtime\n');
   const freshRun = stubRun([[/icacls /, { success: true }]]);
-  const fresh = await op.prepareProtectedDir(withFileStub({
+  const fresh = await op.prepareProtectedDir(stubFiles({
     dir: stale, sid: SID, serviceAccount: false, fresh: true, run: freshRun, log: () => {},
   }));
   check('a fresh runtime replaces the whole pre-existing tree', fresh.ok === true
@@ -2084,6 +2177,64 @@ function walkFiles(root) {
   return found.sort();
 }
 
+/**
+ * The files whose DACLs `verifyServiceCodeRoot` reads back, created by a
+ * `copyRuntime` stub so the read-back finds what a real copy leaves behind.
+ */
+function writeRuntimeFixture(dir) {
+  fs.mkdirSync(path.join(dir, 'app', 'src', 'cli'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'node.exe'), 'fixture node.exe\n');
+  fs.writeFileSync(path.join(dir, 'app', 'package.json'), '{"name":"easy-devops"}\n');
+  fs.writeFileSync(path.join(dir, 'app', 'src', 'cli', 'index.js'), '// fixture entry\n');
+}
+
+/**
+ * Answers the icacls forms an install/repair read-back makes from the real
+ * files in the temp tree: other verbs succeed, and a listing — one path or
+ * `<dir>\* /T` — reports the actual entries with the ACLs a protected tree has.
+ *
+ * This is the `run`-string side of `withFileStub`, so it takes the formatted
+ * command line rather than argv.
+ */
+function aclReadback(cmd) {
+  if (!/^icacls "/.test(cmd)) return { success: true, stdout: 'Successfully processed 1 files' };
+  if (/\/save|\/setowner|\/grant|\/inheritance|\/reset|\/restore|\/remove/.test(cmd)) {
+    return { success: true, stdout: 'Successfully processed 1 files' };
+  }
+  const target = /^icacls "([^"]+)"/.exec(cmd)?.[1] ?? null;
+  if (!target) return { success: true, stdout: 'Successfully processed 1 files' };
+  const tree = cmd.includes('/T') && cmd.includes('/C');
+
+  const line = (file, folder) => {
+    const flags = folder ? '(OI)(CI)' : '(I)';
+    return [
+      `${file} NT AUTHORITY\\SYSTEM:${flags}(F)`,
+      `    BUILTIN\\Administrators:${flags}(F)`,
+      `    BUILTIN\\Users:${flags}(RX)`,
+      `    NT SERVICE\\EasyDevOps:${flags}(RX)`,
+    ].join('\r\n');
+  };
+
+  const lines = [];
+  if (!tree) {
+    lines.push(line(target, true));
+  } else {
+    const root = target.replace(/[\\/]\*$/, '');
+    const pending = [root];
+    while (pending.length) {
+      const dir = pending.pop();
+      let entries = [];
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { /* absent is fine */ }
+      for (const entry of entries) {
+        const child = path.join(dir, entry.name);
+        if (entry.isDirectory()) pending.push(child);
+        else lines.push(line(child, false));
+      }
+    }
+  }
+  return { success: true, stdout: lines.join('\r\n') };
+}
+
 /** One icacls listing entry, in the format Windows prints. */
 function aclLine(target, { service = true, folder = false, empty = false } = {}) {
   if (empty) return target;
@@ -2101,14 +2252,20 @@ function aclLine(target, { service = true, folder = false, empty = false } = {})
  * files in the redirected ProgramData tree, and records the exact arguments.
  */
 function codeRootRunner({ emptyChild = null, folderEmpty = false, denyResetAlways = false,
-  denyResetOnce = false, sc = null, folderTrustee = null, childExcess = null } = {}) {
+  denyResetOnce = false, healOnReset = false, sc = null, folderTrustee = null, childExcess = null } = {}) {
   const calls = [];
   const removed = new Set();
   let denied = false;
+  let healed = false;
   const key = (value) => String(value ?? '').trim().replace(/^\*/, '').toUpperCase();
-  const runFile = async (file, args) => {
+  const runFile = async (file, args, extra = {}) => {
     calls.push({ file, args: [...args] });
     const exe = path.win32.basename(file).toLowerCase();
+    /** A streamed caller gets the text through onData, as icacls's pipe would. */
+    const deliver = (result) => {
+      if (typeof extra?.onData === 'function' && result?.stdout) extra.onData(result.stdout, 'stdout');
+      return result;
+    };
     if (exe === 'powershell.exe') return { success: true, stdout: '', stderr: '' };
     if (exe === 'sc.exe') return sc ? sc(args) : { success: false, stdout: '', stderr: 'unexpected sc.exe' };
     if (exe !== 'icacls.exe') return { success: false, stdout: '', stderr: `unexpected ${exe}` };
@@ -2126,6 +2283,9 @@ function codeRootRunner({ emptyChild = null, folderEmpty = false, denyResetAlway
         denied = true;
         return { success: false, stdout: '', stderr: 'Access is denied.' };
       }
+      // A real `/reset` makes the child inherit the folder's list again; the
+      // stub has to model that, or an empty-DACL tree could never be repaired.
+      if (healOnReset) healed = true;
       return { success: true, stdout: '', stderr: '' };
     }
     if (args.length === 1) {
@@ -2133,21 +2293,21 @@ function codeRootRunner({ emptyChild = null, folderEmpty = false, denyResetAlway
       if (folderTrustee && !removed.has(key(folderTrustee))) {
         lines.push(`    ${folderTrustee}:(OI)(CI)(F)`);
       }
-      return { success: true, stdout: lines.join('\r\n') };
+      return deliver({ success: true, stdout: lines.join('\r\n') });
     }
     if (args[1] === '/T' && args[2] === '/C') {
       const root = args[0].replace(/[\\/]\*$/, '');
       const files = walkFiles(root);
       const lines = files.map((target) => {
         const entry = aclLine(target, {
-          empty: emptyChild !== null && path.resolve(target) === path.resolve(emptyChild),
+          empty: !healed && emptyChild !== null && path.resolve(target) === path.resolve(emptyChild),
         });
         if (childExcess !== null && path.resolve(target) === path.resolve(childExcess)) {
           return `${entry}\r\n    Everyone:(I)(M)`;
         }
         return entry;
       });
-      return { success: true, stdout: lines.join('\r\n') };
+      return deliver({ success: true, stdout: lines.join('\r\n') });
     }
     return { success: false, stdout: '', stderr: `unexpected icacls ${args.join(' ')}` };
   };
@@ -2164,17 +2324,19 @@ async function testCodeRootProtection() {
   if (!platform.isWindows) {
     for (const label of [
       'the executable root is protected',
-      'the calls are one per tree, never one per file',
-      'the save goes to the temp directory, never the data directory',
-      'the exact argv order is setowner, grant, inheritance, reset, read-back',
-      'grant runs before inheritance is removed',
-      'the children are reset in one recursive call',
-      'every probe file is read back with SYSTEM, Administrators and the service',
-      'an empty ACL on a child fails the protection and restores the saved tree',
-      'the failure names the file, the restore and `ezz service recover`',
+      'the normal path is a folder save, grant, inheritance, cleanup and ONE tree scan',
+      'the folder save goes to the temp directory, never the data directory',
+      'grant runs before inheritance is removed, so SYSTEM and Administrators never lose full control',
+      'a healthy tree needs no reset and no ownership change',
+      'the folder and the required files are read back without /T',
       'an explicit Everyone full-control ACE on the folder is removed',
-      'write access for Everyone on a child fails the read-back',
-      'and that failure restores the saved tree',
+      'the service account only gets read and execute, never write',
+      'an empty ACL on a child resets the children in ONE recursive call',
+      'the tree is saved with /T before the children are reset',
+      'a denied reset takes ownership once and retries',
+      'an explicit write ACE on a child fails the read-back and restores the saved tree',
+      'the failure names the file, whether the ACL was restored and what to run next',
+      'the restore puts the tree back before the folder',
       'before registration the service account is omitted',
     ]) check(label, true, 'skipped: Windows only');
     return;
@@ -2191,33 +2353,42 @@ async function testCodeRootProtection() {
     fs.writeFileSync(path.join(runtime, 'node.exe'), 'node');
     fs.writeFileSync(path.join(runtime, 'app', 'src', 'cli', 'index.js'), 'entry');
 
+    // ── The normal path: one save, grant, inheritance, cleanup, ONE scan ───
     const runFile = codeRootRunner();
     const result = await op.protectServiceFiles({ dirs: [bin], sid: SID, runFile, log: () => {} });
     check('the executable root is protected', result.ok === true, result.failed[0]?.reason ?? '');
-    check('the calls are one per tree, never one per file',
-      runFile.calls.length === 8, String(runFile.calls.length));
 
     const args = runFile.calls.map((call) => call.args);
-    check('the save goes to the temp directory, never the data directory',
-      args[0][0] === bin && args[0][1] === '/save'
-        && args[0][2].startsWith(os.tmpdir())
-        && !args[0][2].startsWith(dataDir),
-      JSON.stringify(args[0]));
-    check('the exact argv order is setowner, grant, inheritance, cleanup, reset, read-back',
-      JSON.stringify(args[1]) === JSON.stringify([bin, '/setowner', '*S-1-5-32-544', '/L', '/Q'])
+    check('the normal path is a folder save, grant, inheritance, cleanup and ONE tree scan',
+      args.length === 8
+        && JSON.stringify(args[0]) === JSON.stringify([bin])
+        && args[1][0] === bin && args[1][1] === '/save'
         && JSON.stringify(args[2]) === JSON.stringify([bin, '/grant:r',
           '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX',
           `${SERVICE_ACCOUNT}:(OI)(CI)RX`, '/L', '/Q'])
         && JSON.stringify(args[3]) === JSON.stringify([bin, '/inheritance:r', '/L', '/Q'])
         && JSON.stringify(args[4]) === JSON.stringify([bin])
-        && JSON.stringify(args[5]) === JSON.stringify([path.join(bin, '*'), '/reset', '/T', '/C', '/L', '/Q'])
+        && JSON.stringify(args[5]) === JSON.stringify([path.join(bin, '*'), '/T', '/C', '/Q'])
         && JSON.stringify(args[6]) === JSON.stringify([bin])
-        && JSON.stringify(args[7]) === JSON.stringify([path.join(bin, '*'), '/T', '/C']),
+        && JSON.stringify(args[7]) === JSON.stringify([path.join(bin, 'EasyDevOps.exe')]),
       JSON.stringify(args));
-    check('grant runs before inheritance is removed',
-      args[2].includes('/grant:r') && args[3].includes('/inheritance:r'), args.slice(2, 4).join(' | '));
-    check('the children are reset in one recursive call after the folder ACL is final',
-      args[5][0] === path.join(bin, '*') && args[5].includes('/T'), args[5].join(' '));
+    check('the folder save goes to the temp directory, never the data directory',
+      args[1][2].startsWith(os.tmpdir()) && !args[1][2].startsWith(dataDir), JSON.stringify(args[1]));
+    check('grant runs before inheritance is removed, so SYSTEM and Administrators never lose full control',
+      args[2].includes('/grant:r') && args[3].includes('/inheritance:r')
+        && args[2][2] === '*S-1-5-18:(OI)(CI)F' && args[2][3] === '*S-1-5-32-544:(OI)(CI)F',
+      args.slice(2, 4).join(' | '));
+    check('a healthy tree needs no reset and no ownership change',
+      !args.some((entry) => entry.includes('/reset') || entry.includes('/setowner')),
+      JSON.stringify(args));
+    check('the folder and the required files are read back without /T',
+      args.slice(6).every((entry) => !entry.includes('/T'))
+        && args[7][0] === path.join(bin, 'EasyDevOps.exe'),
+      JSON.stringify(args.slice(6)));
+    check('the service account only gets read and execute, never write',
+      args[2].includes(`${SERVICE_ACCOUNT}:(OI)(CI)RX`)
+        && !args[2].some((entry) => entry.startsWith(SERVICE_ACCOUNT) && /:[^:]*[MF]$/.test(entry)),
+      args[2].join(' '));
 
     // An explicit ACE for an account we do not name is removed, because
     // /grant:r only replaces the trustees it names.
@@ -2226,38 +2397,60 @@ async function testCodeRootProtection() {
     check('an explicit Everyone full-control ACE on the folder is removed',
       explicit.ok === true
         && explicitRun.calls.some((call) => JSON.stringify(call.args)
-          === JSON.stringify([bin, '/remove:g', 'Everyone', '/L', '/Q'])),
+          === JSON.stringify([bin, '/remove:g', 'Everyone', '/L', '/Q']))
+        && !explicitRun.calls.some((call) => call.args.includes('/remove:g')
+          && call.args.some((arg) => /S-1-5-18|S-1-5-32-544/.test(arg))),
       explicitRun.calls.map((call) => call.args.join(' ')).join(' | '));
 
-    // The whole runtime tree, including the two probe files, verifies.
-    const runtimeRun = codeRootRunner();
-    const runtimeResult = await op.protectServiceFiles({
-      dirs: [runtime], sid: SID, runFile: runtimeRun, log: () => {},
-    });
-    check('every probe file is read back with SYSTEM, Administrators and the service',
-      runtimeResult.ok === true
-        && runtimeRun.calls.some((call) => call.args.length === 3 && call.args[0] === path.join(runtime, '*')),
-      runtimeResult.failed[0]?.reason ?? '');
-
+    // ── An empty DACL on a child is repaired by ONE recursive reset ────────
     const empty = path.join(runtime, 'node.exe');
-    const badRun = codeRootRunner({ emptyChild: empty });
-    const bad = await op.protectServiceFiles({ dirs: [runtime], sid: SID, runFile: badRun, log: () => {} });
-    const reason = bad.failed[0]?.reason ?? '';
-    check('an empty ACL on a child fails the protection and restores the saved tree',
-      bad.ok === false && badRun.calls.some((call) => call.args.includes('/restore')),
-      JSON.stringify(badRun.calls.filter((call) => call.args.includes('/restore'))));
-    check('the failure names the file, the restore and `ezz service recover`',
-      reason.includes(empty) && /previous permissions were restored/.test(reason)
-        && /ezz service recover/.test(reason), reason);
+    const healRun = codeRootRunner({ emptyChild: empty, healOnReset: true });
+    const healed = await op.protectServiceFiles({ dirs: [runtime], sid: SID, runFile: healRun, log: () => {} });
+    const healArgs = healRun.calls.map((call) => call.args);
+    check('an empty ACL on a child resets the children in ONE recursive call',
+      healed.ok === true
+        && healArgs.some((entry) => entry[0] === path.join(runtime, '*') && entry.includes('/reset') && entry.includes('/T'))
+        && healArgs.filter((entry) => entry.includes('/reset')).length === 1
+        && !healArgs.some((entry) => entry.includes('/setowner')),
+      healed.failed[0]?.reason ?? JSON.stringify(healArgs.slice(-4)));
+    const treeSaveAt = healArgs.findIndex((entry) => entry.includes('/save') && entry.includes('/T'));
+    const resetAt = healArgs.findIndex((entry) => entry.includes('/reset'));
+    check('the tree is saved with /T before the children are reset',
+      treeSaveAt !== -1 && resetAt > treeSaveAt, `${treeSaveAt} < ${resetAt}`);
 
+    const deniedOnceRun = codeRootRunner({ emptyChild: empty, healOnReset: true, denyResetOnce: true });
+    const retried = await op.protectServiceFiles({
+      dirs: [runtime], sid: SID, runFile: deniedOnceRun, log: () => {},
+    });
+    const retryArgs = deniedOnceRun.calls.map((call) => call.args);
+    check('a denied reset takes ownership once and retries',
+      retried.ok === true
+        && retryArgs.some((entry) => entry[0] === path.join(runtime, '*')
+          && entry.includes('/setowner') && entry.includes('/T') && entry.includes('*S-1-5-32-544'))
+        && retryArgs.filter((entry) => entry.includes('/reset')).length >= 2,
+      JSON.stringify(retryArgs.filter((entry) => entry.includes('/reset') || entry.includes('/setowner'))));
+
+    // ── A read-back that stays wrong restores what was there ───────────────
     const excess = path.join(runtime, 'node.exe');
     const excessRun = codeRootRunner({ childExcess: excess });
     const excessResult = await op.protectServiceFiles({ dirs: [runtime], sid: SID, runFile: excessRun, log: () => {} });
     const excessReason = excessResult.failed[0]?.reason ?? '';
-    check('write access for Everyone on a child fails the read-back',
-      excessResult.ok === false && /more than read and execute/.test(excessReason), excessReason);
-    check('and that failure restores the saved tree',
-      excessRun.calls.some((call) => call.args.includes('/restore')), JSON.stringify(excessRun.calls.slice(-2)));
+    check('an explicit write ACE on a child fails the read-back and restores the saved tree',
+      excessResult.ok === false && /more than read and execute/.test(excessReason)
+        && excessResult.failed[0]?.restored === true, excessReason);
+    check('the failure names the file, whether the ACL was restored and what to run next',
+      excessReason.includes(excess)
+        && /previous permissions were restored/.test(excessReason)
+        && /ezz service recover/.test(excessReason), excessReason);
+
+    const restores = excessRun.calls.filter((call) => call.args.includes('/restore')).map((call) => call.args[2]);
+    const excessArgs = excessRun.calls.map((call) => call.args);
+    const treeSave = excessArgs.find((entry) => entry.includes('/save') && entry.includes('/T'))?.[2] ?? null;
+    const folderSave = excessArgs.find((entry) => entry.includes('/save') && !entry.includes('/T'))?.[2] ?? null;
+    check('the restore puts the tree back before the folder',
+      restores.length === 2 && treeSave && folderSave
+        && restores[0] === treeSave && restores[1] === folderSave,
+      JSON.stringify({ restores, treeSave, folderSave }));
 
     const beforeRegistration = codeRootRunner();
     const unregistered = await op.protectServiceFiles({
@@ -2303,11 +2496,14 @@ async function testRecover() {
       'recover finishes on an elevated administrator',
       'the data root only gets an additive, non-recursive grant',
       'nothing is reset or recursed on the data root',
-      'a denied reset takes ownership and retries once',
-      'the folder grant follows the retry reset and keeps inheritance off',
-      'the files are reset again after the FINAL folder list',
+      'recover only targets the data root once and nothing outside the code roots',
+      'a healthy tree costs ONE scan per root and no reset',
+      'an empty-DACL tree saves the tree, resets it once, takes ownership only when denied, then verifies',
+      'a failed verification restores the saved ACLs and says so',
       'an explicit Everyone full-control ACE is removed during recovery',
+      'every ACL written keeps SYSTEM and Administrators in full control',
       'the descriptor gains the Windows defaults and the user grant',
+      'the database was never touched',
       'a permanent refusal explains how to run the same commands as SYSTEM',
     ]) check(label, true, 'skipped: Windows only');
     return;
@@ -2325,31 +2521,33 @@ async function testRecover() {
     fs.writeFileSync(path.join(runtime, 'app', 'src', 'cli', 'index.js'), 'entry');
     fs.writeFileSync(path.join(dataDir, 'easy-devops.sqlite'), 'KEEP');
 
-    const run = recoveryRun(`D:(A;;CC;;;SY)`);
-    const runFile = codeRootRunner({
-      denyResetOnce: true,
+    /** `sc.exe` argv through `runFile`, updating the descriptor recover writes. */
+    const descriptorSc = (run) => async (args) => {
+      if (args[0] === 'sdset') {
+        run.state.sddl = args[2];
+        return { success: true, stdout: '', stderr: '' };
+      }
+      if (args[0] === 'sdshow') return { success: true, stdout: run.state.sddl };
+      return { success: false, stdout: '', stderr: `unexpected sc ${args.join(' ')}` };
+    };
+
+    // ── A HEALTHY server: one scan per root, no reset, no ownership change ─
+    const healthyRun = recoveryRun(`D:(A;;CC;;;SY)`);
+    const healthyFiles = codeRootRunner({
       folderTrustee: 'Everyone',
-      sc: async (args) => {
-        if (args[0] === 'sdset') {
-          run.state.sddl = args[2];
-          return { success: true, stdout: '', stderr: '' };
-        }
-        if (args[0] === 'sdshow') return { success: true, stdout: run.state.sddl };
-        return { success: false, stdout: '', stderr: `unexpected sc ${args.join(' ')}` };
-      },
+      sc: descriptorSc(healthyRun),
     });
     const logs = [];
-    const recovered = await ws.recoverCodePermissions({
-      run,
-      runFile,
+    const healthy = await ws.recoverCodePermissions({
+      run: healthyRun,
+      runFile: healthyFiles,
       operator: { sid: SID, name: 'DOMAIN\\me' },
       dataDir,
       log: (line) => logs.push(line),
     });
-    check('recover finishes on an elevated administrator',
-      recovered.ok === true, recovered.reason ?? '');
+    check('recover finishes on an elevated administrator', healthy.ok === true, healthy.reason ?? '');
 
-    const args = runFile.calls
+    const args = healthyFiles.calls
       .filter((call) => /icacls\.exe$/i.test(call.file))
       .map((call) => call.args);
     check('the data root only gets an additive, non-recursive grant',
@@ -2362,46 +2560,96 @@ async function testRecover() {
     check('recover only targets the data root once and nothing outside the code roots',
       args.every((entry) => entry[0] === dataDir
         || entry[0] === bin || entry[0] === path.join(bin, '*')
+        || entry[0] === path.join(bin, 'EasyDevOps.exe')
         || entry[0] === runtime || entry[0] === path.join(runtime, '*')
+        || entry[0] === path.join(runtime, 'node.exe')
+        || entry[0] === path.join(runtime, 'app', 'src', 'cli', 'index.js')
         || entry[0] === path.join(dataDir, 'runtime.prev')
         || entry[0] === path.join(dataDir, 'runtime.prev', '*')),
       args.map((entry) => entry[0]).join(' | '));
-
-    const binReset = args.findIndex((entry) => entry[0] === path.join(bin, '*') && entry.includes('/reset'));
-    const binOwner = args.findIndex((entry) => entry[0] === path.join(bin, '*') && entry.includes('/setowner'));
-    const binResetAgain = args.findIndex((entry, index) =>
-      index > binOwner && entry[0] === path.join(bin, '*') && entry.includes('/reset'));
-    const binGrant = args.findIndex((entry) => entry[0] === bin && entry.includes('/grant:r'));
-    const binInherit = args.findIndex((entry) => entry[0] === bin && entry.includes('/inheritance:r'));
-    const binFinalReset = args.findIndex((entry, index) =>
-      index > binInherit && entry[0] === path.join(bin, '*') && entry.includes('/reset'));
-    check('a denied reset takes ownership and retries once',
-      binReset !== -1 && binOwner !== -1 && binResetAgain > binOwner
-        && JSON.stringify(args[binOwner]) === JSON.stringify([
-          path.join(bin, '*'), '/setowner', '*S-1-5-32-544', '/T', '/C', '/L', '/Q',
-        ]),
-      JSON.stringify({ binReset, binOwner, binResetAgain, owner: args[binOwner] }));
-    check('the folder grant follows the retry reset and keeps inheritance off',
-      binGrant > binResetAgain && binInherit > binGrant, JSON.stringify({ binGrant, binInherit }));
-    check('the files are reset again after the FINAL folder list',
-      binFinalReset > binInherit, JSON.stringify({ binInherit, binFinalReset }));
+    check('a healthy tree costs ONE scan per root and no reset',
+      !args.some((entry) => entry.includes('/reset') || entry.includes('/setowner'))
+        && args.filter((entry) => entry.includes('/T')).length === 2,
+      JSON.stringify(args.filter((entry) => entry.includes('/T') || entry.includes('/reset'))));
     check('an explicit Everyone full-control ACE is removed during recovery',
-      runFile.calls.some((call) => JSON.stringify(call.args)
+      healthyFiles.calls.some((call) => JSON.stringify(call.args)
         === JSON.stringify([bin, '/remove:g', 'Everyone', '/L', '/Q'])),
-      runFile.calls.map((call) => call.args.join(' ')).join(' | '));
+      healthyFiles.calls.map((call) => call.args.join(' ')).join(' | '));
 
+    const writtenGrants = args.filter((entry) => entry.includes('/grant') || entry.includes('/grant:r'));
+    check('every ACL written keeps SYSTEM and Administrators in full control',
+      writtenGrants.length > 0
+        && writtenGrants.every((entry) => entry.includes('*S-1-5-18:(OI)(CI)F')
+          && entry.includes('*S-1-5-32-544:(OI)(CI)F'))
+        && !args.some((entry) => entry.includes('/remove:g')
+          && entry.some((arg) => /S-1-5-18|S-1-5-32-544/.test(arg))),
+      JSON.stringify(writtenGrants));
     check('the descriptor gains the Windows defaults and the user grant',
-      recovered.ok === true
-        && run.state.sddl.includes('(A;;CCLCSWRPWPDTLOCRRC;;;SY)')
-        && run.state.sddl.includes('(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)')
-        && run.state.sddl.includes(OPERATOR_ACE), run.state.sddl);
+      healthyRun.state.sddl.includes('(A;;CCLCSWRPWPDTLOCRRC;;;SY)')
+        && healthyRun.state.sddl.includes('(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)')
+        && healthyRun.state.sddl.includes(OPERATOR_ACE), healthyRun.state.sddl);
     check('the database was never touched',
       fs.readFileSync(path.join(dataDir, 'easy-devops.sqlite'), 'utf8') === 'KEEP');
     check('each step is reported',
-      logs.some((line) => /data directory|runtime|descriptor/.test(line)), logs.join(' | '));
+      logs.some((line) => /data directory|runtime|descriptor|verified/.test(line)), logs.join(' | '));
+
+    // ── An empty-DACL tree: save /T, ONE reset, ownership only on denial ──
+    const empty = path.join(runtime, 'node.exe');
+    const repairRun = recoveryRun(`D:(A;;CC;;;SY)`);
+    const repairFiles = codeRootRunner({
+      emptyChild: empty,
+      healOnReset: true,
+      denyResetOnce: true,
+      sc: descriptorSc(repairRun),
+    });
+    const repaired = await ws.recoverCodePermissions({
+      run: repairRun,
+      runFile: repairFiles,
+      operator: { sid: SID, name: 'DOMAIN\\me' },
+      dataDir,
+      log: () => {},
+    });
+    const repairArgs = repairFiles.calls
+      .filter((call) => /icacls\.exe$/i.test(call.file))
+      .map((call) => call.args)
+      .filter((entry) => entry[0] === runtime || entry[0] === path.join(runtime, '*')
+        || entry[0] === empty);
+    const treeSave = repairArgs.findIndex((entry) => entry[0] === runtime
+      && entry.includes('/save') && entry.includes('/T'));
+    const firstReset = repairArgs.findIndex((entry) => entry.includes('/reset'));
+    const ownerAt = repairArgs.findIndex((entry) => entry.includes('/setowner'));
+    const retryReset = repairArgs.findIndex((entry, index) => index > ownerAt && entry.includes('/reset'));
+    const verifyAt = repairArgs.findIndex((entry, index) => index > retryReset
+      && entry[0] === path.join(runtime, '*') && entry.includes('/T'));
+    check('an empty-DACL tree saves the tree, resets it once, takes ownership only when denied, then verifies',
+      repaired.ok === true
+        && treeSave !== -1 && firstReset > treeSave
+        && ownerAt > firstReset && retryReset > ownerAt && verifyAt > retryReset
+        && JSON.stringify(repairArgs[ownerAt]) === JSON.stringify([
+          path.join(runtime, '*'), '/setowner', '*S-1-5-32-544', '/T', '/C', '/L', '/Q',
+        ]),
+      repaired.reason ?? JSON.stringify({ treeSave, firstReset, ownerAt, retryReset, verifyAt }));
+
+    // ── A verification that stays wrong restores, and says what next ──────
+    const excessRun = recoveryRun(`D:(A;;CC;;;SY)`);
+    const excessFiles = codeRootRunner({ childExcess: empty, sc: descriptorSc(excessRun) });
+    const excess = await ws.recoverCodePermissions({
+      run: excessRun,
+      runFile: excessFiles,
+      operator: { sid: SID, name: 'DOMAIN\\me' },
+      dataDir,
+      log: () => {},
+    });
+    const restored = excessFiles.calls.filter((call) => call.args.includes('/restore'));
+    check('a failed verification restores the saved ACLs and says so',
+      excess.ok === false && excess.restored === true
+        && /previous permissions were restored/.test(excess.reason ?? '')
+        && /see the commands printed above/.test(excess.reason ?? '')
+        && restored.length >= 2,
+      excess.reason?.split('\n')[0]);
 
     const refusedRun = recoveryRun(`D:(A;;CC;;;SY)`);
-    const refusedFiles = codeRootRunner({ denyResetAlways: true });
+    const refusedFiles = codeRootRunner({ emptyChild: empty, denyResetAlways: true });
     const refused = await ws.recoverCodePermissions({
       run: refusedRun,
       runFile: refusedFiles,
@@ -2461,6 +2709,425 @@ async function testStartErrorMapping() {
     refused.reason?.split('\n')[0]);
 }
 
+// ─── 19. An interrupted install resumes from the failed step ────────────────
+
+async function testInstallResume() {
+  setGroup('19. an interrupted install resumes from the failed step');
+
+  const platform = await import(srcUrl('core/platform.js'));
+  if (!platform.isWindows) {
+    for (const label of [
+      'the resumed install succeeds',
+      'the data directory and the wrapper folder are not prepared again',
+      'the runtime folder IS prepared and copied again',
+      'the later steps run: the service is registered and started',
+      'the progress file is removed after a complete install',
+    ]) check(label, true, 'skipped: Windows only');
+    return;
+  }
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const root = scratch('install-resume');
+
+  await withProgramData(root, async (dataDir) => {
+    const bin = path.join(dataDir, 'bin');
+    const runtime = path.join(dataDir, 'runtime');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.mkdirSync(path.join(runtime, 'app', 'src', 'cli'), { recursive: true });
+    fs.writeFileSync(path.join(bin, 'EasyDevOps.exe'), 'wrapper');
+    fs.writeFileSync(path.join(bin, 'EasyDevOps.xml'), '<service/>');
+    fs.writeFileSync(path.join(runtime, 'node.exe'), 'old node');
+
+    const ledger = scmRun({ initial: 'MISSING' });
+    let failRegister = true;
+    const prepared = [];
+    let copied = 0;
+    const run = async (cmd) => {
+      if (/^icacls /.test(cmd)) return aclReadback(cmd);
+      if (failRegister && / install$/.test(cmd)) {
+        return { success: false, stdout: '', stderr: 'stub: the wrapper refused to register' };
+      }
+      return ledger(cmd);
+    };
+
+    const deps = {
+      isWindows: true,
+      isElevated: async () => true,
+      canWrite: () => true,
+      prepareProtectedDir: async (opts) => {
+        prepared.push(opts.dir);
+        fs.mkdirSync(opts.dir, { recursive: true });
+        return { ok: true };
+      },
+      copyRuntime: () => {
+        copied += 1;
+        writeRuntimeFixture(runtime);
+        return { ok: true, dir: runtime, nodeExe: path.join(runtime, 'node.exe'), entry: 'ENTRY' };
+      },
+      verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
+      verifyWinsw: async () => ({ ok: true, sha256: 'stub' }),
+      grantOperator: async (opts) => ({
+        record: { sid: SID, name: 'DOMAIN\\me', serviceControl: true, dataDir: true, grantedAt: 'T' },
+        protection: { ok: true, protected: opts.protectedDirs ?? [], failed: [] },
+        notes: [],
+      }),
+    };
+    const installOnce = () => ws.install(stubFiles({
+      dataDir,
+      appRoot: path.join(root, 'app'),
+      config: {},
+      operator: { sid: SID, name: 'DOMAIN\\me' },
+      run,
+      log: () => {},
+      fetchImpl: async () => ({ ok: true, status: 200, arrayBuffer: async () => Buffer.from('fresh wrapper') }),
+      deps,
+    }));
+
+    // The first run is interrupted at registration, which writes a REAL
+    // progress record (the version in it is whatever this build writes).
+    const interrupted = await installOnce();
+    check('an interrupted install leaves a progress record',
+      interrupted.ok === false && fs.existsSync(ws.installProgressPath(dataDir)),
+      interrupted.reason ?? '');
+
+    // Rewrite it into the state the owner's server was left in: the data
+    // directory and the wrapper are done, the runtime copy failed.
+    const progress = JSON.parse(fs.readFileSync(ws.installProgressPath(dataDir), 'utf8'));
+    progress.steps = { dataDir: 'done', bin: 'done', runtime: 'failed' };
+    progress.failedStep = 'runtime';
+    progress.error = 'the runtime copy could not be verified';
+    fs.writeFileSync(ws.installProgressPath(dataDir), `${JSON.stringify(progress, null, 2)}\n`);
+
+    prepared.length = 0;
+    copied = 0;
+    failRegister = false;
+    const result = await installOnce();
+
+    check('the resumed install succeeds', result.ok === true, result.reason ?? '');
+    check('the data directory and the wrapper folder are not prepared again',
+      !prepared.includes(dataDir) && !prepared.includes(bin), JSON.stringify(prepared));
+    check('the runtime folder IS prepared and copied again',
+      prepared.includes(runtime) && copied === 1, JSON.stringify({ prepared, copied }));
+    check('the later steps run: the service is registered and started',
+      ledger.calls.some((c) => / install$/.test(c)) && ledger.calls.some((c) => / start$/.test(c)),
+      ledger.calls.join(' | '));
+    check('the progress file is removed after a complete install',
+      !fs.existsSync(ws.installProgressPath(dataDir)));
+  });
+}
+
+// ─── 20. Status of an unfinished install ────────────────────────────────────
+
+async function testStatusWithFailedStep() {
+  setGroup('20. status says an install is unfinished, not that permissions are missing');
+
+  const platform = await import(srcUrl('core/platform.js'));
+  if (!platform.isWindows) {
+    for (const label of [
+      'status says the install is unfinished and how to resume',
+      'and prints no permission warning while install has to finish',
+    ]) check(label, true, 'skipped: Windows only');
+    return;
+  }
+
+  const svc = await import(srcUrl('core/service/index.js'));
+  const dataDir = (await import(srcUrl('core/platform.js'))).getDataDir();
+  const installProgress = {
+    version: '1.4.8',
+    steps: { dataDir: 'done', runtime: 'failed' },
+    failedStep: 'runtime',
+    error: 'the runtime copy could not be verified',
+  };
+
+  const result = await svc.status({
+    deps: {
+      edition: 'server',
+      isRegistered: async () => false,
+      detectLeftoverServerData: async () => ({ leftover: false }),
+      checkDrift: () => ({ cliVersion: '1.4.8', serviceVersion: null, message: null }),
+      inspectRuntime: async () => ({ ok: false }),
+      detectLegacy: async () => ({ items: [] }),
+      // A live read that WOULD produce the false 1.4.7 warning. While an
+      // install is unfinished it must not be printed: the user is sent to
+      // `ezz service install`, not to a repair that would resume nothing.
+      liveGrantState: async () => ({
+        checked: true,
+        missing: [{ path: dataDir, need: 'modify' }],
+        errors: [],
+      }),
+      windowsService: {
+        status: async () => ({
+          installed: true,
+          registered: true,
+          running: true,
+          state: 'running',
+          warnings: [],
+          installProgress,
+        }),
+      },
+    },
+  });
+
+  check('status says the install is unfinished and how to resume',
+    result.warnings.some((warning) => /Install not finished \(stopped at runtime\)/.test(warning)
+      && /ezz service install/.test(warning)),
+    result.warnings.join(' | '));
+  check('and prints no permission warning while install has to finish',
+    !result.warnings.some((warning) => /no (modify|read) access|cannot read|could not verify the service account/i.test(warning)),
+    result.warnings.join(' | '));
+}
+
+// ─── 21. Repair removes a runtime.prev whose DACLs are empty ─────────────────
+
+async function testRepairRemovesUnreadableRuntimePrev() {
+  setGroup('21. repair removes an unreadable runtime.prev through the ACL fallback');
+
+  const platform = await import(srcUrl('core/platform.js'));
+  if (!platform.isWindows) {
+    for (const label of [
+      'the repair succeeds',
+      'the unreadable previous copy is taken ownership of and reset before removal',
+      'the denied recursive check came before the ownership and reset',
+      'the previous copy is gone',
+    ]) check(label, true, 'skipped: Windows only');
+    return;
+  }
+
+  const ws = await import(srcUrl('core/service/windowsService.js'));
+  const root = scratch('repair-unreadable-prev');
+
+  await withProgramData(root, async (dataDir) => {
+    const bin = path.join(dataDir, 'bin');
+    const runtime = path.join(dataDir, 'runtime');
+    const prev = path.join(dataDir, 'runtime.prev');
+    fs.mkdirSync(bin, { recursive: true });
+    writeRuntimeFixture(runtime);
+    fs.mkdirSync(prev, { recursive: true });
+    fs.writeFileSync(path.join(prev, 'node.exe'), 'unreadable node');
+    fs.writeFileSync(path.join(bin, 'EasyDevOps.exe'), 'wrapper');
+    fs.writeFileSync(path.join(bin, 'EasyDevOps.xml'), '<service/>');
+
+    // A 1.4.4-1.4.6 tree: the files have empty DACLs, so even the RECURSIVE
+    // attribute check is refused until ownership is taken and the tree reset.
+    let emptyDacl = true;
+    const deniedChecks = [];
+    const aclCalls = [];
+    const logLines = [];
+    const runFile = async (file, args, options = {}) => {
+      const exe = path.win32.basename(String(file)).toLowerCase();
+      if (exe === 'powershell.exe') {
+        const target = String(options?.env?.EZ_ACL_TARGET ?? '');
+        const recursive = options?.env?.EZ_ACL_TREE === '1';
+        if (recursive && emptyDacl && target
+            && path.resolve(target).toLowerCase() === path.resolve(prev).toLowerCase()) {
+          deniedChecks.push(target);
+          return { success: false, stdout: '', stderr: 'Access is denied.' };
+        }
+        return { success: true, stdout: '', stderr: '' };
+      }
+      if (exe === 'icacls.exe') {
+        aclCalls.push([...args]);
+        if (args.includes('/reset') && String(args[0]).startsWith(prev)) emptyDacl = false;
+        return {
+          success: true,
+          stdout: args.length === 1 ? `${args[0]} NT AUTHORITY\\SYSTEM:(OI)(CI)(F)` : 'Successfully processed 1 files',
+          stderr: '',
+        };
+      }
+      return { success: false, stdout: '', stderr: `unexpected ${exe}` };
+    };
+
+    const run = scmRun({ initial: 'RUNNING' });
+    const repaired = await ws.repair({
+      dataDir,
+      appRoot: path.join(root, 'app'),
+      config: {},
+      operator: { sid: SID, name: 'DOMAIN\\me' },
+      run,
+      runFile,
+      log: (line) => logLines.push(line),
+      waitForStart: async () => ({ alive: true }),
+      deps: {
+        isWindows: true,
+        isElevated: async () => true,
+        canWrite: () => true,
+        verifyWinsw: async () => ({ ok: true }),
+        prepareProtectedDir: async (options) => {
+          fs.mkdirSync(options.dir, { recursive: true });
+          return { ok: true };
+        },
+        copyRuntime: () => {
+          writeRuntimeFixture(runtime);
+          return { ok: true, dir: runtime, nodeExe: path.join(runtime, 'node.exe'), entry: 'ENTRY' };
+        },
+        verifyNativeModules: async () => ({ ok: true, version: 'v20.0.0', abi: '115' }),
+        verifyServiceCodeRoot: async () => ({ ok: true, reason: null, count: 1 }),
+        grantOperator: async (options) => ({
+          record: { sid: SID, name: 'DOMAIN\\me', serviceControl: true, dataDir: true, grantedAt: 'T' },
+          protection: { ok: true, protected: options.protectedDirs ?? [], failed: [] },
+          notes: [],
+        }),
+        stopWaitMs: 2_000,
+      },
+    });
+
+    check('the repair succeeds', repaired.ok === true, repaired.reason ?? '');
+    const prevOwner = aclCalls.findIndex((entry) => String(entry[0]).startsWith(prev) && entry.includes('/setowner'));
+    const prevReset = aclCalls.findIndex((entry) => String(entry[0]).startsWith(prev) && entry.includes('/reset'));
+    check('the unreadable previous copy is taken ownership of and reset before removal',
+      prevOwner !== -1 && prevReset > prevOwner
+        && logLines.some((line) => /taking ownership and resetting the code tree/.test(line)),
+      JSON.stringify({ prevOwner, prevReset, logLines }));
+    check('the denied recursive check came before the ownership and reset',
+      deniedChecks.length >= 1 && prevOwner !== -1, JSON.stringify(deniedChecks));
+    check('the previous copy is gone', !fs.existsSync(prev));
+  });
+}
+
+// ─── 22. A Server with no service never gets a Personal launcher ────────────
+
+/**
+ * The `windowsPersonal` module a test injects.
+ *
+ * Only `dataDir` is ours: every other directory (src also probes the real
+ * `userDataDir()`) resolves to a path that never exists, so a real Personal
+ * install on the machine running the suite can never be found, backed up or
+ * removed by a test.
+ */
+function isolatedPersonal(wp, dataDir) {
+  const ours = path.resolve(dataDir);
+  return {
+    LAUNCHER_FILE: wp.LAUNCHER_FILE,
+    SUPERVISOR_FILE: wp.SUPERVISOR_FILE,
+    launcherPath: (dir) => (dir ? path.join(dir, wp.LAUNCHER_FILE) : null),
+    supervisorPath: (dir) => (path.resolve(String(dir ?? '')) === ours
+      ? path.join(dir, wp.SUPERVISOR_FILE)
+      : path.join(String(dir ?? ''), 'ez-test-not-ours', wp.SUPERVISOR_FILE)),
+  };
+}
+
+async function testRepairOnServerWithoutService() {
+  setGroup('22. repair on a Windows Server with no service says "not installed"');
+
+  const platform = await import(srcUrl('core/platform.js'));
+  if (!platform.isWindows) {
+    for (const label of [
+      'repair reports not_installed',
+      'with the install instruction, never a Personal launcher',
+      'and writes no Personal launcher files',
+    ]) check(label, true, 'skipped: Windows only');
+    return;
+  }
+
+  const svc = await import(srcUrl('core/service/index.js'));
+  const wp = await import(srcUrl('core/service/windowsPersonal.js'));
+  const startupDir = scratch('server-repair-startup');
+  const dataDir = (await import(srcUrl('core/platform.js'))).getDataDir();
+
+  const result = await svc.repair({
+    log: () => {},
+    deps: {
+      edition: 'server',
+      isRegistered: async () => false,
+      detectLeftoverServerData: async () => ({ leftover: false }),
+      startupDir,
+      windowsPersonal: isolatedPersonal(wp, dataDir),
+      legacy: { run: async () => ({ success: false, stdout: '', stderr: '' }) },
+    },
+  });
+
+  check('repair reports not_installed',
+    result.ok === false && result.code === 'not_installed', JSON.stringify(result.code ?? result.reason));
+  check('with the install instruction, never a Personal launcher',
+    /not installed on this Windows Server/.test(result.reason ?? '')
+      && /ezz service install/.test(result.reason ?? '')
+      && !/Startup|Personal|supervisor/i.test(result.reason ?? ''),
+    (result.reason ?? '').split('\n')[0]);
+  check('and writes no Personal launcher files',
+    fs.readdirSync(startupDir).length === 0
+      && !fs.existsSync(path.join(dataDir, wp.SUPERVISOR_FILE)),
+    JSON.stringify({ startup: fs.readdirSync(startupDir), supervisor: fs.existsSync(path.join(dataDir, wp.SUPERVISOR_FILE)) }));
+}
+
+// ─── 23. A Personal launcher on a Server is backed up, then removed ─────────
+
+async function testPersonalLauncherOnServerEdition() {
+  setGroup('23. install on a Server backs up a Personal launcher before removing it');
+
+  const platform = await import(srcUrl('core/platform.js'));
+  if (!platform.isWindows) {
+    for (const label of [
+      'the install reaches the launcher cleanup',
+      'both launcher files are copied byte for byte into a backup folder',
+      'only those two files are removed',
+      'an unrelated Startup file is left alone',
+    ]) check(label, true, 'skipped: Windows only');
+    return;
+  }
+
+  const svc = await import(srcUrl('core/service/index.js'));
+  const wp = await import(srcUrl('core/service/windowsPersonal.js'));
+  const dataDir = (await import(srcUrl('core/platform.js'))).getDataDir();
+  const startupDir = scratch('server-launcher-startup');
+
+  const launcher = path.join(startupDir, wp.LAUNCHER_FILE);
+  const supervisor = path.join(dataDir, wp.SUPERVISOR_FILE);
+  const unrelated = path.join(startupDir, 'someone-elses-tool.cmd');
+  const launcherBytes = Buffer.from('@echo off\r\nrem Personal launcher\r\n');
+  const supervisorBytes = Buffer.from('@echo off\r\nrem Personal supervisor\r\n');
+  fs.writeFileSync(launcher, launcherBytes);
+  fs.writeFileSync(supervisor, supervisorBytes);
+  fs.writeFileSync(unrelated, '@echo off\r\n');
+
+  const result = await svc.install({
+    mode: 'server',
+    log: () => {},
+    deps: {
+      edition: 'server',
+      isRegistered: async () => false,
+      detectLeftoverServerData: async () => ({ leftover: false }),
+      isElevated: async () => true,
+      isServerMode: () => true,
+      enableServerMode: async () => ({ ok: true, dataDir, migrated: false }),
+      closeDb: () => {},
+      reopenDb: () => {},
+      resolveOperator: async () => null,
+      startupDir,
+      windowsPersonal: isolatedPersonal(wp, dataDir),
+      legacy: { run: async () => ({ success: false, stdout: '', stderr: '' }) },
+      windowsService: {
+        install: async () => ({ ok: false, reason: 'stub: the service is not registered in this test' }),
+      },
+    },
+  });
+
+  check('the install reaches the launcher cleanup',
+    result.ok === false && /stub: the service is not registered/.test(result.reason ?? ''),
+    (result.reason ?? '').split('\n')[0]);
+
+  const backupRoot = path.join(dataDir, 'backup');
+  const backups = fs.existsSync(backupRoot)
+    ? fs.readdirSync(backupRoot).filter((name) => name.startsWith('personal-launcher-'))
+    : [];
+  const backupDir = backups.length ? path.join(backupRoot, backups[0]) : null;
+  const backedUp = backupDir && fs.existsSync(backupDir) ? fs.readdirSync(backupDir) : [];
+  const backupsDetail = backups.map((name) => ({
+    name,
+    files: fs.readdirSync(path.join(backupRoot, name)),
+  }));
+  check('both launcher files are copied byte for byte into a backup folder',
+    backups.length === 1 && backupDir !== null
+      && backedUp.length === 2
+      && fs.readFileSync(path.join(backupDir, wp.LAUNCHER_FILE)).equals(launcherBytes)
+      && fs.readFileSync(path.join(backupDir, wp.SUPERVISOR_FILE)).equals(supervisorBytes),
+    JSON.stringify({ backupsDetail, backedUp }));
+  check('only those two files are removed',
+    !fs.existsSync(launcher) && !fs.existsSync(supervisor), JSON.stringify({ launcher, supervisor }));
+  check('an unrelated Startup file is left alone',
+    fs.existsSync(unrelated) && fs.readdirSync(startupDir).length === 1,
+    JSON.stringify(fs.readdirSync(startupDir)));
+}
+
 // ─── main ────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -2497,7 +3164,7 @@ async function main() {
       'and WITHOUT the service account, which does not exist before registration',
       'the preparation happens before the runtime is copied',
       'and before the wrapper is downloaded or verified',
-      'the wrapper folder is prepared before any icacls grant on it',
+      'the wrapper folder is prepared before any icacls read-back or grant on it',
       'the grant runs after the service-account ACLs',
       'and before the service is started',
       'a folder that cannot be protected fails the install',
@@ -2528,6 +3195,11 @@ async function main() {
   await testCodeRootProtection();
   await testRecover();
   await testStartErrorMapping();
+  await testInstallResume();
+  await testStatusWithFailedStep();
+  await testRepairRemovesUnreadableRuntimePrev();
+  await testRepairOnServerWithoutService();
+  await testPersonalLauncherOnServerEdition();
 
   const failed = results.filter((r) => !r.passed);
   process.stdout.write(`\n${'-'.repeat(62)}\n`);
